@@ -1,0 +1,32 @@
+[package]
+name = "froe-cli"
+description = "Command-line interface for inspecting and extracting data from Apache Jackrabbit Oak segment-tar (TarMK) repositories."
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "froe"
+path = "src/main.rs"
+# The binary shares its name with the library crate; documentation for the
+# workspace is the library's (cargo would otherwise report a filename
+# collision at target/doc/froe).
+doc = false
+
+[dependencies]
+froe = { version = "0.1.0", path = "../froe" }
+clap = { version = "4.5", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+# Restores default SIGPIPE handling so piping into `head` and friends
+# ends the process quietly instead of panicking on a closed pipe.
+# Already in the dependency graph through memmap2.
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "froe"
+description = "Reader for Apache Jackrabbit Oak segment-tar (TarMK) repositories: parses tar archives, segments, and records, and extracts node data."
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories = ["filesystem", "parser-implementations"]
+
+[dependencies]
+memmap2 = "0.9"
+
+[lints]
+workspace = true
