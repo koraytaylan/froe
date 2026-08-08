@@ -33,9 +33,11 @@ use crate::mutation::CheckpointRemoval;
     about = "Tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories",
     long_about = "Tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories, the storage \
                   format of Apache Jackrabbit Oak and Adobe Experience Manager. Inspection and \
-                  extraction commands are read-only and safe against a live repository; the \
-                  compact, backup, restore, recover-journal, and checkpoint commands modify the \
-                  store and must be run against a stopped repository."
+                  extraction commands are read-only and safe against a live repository (archives \
+                  are memory-mapped under the store's never-modify-in-place file protocol, the \
+                  same reliance a running Oak instance has); the compact, backup, restore, \
+                  recover-journal, and checkpoint commands modify the store and must be run \
+                  against a stopped repository."
 )]
 struct CommandLine {
     #[command(subcommand)]
@@ -314,7 +316,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
         }
         Command::Node { repository, path } => {
             if !content_display::print_node(&Repository::open(&repository)?, &path)? {
-                eprintln!("froe: no node at {path}");
+                eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -324,7 +326,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             depth,
         } => {
             if !content_display::print_tree(&Repository::open(&repository)?, &path, depth)? {
-                eprintln!("froe: no node at {path}");
+                eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -374,7 +376,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             if let Some(node_count) = written {
                 eprintln!("froe: extracted {node_count} nodes");
             } else {
-                eprintln!("froe: no node at {path}");
+                eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
                 return Ok(ExitCode::FAILURE);
             }
         }

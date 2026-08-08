@@ -2,9 +2,13 @@
 //!
 //! Everything below this module ultimately serves one contract: a store
 //! written by `froe` must be indistinguishable, to Oak and AEM, from a
-//! store written by Oak itself. Byte layouts, durability ordering, file
-//! naming, and locking all follow the specifications in
-//! `docs/analysis/` extracted from the Java implementation.
+//! store written by Oak itself (one documented rendering residue:
+//! extreme-subnormal doubles; see
+//! [`crate::content::property::double_to_text`]). Byte layouts,
+//! durability ordering, file naming, and locking all follow the
+//! specifications in `docs/analysis/` extracted from the Java
+//! implementation. Writing requires a Unix operating system entropy
+//! source; the writable store refuses to open on Windows.
 
 pub mod backup;
 pub mod commit;

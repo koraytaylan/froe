@@ -118,7 +118,9 @@ after which a normal AEM start consumes the result cleanly.
 
 ### The `froe` command surface
 
-Read-only (safe against a live repository):
+Read-only (safe against a live repository, under the store's
+never-modify-in-place file protocol — see the mmap note in the
+introduction above):
 
 | Command | Purpose |
 | --- | --- |

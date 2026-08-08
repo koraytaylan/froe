@@ -13,6 +13,8 @@ process mutating archives outside that protocol would disturb froe and a
 running Oak instance alike). Maintenance commands
 (`compact`, `backup`, `restore`, `recover-journal`, `checkpoint`) take the
 exclusive repository lock and modify the store, so they must run against a
-*stopped* repository; each asks for confirmation first.
+*stopped* repository; each asks for confirmation first. The maintenance
+commands require a Unix operating system entropy source and refuse to run
+on Windows; the read-only commands work everywhere.
 
 Licensed under the Apache License, Version 2.0.

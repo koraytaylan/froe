@@ -16,21 +16,38 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{Error, Result};
 
-/// The repository directories this process currently holds locked.
-/// Classic process-associated POSIX record locks do not conflict within
-/// one process, so same-process double opens must be refused here — Java
+/// How a locked repository is identified in the process-local registry.
+/// On Unix the lock *file's* `(device, inode)` identity, so directory
+/// renames and mount aliases cannot smuggle a second same-process
+/// acquisition past the registry; elsewhere the canonical lock-file
+/// path (Windows `LockFileEx` already conflicts across handles within
+/// one process, so the registry is belt and braces there).
+#[cfg(unix)]
+type LockIdentity = (u64, u64);
+#[cfg(not(unix))]
+type LockIdentity = std::path::PathBuf;
+
+#[cfg(unix)]
+fn lock_identity(metadata: &std::fs::Metadata) -> LockIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+/// The lock identities this process currently holds. Classic
+/// process-associated POSIX record locks do not conflict within one
+/// process, so same-process double opens must be refused here — Java
 /// throws `OverlappingFileLockException` for exactly this case. The
 /// registry also gives open-file-description platforms the identical
 /// same-process behavior.
-static LOCKED_DIRECTORIES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static LOCKED_IDENTITIES: OnceLock<Mutex<HashSet<LockIdentity>>> = OnceLock::new();
 
-fn locked_directories() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
-    LOCKED_DIRECTORIES
+fn locked_identities() -> std::sync::MutexGuard<'static, HashSet<LockIdentity>> {
+    LOCKED_IDENTITIES
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -40,11 +57,11 @@ fn locked_directories() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
 pub struct RepositoryLock {
     /// Held for the lifetime of the lock; closing the file releases the
     /// operating system lock. An `Option` so [`Drop`] can close it
-    /// *before* unregistering the directory, inside one registry
-    /// critical section.
+    /// *before* unregistering the identity, inside one registry critical
+    /// section.
     lock_file: Option<File>,
-    /// The canonical directory registered in [`LOCKED_DIRECTORIES`].
-    registered_directory: PathBuf,
+    /// The identity registered in [`LOCKED_IDENTITIES`].
+    registered_identity: LockIdentity,
 }
 
 impl RepositoryLock {
@@ -52,7 +69,8 @@ impl RepositoryLock {
     /// absent. Fails immediately — with a message pointing at a possibly
     /// running AEM instance — when another process holds the lock, and
     /// equally when *this* process already holds it (Java's
-    /// `OverlappingFileLockException`).
+    /// `OverlappingFileLockException`), regardless of the path the
+    /// repository is reached through.
     pub fn acquire(repository_directory: &Path) -> Result<Self> {
         let in_use = |detail: &str| Error::InvalidFormat {
             details: format!(
@@ -61,30 +79,64 @@ impl RepositoryLock {
                 repository_directory.display()
             ),
         };
-        let canonical_directory = std::fs::canonicalize(repository_directory)?;
-        if !locked_directories().insert(canonical_directory.clone()) {
-            return Err(in_use("this process"));
-        }
-        let unregister = |directory: &PathBuf| {
-            locked_directories().remove(directory);
+        let lock_path = repository_directory.join("repo.lock");
+
+        // One critical section covers identity resolution, registration,
+        // and the operating system lock, so no interleaving same-process
+        // acquire can observe a half-registered state.
+        let mut registry = locked_identities();
+
+        #[cfg(unix)]
+        let (lock_file, identity) = {
+            // Stat *before* open: on classic process-associated POSIX
+            // locks, merely opening and closing a descriptor of a lock
+            // file another guard in this process holds would release
+            // that guard's locks — so the file is opened only once the
+            // registry proves no in-process guard holds this identity.
+            match std::fs::metadata(&lock_path) {
+                Ok(metadata) => {
+                    let identity = lock_identity(&metadata);
+                    if registry.contains(&identity) {
+                        return Err(in_use("this process"));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let file = open_lock_file(&lock_path)?;
+            let identity = lock_identity(&file.metadata()?);
+            if registry.contains(&identity) {
+                // The lock file changed identity between the stat and the
+                // open (replaced, or freshly created by a racing
+                // acquire) and this process already holds the new
+                // identity. Closing our descriptor would release that
+                // guard's record locks, so the descriptor is deliberately
+                // leaked — one descriptor, in a pathological race.
+                std::mem::forget(file);
+                return Err(in_use("this process"));
+            }
+            (file, identity)
+        };
+        #[cfg(not(unix))]
+        let (lock_file, identity) = {
+            let file = open_lock_file(&lock_path)?;
+            let identity = std::fs::canonicalize(&lock_path)?;
+            if registry.contains(&identity) {
+                return Err(in_use("this process"));
+            }
+            (file, identity)
         };
 
-        let lock_path = repository_directory.join("repo.lock");
-        let lock_file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                unregister(&canonical_directory);
-                return Err(error.into());
-            }
-        };
+        #[allow(
+            clippy::clone_on_copy,
+            reason = "the identity is a PathBuf on non-Unix targets"
+        )]
+        registry.insert(identity.clone());
         if let Err(source) = lock_exclusively(&lock_file) {
-            unregister(&canonical_directory);
+            registry.remove(&identity);
+            // Closing this descriptor is safe: the registry proved no
+            // other in-process guard holds this identity, so no foreign
+            // locks hang off it.
             return Err(if source.kind() == std::io::ErrorKind::WouldBlock {
                 in_use("another process")
             } else {
@@ -93,14 +145,24 @@ impl RepositoryLock {
         }
         Ok(Self {
             lock_file: Some(lock_file),
-            registered_directory: canonical_directory,
+            registered_identity: identity,
         })
     }
 }
 
+/// Opens (creating when absent) the lock file for locking.
+fn open_lock_file(lock_path: &Path) -> Result<File> {
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?)
+}
+
 impl Drop for RepositoryLock {
     fn drop(&mut self) {
-        // The operating system lock is released *before* the directory is
+        // The operating system lock is released *before* the identity is
         // unregistered, and both happen inside one registry critical
         // section. The reverse order would open a race on classic
         // process-associated POSIX locks: a same-process acquire slipping
@@ -108,9 +170,9 @@ impl Drop for RepositoryLock {
         // descriptor's close then silently releases (closing any
         // descriptor of a file drops all of the process's record locks
         // on it).
-        let mut registry = locked_directories();
+        let mut registry = locked_identities();
         drop(self.lock_file.take());
-        registry.remove(&self.registered_directory);
+        registry.remove(&self.registered_identity);
     }
 }
 
@@ -234,5 +296,30 @@ mod tests {
         // Releasing makes the directory acquirable again.
         drop(held);
         RepositoryLock::acquire(&directory.path).expect("reacquire after release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renaming_the_directory_does_not_defeat_same_process_exclusion() {
+        // The registry keys on the lock file's (device, inode) identity,
+        // so reaching the same repository through a renamed path is
+        // still refused while the lock is held.
+        let directory = TestDirectory::new("rename-alias");
+        let renamed = directory.path.with_extension("renamed");
+        let _ = std::fs::remove_dir_all(&renamed);
+
+        let held = RepositoryLock::acquire(&directory.path).expect("acquire");
+        std::fs::rename(&directory.path, &renamed).expect("rename directory");
+        let through_new_path = RepositoryLock::acquire(&renamed);
+        assert!(
+            through_new_path.is_err(),
+            "the renamed path is the same lock file and must be refused"
+        );
+        let message = through_new_path.err().expect("error").to_string();
+        assert!(message.contains("locked by this process"), "{message}");
+
+        drop(held);
+        RepositoryLock::acquire(&renamed).expect("reacquire after release");
+        let _ = std::fs::remove_dir_all(&renamed);
     }
 }

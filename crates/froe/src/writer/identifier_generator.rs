@@ -122,9 +122,12 @@ fn draw_uuid_halves() -> (u64, u64) {
 ///
 /// # Panics
 ///
-/// Panics when the operating system entropy source fails mid-session;
+/// Panics whenever the operating system entropy source is unavailable
+/// or fails — including on platforms without `/dev/urandom` when called
+/// directly.
 /// [`WritableRepository::open`](crate::writer::store_writer::WritableRepository::open)
-/// verifies the source up front, so this is unreachable in normal use.
+/// verifies the source up front and refuses to open instead, so the
+/// panic is unreachable through the store API in normal use.
 #[must_use]
 pub fn new_data_segment_identifier() -> SegmentIdentifier {
     new_segment_identifier(0xA)
@@ -135,9 +138,12 @@ pub fn new_data_segment_identifier() -> SegmentIdentifier {
 ///
 /// # Panics
 ///
-/// Panics when the operating system entropy source fails mid-session;
+/// Panics whenever the operating system entropy source is unavailable
+/// or fails — including on platforms without `/dev/urandom` when called
+/// directly.
 /// [`WritableRepository::open`](crate::writer::store_writer::WritableRepository::open)
-/// verifies the source up front, so this is unreachable in normal use.
+/// verifies the source up front and refuses to open instead, so the
+/// panic is unreachable through the store API in normal use.
 #[must_use]
 pub fn new_bulk_segment_identifier() -> SegmentIdentifier {
     new_segment_identifier(0xB)
