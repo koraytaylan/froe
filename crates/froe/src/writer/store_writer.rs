@@ -128,6 +128,26 @@ impl WritableRepository {
             state.head = head;
             state.persisted_head = Some(head);
         } else {
+            // Deliberate deviation from Java's TarRevisions.bind, which
+            // bootstraps a fresh initial node even when the archives hold
+            // segments — silently replacing all reachable content with an
+            // empty tree at the next flush. A populated store whose
+            // journal has no resolvable line needs journal recovery, not
+            // a new empty head; refusing loses nothing.
+            if store
+                .base_archives
+                .iter()
+                .any(|archive| archive.segment_count() > 0)
+            {
+                return Err(Error::InvalidFormat {
+                    details: format!(
+                        "{} has segment archives but no journal revision resolves; refusing to \
+                         bootstrap an empty head over existing content — run recover-journal \
+                         first",
+                        directory.display()
+                    ),
+                });
+            }
             let head = store.write_initial_node()?;
             let mut state = store.lock_write_state();
             state.head = head;
@@ -197,10 +217,10 @@ impl WritableRepository {
         let mut total = 0u64;
         for entry in std::fs::read_dir(&self.directory)? {
             let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if ArchiveFileName::parse(name).is_some() {
-                    total += entry.metadata()?.len();
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && ArchiveFileName::parse(name).is_some()
+            {
+                total += entry.metadata()?.len();
             }
         }
         Ok(total)
@@ -216,6 +236,12 @@ impl WritableRepository {
     /// This is safe only when every record reachable from the current
     /// head lives in `reference_generation` — which compaction's deep
     /// copy guarantees.
+    ///
+    /// Scope: only the archives that existed when this session opened are
+    /// swept. Archives written earlier in the *same* session are left for
+    /// the next compaction run, which sees them as base archives — the
+    /// CLI always compacts in a fresh session, so this only concerns
+    /// library callers interleaving commits and compaction.
     pub fn reclaim_old_generations(
         &mut self,
         reference_generation: GarbageCollectionGeneration,
@@ -487,10 +513,10 @@ impl WritableRepository {
             &segment.referenced_segments,
             &segment.binary_reference_identifiers,
         )?;
-        if length >= self.maximum_archive_size {
-            if let Some(finished) = state.tar_writer.take() {
-                finished.close()?;
-            }
+        if length >= self.maximum_archive_size
+            && let Some(finished) = state.tar_writer.take()
+        {
+            finished.close()?;
         }
         drop(state);
 
@@ -503,14 +529,16 @@ impl WritableRepository {
 
     /// Flushes with Oak's durability ordering: archive fsync first, then
     /// — only when the head moved since the last flush — one appended
-    /// journal line, fdatasynced.
+    /// journal line, fdatasynced. Pending segment bytes are forced to
+    /// disk even when the head is unchanged, exactly like Java's
+    /// `flush()`; only the journal line is conditional.
     pub fn flush(&self) -> Result<()> {
         let mut state = self.lock_write_state();
-        if state.persisted_head == Some(state.head) {
-            return Ok(());
-        }
         if let Some(tar_writer) = &mut state.tar_writer {
             tar_writer.flush()?;
+        }
+        if state.persisted_head == Some(state.head) {
+            return Ok(());
         }
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -711,10 +739,10 @@ fn initialize_archives_for_writing(directory: &Path) -> Result<Vec<TarArchiveRea
     let mut file_names = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let name = entry?.file_name();
-        if let Ok(name) = name.into_string() {
-            if name.ends_with(".tar") {
-                file_names.push(name);
-            }
+        if let Ok(name) = name.into_string()
+            && name.ends_with(".tar")
+        {
+            file_names.push(name);
         }
     }
     // Validate against duplicate (number, letter) pairs.
@@ -767,13 +795,123 @@ fn initialize_archives_for_writing(directory: &Path) -> Result<Vec<TarArchiveRea
 }
 
 /// Recovers one archive number with no valid index: scans every letter in
-/// ascending order (later letters overwrite duplicates), renames the
-/// originals to `.bak` names, and rewrites the recovered segments as a
-/// fresh archive under the lowest letter's file name.
+/// ascending order (later letters overwrite duplicates), rebuilds the
+/// recovered segments as a fresh archive, and only after that archive is
+/// written, fsynced, and re-validated are the originals retired to
+/// `.bak` names and the replacement installed under the lowest letter's
+/// file name — a failure at any point leaves every original in place.
 fn recover_archive_number(
     directory: &Path,
     generations: &[ArchiveFileName],
 ) -> Result<TarArchiveReader> {
+    let recovered = scan_recoverable_segments(directory, generations);
+
+    // Parse every data segment once; the parsed structures also back the
+    // provider that resolves blob identifier strings across the recovered
+    // segments of this archive number.
+    let mut parsed_segments: HashMap<SegmentIdentifier, Arc<ParsedSegment>> = HashMap::new();
+    for (identifier, bytes) in &recovered {
+        if identifier.is_data_segment() {
+            parsed_segments.insert(
+                *identifier,
+                Arc::new(ParsedSegment::parse(*identifier, bytes)?),
+            );
+        }
+    }
+    let provider = RecoveredSegmentsProvider {
+        segments: recovered
+            .iter()
+            .filter_map(|(identifier, bytes)| {
+                parsed_segments
+                    .get(identifier)
+                    .map(|parsed| (*identifier, (Arc::clone(parsed), bytes.as_slice())))
+            })
+            .collect(),
+    };
+
+    // Build the replacement beside the originals; nothing is renamed or
+    // deleted until it exists, is durable, and re-opens with a valid
+    // index.
+    let target_name = &generations[0].file_name;
+    let temporary_name = format!("{target_name}.recovering");
+    let temporary_path = directory.join(&temporary_name);
+    let _ = std::fs::remove_file(&temporary_path);
+    let write_replacement = || -> Result<()> {
+        let mut writer = TarArchiveWriter::new(directory, &temporary_name);
+        for (identifier, bytes) in &recovered {
+            let (generation, references, binary_references) =
+                if let Some(parsed) = parsed_segments.get(identifier) {
+                    // Fail closed when a blob identifier cannot be
+                    // resolved: publishing an incomplete catalog would let
+                    // AEM's blob garbage collection delete a
+                    // still-referenced binary.
+                    let binary_references =
+                        read_blob_identifiers(&provider, parsed).map_err(|error| {
+                            Error::InvalidFormat {
+                                details: format!(
+                                    "cannot rebuild the binary references catalog while \
+                                     recovering {target_name}: an external blob identifier in \
+                                     segment {identifier} does not resolve within the recovered \
+                                     segments ({error}); refusing to publish an incomplete \
+                                     catalog, which could let blob garbage collection delete \
+                                     referenced binaries"
+                                ),
+                            }
+                        })?;
+                    (
+                        GarbageCollectionGeneration {
+                            generation: parsed.generation,
+                            full_generation: parsed.full_generation,
+                            is_compacted: parsed.is_compacted,
+                        },
+                        parsed.referenced_segments.clone(),
+                        binary_references,
+                    )
+                } else {
+                    (
+                        GarbageCollectionGeneration {
+                            generation: 0,
+                            full_generation: 0,
+                            is_compacted: false,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                };
+            writer.write_segment(
+                *identifier,
+                bytes,
+                generation,
+                &references,
+                &binary_references,
+            )?;
+        }
+        writer.close()?;
+        Ok(())
+    };
+    if let Err(error) = write_replacement() {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    crate::writer::compaction::fsync_directory(directory);
+    let validated = TarArchiveReader::open(&temporary_path)?;
+    if validated.is_recovered() {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(Error::InvalidFormat {
+            details: format!("the rebuilt archive {temporary_name} failed index validation"),
+        });
+    }
+    drop(validated);
+    install_recovered_archive(directory, generations, target_name, &temporary_path)
+}
+
+/// Scans every generation letter of one archive number in ascending
+/// order — later letters overwrite duplicate segments — returning the
+/// recovered segments in scan order.
+fn scan_recoverable_segments(
+    directory: &Path,
+    generations: &[ArchiveFileName],
+) -> Vec<(SegmentIdentifier, Vec<u8>)> {
     let mut recovered: Vec<(SegmentIdentifier, Vec<u8>)> = Vec::new();
     let mut positions: HashMap<SegmentIdentifier, usize> = HashMap::new();
     for generation in generations {
@@ -790,46 +928,38 @@ fn recover_archive_number(
                 }
             }
         }
-        std::fs::rename(&path, backup_path(directory, &generation.file_name))?;
     }
+    recovered
+}
 
-    let target_name = &generations[0].file_name;
-    let mut writer = TarArchiveWriter::new(directory, target_name);
-    for (identifier, bytes) in &recovered {
-        let (generation, references, binary_references) = if identifier.is_data_segment() {
-            let parsed = Arc::new(ParsedSegment::parse(*identifier, bytes)?);
-            let references = parsed.referenced_segments.clone();
-            let binary_references = read_segment_blob_identifiers(&parsed, bytes);
-            (
-                GarbageCollectionGeneration {
-                    generation: parsed.generation,
-                    full_generation: parsed.full_generation,
-                    is_compacted: parsed.is_compacted,
-                },
-                references,
-                binary_references,
-            )
+/// Retires the original generation letters to `.bak` names and installs
+/// the validated replacement under the target name. The target's own
+/// original is preserved through a hard link first, so a `.tar` under
+/// the target name exists at every instant; the other letters are plain
+/// renames.
+fn install_recovered_archive(
+    directory: &Path,
+    generations: &[ArchiveFileName],
+    target_name: &str,
+    temporary_path: &Path,
+) -> Result<TarArchiveReader> {
+    for generation in generations {
+        let path = directory.join(&generation.file_name);
+        let backup = backup_path(directory, &generation.file_name);
+        if generation.file_name == *target_name {
+            if std::fs::hard_link(&path, &backup).is_err() {
+                // No hard links on this filesystem: fall back to a rename
+                // with its momentary no-target window.
+                std::fs::rename(&path, &backup)?;
+            }
         } else {
-            (
-                GarbageCollectionGeneration {
-                    generation: 0,
-                    full_generation: 0,
-                    is_compacted: false,
-                },
-                Vec::new(),
-                Vec::new(),
-            )
-        };
-        writer.write_segment(
-            *identifier,
-            bytes,
-            generation,
-            &references,
-            &binary_references,
-        )?;
+            std::fs::rename(&path, &backup)?;
+        }
     }
-    writer.close()?;
-    TarArchiveReader::open(&directory.join(target_name))
+    let target_path = directory.join(target_name);
+    std::fs::rename(temporary_path, &target_path)?;
+    crate::writer::compaction::fsync_directory(directory);
+    TarArchiveReader::open(&target_path)
 }
 
 /// The first free `.bak` name for a damaged archive: `name.bak`, then
@@ -980,36 +1110,65 @@ pub(crate) fn read_segment_blob_identifiers(
         structure: Arc::clone(structure),
         bytes,
     };
+    read_blob_identifiers(&provider, structure).unwrap_or_default()
+}
+
+/// Extracts every external blob identifier recorded in one segment,
+/// resolving large (`0xF0`-class) identifiers through `provider`. Fails
+/// when any identifier cannot be resolved: a rebuilt catalog missing an
+/// entry would let AEM's blob garbage collection delete a binary that is
+/// still referenced, so callers that *publish* the catalog must fail
+/// closed instead.
+fn read_blob_identifiers(
+    provider: &dyn SegmentProvider,
+    structure: &ParsedSegment,
+) -> Result<Vec<String>> {
     let mut identifiers = Vec::new();
+    let view = provider.segment(structure.identifier)?;
     for entry in structure.record_table() {
         if entry.record_type() != Some(RecordType::ExternalBlobIdentifier) {
             continue;
         }
-        let Ok(view) = provider.segment(structure.identifier) else {
-            continue;
-        };
-        let Ok(head) = view.read_u8(entry.record_number, 0) else {
-            continue;
-        };
+        let head = view.read_u8(entry.record_number, 0)?;
         if head & 0xF0 == 0xE0 {
-            let Ok(stored) = view.read_u16(entry.record_number, 0) else {
-                continue;
-            };
+            let stored = view.read_u16(entry.record_number, 0)?;
             let length = usize::from(stored & 0x0FFF);
-            if let Ok(reference_bytes) = view.read_bytes(entry.record_number, 2, length) {
-                identifiers.push(String::from_utf8_lossy(reference_bytes).into_owned());
-            }
+            let reference_bytes = view.read_bytes(entry.record_number, 2, length)?;
+            identifiers.push(String::from_utf8_lossy(reference_bytes).into_owned());
         } else if head & 0xF8 == 0xF0 {
-            let Ok(string_identifier) = view.read_record_identifier(entry.record_number, 1, 0)
-            else {
-                continue;
-            };
-            if let Ok(reference) = read_string(&provider, string_identifier) {
-                identifiers.push(reference);
-            }
+            let string_identifier = view.read_record_identifier(entry.record_number, 1, 0)?;
+            identifiers.push(read_string(provider, string_identifier)?);
         }
     }
-    identifiers
+    Ok(identifiers)
+}
+
+/// A provider over the segments recovered for one archive number, so
+/// blob identifier strings referenced across segments of the same
+/// archive resolve during catalog reconstruction.
+struct RecoveredSegmentsProvider<'bytes> {
+    segments: HashMap<SegmentIdentifier, (Arc<ParsedSegment>, &'bytes [u8])>,
+}
+
+impl SegmentProvider for RecoveredSegmentsProvider<'_> {
+    fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+        let (structure, bytes) = self
+            .segments
+            .get(&segment_identifier)
+            .ok_or(Error::SegmentNotFound { segment_identifier })?;
+        Ok(SegmentView {
+            structure: Arc::clone(structure),
+            bytes: (*bytes).into(),
+        })
+    }
+
+    fn string(&self, record_identifier: RecordIdentifier) -> Result<Arc<str>> {
+        read_string(self, record_identifier).map(Arc::from)
+    }
+
+    fn template(&self, record_identifier: RecordIdentifier) -> Result<Arc<Template>> {
+        read_template(self, record_identifier).map(Arc::new)
+    }
 }
 
 #[cfg(test)]
@@ -1061,6 +1220,51 @@ mod tests {
         let content_root = repository.content_root().expect("content root exists");
         assert_eq!(content_root.child_node_count().expect("count"), 0);
         assert!(content_root.properties().expect("properties").is_empty());
+    }
+
+    #[test]
+    fn refuses_to_bootstrap_over_a_populated_store_with_no_resolvable_journal() {
+        let directory = TestDirectory::new("refuse-bootstrap");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            crate::writer::commit::create_checkpoint(&store, 10_000_000, &[]).expect("checkpoint");
+            store.close().expect("close");
+        }
+        std::fs::write(directory.path.join("journal.log"), b"").expect("truncate journal");
+
+        assert!(
+            WritableRepository::open(&directory.path).is_err(),
+            "a populated store with no resolvable journal must not bootstrap an empty head"
+        );
+
+        // The refusal leaves the store intact; journal recovery restores
+        // it and the write open then succeeds.
+        crate::writer::backup::recover_journal(&directory.path).expect("recover");
+        let store = WritableRepository::open(&directory.path).expect("open after recovery");
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn flush_without_head_movement_syncs_segments_but_appends_no_journal_line() {
+        let directory = TestDirectory::new("flush-pending");
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        // Write a segment without moving the head, then flush: the
+        // archive fsync must run (flush succeeds with a pending writer)
+        // while the journal stays untouched.
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        writer
+            .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+            .expect("node");
+        writer.finish().expect("finish");
+        store.flush().expect("flush with pending segments");
+        let journal = std::fs::read_to_string(directory.path.join("journal.log")).expect("journal");
+        assert_eq!(
+            journal.lines().count(),
+            1,
+            "only the bootstrap line: an unchanged head appends nothing"
+        );
+        store.close().expect("close");
     }
 
     #[test]

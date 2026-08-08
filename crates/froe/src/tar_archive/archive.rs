@@ -10,6 +10,15 @@
 //! Unlike the Java implementation, which persists recovered entries to a
 //! `.ro.bak` file even when opened read-only, this reader keeps recovery
 //! results in memory and never writes to the repository directory.
+//!
+//! The memory mapping relies on the segment store's file protocol —
+//! shared with Java, whose `FileChannel.map` carries the identical
+//! assumption: existing archive bytes are immutable, a live writer only
+//! ever *appends* (beyond the mapped length) or replaces whole files via
+//! rename (which keeps this mapping on the old inode). A process that
+//! truncates or rewrites an archive in place steps outside that protocol
+//! and can fault the mapping — the same failure mode a running Oak
+//! instance would suffer.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -67,11 +76,17 @@ impl TarArchiveReader {
         // valid index (positions are 32-bit), but the Java reader still
         // recovers their segments with the full scan — so no size check
         // here; index parsing rejects the file and recovery takes over.
-        // SAFETY: the mapping is read-only and the segment store only ever
-        // appends new files or replaces whole files; the bytes an existing
-        // archive already contains are immutable. A concurrent writer can
-        // append to the archive it is currently filling, but appended bytes
-        // lie beyond our mapped length.
+        // SAFETY: the mapping is read-only and the segment store's file
+        // protocol makes the mapped bytes immutable — Oak only ever
+        // appends new files, appends to the archive it is currently
+        // filling (beyond our mapped length), or replaces whole files by
+        // rename, which leaves this mapping on the old inode. This is
+        // the same assumption Java's FileChannel.map makes for the same
+        // files. What the protocol cannot rule out — an unrelated
+        // process truncating or rewriting the file in place — would
+        // fault this mapping exactly as it would fault a running Oak
+        // instance; froe accepts that shared residual risk rather than
+        // give up zero-copy segment access.
         let bytes = unsafe { memmap2::Mmap::map(&file)? };
 
         let content = if let Ok(index) = parse_segment_index(&bytes) {
@@ -300,12 +315,12 @@ fn recover_segment_entries(bytes: &[u8], archive_file_name: &str) -> RecoveredSe
                 let size = size as usize;
                 let data = position_after_header..position_after_header + size;
                 let next_position = skip_past_data(position_after_header);
-                if let Some(expected) = checksum {
-                    if crc32(&bytes[data.clone()]) != expected {
-                        // Corrupt segment: drop it and continue scanning.
-                        position = next_position;
-                        continue;
-                    }
+                if let Some(expected) = checksum
+                    && crc32(&bytes[data.clone()]) != expected
+                {
+                    // Corrupt segment: drop it and continue scanning.
+                    position = next_position;
+                    continue;
                 }
                 if let Some(&existing) = lookup.get(&identifier) {
                     entries[existing].1 = data;

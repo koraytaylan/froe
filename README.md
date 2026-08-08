@@ -11,6 +11,10 @@ instance and without the JVM's startup and garbage collection overhead:
   takes the repository lock and never writes. Traverse the content tree,
   extract node data as JSON, inspect archives and segments, check
   consistency, diff revisions, trace node history, and search nodes.
+  Like Oak itself, the reader memory-maps archives and relies on the
+  store's file protocol (existing archive bytes are never modified in
+  place); a process that truncates or rewrites archives outside that
+  protocol would disturb froe and a running Oak instance alike.
 * **Writing** takes the exclusive repository lock and produces stores
   byte-for-byte compatible with what Oak writes, so a subsequent AEM start
   consumes the result cleanly. Compact offline, back up and restore,

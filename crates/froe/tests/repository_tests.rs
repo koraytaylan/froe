@@ -820,3 +820,121 @@ fn stable_identifiers_use_the_journal_record_form() {
         )
     );
 }
+
+/// Builds a two-segment archive fixture where a large (`0xF0`-class)
+/// external blob identifier in one segment points at a string record in
+/// the *other* segment — the layout the production writer emits when a
+/// segment boundary falls between the two records. `resolvable` controls
+/// whether the string-bearing segment is actually included.
+fn cross_segment_blob_archive(resolvable: bool) -> Vec<u8> {
+    let identifier_holder = data_segment_uuid(0x51);
+    let string_holder = data_segment_uuid(0x52);
+
+    let mut string_segment = SegmentBuilder::new(string_holder);
+    string_segment.add_record(
+        0,
+        TYPE_VALUE,
+        string_record("blob-identifier-in-another-segment"),
+    );
+
+    let mut identifier_segment = SegmentBuilder::new(identifier_holder);
+    let reference = identifier_segment.add_referenced_segment(string_holder);
+    let mut blob_identifier_record = vec![0xF0u8];
+    blob_identifier_record.extend(record_identifier_bytes(reference, 0));
+    identifier_segment.add_record(
+        0,
+        support::TYPE_EXTERNAL_BLOB_IDENTIFIER,
+        blob_identifier_record,
+    );
+
+    let mut archive = ArchiveBuilder::new().without_index();
+    if resolvable {
+        archive.add_segment(string_holder, string_segment.build());
+    }
+    archive.add_segment(identifier_holder, identifier_segment.build());
+    archive.build("data00001a.tar")
+}
+
+/// Writes the synthetic content repository plus the cross-segment blob
+/// archive (which has no index, so a write open must recover it).
+fn write_repository_with_blob_archive(directory: &TestDirectory, resolvable: bool) {
+    let repository = build_synthetic_repository();
+    let mut content_archive = ArchiveBuilder::new();
+    content_archive.add_segment(
+        repository.values_segment.0,
+        repository.values_segment.1.clone(),
+    );
+    content_archive.add_segment(repository.tree_segment.0, repository.tree_segment.1.clone());
+    write_repository(
+        &directory.path,
+        &[
+            (
+                "data00000a.tar".to_owned(),
+                content_archive.build("data00000a.tar"),
+            ),
+            (
+                "data00001a.tar".to_owned(),
+                cross_segment_blob_archive(resolvable),
+            ),
+        ],
+        std::slice::from_ref(&repository.journal_line),
+    );
+}
+
+#[test]
+fn write_open_recovery_resolves_cross_segment_blob_identifiers() {
+    let directory = TestDirectory::new("recovery-blob-catalog");
+    write_repository_with_blob_archive(&directory, true);
+
+    // The write open recovers the index-less archive; the rebuilt binary
+    // references catalog must contain the cross-segment identifier —
+    // dropping it would let AEM's blob garbage collection delete the
+    // referenced binary.
+    let store =
+        froe::writer::store_writer::WritableRepository::open(&directory.path).expect("open");
+    store.close().expect("close");
+
+    assert!(
+        directory.path.join("data00001a.tar.bak").exists(),
+        "the original archive is retired to a backup name"
+    );
+    let repository = Repository::open(&directory.path).expect("reader");
+    let recovered = repository
+        .archives()
+        .iter()
+        .find(|archive| archive.file_name() == "data00001a.tar")
+        .expect("recovered archive present");
+    assert!(
+        !recovered.is_recovered(),
+        "the rebuilt archive has a valid index"
+    );
+    let catalog = recovered
+        .binary_references()
+        .expect("the rebuilt archive has a catalog");
+    let identifiers: Vec<&str> = catalog
+        .generations
+        .iter()
+        .flat_map(|generation| generation.segments.iter())
+        .flat_map(|(_, references)| references.iter().map(String::as_str))
+        .collect();
+    assert_eq!(identifiers, ["blob-identifier-in-another-segment"]);
+}
+
+#[test]
+fn write_open_recovery_fails_closed_on_unresolvable_blob_identifiers() {
+    let directory = TestDirectory::new("recovery-blob-fail-closed");
+    write_repository_with_blob_archive(&directory, false);
+
+    let error = froe::writer::store_writer::WritableRepository::open(&directory.path);
+    assert!(
+        error.is_err(),
+        "recovery must refuse to publish an incomplete blob catalog"
+    );
+    // The failure leaves every original archive untouched: nothing was
+    // renamed, deleted, or replaced.
+    assert!(directory.path.join("data00000a.tar").exists());
+    assert!(directory.path.join("data00001a.tar").exists());
+    assert!(!directory.path.join("data00001a.tar.bak").exists());
+    // The store still opens read-only (recovery stays in memory there).
+    Repository::open(&directory.path).expect("read-only open still works");
+}

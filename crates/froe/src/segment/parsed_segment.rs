@@ -222,12 +222,12 @@ impl ParsedSegment {
                 )));
             }
             let record_number = record_number as u32;
-            if let Some(previous) = previous_record_number {
-                if previous >= record_number {
-                    return Err(invalid(format!(
-                        "record table of segment {identifier} is not sorted by record number"
-                    )));
-                }
+            if let Some(previous) = previous_record_number
+                && previous >= record_number
+            {
+                return Err(invalid(format!(
+                    "record table of segment {identifier} is not sorted by record number"
+                )));
             }
             previous_record_number = Some(record_number);
             record_table.push(RecordTableEntry {

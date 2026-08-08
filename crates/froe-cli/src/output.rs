@@ -82,6 +82,26 @@ pub(crate) fn append_json_values(buffer: &mut String, values: &PropertyValues) {
     }
 }
 
+/// Renders repository-controlled text for plain terminal output: C0
+/// control characters and DEL become visible `\u{..}` escapes, so a
+/// hostile node name or value cannot inject ANSI or OSC terminal control
+/// sequences. JSON output paths escape through
+/// [`append_json_string`] instead.
+pub(crate) fn sanitize_terminal_text(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_owned();
+    }
+    let mut sanitized = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            let _ = write!(sanitized, "\\u{{{:x}}}", character as u32);
+        } else {
+            sanitized.push(character);
+        }
+    }
+    sanitized
+}
+
 /// The Java spelling of a non-finite double.
 fn non_finite_double_text(number: f64) -> String {
     if number.is_nan() {

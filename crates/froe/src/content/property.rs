@@ -137,23 +137,88 @@ impl PropertyValue {
     }
 }
 
-/// Renders a double the way `java.lang.Double::toString` does, so a value
-/// re-stored by the writer round-trips through Oak's `Double.parseDouble`.
-/// The only meaningful differences from Rust's `f64::Display` are the
-/// non-finite spellings.
+/// Renders a double the way `java.lang.Double::toString` does, so a
+/// value re-stored by the writer (compaction re-renders doubles exactly
+/// as Oak's `SegmentWriter` does) reproduces the text Oak originally
+/// wrote: `NaN`/`Infinity` spellings, a signed `0.0`, plain decimal form
+/// with at least one fractional digit for magnitudes in
+/// `[10^-3, 10^7)`, and `d.dddEn` computerized scientific notation
+/// outside that range. Digit selection is the shortest representation
+/// that round-trips, like modern Java; a handful of extreme subnormals
+/// pick a different (equally round-tripping) shortest form.
 #[must_use]
 pub fn double_to_text(value: f64) -> String {
     if value.is_nan() {
-        "NaN".to_owned()
-    } else if value.is_infinite() {
-        if value.is_sign_positive() {
+        return "NaN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_positive() {
             "Infinity".to_owned()
         } else {
             "-Infinity".to_owned()
+        };
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_owned()
+        } else {
+            "0.0".to_owned()
+        };
+    }
+    // Shortest round-trip digits and the decimal exponent, from Rust's
+    // scientific rendering `d[.ddd]e<exponent>`. The fallbacks are
+    // unreachable — the format always contains a parseable exponent —
+    // but a plain rendering is safer than a panic.
+    let scientific = format!("{:e}", value.abs());
+    let Some((mantissa, exponent_text)) = scientific.split_once('e') else {
+        return value.to_string();
+    };
+    let Ok(exponent) = exponent_text.parse::<i32>() else {
+        return value.to_string();
+    };
+    let digits: String = mantissa
+        .chars()
+        .filter(|character| *character != '.')
+        .collect();
+
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let digit_count = digits.len() as i32;
+    let mut rendered = String::new();
+    if (-3..7).contains(&exponent) {
+        // Plain decimal form, always with a fractional part.
+        if exponent < 0 {
+            rendered.push_str("0.");
+            for _ in 0..(-exponent - 1) {
+                rendered.push('0');
+            }
+            rendered.push_str(&digits);
+        } else if exponent >= digit_count - 1 {
+            rendered.push_str(&digits);
+            for _ in 0..(exponent - (digit_count - 1)) {
+                rendered.push('0');
+            }
+            rendered.push_str(".0");
+        } else {
+            let (integer_digits, fraction_digits) = digits.split_at(exponent as usize + 1);
+            rendered.push_str(integer_digits);
+            rendered.push('.');
+            rendered.push_str(fraction_digits);
         }
     } else {
-        value.to_string()
+        // Computerized scientific notation with at least one fractional
+        // digit: `d.dddEn`.
+        let (first_digit, rest) = digits.split_at(1);
+        rendered.push_str(first_digit);
+        rendered.push('.');
+        if rest.is_empty() {
+            rendered.push('0');
+        } else {
+            rendered.push_str(rest);
+        }
+        rendered.push('E');
+        rendered.push_str(&exponent.to_string());
     }
+    format!("{sign}{rendered}")
 }
 
 /// Reads and decodes the value record at `value_identifier` as a value of
@@ -329,5 +394,55 @@ mod tests {
             PropertyValue::Name("nt:file".to_owned()).as_text(),
             Some("nt:file".to_owned())
         );
+    }
+
+    #[test]
+    fn doubles_render_like_java_double_to_string() {
+        // Expected strings are Java `Double.toString` outputs, written
+        // out by hand — a compaction re-render must reproduce the text
+        // Oak originally wrote.
+        use super::double_to_text;
+        assert_eq!(double_to_text(0.0), "0.0");
+        assert_eq!(double_to_text(-0.0), "-0.0");
+        assert_eq!(double_to_text(1.0), "1.0");
+        assert_eq!(double_to_text(-1.5), "-1.5");
+        assert_eq!(double_to_text(100.0), "100.0");
+        assert_eq!(double_to_text(0.5), "0.5");
+        assert_eq!(double_to_text(12345.678), "12345.678");
+        assert_eq!(double_to_text(0.001), "0.001");
+        assert_eq!(double_to_text(0.0001), "1.0E-4");
+        assert_eq!(double_to_text(-0.000_025), "-2.5E-5");
+        assert_eq!(double_to_text(9_999_999.0), "9999999.0");
+        assert_eq!(double_to_text(10_000_000.0), "1.0E7");
+        assert_eq!(double_to_text(123_456_789.0), "1.23456789E8");
+        assert_eq!(
+            double_to_text(f64::MAX),
+            "1.7976931348623157E308",
+            "the maximum double keeps its full seventeen digits"
+        );
+        assert_eq!(double_to_text(f64::NAN), "NaN");
+        assert_eq!(double_to_text(f64::INFINITY), "Infinity");
+        assert_eq!(double_to_text(f64::NEG_INFINITY), "-Infinity");
+        // Every rendering round-trips to the identical bits, which is
+        // what Oak's Double.parseDouble relies on.
+        for value in [
+            0.0,
+            -0.0,
+            1.0,
+            -1.5,
+            12345.678,
+            0.0001,
+            9_999_999.0,
+            1.0e300,
+            5e-324,
+            f64::MAX,
+        ] {
+            let round_tripped: f64 = double_to_text(value).parse().expect("parses");
+            assert_eq!(
+                round_tripped.to_bits(),
+                value.to_bits(),
+                "{value} round-trips"
+            );
+        }
     }
 }

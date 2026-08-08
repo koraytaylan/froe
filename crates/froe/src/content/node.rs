@@ -240,14 +240,14 @@ impl<'provider> NodeState<'provider> {
     /// is stored as an ordinary property, and Java returns it.
     pub fn property(&self, name: &str) -> Result<Option<PropertyState>> {
         let template = self.template()?;
-        if name == "jcr:primaryType" {
-            if let Some(primary_type) = &template.primary_type {
-                return Ok(Some(PropertyState {
-                    name: "jcr:primaryType".to_owned(),
-                    property_type: PropertyType::Name,
-                    values: PropertyValues::Single(PropertyValue::Name(primary_type.clone())),
-                }));
-            }
+        if name == "jcr:primaryType"
+            && let Some(primary_type) = &template.primary_type
+        {
+            return Ok(Some(PropertyState {
+                name: "jcr:primaryType".to_owned(),
+                property_type: PropertyType::Name,
+                values: PropertyValues::Single(PropertyValue::Name(primary_type.clone())),
+            }));
         }
         if name == "jcr:mixinTypes" && !template.mixin_types.is_empty() {
             return Ok(Some(PropertyState {

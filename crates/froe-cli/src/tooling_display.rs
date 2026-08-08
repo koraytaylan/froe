@@ -8,7 +8,7 @@ use froe::tooling::diff::{NodeDifference, PropertyChange};
 use froe::tooling::search::SearchQuery;
 use froe::tooling::{check_consistency, diff_revisions, node_history, search_nodes};
 
-use crate::output::{append_json_values, format_timestamp};
+use crate::output::{append_json_values, format_timestamp, sanitize_terminal_text};
 
 /// `froe check`: each path's latest good revision, Oak-style. Succeeds
 /// (exit 0) when any path found a good revision — Java's default,
@@ -32,7 +32,7 @@ pub(crate) fn print_check(
     if !report.checkpoints.is_empty() {
         println!("checkpoints");
         for (checkpoint, verdicts) in &report.checkpoint_paths {
-            println!("- {checkpoint}");
+            println!("- {}", sanitize_terminal_text(checkpoint));
             for verdict in verdicts {
                 print_path_verdict(verdict, "    ");
             }
@@ -63,8 +63,9 @@ fn print_path_verdict(verdict: &froe::tooling::PathVerdict, indent: &str) {
     } else {
         let reason = verdict.newest_failure.as_deref().unwrap_or("never checked");
         println!(
-            "{indent}latest good revision for path {} is none ({reason})",
-            verdict.path
+            "{indent}latest good revision for path {} is none ({})",
+            verdict.path,
+            sanitize_terminal_text(reason)
         );
     }
 }
@@ -83,8 +84,12 @@ pub(crate) fn print_difference(
     }
     for difference in &differences {
         match difference {
-            NodeDifference::NodeAdded { path } => println!("+ {path}"),
-            NodeDifference::NodeRemoved { path } => println!("- {path}"),
+            NodeDifference::NodeAdded { path } => {
+                println!("+ {}", sanitize_terminal_text(path));
+            }
+            NodeDifference::NodeRemoved { path } => {
+                println!("- {}", sanitize_terminal_text(path));
+            }
             NodeDifference::PropertyChanged { path, change } => {
                 print_property_change(path, change);
             }
@@ -97,15 +102,17 @@ fn print_property_change(path: &str, change: &PropertyChange) {
     match change {
         PropertyChange::Added(property) => {
             println!(
-                "  + {path}/{} = {}",
-                property.name,
+                "  + {}/{} = {}",
+                sanitize_terminal_text(path),
+                sanitize_terminal_text(&property.name),
                 render(&property.values)
             );
         }
         PropertyChange::Removed(property) => {
             println!(
-                "  - {path}/{} = {}",
-                property.name,
+                "  - {}/{} = {}",
+                sanitize_terminal_text(path),
+                sanitize_terminal_text(&property.name),
                 render(&property.values)
             );
         }
@@ -114,7 +121,11 @@ fn print_property_change(path: &str, change: &PropertyChange) {
             before,
             after,
         } => {
-            println!("  ^ {path}/{name}");
+            println!(
+                "  ^ {}/{}",
+                sanitize_terminal_text(path),
+                sanitize_terminal_text(name)
+            );
             println!("      - {}", render(before));
             println!("      + {}", render(after));
         }

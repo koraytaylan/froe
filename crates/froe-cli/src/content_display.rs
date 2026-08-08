@@ -5,20 +5,23 @@ use froe::content::node::NodeState;
 use froe::content::property::PropertyValue;
 use froe::store::Repository;
 
-use crate::output::append_json_values;
+use crate::output::{append_json_values, sanitize_terminal_text};
 
 /// `froe node`: one node's properties and child names.
 pub(crate) fn print_node(repository: &Repository, path: &str) -> froe::Result<bool> {
     let Some(node) = repository.node_at_path(path)? else {
         return Ok(false);
     };
-    println!("path              {}", normalized_path(path));
+    println!(
+        "path              {}",
+        sanitize_terminal_text(&normalized_path(path))
+    );
     println!("record            {}", node.record_identifier());
     println!("stable identifier {}", node.stable_identifier()?);
     for property in node.properties()? {
         println!(
             "property          {} <{}{}> = {}",
-            property.name,
+            sanitize_terminal_text(&property.name),
             property.property_type.jcr_name(),
             if matches!(property.values, PropertyValues::Multiple(_)) {
                 "[]"
@@ -29,7 +32,11 @@ pub(crate) fn print_node(repository: &Repository, path: &str) -> froe::Result<bo
         );
     }
     for (name, child) in node.child_node_entries()? {
-        println!("child             {name}  {}", child.record_identifier());
+        println!(
+            "child             {}  {}",
+            sanitize_terminal_text(&name),
+            child.record_identifier()
+        );
     }
     Ok(true)
 }
@@ -50,8 +57,13 @@ pub(crate) fn print_tree(repository: &Repository, path: &str, depth: usize) -> f
                     _ => None,
                 });
         let indentation = level * 2;
+        let name = sanitize_terminal_text(&name);
         match primary_type {
-            Some(primary_type) => println!("{:indentation$}{name}  [{primary_type}]", ""),
+            Some(primary_type) => println!(
+                "{:indentation$}{name}  [{}]",
+                "",
+                sanitize_terminal_text(&primary_type)
+            ),
             None => println!("{:indentation$}{name}", ""),
         }
         if level < depth {

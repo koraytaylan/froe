@@ -76,8 +76,8 @@ pub fn diff_revisions(
     let archives = open_all_archives(directory)?;
     let provider = ArchiveSet::new(archives);
 
-    let before_head = resolve_revision(directory, before_revision)?;
-    let after_head = resolve_revision(directory, after_revision)?;
+    let before_head = resolve_revision(directory, before_revision, &provider)?;
+    let after_head = resolve_revision(directory, after_revision, &provider)?;
 
     let before_node = content_node_at(&provider, before_head, filter_path)?;
     let after_node = content_node_at(&provider, after_head, filter_path)?;
@@ -97,13 +97,21 @@ pub fn diff_revisions(
     Ok(differences)
 }
 
-/// Resolves a revision string to a head record identifier.
-fn resolve_revision(directory: &std::path::Path, revision: &str) -> Result<RecordIdentifier> {
+/// Resolves a revision string to a head record identifier. `"head"`
+/// rewinds past journal lines whose segment is missing, exactly like the
+/// repository open — a syntactically valid line pointing at a lost
+/// segment must not shadow the newest revision that actually resolves.
+fn resolve_revision(
+    directory: &std::path::Path,
+    revision: &str,
+    provider: &ArchiveSet,
+) -> Result<RecordIdentifier> {
     if revision.eq_ignore_ascii_case("head") {
         let entries = crate::journal::read_journal(&directory.join("journal.log"))?;
         return entries
             .iter()
-            .find_map(crate::journal::JournalEntry::record_identifier)
+            .filter_map(crate::journal::JournalEntry::record_identifier)
+            .find(|identifier| provider.segment(identifier.segment).is_ok())
             .ok_or_else(|| crate::error::Error::InvalidFormat {
                 details: "the journal has no resolvable head".to_owned(),
             });
@@ -365,6 +373,15 @@ fn property_value_equal(
             *after_record,
             *before_length,
         );
+    }
+    // Doubles compare like Java's Double.equals — by bits, so NaN equals
+    // NaN and -0.0 differs from 0.0 — where the derived f64 equality
+    // would report a NaN property as perpetually changed and a sign flip
+    // of zero as unchanged.
+    if let (PropertyValue::Double(before_value), PropertyValue::Double(after_value)) =
+        (before, after)
+    {
+        return Ok(before_value.to_bits() == after_value.to_bits());
     }
     Ok(before == after)
 }

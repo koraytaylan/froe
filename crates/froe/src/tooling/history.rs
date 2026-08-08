@@ -31,7 +31,8 @@ pub struct NodeHistoryEntry {
 pub fn node_history(directory: &std::path::Path, path: &str) -> Result<Vec<NodeHistoryEntry>> {
     let archives = open_all_archives(directory)?;
     let provider = ArchiveSet::new(archives);
-    let journal_entries = read_journal(&directory.join("journal.log")).unwrap_or_default();
+    // An unreadable journal is a loud failure, not an empty history.
+    let journal_entries = read_journal(&directory.join("journal.log"))?;
 
     let mut history = Vec::new();
     for entry in &journal_entries {
@@ -62,8 +63,11 @@ fn navigate<'provider>(
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
+    // A path starting with "checkpoints" walks from the super-root, whose
+    // children are `root` and `checkpoints` — the first segment names the
+    // checkpoints container itself, so nothing is skipped.
     let (mut current, rest) = if segments.first() == Some(&"checkpoints") {
-        (super_root, &segments[1..])
+        (super_root, &segments[..])
     } else {
         match super_root.child_node("root")? {
             Some(root) => (root, &segments[..]),

@@ -5,7 +5,10 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.89 stabilized File::try_lock, which the non-Unix repository lock
+# uses; the Unix lock needs fcntl open-file-description locks (Linux,
+# Android, macOS), the same lock space as Oak's FileChannel.lock().
+rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["Koray Taylan Davgana <koraytaylan@gmail.com>"]
 keywords = ["jackrabbit", "oak", "tarmk", "aem", "segment"]

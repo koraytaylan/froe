@@ -105,11 +105,16 @@ enum Command {
         /// Bound the extraction depth; omit to extract the whole subtree.
         #[arg(long)]
         depth: Option<usize>,
-        /// Write to this file instead of standard output.
+        /// Write to this file instead of standard output. The file must
+        /// not exist yet; extraction never overwrites.
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Find each path's newest consistent revision (read-only).
+    /// Find each path's newest consistent revision (read-only). Exits 0
+    /// when ANY checked path found a good revision — oak-run's contract
+    /// with fail-fast off, not an all-paths-healthy integrity gate; a
+    /// script needing every path healthy must inspect the per-path
+    /// output.
     Check {
         /// The segment store directory.
         repository: PathBuf,
@@ -332,7 +337,27 @@ fn run(command: Command) -> froe::Result<ExitCode> {
         } => {
             let repository = Repository::open(&repository)?;
             let written = if let Some(output_path) = output {
-                let file = std::fs::File::create(&output_path)?;
+                // Refuse to touch an existing file: an output path
+                // pointing at the repository itself (journal.log, an
+                // archive, or an alias of one) must never be truncated,
+                // and unrelated files must never be silently overwritten.
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&output_path)
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            froe::Error::InvalidFormat {
+                                details: format!(
+                                    "output file {} already exists; extraction never \
+                                     overwrites — choose a fresh path or remove the file first",
+                                    output_path.display()
+                                ),
+                            }
+                        } else {
+                            froe::Error::InputOutput(error)
+                        }
+                    })?;
                 let mut sink = std::io::BufWriter::with_capacity(1 << 20, file);
                 let written = extraction::extract_json_lines(&repository, &path, depth, &mut sink)?;
                 sink.flush()?;

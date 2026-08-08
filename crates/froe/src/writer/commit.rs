@@ -380,22 +380,22 @@ pub fn remove_unreferenced_checkpoints(store: &WritableRepository) -> Result<u64
 
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     let head_node = store.head_node();
-    if let Some(content_root) = head_node.child_node("root")? {
-        if let Some(async_state) = content_root.child_node(":async")? {
-            for property in async_state.properties()? {
-                match property.values {
-                    PropertyValues::Single(PropertyValue::String(value)) => {
-                        referenced.insert(value);
-                    }
-                    PropertyValues::Multiple(values) => {
-                        for value in values {
-                            if let PropertyValue::String(value) = value {
-                                referenced.insert(value);
-                            }
+    if let Some(content_root) = head_node.child_node("root")?
+        && let Some(async_state) = content_root.child_node(":async")?
+    {
+        for property in async_state.properties()? {
+            match property.values {
+                PropertyValues::Single(PropertyValue::String(value)) => {
+                    referenced.insert(value);
+                }
+                PropertyValues::Multiple(values) => {
+                    for value in values {
+                        if let PropertyValue::String(value) = value {
+                            referenced.insert(value);
                         }
                     }
-                    PropertyValues::Single(_) => {}
                 }
+                PropertyValues::Single(_) => {}
             }
         }
     }

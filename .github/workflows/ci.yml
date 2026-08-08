@@ -1,0 +1,42 @@
+# The full quality gate from CONTRIBUTING.md, on every push and pull
+# request: formatting, both test profiles, pedantic clippy, and warning-
+# free documentation — on Linux and macOS, at the stable and minimum
+# supported Rust versions. Windows builds are checked but not tested:
+# the writable store requires an operating system entropy source that
+# froe only reads on Unix, so writer tests cannot pass there yet.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: --deny warnings
+  RUSTDOCFLAGS: --deny warnings
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, "1.89"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt,clippy
+      - run: rustup default ${{ matrix.rust }}
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace
+      - run: cargo test --workspace --release
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo doc --workspace --no-deps
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.89 --profile minimal --component clippy
+      - run: rustup default 1.89
+      - run: cargo check --workspace --all-targets

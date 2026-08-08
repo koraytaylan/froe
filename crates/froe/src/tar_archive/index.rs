@@ -108,7 +108,7 @@ fn signed_order_key(identifier: SegmentIdentifier) -> (i64, i64) {
 pub fn parse_segment_index(archive_bytes: &[u8]) -> Result<SegmentIndex> {
     let invalid = |details: String| Error::InvalidFormat { details };
     let length = archive_bytes.len();
-    if length % 512 != 0 {
+    if !length.is_multiple_of(512) {
         return Err(invalid(format!(
             "archive length {length} is not a multiple of 512"
         )));

@@ -88,6 +88,7 @@ pub const TYPE_LIST_BUCKET: u8 = 2;
 pub const TYPE_VALUE: u8 = 4;
 pub const TYPE_TEMPLATE: u8 = 6;
 pub const TYPE_NODE: u8 = 7;
+pub const TYPE_EXTERNAL_BLOB_IDENTIFIER: u8 = 8;
 
 /// Builds one version 13 data segment.
 /// One map entry to serialize: the name, the key's serialized record

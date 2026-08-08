@@ -89,11 +89,16 @@ fn lock_exclusively(file: &File) -> std::io::Result<()> {
     }
 }
 
-/// Takes an exclusive whole-file lock without blocking.
+/// Takes an exclusive whole-file lock without blocking. On Windows,
+/// `File::try_lock` (Rust 1.89) uses `LockFileEx` — the same lock space
+/// as Java's `FileChannel.lock()` there, so a running Oak instance is
+/// genuinely excluded.
 #[cfg(not(unix))]
 fn lock_exclusively(file: &File) -> std::io::Result<()> {
-    file.try_lock()
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::WouldBlock))
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        std::fs::TryLockError::Error(error) => error,
+    })
 }
 
 #[cfg(test)]
