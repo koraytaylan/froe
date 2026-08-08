@@ -72,9 +72,13 @@ pub fn deep_copy_tree<Sink: SegmentSink>(
         rewritten_nodes: HashMap::new(),
         compacted_nodes: 0,
     };
-    let root = copier.compact_node(source_root)?;
+    let root = copier.compact_node(source_root, 0)?;
     Ok((root, copier.compacted_nodes))
 }
+
+/// A content tree is never this deep; a greater depth means the source
+/// node records form a cycle in a corrupt store.
+const MAXIMUM_COMPACTION_DEPTH: usize = 100_000;
 
 /// Deep-copies nodes into a fresh generation, sharing rewritten records
 /// through a source-record cache.
@@ -86,9 +90,24 @@ struct Compactor<'writer, Sink: SegmentSink> {
 }
 
 impl<Sink: SegmentSink> Compactor<'_, Sink> {
-    fn compact_node(&mut self, source_node: RecordIdentifier) -> Result<RecordIdentifier> {
+    fn compact_node(
+        &mut self,
+        source_node: RecordIdentifier,
+        depth: usize,
+    ) -> Result<RecordIdentifier> {
         if let Some(&rewritten) = self.rewritten_nodes.get(&source_node) {
             return Ok(rewritten);
+        }
+        // The cache is only populated once a node is fully written, so a
+        // cycle in a corrupt source would otherwise recurse forever before
+        // any entry exists; the depth bound stops it.
+        if depth > MAXIMUM_COMPACTION_DEPTH {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "node tree exceeds depth {MAXIMUM_COMPACTION_DEPTH}; \
+                     the source records probably form a cycle"
+                ),
+            });
         }
         let node = NodeState::new(self.source, source_node);
         let template = node.template()?;
@@ -96,7 +115,10 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         // Rewrite children first so the node record can reference them.
         let mut child_entries = Vec::new();
         for (name, child) in node.child_node_entries()? {
-            child_entries.push((name, self.compact_node(child.record_identifier())?));
+            child_entries.push((
+                name,
+                self.compact_node(child.record_identifier(), depth + 1)?,
+            ));
         }
         let children = match child_entries.len() {
             0 => ChildNodesToWrite::Zero,

@@ -13,6 +13,10 @@ use crate::journal::parse_record_identifier_text;
 use crate::segment::record::RecordIdentifier;
 use crate::store::{ArchiveSet, open_all_archives};
 
+/// A content tree is never this deep; beyond it the node records form a
+/// cycle in a corrupt store, and the diff walk stops.
+const MAXIMUM_DIFF_DEPTH: usize = 100_000;
+
 /// A property-level change within a node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropertyChange {
@@ -79,6 +83,7 @@ pub fn diff_revisions(
         before_node.as_ref(),
         after_node.as_ref(),
         &base_path,
+        0,
         &mut differences,
     )?;
     Ok(differences)
@@ -138,8 +143,16 @@ fn diff_nodes(
     before: Option<&NodeState<'_>>,
     after: Option<&NodeState<'_>>,
     path: &str,
+    depth: usize,
     differences: &mut Vec<NodeDifference>,
 ) -> Result<()> {
+    if depth > MAXIMUM_DIFF_DEPTH {
+        return Err(crate::error::Error::InvalidFormat {
+            details: format!(
+                "node tree exceeds depth {MAXIMUM_DIFF_DEPTH}; the records probably form a cycle"
+            ),
+        });
+    }
     match (before, after) {
         (None, None) => {}
         (None, Some(_)) => differences.push(NodeDifference::NodeAdded {
@@ -154,7 +167,7 @@ fn diff_nodes(
                 return Ok(());
             }
             diff_properties(before_node, after_node, path, differences)?;
-            diff_children(provider, before_node, after_node, path, differences)?;
+            diff_children(provider, before_node, after_node, path, depth, differences)?;
         }
     }
     Ok(())
@@ -212,6 +225,7 @@ fn diff_children(
     before: &NodeState<'_>,
     after: &NodeState<'_>,
     path: &str,
+    depth: usize,
     differences: &mut Vec<NodeDifference>,
 ) -> Result<()> {
     let before_children = before.child_node_entries()?;
@@ -228,6 +242,7 @@ fn diff_children(
             before_child,
             Some(after_child),
             &child_path,
+            depth + 1,
             differences,
         )?;
     }
@@ -237,7 +252,14 @@ fn diff_children(
             .any(|(after_name, _)| after_name == name)
         {
             let child_path = format!("{path}/{name}");
-            diff_nodes(provider, Some(before_child), None, &child_path, differences)?;
+            diff_nodes(
+                provider,
+                Some(before_child),
+                None,
+                &child_path,
+                depth + 1,
+                differences,
+            )?;
         }
     }
     Ok(())
