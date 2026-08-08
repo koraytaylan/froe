@@ -77,6 +77,15 @@ pub enum PropertyValuesToWrite {
     Single(RecordIdentifier),
     /// Multi-valued: any number of value records.
     Multiple(Vec<RecordIdentifier>),
+    /// A slot preserved from an existing node: for single values the
+    /// value record, for multi values the existing counted list record.
+    PreservedSlot {
+        /// The record the node's property value list will point at.
+        value_slot: RecordIdentifier,
+        /// Whether the preserved property is multi-valued (drives the
+        /// template's type byte sign).
+        is_multiple: bool,
+    },
 }
 
 /// The child node shape of a node to be written.
@@ -92,6 +101,8 @@ pub enum ChildNodesToWrite {
     },
     /// Many children as `(name, node record)` pairs.
     Many(Vec<(String, RecordIdentifier)>),
+    /// Many children through an existing, unchanged map record.
+    ManyExistingMap(RecordIdentifier),
 }
 
 /// Writes records into segments, rolling over as segments fill.
@@ -497,7 +508,7 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
                 head |= 1 << 29;
                 None
             }
-            ChildNodesToWrite::Many(_) => {
+            ChildNodesToWrite::Many(_) | ChildNodesToWrite::ManyExistingMap(_) => {
                 head |= 1 << 28;
                 None
             }
@@ -536,6 +547,13 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
             let type_byte = match property.values {
                 PropertyValuesToWrite::Single(_) => tag,
                 PropertyValuesToWrite::Multiple(_) => -tag,
+                PropertyValuesToWrite::PreservedSlot { is_multiple, .. } => {
+                    if is_multiple {
+                        -tag
+                    } else {
+                        tag
+                    }
+                }
             };
             self.current.record_bytes_mut(record)[cursor] = type_byte as u8;
             cursor += 1;
@@ -563,6 +581,7 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
             ChildNodesToWrite::Zero => None,
             ChildNodesToWrite::One { node, .. } => Some(*node),
             ChildNodesToWrite::Many(entries) => Some(self.write_map(entries)?),
+            ChildNodesToWrite::ManyExistingMap(map) => Some(*map),
         };
 
         let property_list_identifier = if properties.is_empty() {
@@ -573,6 +592,7 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
                 let identifier = match &property.values {
                     PropertyValuesToWrite::Single(value) => *value,
                     PropertyValuesToWrite::Multiple(values) => self.write_counted_list(values)?,
+                    PropertyValuesToWrite::PreservedSlot { value_slot, .. } => *value_slot,
                 };
                 value_identifiers.push(identifier);
             }

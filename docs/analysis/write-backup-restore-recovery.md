@@ -410,9 +410,11 @@ The **source** directory is never written (no lock file either — RO open).
 
 Any exception → stack trace to stderr, exit 1. The `finally` blocks close both
 stores, so on failure the target may keep: partially written TARs referenced by
-no journal line (Oak ignores unreferenced segments; cleanup on the next backup
-reclaims them), and a journal whose last line is the *old* head (or the initial
-empty node for a fresh target). All such states are openable by Oak — head
+no journal line (Oak ignores unreferenced segments; a later cleanup reclaims
+them once the source head's `fullGeneration` has advanced past theirs — at the
+*same* generation they are neither generation-old nor "dangling future", so
+they linger harmlessly), and a journal whose last line is the *old* head (or
+the initial empty node for a fresh target). All such states are openable by Oak — head
 resolution skips forward-referencing garbage (`filestore-layer.md` §5.4, §9).
 Nothing is rolled back explicitly.
 
@@ -688,7 +690,7 @@ takes the last resolvable line.
 |---|---|---|
 | `backup` | silent (slf4j `Backup finished in {}.`) | missing args (stderr usage line); any exception (stack trace to stderr) |
 | `restore` | silent (slf4j `Restore finished in {}.`) | missing args; any exception (stack trace) |
-| `recover-journal` | `Old journal backed up at …` + optional `Skipping revision …` lines + `Journal recovered` (stdout) | arg errors; discovery failure; zero candidates; >1000 backups; rename/write/rollback failures (messages in §4.5; per-segment diagnostics on stderr) |
+| `recover-journal` | optional `Skipping revision …` lines (printed during discovery/filtering), then `Old journal backed up at …`, then `Journal recovered` (all stdout) | arg errors; discovery failure (incl. unresolvable journal, §4.2); zero candidates; all 1000 backup names (000–999) taken; rename/rollback failures (messages in §4.5; per-segment diagnostics on stderr) |
 
 ---
 
@@ -722,32 +724,57 @@ Backup / restore:
    a spec-conformant manifest for fresh targets.
 10. **External binaries copy by reference only** — never materialize or drop
     external blob-id records; ensure they land in the target's binary
-    references index so datastore GC stays correct.
+    references index so datastore GC stays correct. Without a (fake) blob
+    store, copying a changed external-binary property must **fail loudly**
+    (Java throws `IllegalStateException`), never silently drop or inline the
+    reference.
 11. Cleanup on the backup target must use the FULL reclaimer with
     `retainedGenerations = 1` against the head generation, must not reclaim
     the head's own generation, must follow the TAR sweep/generation-letter
     rules, and should append the `gc.log` entry only when the generation
-    differs from the last entry.
+    differs from the last entry. The full reclaim predicate has three clauses
+    (§2.6): generation-old **data** segments, unreferenced **bulk** segments
+    (reachability marked newest→oldest, following references into bulk
+    segments only), and compacted segments persisted **after** the
+    compacted-root segment (dangling future segments). Reclaiming bulk
+    segments still referenced by live binaries corrupts the store.
 12. On failure, it is safe (and Oak-compatible) to leave unreferenced segments
     and a journal pointing at the previous head; never leave a journal line
     referencing missing segments as the *only* line.
+13. **gc.log generation-dedup must match Oak's parse asymmetry**: entries read
+    back from `gc.log` always carry `isCompacted = false`, so the "skip if
+    same generation" comparison in practice only suppresses duplicates when
+    the head generation is uncompacted. Reproducing Oak's exact behavior
+    (append when head `isCompacted == true` even if the numbers match) keeps
+    gc.log byte-compatible across alternating Java/Rust runs; gc.log content
+    never affects store openability, only cleanup bookkeeping.
+14. **Fresh-target artifacts are part of the format**: a newly created
+    read-write target immediately gets `repo.lock`, `manifest`, and an initial
+    `{"root":{}}` node written by wid `"init"` at generation `(0,0,false)`;
+    the first journal line must never be written before the segment containing
+    the head it references is durable.
+15. A read-only open (backup/restore source, recover-journal store) **requires
+    a journal with at least one line resolving to a present segment**; head
+    resolution walks bottom-up, skipping malformed record ids and ids whose
+    segment is missing, and fails the open if nothing resolves.
 
 Journal recovery:
 
-13. **Back up before overwrite**: rename the old journal to the first free
+16. **Back up before overwrite**: rename the old journal to the first free
     `journal.log.bak.NNN` (000–999) before creating the new one; on any write
     failure restore the original by renaming back and deleting the partial
     file. Never delete the only copy of the old journal.
-14. Candidates are **data segments only**, records of type NODE whose node has
+17. Candidates are **data segments only**, records of type NODE whose node has
     both a `root` and a `checkpoints` child; timestamp from segment-info key
     `"t"`; skip (with a diagnostic) segments lacking a parsable timestamp.
-15. Sort ascending by `(timestamp, segmentId, recordNumber)` and write
+18. Sort ascending by `(timestamp, segmentId, recordNumber)` and write
     **oldest first** — Oak reads the journal bottom-up, so the newest entry
     must be the last line.
-16. **The last line must be verified consistent**: full-tree DFS of the head
+19. **The last line must be verified consistent**: full-tree DFS of the head
     (reading every property, streaming every non-external binary) and of every
     checkpoint root, dropping newer revisions until one passes. Unverified
     older lines are acceptable; an unverified last line is not.
-17. Journal lines use `toString10` (colon + decimal offset) — both offset
+20. Journal lines use `toString10` (colon + decimal offset) — both offset
     grammars are accepted by Oak's parser, but stay byte-identical to Oak
-    output to keep external tooling happy.
+    output to keep external tooling happy. Surface (and roll back on) mid-write
+    failures even though Java's `PrintWriter` swallows them (§4.5 step 6).

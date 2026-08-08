@@ -163,10 +163,142 @@ impl WritableRepository {
         self.lock_write_state().head = new_head;
     }
 
+    /// Marks `head` as the persisted head, so the next flush does not
+    /// re-append a journal line. Used after an out-of-band journal
+    /// rewrite (compaction).
+    pub fn reset_persisted_head(&self, head: RecordIdentifier) {
+        let mut state = self.lock_write_state();
+        state.head = head;
+        state.persisted_head = Some(head);
+    }
+
     /// The head node state (the super-root).
     #[must_use]
     pub fn head_node(&self) -> NodeState<'_> {
         NodeState::new(self, self.head())
+    }
+
+    /// The total size of the store's archive files on disk.
+    pub fn archive_size_on_disk(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str() {
+                if ArchiveFileName::parse(name).is_some() {
+                    total += entry.metadata()?.len();
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Reclaims segments older than `reference_generation` after a
+    /// compaction, using Oak's reclaim predicate with a single retained
+    /// generation. `full` selects the full-compaction predicate; a base
+    /// archive whose segments all reclaim is deleted, one with survivors
+    /// is rewritten to the next generation letter with only the
+    /// survivors.
+    ///
+    /// This is safe only when every record reachable from the current
+    /// head lives in `reference_generation` — which compaction's deep
+    /// copy guarantees.
+    pub fn reclaim_old_generations(
+        &mut self,
+        reference_generation: GarbageCollectionGeneration,
+        full: bool,
+    ) -> Result<()> {
+        // Finalize the session archive so its new-generation segments are
+        // complete on disk before old archives are removed.
+        {
+            let mut state = self.lock_write_state();
+            if let Some(tar_writer) = state.tar_writer.take() {
+                tar_writer.close()?;
+            }
+        }
+
+        // Drop the memory maps before deleting or rewriting the files.
+        let base_archives = std::mem::take(&mut self.base_archives);
+        let archive_files: Vec<ArchiveFileName> = base_archives
+            .iter()
+            .filter_map(|archive| ArchiveFileName::parse(archive.file_name()))
+            .collect();
+        drop(base_archives);
+        self.parsed_segment_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        for archive_name in archive_files {
+            self.reclaim_one_archive(&archive_name, reference_generation, full)?;
+        }
+        Ok(())
+    }
+
+    /// Applies the reclaim predicate to one base archive.
+    fn reclaim_one_archive(
+        &self,
+        archive_name: &ArchiveFileName,
+        reference: GarbageCollectionGeneration,
+        full: bool,
+    ) -> Result<()> {
+        let path = self.directory.join(&archive_name.file_name);
+        let reader = TarArchiveReader::open(&path)?;
+        let mut survivors: Vec<(SegmentIdentifier, Vec<u8>)> = Vec::new();
+        for identifier in reader.segment_identifiers() {
+            let generation = archive_segment_generation(&reader, identifier)?;
+            if !is_reclaimable(reference, generation, full) {
+                if let Some(bytes) = reader.segment_data(identifier) {
+                    survivors.push((identifier, bytes.to_vec()));
+                }
+            }
+        }
+        let survivor_count = survivors.len();
+        drop(reader);
+
+        if survivor_count == 0 {
+            std::fs::remove_file(&path)?;
+            return Ok(());
+        }
+        // Rewrite the survivors to the next generation letter, then delete
+        // the original — matching Oak's sweep.
+        let next_letter = char::from(archive_name.file_generation as u8 + 1);
+        let swept_name = format!("data{:05}{next_letter}.tar", archive_name.archive_number);
+        let mut writer = TarArchiveWriter::new(&self.directory, &swept_name);
+        for (identifier, bytes) in &survivors {
+            let (generation, references, binary_references) = if identifier.is_data_segment() {
+                let parsed = ParsedSegment::parse(*identifier, bytes)?;
+                let binary_references = read_segment_blob_identifiers(&parsed, bytes)?;
+                (
+                    GarbageCollectionGeneration {
+                        generation: parsed.generation,
+                        full_generation: parsed.full_generation,
+                        is_compacted: parsed.is_compacted,
+                    },
+                    parsed.referenced_segments.clone(),
+                    binary_references,
+                )
+            } else {
+                (
+                    GarbageCollectionGeneration {
+                        generation: 0,
+                        full_generation: 0,
+                        is_compacted: false,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+            writer.write_segment(
+                *identifier,
+                bytes,
+                generation,
+                &references,
+                &binary_references,
+            )?;
+        }
+        writer.close()?;
+        std::fs::remove_file(&path)?;
+        Ok(())
     }
 
     /// Whether any source of this store holds the segment.
@@ -416,6 +548,57 @@ impl SegmentSink for StoreSink<'_> {
     fn write_segment(&mut self, segment: BuiltSegment) -> Result<()> {
         self.store.persist_segment(segment)
     }
+}
+
+/// The reclaim predicate for one segment, Oak's `newOldReclaimer` with a
+/// single retained generation. `reference` is the generation the
+/// compaction produced; `segment` is a candidate segment's generation.
+fn is_reclaimable(
+    reference: GarbageCollectionGeneration,
+    segment: GarbageCollectionGeneration,
+    full: bool,
+) -> bool {
+    const RETAINED: i32 = 1;
+    if full {
+        reference.full_generation - segment.full_generation >= RETAINED
+            || (reference.generation - segment.generation >= RETAINED && !segment.is_compacted)
+    } else {
+        reference.generation - segment.generation >= RETAINED
+            && !(segment.is_compacted && segment.full_generation == reference.full_generation)
+    }
+}
+
+/// The generation of a segment in an archive: from its index entry when
+/// present, otherwise parsed from the segment header.
+fn archive_segment_generation(
+    reader: &TarArchiveReader,
+    identifier: SegmentIdentifier,
+) -> Result<GarbageCollectionGeneration> {
+    if let Some(entry) = reader.index_entry(identifier) {
+        return Ok(GarbageCollectionGeneration {
+            generation: entry.generation,
+            full_generation: entry.full_generation,
+            is_compacted: entry.is_compacted,
+        });
+    }
+    if identifier.is_bulk_segment() {
+        return Ok(GarbageCollectionGeneration {
+            generation: 0,
+            full_generation: 0,
+            is_compacted: false,
+        });
+    }
+    let bytes = reader
+        .segment_data(identifier)
+        .ok_or(Error::SegmentNotFound {
+            segment_identifier: identifier,
+        })?;
+    let parsed = ParsedSegment::parse(identifier, bytes)?;
+    Ok(GarbageCollectionGeneration {
+        generation: parsed.generation,
+        full_generation: parsed.full_generation,
+        is_compacted: parsed.is_compacted,
+    })
 }
 
 /// Rewrites the manifest with `store.version=2` after validating it with

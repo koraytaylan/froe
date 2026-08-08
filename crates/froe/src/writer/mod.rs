@@ -6,6 +6,8 @@
 //! naming, and locking all follow the specifications in
 //! `docs/analysis/` extracted from the Java implementation.
 
+pub mod commit;
+pub mod compaction;
 pub mod identifier_generator;
 pub mod record_writer;
 pub mod repository_lock;
@@ -13,6 +15,11 @@ pub mod segment_builder;
 pub mod store_writer;
 pub mod tar_writer;
 
+pub use commit::{
+    CheckpointDescription, create_checkpoint, list_checkpoints, release_checkpoint,
+    remove_all_checkpoints, remove_unreferenced_checkpoints, replace_content_root,
+};
+pub use compaction::{CompactionKind, CompactionOutcome, compact};
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};
 pub use record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
