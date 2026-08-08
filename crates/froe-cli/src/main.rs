@@ -1,13 +1,19 @@
-//! Command-line interface for inspecting and extracting data from Apache
-//! Jackrabbit Oak `segment-tar` (`TarMK`) repositories.
+//! Command-line interface for inspecting, extracting from, and maintaining
+//! Apache Jackrabbit Oak `segment-tar` (`TarMK`) repositories.
 //!
-//! Every command is read-only: the repository lock is never taken and no
-//! file is ever modified, so pointing `froe` at a live repository is safe.
+//! Inspection and extraction commands are read-only: the repository lock
+//! is never taken, so they are safe against a live repository. The
+//! maintenance commands — `compact`, `backup`, `restore`,
+//! `recover-journal`, and `checkpoint` — take the exclusive repository
+//! lock and modify the store, so they must only be run against a *stopped*
+//! repository, and each asks for confirmation first.
 
 mod content_display;
 mod extraction;
 mod inspection;
+mod mutation;
 mod output;
+mod tooling_display;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,14 +22,18 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use froe::store::Repository;
 
+use crate::mutation::CheckpointRemoval;
+
 #[derive(Parser)]
 #[command(
     name = "froe",
     version,
-    about = "Read-only tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories",
-    long_about = "Read-only tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories, \
-                  the storage format of Apache Jackrabbit Oak and Adobe Experience Manager. \
-                  All commands open the repository without locking and never modify any file."
+    about = "Tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories",
+    long_about = "Tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories, the storage \
+                  format of Apache Jackrabbit Oak and Adobe Experience Manager. Inspection and \
+                  extraction commands are read-only and safe against a live repository; the \
+                  compact, backup, restore, recover-journal, and checkpoint commands modify the \
+                  store and must be run against a stopped repository."
 )]
 struct CommandLine {
     #[command(subcommand)]
@@ -99,6 +109,154 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Find the newest fully consistent revision (read-only).
+    Check {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Content paths to verify; defaults to the whole content tree.
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Also read binary content, not only resolve its records.
+        #[arg(long)]
+        binaries: bool,
+        /// Examine at most this many revisions.
+        #[arg(long, default_value_t = 100)]
+        revisions: usize,
+    },
+    /// Show the differences between two revisions (read-only).
+    Difference {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// The older revision (a record identifier, or "head").
+        before: String,
+        /// The newer revision (a record identifier, or "head").
+        after: String,
+        /// Restrict the diff to this content path.
+        #[arg(long, default_value = "/")]
+        path: String,
+    },
+    /// Show how a node changed across revisions (read-only).
+    History {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// The content path to trace.
+        path: String,
+    },
+    /// Search every node for property, child, or value matches (read-only).
+    SearchNodes {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Require a property with this name (repeatable).
+        #[arg(long = "has-property")]
+        has_properties: Vec<String>,
+        /// Require a child with this name (repeatable).
+        #[arg(long = "has-child")]
+        has_children: Vec<String>,
+        /// Require a property NAME=VALUE (repeatable).
+        #[arg(long = "value")]
+        values: Vec<String>,
+        /// Stop after this many matches (0 = no limit).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
+    /// Compact the repository offline (modifies the store).
+    Compact {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Run a tail compaction instead of a full one.
+        #[arg(long)]
+        tail: bool,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Copy a repository's head into a target store (modifies the target).
+    Backup {
+        /// The source segment store directory.
+        source: PathBuf,
+        /// The target segment store directory (created if absent).
+        target: PathBuf,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Restore a backup into an existing store (modifies the target).
+    Restore {
+        /// The backup segment store directory.
+        backup: PathBuf,
+        /// The target segment store directory.
+        target: PathBuf,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rebuild journal.log from the segments (modifies the store).
+    RecoverJournal {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Manage checkpoints (list is read-only; the rest modify the store).
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckpointAction {
+    /// List the checkpoints.
+    List {
+        /// The segment store directory.
+        repository: PathBuf,
+    },
+    /// Create a checkpoint.
+    Create {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// The checkpoint lifetime in milliseconds.
+        #[arg(long, default_value_t = 1_000 * 60 * 60 * 24 * 30)]
+        lifetime_milliseconds: i64,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove one checkpoint by name.
+    Remove {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// The checkpoint name.
+        name: String,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove every checkpoint.
+    RemoveAll {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove checkpoints not referenced by the asynchronous indexer.
+    RemoveUnreferenced {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Proceed without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Parses a `NAME=VALUE` search predicate.
+fn parse_value_predicate(argument: &str) -> std::result::Result<(String, String), String> {
+    argument
+        .split_once('=')
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .ok_or_else(|| format!("expected NAME=VALUE, got {argument:?}"))
 }
 
 fn main() -> ExitCode {
@@ -121,6 +279,10 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per command reads best as a single dispatch"
+)]
 fn run(command: Command) -> froe::Result<ExitCode> {
     match command {
         Command::Summary { repository } => {
@@ -188,6 +350,115 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        Command::Check {
+            repository,
+            paths,
+            binaries,
+            revisions,
+        } => {
+            if !tooling_display::print_check(&repository, &paths, binaries, revisions)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Difference {
+            repository,
+            before,
+            after,
+            path,
+        } => {
+            tooling_display::print_difference(&repository, &before, &after, &path)?;
+        }
+        Command::History { repository, path } => {
+            tooling_display::print_history(&repository, &path)?;
+        }
+        Command::SearchNodes {
+            repository,
+            has_properties,
+            has_children,
+            values,
+            limit,
+        } => {
+            let mut property_values = Vec::with_capacity(values.len());
+            for value in &values {
+                match parse_value_predicate(value) {
+                    Ok(pair) => property_values.push(pair),
+                    Err(message) => {
+                        eprintln!("froe: {message}");
+                        return Ok(ExitCode::FAILURE);
+                    }
+                }
+            }
+            tooling_display::print_search(
+                &repository,
+                &has_properties,
+                &has_children,
+                &property_values,
+                limit,
+            )?;
+        }
+        Command::Compact {
+            repository,
+            tail,
+            yes,
+        } => {
+            if !mutation::run_compact(&repository, tail, yes)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Backup {
+            source,
+            target,
+            yes,
+        } => {
+            if !mutation::run_backup(&source, &target, yes)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Restore {
+            backup,
+            target,
+            yes,
+        } => {
+            if !mutation::run_restore(&backup, &target, yes)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::RecoverJournal { repository, yes } => {
+            if !mutation::run_recover_journal(&repository, yes)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Checkpoint { action } => {
+            if !run_checkpoint(action)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Dispatches a checkpoint subcommand. Returns whether it succeeded.
+fn run_checkpoint(action: CheckpointAction) -> froe::Result<bool> {
+    match action {
+        CheckpointAction::List { repository } => {
+            mutation::run_checkpoint_list(&repository)?;
+            Ok(true)
+        }
+        CheckpointAction::Create {
+            repository,
+            lifetime_milliseconds,
+            yes,
+        } => mutation::run_checkpoint_create(&repository, lifetime_milliseconds, yes),
+        CheckpointAction::Remove {
+            repository,
+            name,
+            yes,
+        } => mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::Named(name), yes),
+        CheckpointAction::RemoveAll { repository, yes } => {
+            mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::All, yes)
+        }
+        CheckpointAction::RemoveUnreferenced { repository, yes } => {
+            mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::Unreferenced, yes)
+        }
+    }
 }

@@ -7,9 +7,14 @@
 //! the current head state, and exposes the content tree for traversal and
 //! extraction — without a running Oak instance.
 //!
-//! The crate is read-only by design: it never takes the repository lock and
-//! never modifies any file, so it is safe to point at a live repository or
-//! a backup.
+//! The reading API ([`Repository`], [`store`], [`content`], [`tooling`]) is
+//! read-only by design: it never takes the repository lock and never
+//! modifies any file, so it is safe to point at a live repository. The
+//! writing API ([`writer`]) — commits, checkpoints, compaction, backup,
+//! restore, journal recovery — takes the exclusive repository lock first,
+//! so it can never race a running instance, and produces stores byte-for-byte
+//! compatible with what Oak itself writes. Only run the writing API against a
+//! *stopped* repository.
 //!
 //! # Example
 //!
@@ -63,3 +68,7 @@ pub use error::{Error, Result};
 pub use journal::JournalEntry;
 pub use segment::{RecordIdentifier, RecordType, SegmentIdentifier, SegmentKind};
 pub use store::Repository;
+pub use writer::{
+    CompactionKind, CompactionOutcome, RecoveryOutcome, WritableRepository, backup, compact,
+    recover_journal, restore,
+};
