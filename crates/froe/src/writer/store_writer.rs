@@ -488,6 +488,22 @@ impl WritableRepository {
     ) -> RecordWriter<StoreSink<'_>> {
         RecordWriter::new(StoreSink { store: self }, generation)
     }
+
+    /// A record writer stamping its segments with the given writer
+    /// identifier (recorded in each segment's info string): `sys` for
+    /// commits, `c` for compaction, `b` for backup, `r` for restore.
+    #[must_use]
+    pub fn record_writer_with_identifier(
+        &self,
+        generation: GarbageCollectionGeneration,
+        writer_identifier: &str,
+    ) -> RecordWriter<StoreSink<'_>> {
+        RecordWriter::with_writer_identifier(
+            StoreSink { store: self },
+            generation,
+            writer_identifier,
+        )
+    }
 }
 
 impl SegmentProvider for WritableRepository {

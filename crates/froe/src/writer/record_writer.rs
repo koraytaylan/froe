@@ -109,6 +109,8 @@ pub enum ChildNodesToWrite {
 pub struct RecordWriter<Sink: SegmentSink> {
     sink: Sink,
     generation: GarbageCollectionGeneration,
+    writer_identifier: String,
+    segment_sequence: u32,
     current: SegmentBufferBuilder,
 }
 
@@ -116,11 +118,26 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     /// Creates a writer stamping `generation` on every produced segment.
     #[must_use]
     pub fn new(sink: Sink, generation: GarbageCollectionGeneration) -> Self {
-        Self {
+        Self::with_writer_identifier(sink, generation, "froe")
+    }
+
+    /// Creates a writer with an explicit writer identifier, recorded in
+    /// each segment's info string.
+    #[must_use]
+    pub fn with_writer_identifier(
+        sink: Sink,
+        generation: GarbageCollectionGeneration,
+        writer_identifier: &str,
+    ) -> Self {
+        let mut writer = Self {
             sink,
             generation,
+            writer_identifier: writer_identifier.to_owned(),
+            segment_sequence: 0,
             current: SegmentBufferBuilder::new(new_data_segment_identifier(), generation),
-        }
+        };
+        writer.write_segment_info_record();
+        writer
     }
 
     /// The sink, for inspection after writing.
@@ -130,23 +147,48 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     }
 
     /// Consumes the writer, flushing the current segment when it holds
-    /// any records, and returns the sink.
+    /// content beyond the segment-info record, and returns the sink.
     pub fn finish(mut self) -> Result<Sink> {
         self.flush_current_segment()?;
         Ok(self.sink)
     }
 
     /// Flushes the segment under construction to the sink when it holds
-    /// any records.
+    /// content records — a segment with only the info record is not
+    /// written.
     pub fn flush_current_segment(&mut self) -> Result<()> {
-        if self.current.record_count() == 0 {
+        if self.current.record_count() <= 1 {
             return Ok(());
         }
-        let finished = std::mem::replace(
-            &mut self.current,
-            SegmentBufferBuilder::new(new_data_segment_identifier(), self.generation),
+        let mut fresh = SegmentBufferBuilder::new(new_data_segment_identifier(), self.generation);
+        std::mem::swap(&mut fresh, &mut self.current);
+        self.write_segment_info_record();
+        self.sink.write_segment(fresh.finish())
+    }
+
+    /// Writes the segment-info string as record 0 of the current builder:
+    /// `{"wid":"<id>","sno":<sequence>,"t":<milliseconds>}`. Diagnostic
+    /// only, but Oak guarantees every data segment's first record is a
+    /// string, and tooling relies on it.
+    fn write_segment_info_record(&mut self) {
+        let milliseconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let info = format!(
+            "{{\"wid\":\"{}\",\"sno\":{},\"t\":{milliseconds}}}",
+            self.writer_identifier, self.segment_sequence
         );
-        self.sink.write_segment(finished.finish())
+        self.segment_sequence = self.segment_sequence.wrapping_add(1);
+        let bytes = info.as_bytes();
+        // The info string is always well under the 128-byte small-value
+        // limit for reasonable writer identifiers.
+        let record = self
+            .current
+            .allocate(RecordType::Value, 1 + bytes.len(), &[])
+            .expect("the segment-info record always fits an empty segment");
+        let target = self.current.record_bytes_mut(record);
+        target[0] = bytes.len() as u8;
+        target[1..=bytes.len()].copy_from_slice(bytes);
     }
 
     /// Allocates a record, rolling to a fresh segment when full.

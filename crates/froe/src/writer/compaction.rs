@@ -56,6 +56,26 @@ pub struct CompactionOutcome {
     pub compacted_nodes: u64,
 }
 
+/// Deep-copies a node tree from a source provider into a record writer,
+/// rewriting every reachable record and sharing results through a
+/// source-record cache so the content DAG's sharing is preserved and the
+/// walk terminates. Returns the rewritten root and the number of nodes
+/// copied. Used by compaction, backup, and restore.
+pub fn deep_copy_tree<Sink: SegmentSink>(
+    source: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    source_root: RecordIdentifier,
+) -> Result<(RecordIdentifier, u64)> {
+    let mut copier = Compactor {
+        source,
+        writer,
+        rewritten_nodes: HashMap::new(),
+        compacted_nodes: 0,
+    };
+    let root = copier.compact_node(source_root)?;
+    Ok((root, copier.compacted_nodes))
+}
+
 /// Deep-copies nodes into a fresh generation, sharing rewritten records
 /// through a source-record cache.
 struct Compactor<'writer, Sink: SegmentSink> {
@@ -189,19 +209,8 @@ pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<C
         },
     };
 
-    let mut writer = store.record_writer(target_generation);
-    let compacted_nodes;
-    let new_head;
-    {
-        let mut compactor = Compactor {
-            source: store,
-            writer: &mut writer,
-            rewritten_nodes: HashMap::new(),
-            compacted_nodes: 0,
-        };
-        new_head = compactor.compact_node(head)?;
-        compacted_nodes = compactor.compacted_nodes;
-    }
+    let mut writer = store.record_writer_with_identifier(target_generation, "c");
+    let (new_head, compacted_nodes) = deep_copy_tree(store, &mut writer, head)?;
     writer.finish()?;
 
     if !store.set_head(head, new_head) {

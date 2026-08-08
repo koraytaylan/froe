@@ -52,6 +52,7 @@ pub mod journal;
 pub mod segment;
 pub mod store;
 pub mod tar_archive;
+pub mod tooling;
 pub mod writer;
 
 pub use content::{

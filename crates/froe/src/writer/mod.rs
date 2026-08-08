@@ -6,6 +6,7 @@
 //! naming, and locking all follow the specifications in
 //! `docs/analysis/` extracted from the Java implementation.
 
+pub mod backup;
 pub mod commit;
 pub mod compaction;
 pub mod identifier_generator;
@@ -15,6 +16,7 @@ pub mod segment_builder;
 pub mod store_writer;
 pub mod tar_writer;
 
+pub use backup::{RecoveryOutcome, backup, recover_journal, restore};
 pub use commit::{
     CheckpointDescription, create_checkpoint, list_checkpoints, release_checkpoint,
     remove_all_checkpoints, remove_unreferenced_checkpoints, replace_content_root,

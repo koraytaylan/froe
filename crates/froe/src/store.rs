@@ -287,6 +287,96 @@ impl std::fmt::Debug for Repository {
     }
 }
 
+/// A read-only provider over a set of archives, without a journal or
+/// resolved head. Used by journal recovery, which must read segments
+/// before any head exists.
+pub struct ArchiveSet {
+    archives: Vec<TarArchiveReader>,
+    segment_locations: HashMap<SegmentIdentifier, usize>,
+    parsed_segment_cache: RwLock<BoundedCache<SegmentIdentifier, Arc<ParsedSegment>>>,
+}
+
+impl ArchiveSet {
+    /// Wraps a set of already-opened archives.
+    #[must_use]
+    pub fn new(archives: Vec<TarArchiveReader>) -> Self {
+        let mut segment_locations = HashMap::new();
+        for (position, archive) in archives.iter().enumerate() {
+            for identifier in archive.segment_identifiers() {
+                segment_locations.entry(identifier).or_insert(position);
+            }
+        }
+        Self {
+            archives,
+            segment_locations,
+            parsed_segment_cache: RwLock::new(BoundedCache::new(SEGMENT_CACHE_CAPACITY)),
+        }
+    }
+
+    /// Every segment identifier across the archives.
+    pub fn segment_identifiers(&self) -> impl Iterator<Item = SegmentIdentifier> + '_ {
+        self.archives
+            .iter()
+            .flat_map(TarArchiveReader::segment_identifiers)
+    }
+}
+
+impl SegmentProvider for ArchiveSet {
+    fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+        let archive_position = *self
+            .segment_locations
+            .get(&segment_identifier)
+            .ok_or(Error::SegmentNotFound { segment_identifier })?;
+        let bytes = self.archives[archive_position]
+            .segment_data(segment_identifier)
+            .ok_or(Error::SegmentNotFound { segment_identifier })?;
+        if let Some(structure) = self
+            .parsed_segment_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&segment_identifier)
+        {
+            return Ok(SegmentView {
+                structure,
+                bytes: bytes.into(),
+            });
+        }
+        let structure = Arc::new(ParsedSegment::parse(segment_identifier, bytes)?);
+        self.parsed_segment_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(segment_identifier, Arc::clone(&structure));
+        Ok(SegmentView {
+            structure,
+            bytes: bytes.into(),
+        })
+    }
+
+    fn string(&self, record_identifier: RecordIdentifier) -> Result<Arc<str>> {
+        read_string(self, record_identifier).map(Arc::from)
+    }
+
+    fn template(&self, record_identifier: RecordIdentifier) -> Result<Arc<Template>> {
+        read_template(self, record_identifier).map(Arc::new)
+    }
+}
+
+/// Opens every archive in a directory read-only, selecting the newest
+/// generation letter of each archive number. Unlike [`Repository::open`]
+/// this needs no journal or manifest, so recovery can read segments
+/// before a head exists.
+pub fn open_all_archives(directory: &Path) -> Result<Vec<TarArchiveReader>> {
+    let file_names = list_archive_file_names(directory)?;
+    let selected = select_newest_file_generations(&file_names)?;
+    let mut archives = Vec::with_capacity(selected.len());
+    for archive_file_name in &selected {
+        archives.push(TarArchiveReader::open(
+            &directory.join(&archive_file_name.file_name),
+        )?);
+    }
+    Ok(archives)
+}
+
 /// Lists the file names ending in `.tar` in the repository directory.
 #[allow(
     clippy::case_sensitive_file_extension_comparisons,
