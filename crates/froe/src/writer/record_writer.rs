@@ -239,10 +239,13 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     ) {
         let reference = self.current.reference_for(identifier.segment);
         let bytes = self.current.record_bytes_mut(record_number);
+        let target: &mut [u8; 6] = (&mut bytes[offset..offset + 6])
+            .try_into()
+            .expect("the slice is exactly six bytes");
         SegmentBufferBuilder::write_record_identifier_bytes(
             reference,
             identifier.record_number,
-            &mut bytes[offset..offset + 6],
+            target,
         );
     }
 

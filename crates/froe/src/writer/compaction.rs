@@ -340,6 +340,7 @@ mod tests {
     use super::{CompactionKind, compact};
     use crate::content::node::PropertyValues;
     use crate::content::property::PropertyValue;
+    use crate::content::provider::SegmentProvider;
     use crate::store::Repository;
     use crate::writer::commit::{create_checkpoint, list_checkpoints};
     use crate::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
@@ -835,5 +836,115 @@ mod tests {
         let store = WritableRepository::open(&directory.path).expect("open");
         assert_eq!(list_checkpoints(&store).expect("list").len(), 1);
         store.close().expect("close");
+    }
+
+    /// Every data segment's referenced segments must resolve — the sweep
+    /// must never delete a bulk segment a kept data segment points at.
+    fn assert_no_dangling_segment_references(directory: &TestDirectory) {
+        let repository = Repository::open(&directory.path).expect("reader opens");
+        for segment_identifier in repository.segment_identifiers() {
+            if segment_identifier.is_bulk_segment() {
+                continue;
+            }
+            let view = repository
+                .segment(segment_identifier)
+                .expect("data segment readable");
+            for referenced in &view.structure.referenced_segments {
+                assert!(
+                    repository.contains_segment(*referenced),
+                    "kept data segment {segment_identifier} references missing segment \
+                     {referenced}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_compaction_keeps_bulk_segments_referenced_by_retained_data_segments() {
+        let directory = TestDirectory::new("tail-bulk-mark");
+        build_populated_store(&directory);
+
+        // A value long enough to force a full 256 KiB block run, stored
+        // as a bulk segment referenced by the data segment holding the
+        // value's block list.
+        {
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let large = writer
+                .write_string(&"bulk-backed-value ".repeat(20_000))
+                .expect("large value");
+            let content = writer
+                .write_node(
+                    Some("nt:unstructured"),
+                    &[],
+                    &ChildNodesToWrite::Zero,
+                    &[PropertyToWrite {
+                        name: "data".to_owned(),
+                        property_type: crate::content::property::PropertyType::String,
+                        values: PropertyValuesToWrite::Single(large),
+                    }],
+                )
+                .expect("content");
+            let root = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "content".to_owned(),
+                        node: content,
+                    },
+                    &[],
+                )
+                .expect("root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("super root");
+            writer.finish().expect("finish");
+            let previous = store.head();
+            assert!(store.set_head(previous, head));
+            store.close().expect("close");
+        }
+
+        // Full compaction rewrites everything into compacted segments —
+        // including fresh bulk segments at (0, 0, false), the triple the
+        // format mandates for bulk.
+        {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            compact(&mut store, CompactionKind::Full).expect("full compact");
+            store.close().expect("close");
+        }
+        assert_no_dangling_segment_references(&directory);
+
+        // Tail compaction *retains* the full-compacted data segments
+        // (same full generation, compacted) — the mark phase must then
+        // keep the generation-(0,0,false) bulk segments they reference,
+        // which the generation predicate alone would reclaim.
+        {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            compact(&mut store, CompactionKind::Tail).expect("tail compact");
+            store.close().expect("close");
+        }
+        assert_no_dangling_segment_references(&directory);
+
+        // The large value itself is still fully readable.
+        let repository = Repository::open(&directory.path).expect("reader opens");
+        let content = repository
+            .node_at_path("/content")
+            .expect("resolve")
+            .expect("present");
+        let data = content.property("data").expect("read").expect("present");
+        assert_eq!(
+            data.values,
+            PropertyValues::Single(PropertyValue::String("bulk-backed-value ".repeat(20_000)))
+        );
     }
 }

@@ -52,7 +52,7 @@ pub(crate) fn print_journal(repository: &Repository, limit: usize) {
         println!(
             "{}  {}{validity}",
             format_timestamp(entry.timestamp_milliseconds),
-            entry.revision_text,
+            crate::output::sanitize_terminal_text(&entry.revision_text),
         );
     }
 }

@@ -28,8 +28,9 @@ use crate::output::{append_json_string, append_json_values};
 /// archive, or an alias of one) must never be truncated, and unrelated
 /// files must never be silently overwritten — and never a fresh file
 /// *inside* the repository directory, where the next open would mistake
-/// it for a damaged archive. On Unix the file is created
-/// owner-accessible only, regardless of the ambient umask.
+/// it for a damaged archive. On Unix the file is created with mode 0600
+/// before the umask applies — never *broader* than owner-only, though a
+/// restrictive umask can narrow it further.
 pub(crate) fn create_extraction_output(
     repository_path: &Path,
     output_path: &Path,

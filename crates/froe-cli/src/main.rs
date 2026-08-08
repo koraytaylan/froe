@@ -346,7 +346,14 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                         Ok(written)
                     },
                 ) {
-                    Ok(written) => written,
+                    Ok(Some(node_count)) => Some(node_count),
+                    Ok(None) => {
+                        // Nothing was extracted: the freshly created,
+                        // empty output file must not linger either.
+                        drop(sink);
+                        let _ = std::fs::remove_file(&output_path);
+                        None
+                    }
                     Err(error) => {
                         // The file was freshly created above; a partial
                         // extraction must not linger as if complete.

@@ -14,46 +14,91 @@
 //! use. The lock file's content is never written and the file is never
 //! deleted — only the advisory lock matters.
 
+use std::collections::HashSet;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::{Error, Result};
+
+/// The repository directories this process currently holds locked.
+/// Classic process-associated POSIX record locks do not conflict within
+/// one process, so same-process double opens must be refused here — Java
+/// throws `OverlappingFileLockException` for exactly this case. The
+/// registry also gives open-file-description platforms the identical
+/// same-process behavior.
+static LOCKED_DIRECTORIES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn locked_directories() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    LOCKED_DIRECTORIES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// An exclusive lock on a repository, released on drop.
 pub struct RepositoryLock {
     /// Held for the lifetime of the lock; dropping the file releases the
-    /// open-file-description lock.
+    /// operating system lock.
     _lock_file: File,
+    /// The canonical directory registered in [`LOCKED_DIRECTORIES`].
+    registered_directory: PathBuf,
 }
 
 impl RepositoryLock {
     /// Acquires the exclusive repository lock, creating `repo.lock` when
     /// absent. Fails immediately — with a message pointing at a possibly
-    /// running AEM instance — when another process holds the lock.
+    /// running AEM instance — when another process holds the lock, and
+    /// equally when *this* process already holds it (Java's
+    /// `OverlappingFileLockException`).
     pub fn acquire(repository_directory: &Path) -> Result<Self> {
+        let in_use = |detail: &str| Error::InvalidFormat {
+            details: format!(
+                "the repository at {} is locked by {detail} — \
+                 is an AEM or Oak instance still running?",
+                repository_directory.display()
+            ),
+        };
+        let canonical_directory = std::fs::canonicalize(repository_directory)?;
+        if !locked_directories().insert(canonical_directory.clone()) {
+            return Err(in_use("this process"));
+        }
+        let unregister = |directory: &PathBuf| {
+            locked_directories().remove(directory);
+        };
+
         let lock_path = repository_directory.join("repo.lock");
-        let lock_file = std::fs::OpenOptions::new()
+        let lock_file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&lock_path)?;
-        lock_exclusively(&lock_file).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
-                Error::InvalidFormat {
-                    details: format!(
-                        "the repository at {} is locked by another process — \
-                         is an AEM or Oak instance still running?",
-                        repository_directory.display()
-                    ),
-                }
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                unregister(&canonical_directory);
+                return Err(error.into());
+            }
+        };
+        if let Err(source) = lock_exclusively(&lock_file) {
+            unregister(&canonical_directory);
+            return Err(if source.kind() == std::io::ErrorKind::WouldBlock {
+                in_use("another process")
             } else {
                 Error::InputOutput(source)
-            }
-        })?;
+            });
+        }
         Ok(Self {
             _lock_file: lock_file,
+            registered_directory: canonical_directory,
         })
+    }
+}
+
+impl Drop for RepositoryLock {
+    fn drop(&mut self) {
+        locked_directories().remove(&self.registered_directory);
     }
 }
 
@@ -84,13 +129,16 @@ fn lock_exclusively(file: &File) -> std::io::Result<()> {
     )))]
     const SET_LOCK_COMMAND: libc::c_int = libc::F_SETLK;
 
-    let mut lock = libc::flock {
-        l_type: libc::F_WRLCK as libc::c_short,
-        l_whence: libc::SEEK_SET as libc::c_short,
-        l_start: 0,
-        l_len: 0, // zero length means "to the end of the file, however it grows"
-        l_pid: 0,
-    };
+    // Zero-initialized rather than a struct literal: `libc::flock`
+    // carries platform-specific extra fields (for example `l_sysid` on
+    // the BSDs), and zero is the correct value for every one of them —
+    // including `l_start`/`l_len`, where zero length means "to the end
+    // of the file, however it grows".
+    // SAFETY: `flock` is plain old data; the all-zero bit pattern is a
+    // valid value.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
     // SAFETY: fcntl with a record-lock command reads the flock structure
     // we own and has no other memory effects.
     let result = unsafe { libc::fcntl(file.as_raw_fd(), SET_LOCK_COMMAND, &raw mut lock) };
@@ -159,15 +207,20 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_processes_are_excluded() {
-        // Open-file-description locks conflict across file handles even in
-        // one process, so a second acquire in this test observes exactly
-        // what a second process would.
+    fn concurrent_acquisitions_are_excluded() {
+        // A second acquire in the same process is refused by the
+        // process-local registry — on every platform, including those
+        // whose classic POSIX locks would not conflict in-process — the
+        // same behavior as Java's OverlappingFileLockException. (A second
+        // *process* is excluded by the operating system lock itself.)
         let directory = TestDirectory::new("exclusion");
-        let _held = RepositoryLock::acquire(&directory.path).expect("acquire");
+        let held = RepositoryLock::acquire(&directory.path).expect("acquire");
         let second = RepositoryLock::acquire(&directory.path);
         assert!(second.is_err(), "the second acquisition must fail");
         let message = second.err().expect("error").to_string();
-        assert!(message.contains("locked by another process"), "{message}");
+        assert!(message.contains("locked by this process"), "{message}");
+        // Releasing makes the directory acquirable again.
+        drop(held);
+        RepositoryLock::acquire(&directory.path).expect("reacquire after release");
     }
 }

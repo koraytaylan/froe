@@ -209,8 +209,9 @@ impl SegmentBufferBuilder {
     }
 
     /// Serializes a record identifier (reference and record number) into
-    /// `target`, which must be exactly six bytes of a record's content.
-    pub fn write_record_identifier_bytes(reference: u16, record_number: u32, target: &mut [u8]) {
+    /// `target` — six bytes of a record's content. The array type makes a
+    /// short buffer unrepresentable, so no argument can make this panic.
+    pub fn write_record_identifier_bytes(reference: u16, record_number: u32, target: &mut [u8; 6]) {
         target[0..2].copy_from_slice(&reference.to_be_bytes());
         target[2..6].copy_from_slice(&record_number.to_be_bytes());
     }

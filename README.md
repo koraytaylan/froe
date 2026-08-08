@@ -24,6 +24,18 @@ instance and without the JVM's startup and garbage collection overhead:
 The writing path reproduces every invariant Oak depends on — locking,
 durability ordering, generation arithmetic, archive and trailer layout —
 verified against byte-exact specifications extracted from the Oak sources.
+(One documented rendering residue: a handful of extreme-subnormal doubles
+re-render during compaction to a different — equally round-tripping —
+shortest form than Java's; see `double_to_text`.)
+
+## Platform support
+
+Rust 1.89 or newer. Linux and macOS are fully supported and CI-tested;
+other Unixes build with a classic POSIX `fcntl` lock in the same lock
+space Oak uses, but are not CI-verified. On Windows the reading API works;
+the writing API refuses to open because segment identifiers require an
+operating system entropy source, which froe currently reads only from
+`/dev/urandom`.
 
 ## Quick start
 

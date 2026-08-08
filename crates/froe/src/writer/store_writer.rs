@@ -227,11 +227,14 @@ impl WritableRepository {
     }
 
     /// Reclaims segments older than `reference_generation` after a
-    /// compaction, using Oak's reclaim predicate with a single retained
-    /// generation. `full` selects the full-compaction predicate; a base
-    /// archive whose segments all reclaim is deleted, one with survivors
-    /// is rewritten to the next generation letter with only the
-    /// survivors.
+    /// compaction: Oak's mark phase decides what goes, then each base
+    /// archive is swept. Data segments are retained purely by the
+    /// generation predicate with a single retained generation (`full`
+    /// selects the full-compaction predicate); bulk segments are
+    /// retained purely by reachability from kept data segments, through
+    /// a references set shared across all archives. A base archive whose
+    /// segments all reclaim is deleted; one with survivors is rewritten
+    /// to the next generation letter with only the survivors.
     ///
     /// This is safe only when every record reachable from the current
     /// head lives in `reference_generation` — which compaction's deep
@@ -256,167 +259,55 @@ impl WritableRepository {
             }
         }
 
-        // Drop the memory maps before deleting or rewriting the files.
+        // The taken readers drive both the mark and the sweep. Files are
+        // unlinked while other archives' maps are still open, which is
+        // fine on Unix (the write path already requires a Unix entropy
+        // source).
         let base_archives = std::mem::take(&mut self.base_archives);
-        let archive_files: Vec<ArchiveFileName> = base_archives
-            .iter()
-            .filter_map(|archive| ArchiveFileName::parse(archive.file_name()))
-            .collect();
-        drop(base_archives);
         self.parsed_segment_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
 
-        for archive_name in archive_files {
-            self.reclaim_one_archive(&archive_name, reference_generation, full)?;
+        // Oak's mark phase (§3 of the cleanup specification): archives
+        // newest first, entries within each archive in reverse file
+        // order, one references set shared across all archives so a kept
+        // data segment in a newer archive protects bulk segments in
+        // older ones. The seed set is empty — sanctioned for an offline
+        // tool on a quiescent store, which the exclusive repository lock
+        // guarantees — and the dangling-future rule runs with a null
+        // compacted root, i.e. disabled, which the specification calls
+        // always safe.
+        let mut references: std::collections::HashSet<SegmentIdentifier> =
+            std::collections::HashSet::new();
+        let mut reclaim_sets = Vec::with_capacity(base_archives.len());
+        for archive in &base_archives {
+            reclaim_sets.push(mark_one_archive(
+                archive,
+                reference_generation,
+                full,
+                &mut references,
+            )?);
         }
+
+        // Store-wide fallback provider for catalog reconstruction, built
+        // only if some swept archive turns out to have no readable
+        // catalog.
+        let mut fallback_provider: Option<ArchiveSegmentsProvider<'_>> = None;
+        for (archive, cleaned) in base_archives.iter().zip(&reclaim_sets) {
+            sweep_one_archive(
+                &self.directory,
+                archive,
+                cleaned,
+                &base_archives,
+                &mut fallback_provider,
+            )?;
+        }
+        drop(fallback_provider);
+        drop(base_archives);
         // Make the archive deletions and any swept replacements durable
         // before the caller proceeds to the journal rewrite.
         crate::writer::compaction::fsync_directory(&self.directory);
-        Ok(())
-    }
-
-    /// Applies the reclaim predicate to one base archive — Oak's
-    /// `TarReader.sweep`: entries are judged and rewritten in original
-    /// file-position order, the generation triple comes from the index
-    /// entry, sub-25% savings keep the file untouched, and the graph and
-    /// binary-references trailers are *filtered* from the existing ones,
-    /// never recomputed — a raw segment scan cannot see every catalog
-    /// entry, and dropping one would let AEM's blob garbage collection
-    /// delete a still-referenced binary.
-    fn reclaim_one_archive(
-        &self,
-        archive_name: &ArchiveFileName,
-        reference: GarbageCollectionGeneration,
-        full: bool,
-    ) -> Result<()> {
-        let path = self.directory.join(&archive_name.file_name);
-        let reader = TarArchiveReader::open(&path)?;
-        let Some(index) = reader.index() else {
-            // Archives are recovered (rewritten with an index) at open,
-            // so a base archive always has one; leave it untouched if a
-            // later corruption made it unreadable anyway.
-            return Ok(());
-        };
-
-        // Judge every entry in file-position order, accumulating Oak's
-        // sweep arithmetic (`i64` cannot wrap where Java's `int` could
-        // not either: entries are position-bounded below 2 GiB).
-        let mut entries: Vec<_> = index.entries().to_vec();
-        entries.sort_by_key(|entry| entry.position);
-        let mut survivors = Vec::new();
-        let mut cleaned: std::collections::HashSet<SegmentIdentifier> =
-            std::collections::HashSet::new();
-        let mut size_before: i64 = 0;
-        let mut size_after: i64 = 0;
-        for entry in entries {
-            let entry_size = 512
-                + i64::from(entry.size)
-                + crate::writer::tar_writer::padding_size(entry.size as usize) as i64;
-            size_before += entry_size;
-            let generation = GarbageCollectionGeneration {
-                generation: entry.generation,
-                full_generation: entry.full_generation,
-                is_compacted: entry.is_compacted,
-            };
-            if is_reclaimable(reference, generation, full) {
-                cleaned.insert(entry.segment_identifier);
-            } else {
-                size_after += entry_size;
-                survivors.push(entry);
-            }
-        }
-
-        if survivors.is_empty() {
-            drop(reader);
-            // Deletion failures are never fatal, matching Oak's retrying
-            // FileReaper: both letters coexisting is a state the next
-            // open resolves safely (newest valid index wins).
-            let _ = std::fs::remove_file(&path);
-            return Ok(());
-        }
-        // Oak's savings gate: below 25% reclaimed, the file is kept as-is
-        // rather than rewritten.
-        if size_after >= size_before * 3 / 4 {
-            return Ok(());
-        }
-        // A file already at generation `z` is never rewritten (Oak stops
-        // garbage collection at `z`); leave its survivors in place.
-        if archive_name.file_generation >= 'z' {
-            return Ok(());
-        }
-
-        let trailers = FilteredTrailers::from_archive(&reader, &cleaned);
-        // When the original archive has no readable catalog, survivor
-        // references are reconstructed by a strict scan resolving across
-        // *every* segment of the archive — and the sweep fails closed on
-        // an unresolvable identifier rather than publish an incomplete
-        // catalog that could let blob garbage collection delete
-        // referenced binaries. (Java would publish an *empty* catalog
-        // here; the scan is a strict superset of that.)
-        let scan_provider = if trailers.catalog.is_none() {
-            Some(archive_segments_provider(&reader)?)
-        } else {
-            None
-        };
-
-        // Rewrite the survivors to the next generation letter, then delete
-        // the original — matching Oak's sweep.
-        let next_letter = char::from(archive_name.file_generation as u8 + 1);
-        let swept_name = format!("data{:05}{next_letter}.tar", archive_name.archive_number);
-        let mut writer = TarArchiveWriter::new(&self.directory, &swept_name);
-        if let Some(catalog_entries) = &trailers.catalog {
-            for (generation, segment, references) in catalog_entries {
-                writer.add_binary_references(*generation, *segment, references.iter().cloned());
-            }
-        }
-        for entry in &survivors {
-            let identifier = entry.segment_identifier;
-            let Some(bytes) = reader.segment_data(identifier) else {
-                return Err(Error::SegmentNotFound {
-                    segment_identifier: identifier,
-                });
-            };
-            let generation = GarbageCollectionGeneration {
-                generation: entry.generation,
-                full_generation: entry.full_generation,
-                is_compacted: entry.is_compacted,
-            };
-            let (references, binary_references) = if identifier.is_data_segment() {
-                trailers.for_segment(identifier, bytes, &cleaned, scan_provider.as_ref())?
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            writer.write_segment(
-                identifier,
-                bytes,
-                generation,
-                &references,
-                &binary_references,
-            )?;
-        }
-        drop(reader);
-        writer.close()?;
-        // The swept file and its directory entry must be durable, and the
-        // swept file must re-open with a valid index, *before* the
-        // original is deleted — a crash in between must never leave both
-        // generations unusable, and a bad rewrite must never destroy the
-        // only good copy.
-        crate::writer::compaction::fsync_directory(&self.directory);
-        let swept_path = self.directory.join(&swept_name);
-        let swept_is_valid =
-            TarArchiveReader::open(&swept_path).is_ok_and(|swept| !swept.is_recovered());
-        if swept_is_valid {
-            // Deletion failures are never fatal, matching Oak's retrying
-            // FileReaper: both letters coexisting is resolved safely at
-            // the next open (newest valid index wins).
-            let _ = std::fs::remove_file(&path);
-        } else {
-            // Keep the original untouched; discard the bad rewrite, as
-            // Java falls back to the original reader on a failed re-open.
-            let _ = std::fs::remove_file(&swept_path);
-        }
         Ok(())
     }
 
@@ -694,6 +585,207 @@ impl SegmentSink for StoreSink<'_> {
 /// The reclaim predicate for one segment, Oak's `newOldReclaimer` with a
 /// single retained generation. `reference` is the generation the
 /// compaction produced; `segment` is a candidate segment's generation.
+/// Oak's `TarReader.mark` for one archive: entries are visited in
+/// *reverse* file order, so a bulk segment — always written before the
+/// data segments referencing it — is judged after all of them. Data
+/// segments are judged by the generation predicate alone; bulk segments
+/// purely by membership in the shared `references` set (`remove` both
+/// queries and consumes, exactly like Java). Every *kept* data segment
+/// protects the bulk segments it references — through the graph trailer
+/// when present, else the segment header's reference list — following
+/// only bulk targets, Java's `shouldFollow`. Returns the archive's
+/// reclaimable set.
+fn mark_one_archive(
+    reader: &TarArchiveReader,
+    reference: GarbageCollectionGeneration,
+    full: bool,
+    references: &mut std::collections::HashSet<SegmentIdentifier>,
+) -> Result<std::collections::HashSet<SegmentIdentifier>> {
+    let mut reclaimable = std::collections::HashSet::new();
+    let Some(index) = reader.index() else {
+        // No valid index: the sweep leaves such an archive untouched, so
+        // nothing of it is reclaimable.
+        return Ok(reclaimable);
+    };
+    let mut entries: Vec<_> = index.entries().to_vec();
+    entries.sort_by_key(|entry| entry.position);
+
+    let graph_adjacency: Option<HashMap<SegmentIdentifier, Vec<SegmentIdentifier>>> = reader
+        .segment_graph()
+        .map(|graph| graph.adjacency.into_iter().collect());
+
+    for entry in entries.iter().rev() {
+        let identifier = entry.segment_identifier;
+        let was_referenced = references.remove(&identifier);
+        let reclaim = if identifier.is_data_segment() {
+            let generation = GarbageCollectionGeneration {
+                generation: entry.generation,
+                full_generation: entry.full_generation,
+                is_compacted: entry.is_compacted,
+            };
+            is_reclaimable(reference, generation, full)
+        } else {
+            !was_referenced
+        };
+        if reclaim {
+            reclaimable.insert(identifier);
+        } else if identifier.is_data_segment() {
+            let targets = match &graph_adjacency {
+                Some(adjacency) => adjacency.get(&identifier).cloned().unwrap_or_default(),
+                None => match reader.segment_data(identifier) {
+                    Some(bytes) => ParsedSegment::parse(identifier, bytes)?.referenced_segments,
+                    None => Vec::new(),
+                },
+            };
+            for target in targets {
+                if target.is_bulk_segment() {
+                    references.insert(target);
+                }
+            }
+        }
+    }
+    Ok(reclaimable)
+}
+
+/// Oak's `TarReader.sweep` for one base archive, with a precomputed
+/// reclaim set from the mark phase: entries are judged and rewritten in
+/// original file-position order, the generation triple comes from the
+/// index entry, sub-25% savings keep the file untouched, and the graph
+/// and binary-references trailers are *filtered* from the existing ones,
+/// never recomputed — a raw segment scan cannot see every catalog entry,
+/// and dropping one would let AEM's blob garbage collection delete a
+/// still-referenced binary.
+fn sweep_one_archive<'archives>(
+    directory: &Path,
+    reader: &'archives TarArchiveReader,
+    cleaned: &std::collections::HashSet<SegmentIdentifier>,
+    all_archives: &'archives [TarArchiveReader],
+    fallback_provider: &mut Option<ArchiveSegmentsProvider<'archives>>,
+) -> Result<()> {
+    let Some(archive_name) = ArchiveFileName::parse(reader.file_name()) else {
+        return Ok(());
+    };
+    let path = directory.join(&archive_name.file_name);
+    let Some(index) = reader.index() else {
+        // Archives are recovered (rewritten with an index) at open, so a
+        // base archive always has one; leave it untouched if a later
+        // corruption made it unreadable anyway.
+        return Ok(());
+    };
+
+    // Partition the entries in file-position order, accumulating Oak's
+    // sweep arithmetic (`i64` cannot wrap where Java's `int` could not
+    // either: entries are position-bounded below 2 GiB).
+    let mut entries: Vec<_> = index.entries().to_vec();
+    entries.sort_by_key(|entry| entry.position);
+    let mut survivors = Vec::new();
+    let mut size_before: i64 = 0;
+    let mut size_after: i64 = 0;
+    for entry in entries {
+        let entry_size = 512
+            + i64::from(entry.size)
+            + crate::writer::tar_writer::padding_size(entry.size as usize) as i64;
+        size_before += entry_size;
+        if !cleaned.contains(&entry.segment_identifier) {
+            size_after += entry_size;
+            survivors.push(entry);
+        }
+    }
+
+    if survivors.is_empty() {
+        // Deletion failures are never fatal, matching Oak's retrying
+        // FileReaper: both letters coexisting is a state the next open
+        // resolves safely (newest valid index wins).
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    // Oak's savings gate: below 25% reclaimed, the file is kept as-is
+    // rather than rewritten.
+    if size_after >= size_before * 3 / 4 {
+        return Ok(());
+    }
+    // A file already at generation `z` is never rewritten (Oak stops
+    // garbage collection at `z`); leave its survivors in place.
+    if archive_name.file_generation >= 'z' {
+        return Ok(());
+    }
+
+    let trailers = FilteredTrailers::from_archive(reader, cleaned);
+    // When the original archive has no readable catalog, survivor
+    // references are reconstructed by a strict scan resolving across
+    // every segment of every base archive — and the sweep fails closed
+    // on an unresolvable identifier rather than publish an incomplete
+    // catalog that could let blob garbage collection delete referenced
+    // binaries. (Java would publish an *empty* catalog here; the scan is
+    // a strict superset of that.)
+    let scan_provider = if trailers.catalog.is_none() {
+        if fallback_provider.is_none() {
+            *fallback_provider = Some(archive_segments_provider(all_archives)?);
+        }
+        fallback_provider.as_ref()
+    } else {
+        None
+    };
+
+    // Rewrite the survivors to the next generation letter, then delete
+    // the original — matching Oak's sweep.
+    let next_letter = char::from(archive_name.file_generation as u8 + 1);
+    let swept_name = format!("data{:05}{next_letter}.tar", archive_name.archive_number);
+    let mut writer = TarArchiveWriter::new(directory, &swept_name);
+    if let Some(catalog_entries) = &trailers.catalog {
+        for (generation, segment, references) in catalog_entries {
+            writer.add_binary_references(*generation, *segment, references.iter().cloned());
+        }
+    }
+    for entry in &survivors {
+        let identifier = entry.segment_identifier;
+        let Some(bytes) = reader.segment_data(identifier) else {
+            return Err(Error::SegmentNotFound {
+                segment_identifier: identifier,
+            });
+        };
+        let generation = GarbageCollectionGeneration {
+            generation: entry.generation,
+            full_generation: entry.full_generation,
+            is_compacted: entry.is_compacted,
+        };
+        let (references, binary_references) = if identifier.is_data_segment() {
+            trailers.for_segment(identifier, bytes, cleaned, scan_provider)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        writer.write_segment(
+            identifier,
+            bytes,
+            generation,
+            &references,
+            &binary_references,
+        )?;
+    }
+    writer.close()?;
+    // The swept file and its directory entry must be durable, and the
+    // swept file must re-open with a valid index, *before* the original
+    // is deleted — a crash in between must never leave both generations
+    // unusable, and a bad rewrite must never destroy the only good copy.
+    crate::writer::compaction::fsync_directory(directory);
+    let swept_path = directory.join(&swept_name);
+    let swept_is_valid =
+        TarArchiveReader::open(&swept_path).is_ok_and(|swept| !swept.is_recovered());
+    if swept_is_valid {
+        // Deletion failures are never fatal, matching Oak's retrying
+        // FileReaper: both letters coexisting is resolved safely at the
+        // next open (newest valid index wins). The original stays mapped
+        // by its reader until the reclaim finishes — unlinking a mapped
+        // file is safe on Unix.
+        let _ = std::fs::remove_file(&path);
+    } else {
+        // Keep the original untouched; discard the bad rewrite, as Java
+        // falls back to the original reader on a failed re-open.
+        let _ = std::fs::remove_file(&swept_path);
+    }
+    Ok(())
+}
+
 fn is_reclaimable(
     reference: GarbageCollectionGeneration,
     segment: GarbageCollectionGeneration,
@@ -953,9 +1045,12 @@ fn scan_recoverable_segments(
 /// the validated replacement under the target name. The target's own
 /// original is preserved through a hard link (or, on filesystems without
 /// hard links, a full copy), so a `.tar` under the target name exists at
-/// every instant; the other letters are plain renames. A failure at any
-/// step rolls every completed rename back, so an error always leaves the
-/// originals under their own names.
+/// every instant; the other letters are plain renames. An *error* at any
+/// step — including the final re-open — rolls every completed step back
+/// (best effort: rollback I/O errors cannot be recovered further and are
+/// dropped), so an error leaves the originals under their own names. A
+/// *crash* mid-installation can still leave a mix of `.bak` and
+/// installed states, the inherent limit of multi-file replacement.
 fn install_recovered_archive(
     directory: &Path,
     generations: &[ArchiveFileName],
@@ -963,6 +1058,7 @@ fn install_recovered_archive(
     temporary_path: &Path,
 ) -> Result<TarArchiveReader> {
     let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut target_backup: Option<PathBuf> = None;
     let roll_back = |renamed: &[(PathBuf, PathBuf)]| {
         for (original, backup) in renamed.iter().rev() {
             let _ = std::fs::rename(backup, original);
@@ -981,6 +1077,7 @@ fn install_recovered_archive(
                 roll_back(&renamed);
                 return Err(error.into());
             }
+            target_backup = Some(backup);
         } else if let Err(error) = std::fs::rename(&path, &backup) {
             roll_back(&renamed);
             return Err(error.into());
@@ -990,11 +1087,28 @@ fn install_recovered_archive(
     }
     let target_path = directory.join(target_name);
     if let Err(error) = std::fs::rename(temporary_path, &target_path) {
+        if let Some(backup) = &target_backup {
+            let _ = std::fs::remove_file(backup);
+        }
         roll_back(&renamed);
         return Err(error.into());
     }
     crate::writer::compaction::fsync_directory(directory);
-    TarArchiveReader::open(&target_path)
+    match TarArchiveReader::open(&target_path) {
+        Ok(reader) => Ok(reader),
+        Err(error) => {
+            // The replacement was validated before installation, so a
+            // failing re-open is environmental (for example an I/O
+            // error). Restore the original atomically from its backup
+            // link and undo the other renames before reporting.
+            if let Some(backup) = &target_backup {
+                let _ = std::fs::rename(backup, &target_path);
+            }
+            roll_back(&renamed);
+            crate::writer::compaction::fsync_directory(directory);
+            Err(error)
+        }
+    }
 }
 
 /// The first free `.bak` name for a damaged archive: `name.bak`, then
@@ -1119,17 +1233,20 @@ impl FilteredTrailers {
     }
 }
 
-/// Parses every segment of an archive — data and bulk — into a provider,
-/// so blob identifier strings (including block lists spilling into bulk
-/// segments) resolve during catalog reconstruction.
-fn archive_segments_provider(reader: &TarArchiveReader) -> Result<ArchiveSegmentsProvider<'_>> {
+/// Parses every segment of the given archives — data and bulk — into a
+/// provider, so blob identifier strings (including block lists spilling
+/// into bulk segments, or strings stored in another archive) resolve
+/// during catalog reconstruction.
+fn archive_segments_provider(readers: &[TarArchiveReader]) -> Result<ArchiveSegmentsProvider<'_>> {
     let mut segments = HashMap::new();
-    for identifier in reader.segment_identifiers() {
-        if let Some(bytes) = reader.segment_data(identifier) {
-            segments.insert(
-                identifier,
-                (Arc::new(ParsedSegment::parse(identifier, bytes)?), bytes),
-            );
+    for reader in readers {
+        for identifier in reader.segment_identifiers() {
+            if let Some(bytes) = reader.segment_data(identifier) {
+                segments.insert(
+                    identifier,
+                    (Arc::new(ParsedSegment::parse(identifier, bytes)?), bytes),
+                );
+            }
         }
     }
     Ok(ArchiveSegmentsProvider { segments })

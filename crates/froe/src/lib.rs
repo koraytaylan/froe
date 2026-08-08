@@ -9,7 +9,11 @@
 //!
 //! The reading API ([`Repository`], [`store`], [`content`], [`tooling`]) is
 //! read-only by design: it never takes the repository lock and never
-//! modifies any file, so it is safe to point at a live repository. The
+//! modifies any file, so it is safe to point at a live repository. Like
+//! Oak itself the reader memory-maps archives, relying on the store's
+//! file protocol (existing archive bytes are never modified in place); a
+//! process mutating archives outside that protocol would disturb froe
+//! and a running Oak instance alike. The
 //! writing API ([`writer`]) — commits, checkpoints, compaction, backup,
 //! restore, journal recovery — takes the exclusive repository lock first,
 //! so it can never race a running instance, and produces stores byte-for-byte
