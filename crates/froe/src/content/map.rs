@@ -219,7 +219,8 @@ pub fn map_entries(
     };
 
     let mut entries = Vec::new();
-    collect_map_entries(provider, base, &mut entries, 0)?;
+    let mut visited = std::collections::HashSet::new();
+    collect_map_entries(provider, base, &mut entries, 0, &mut visited)?;
     if !overlays.is_empty() {
         for entry in &mut entries {
             if let Some((_, value)) = overlays
@@ -252,10 +253,20 @@ fn collect_map_entries(
     map_identifier: RecordIdentifier,
     entries: &mut Vec<CollectedEntry>,
     depth: u32,
+    visited: &mut std::collections::HashSet<RecordIdentifier>,
 ) -> Result<()> {
     // Valid tries are at most seven levels deep (plus stray diffs); a much
     // larger depth means the records form a cycle.
     if depth >= 64 {
+        return Err(walk_too_long(map_identifier));
+    }
+    // In a valid trie every record is reachable exactly once — a key's
+    // hash fixes its unique bucket path, so two buckets can never share a
+    // subtree. A revisit therefore means corrupt records shaped as a DAG,
+    // on which a depth bound alone would allow exponential work (Java
+    // enumerates such maps forever; returning an error is the documented
+    // safer deviation).
+    if !visited.insert(map_identifier) {
         return Err(walk_too_long(map_identifier));
     }
     let view = provider.segment(map_identifier.segment)?;
@@ -264,7 +275,7 @@ fn collect_map_entries(
         // A nested diff below a branch never occurs in well-formed data,
         // but the Java reader recurses, so we do too.
         let base = view.read_record_identifier(map_identifier.record_number, 8, 2)?;
-        return collect_map_entries(provider, base, entries, depth + 1);
+        return collect_map_entries(provider, base, entries, depth + 1, visited);
     }
     let size = head & SIZE_MASK;
     let level = head >> LEVEL_SHIFT;
@@ -277,7 +288,7 @@ fn collect_map_entries(
         for bucket_position in 0..bucket_count {
             let bucket =
                 view.read_record_identifier(map_identifier.record_number, 8, bucket_position)?;
-            collect_map_entries(provider, bucket, entries, depth + 1)?;
+            collect_map_entries(provider, bucket, entries, depth + 1, visited)?;
         }
         return Ok(());
     }
@@ -333,13 +344,14 @@ mod tests {
     }
 
     /// Builds a leaf record for entries of (name, key record, value record),
-    /// sorting by unsigned hash then name as the writer does.
+    /// sorting by unsigned hash then name in UTF-16 order as the writer
+    /// does.
     fn leaf_record(level: u32, entries: &[(&str, u32, u32)]) -> Vec<u8> {
         let mut sorted: Vec<&(&str, u32, u32)> = entries.iter().collect();
         sorted.sort_by(|first, second| {
             map_entry_hash(first.0)
                 .cmp(&map_entry_hash(second.0))
-                .then_with(|| first.0.cmp(second.0))
+                .then_with(|| first.0.encode_utf16().cmp(second.0.encode_utf16()))
         });
         let head = (level << 29) | entries.len() as u32;
         let mut bytes = head.to_be_bytes().to_vec();
@@ -404,6 +416,100 @@ mod tests {
         assert_eq!(entries.len(), 3);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains(&"alpha") && names.contains(&"beta") && names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn colliding_hashes_resolve_by_name_within_a_leaf() {
+        // "Aa", "BB", "AaAa", and "BBBB" all pairwise collide in Java's
+        // string hash (and therefore in the scrambled map hash), driving
+        // the binary-search-then-walk over equal hash runs.
+        assert_eq!(map_entry_hash("Aa"), map_entry_hash("BB"));
+        assert_eq!(map_entry_hash("AaAa"), map_entry_hash("BBBB"));
+        let segment = data_segment_identifier(1);
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("Aa")),
+                    (2, 4, small_string_record("BB")),
+                    (3, 4, small_string_record("AaAa")),
+                    (4, 4, small_string_record("BBBB")),
+                    (5, 4, small_string_record("v1")),
+                    (6, 4, small_string_record("v2")),
+                    (7, 4, small_string_record("v3")),
+                    (8, 4, small_string_record("v4")),
+                    (
+                        10,
+                        0,
+                        leaf_record(
+                            0,
+                            &[("Aa", 1, 5), ("BB", 2, 6), ("AaAa", 3, 7), ("BBBB", 4, 8)],
+                        ),
+                    ),
+                ],
+            ),
+        );
+        let map = RecordIdentifier::new(segment, 10);
+        assert_eq!(
+            map_entry(&provider, map, "Aa").expect("lookup"),
+            Some(RecordIdentifier::new(segment, 5))
+        );
+        assert_eq!(
+            map_entry(&provider, map, "BB").expect("lookup"),
+            Some(RecordIdentifier::new(segment, 6))
+        );
+        assert_eq!(
+            map_entry(&provider, map, "AaAa").expect("lookup"),
+            Some(RecordIdentifier::new(segment, 7))
+        );
+        assert_eq!(
+            map_entry(&provider, map, "BBBB").expect("lookup"),
+            Some(RecordIdentifier::new(segment, 8))
+        );
+        // "AaBB" shares the four-character collision hash but is absent:
+        // the equal-hash walk must confirm names, not stop at the hash.
+        assert_eq!(map_entry_hash("AaBB"), map_entry_hash("AaAa"));
+        assert_eq!(map_entry(&provider, map, "AaBB").expect("lookup"), None);
+    }
+
+    #[test]
+    fn level_six_branch_lookup_sign_extends_the_masked_shift() {
+        // At trie level 6 the shift distance is (32 - 7*5) & 31 = 29 with
+        // an *arithmetic* shift. map_entry_hash("root") = 0xC28924EE has
+        // its top bit set, so sign extension selects bucket
+        // ((0xC28924EE as i32) >> 29) & 0x1F = 30 — a logical shift would
+        // select bucket 6 and the lookup would miss.
+        let name = "root";
+        assert_eq!(map_entry_hash(name), 0xC289_24EE);
+        let bucket_index = 30u32;
+        let bitmap = 1u32 << bucket_index;
+
+        // Head: level 6, declared size 33.
+        let mut branch = ((6u32 << 29) | 0x21).to_be_bytes().to_vec();
+        branch.extend_from_slice(&bitmap.to_be_bytes());
+        branch.extend_from_slice(&identifier_bytes(10));
+
+        let segment = data_segment_identifier(1);
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record(name)),
+                    (4, 4, small_string_record("value")),
+                    (10, 0, leaf_record(7, &[(name, 1, 4)])),
+                    (20, 1, branch),
+                ],
+            ),
+        );
+        let map = RecordIdentifier::new(segment, 20);
+        assert_eq!(
+            map_entry(&provider, map, name).expect("lookup"),
+            Some(RecordIdentifier::new(segment, 4))
+        );
     }
 
     #[test]

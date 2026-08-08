@@ -466,14 +466,32 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     }
 
     /// Writes a child map: keys become string records, the structure a
-    /// hash trie of leaf and branch records.
+    /// hash trie of leaf and branch records. Fails on duplicate names and
+    /// on maps of `MapRecord.MAX_SIZE` entries or more — Java's writer
+    /// enforces both (its `Map`-typed API makes duplicates impossible),
+    /// and packing a larger size would silently corrupt the head's level
+    /// bits.
     pub fn write_map(
         &mut self,
         entries: &[(String, RecordIdentifier)],
     ) -> Result<RecordIdentifier> {
+        // Java: checkIndex(size, MapRecord.MAX_SIZE) with
+        // MAX_SIZE = (1 << 29) - 1, so size == MAX_SIZE is already
+        // rejected before any head word is packed.
+        if entries.len() >= (1 << 29) - 1 {
+            return Err(Error::InvalidFormat {
+                details: format!("a child map of {} entries exceeds MAX_SIZE", entries.len()),
+            });
+        }
         let mut prepared: Vec<(u32, String, RecordIdentifier, RecordIdentifier)> =
             Vec::with_capacity(entries.len());
+        let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (name, value) in entries {
+            if !names.insert(name.as_str()) {
+                return Err(Error::InvalidFormat {
+                    details: format!("duplicate child name {name:?} in a map"),
+                });
+            }
             let key_identifier = self.write_string(name)?;
             prepared.push((map_entry_hash(name), name.clone(), key_identifier, *value));
         }
@@ -1111,5 +1129,53 @@ mod tests {
         for (text, identifier) in identifiers {
             assert_eq!(read_string(&store, identifier).expect("read"), text);
         }
+    }
+
+    #[test]
+    fn template_property_sort_orders_by_signed_hash_then_name_then_type() {
+        use crate::content::property::PropertyType;
+        use crate::segment::identifier::SegmentIdentifier;
+        use crate::segment::record::RecordIdentifier;
+        use crate::writer::record_writer::sort_properties_for_template;
+
+        let property = |name: &str, property_type: PropertyType| PropertyToWrite {
+            name: name.to_owned(),
+            property_type,
+            values: PropertyValuesToWrite::Single(RecordIdentifier::new(
+                SegmentIdentifier::new(0, 0xA000_0000_0000_0001),
+                0,
+            )),
+        };
+
+        // Java hashes (signed): active = -1422950650, count = 94851343,
+        // title = 110371416 — the negative hash must sort first, which an
+        // unsigned comparison would get wrong. "Aa" and "BB" collide
+        // (2112), so their tie breaks by name; two "count" entries tie on
+        // hash and name, so their tie breaks by type tag (STRING=1 before
+        // LONG=3).
+        let mut properties = vec![
+            property("title", PropertyType::String),
+            property("BB", PropertyType::Long),
+            property("count", PropertyType::Long),
+            property("count", PropertyType::String),
+            property("Aa", PropertyType::String),
+            property("active", PropertyType::Boolean),
+        ];
+        sort_properties_for_template(&mut properties);
+        let names_and_types: Vec<(&str, PropertyType)> = properties
+            .iter()
+            .map(|property| (property.name.as_str(), property.property_type))
+            .collect();
+        assert_eq!(
+            names_and_types,
+            [
+                ("active", PropertyType::Boolean),
+                ("Aa", PropertyType::String),
+                ("BB", PropertyType::Long),
+                ("count", PropertyType::String),
+                ("count", PropertyType::Long),
+                ("title", PropertyType::String),
+            ]
+        );
     }
 }

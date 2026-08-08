@@ -44,17 +44,29 @@ pub struct NodeMatch {
     pub stable_identifier: String,
 }
 
+/// The result of a node search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchOutcome {
+    /// The matching nodes, in scan order.
+    pub matches: Vec<NodeMatch>,
+    /// How many node records could not be read and were skipped —
+    /// widespread corruption must be visible, not silently absent from
+    /// the results.
+    pub unreadable_nodes: u64,
+}
+
 /// Searches every node record in the store for nodes matching `query`.
 /// A limit of zero means no limit.
 pub fn search_nodes(
     directory: &std::path::Path,
     query: &SearchQuery,
     limit: usize,
-) -> Result<Vec<NodeMatch>> {
+) -> Result<SearchOutcome> {
     let archives = open_all_archives(directory)?;
     let provider = ArchiveSet::new(archives);
 
     let mut matches = Vec::new();
+    let mut unreadable_nodes = 0u64;
     for segment_identifier in provider.segment_identifiers() {
         if segment_identifier.is_bulk_segment() {
             continue;
@@ -62,30 +74,44 @@ pub fn search_nodes(
         let Ok(view) = provider.segment(segment_identifier) else {
             continue;
         };
-        let node_records: Vec<u32> = view
-            .structure
-            .record_table()
-            .iter()
-            .filter(|entry| entry.record_type == RecordType::Node)
-            .map(|entry| entry.record_number)
-            .collect();
+        // An unknown type byte means the record table itself is suspect;
+        // Java's search dies on it, froe keeps scanning but the skipped
+        // entries must be visible in the outcome.
+        let mut node_records: Vec<u32> = Vec::new();
+        for entry in view.structure.record_table() {
+            match entry.record_type() {
+                Some(RecordType::Node) => node_records.push(entry.record_number),
+                Some(_) => {}
+                None => unreadable_nodes += 1,
+            }
+        }
         for record_number in node_records {
             let record = RecordIdentifier::new(segment_identifier, record_number);
-            if node_matches(&provider, record, query).unwrap_or(false) {
-                let stable_identifier = NodeState::new(&provider, record)
-                    .stable_identifier()
-                    .unwrap_or_else(|_| record.to_string());
-                matches.push(NodeMatch {
-                    record,
-                    stable_identifier,
-                });
-                if limit != 0 && matches.len() >= limit {
-                    return Ok(matches);
+            match node_matches(&provider, record, query) {
+                Ok(false) => {}
+                Ok(true) => {
+                    let stable_identifier = NodeState::new(&provider, record)
+                        .stable_identifier()
+                        .unwrap_or_else(|_| record.to_string());
+                    matches.push(NodeMatch {
+                        record,
+                        stable_identifier,
+                    });
+                    if limit != 0 && matches.len() >= limit {
+                        return Ok(SearchOutcome {
+                            matches,
+                            unreadable_nodes,
+                        });
+                    }
                 }
+                Err(_) => unreadable_nodes += 1,
             }
         }
     }
-    Ok(matches)
+    Ok(SearchOutcome {
+        matches,
+        unreadable_nodes,
+    })
 }
 
 /// Whether one node satisfies every predicate of the query.
@@ -231,8 +257,9 @@ mod tests {
             has_properties: vec!["marker".to_owned()],
             ..SearchQuery::default()
         };
-        let matches = search_nodes(&directory.path, &query, 0).expect("search");
-        assert_eq!(matches.len(), 1, "one node has the marker property");
+        let outcome = search_nodes(&directory.path, &query, 0).expect("search");
+        assert_eq!(outcome.matches.len(), 1, "one node has the marker property");
+        assert_eq!(outcome.unreadable_nodes, 0);
     }
 
     #[test]
@@ -246,6 +273,7 @@ mod tests {
         assert_eq!(
             search_nodes(&directory.path, &query, 0)
                 .expect("search")
+                .matches
                 .len(),
             1
         );
@@ -257,6 +285,7 @@ mod tests {
         assert!(
             search_nodes(&directory.path, &wrong_value, 0)
                 .expect("search")
+                .matches
                 .is_empty()
         );
     }
@@ -269,8 +298,12 @@ mod tests {
             has_children: vec!["marked".to_owned()],
             ..SearchQuery::default()
         };
-        let matches = search_nodes(&directory.path, &query, 0).expect("search");
-        assert_eq!(matches.len(), 1, "the content node has the marked child");
+        let outcome = search_nodes(&directory.path, &query, 0).expect("search");
+        assert_eq!(
+            outcome.matches.len(),
+            1,
+            "the content node has the marked child"
+        );
     }
 
     #[test]
@@ -283,6 +316,6 @@ mod tests {
             ..SearchQuery::default()
         };
         let limited = search_nodes(&directory.path, &query, 2).expect("search");
-        assert_eq!(limited.len(), 2, "the limit caps the results");
+        assert_eq!(limited.matches.len(), 2, "the limit caps the results");
     }
 }

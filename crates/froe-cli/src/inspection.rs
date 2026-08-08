@@ -131,9 +131,11 @@ pub(crate) fn print_segment(
     let mut counts_by_type: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for entry in structure.record_table() {
-        *counts_by_type
-            .entry(format!("{:?}", entry.record_type))
-            .or_default() += 1;
+        let type_name = entry.record_type().map_or_else(
+            || format!("UnknownType({})", entry.type_byte),
+            |record_type| format!("{record_type:?}"),
+        );
+        *counts_by_type.entry(type_name).or_default() += 1;
     }
     for (record_type, count) in counts_by_type {
         println!("                  {count} x {record_type}");

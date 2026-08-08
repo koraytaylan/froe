@@ -216,6 +216,95 @@ pub fn read_binary_content(
     }
 }
 
+/// Resolves and reads every block of an inline binary without keeping the
+/// content in memory — for consistency gates, which must survive
+/// multi-gigabyte binaries that could never be materialized whole (Oak's
+/// checker streams them in 8 KiB chunks for the same reason). External
+/// binaries have no local content and verify trivially.
+pub fn verify_binary_content(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+) -> Result<()> {
+    match read_binary_value(provider, identifier)? {
+        BinaryValue::External { .. } => Ok(()),
+        BinaryValue::Inline {
+            length,
+            record_identifier,
+        } => {
+            let view = provider.segment(record_identifier.segment)?;
+            if length < SMALL_VALUE_LIMIT {
+                view.read_bytes(record_identifier.record_number, 1, length as usize)?;
+            } else if length < MEDIUM_VALUE_LIMIT {
+                view.read_bytes(record_identifier.record_number, 2, length as usize)?;
+            } else {
+                let list_identifier =
+                    view.read_record_identifier(record_identifier.record_number, 8, 0)?;
+                let block_count = length.div_ceil(BLOCK_SIZE);
+                let block_identifiers =
+                    uncounted_list_entries(provider, list_identifier, block_count)?;
+                let mut remaining = length;
+                for block_identifier in block_identifiers {
+                    let block_length = remaining.min(BLOCK_SIZE) as usize;
+                    let block_view = provider.segment(block_identifier.segment)?;
+                    block_view.read_bytes(block_identifier.record_number, 0, block_length)?;
+                    remaining -= block_length as u64;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Compares two inline binaries by content without materializing either,
+/// assuming their lengths are already known to be equal. Long values
+/// compare block by block: equal lengths mean both block lists chunk at
+/// the same 4096-byte boundaries.
+pub fn inline_binary_contents_equal(
+    provider: &dyn SegmentProvider,
+    first: RecordIdentifier,
+    second: RecordIdentifier,
+    length: u64,
+) -> Result<bool> {
+    if first == second {
+        return Ok(true);
+    }
+    if length < MEDIUM_VALUE_LIMIT {
+        let offset = if length < SMALL_VALUE_LIMIT { 1 } else { 2 };
+        let first_view = provider.segment(first.segment)?;
+        let second_view = provider.segment(second.segment)?;
+        let first_bytes = first_view.read_bytes(first.record_number, offset, length as usize)?;
+        let second_bytes = second_view.read_bytes(second.record_number, offset, length as usize)?;
+        return Ok(first_bytes == second_bytes);
+    }
+    let first_list =
+        provider
+            .segment(first.segment)?
+            .read_record_identifier(first.record_number, 8, 0)?;
+    let second_list =
+        provider
+            .segment(second.segment)?
+            .read_record_identifier(second.record_number, 8, 0)?;
+    let block_count = length.div_ceil(BLOCK_SIZE);
+    let first_blocks = uncounted_list_entries(provider, first_list, block_count)?;
+    let second_blocks = uncounted_list_entries(provider, second_list, block_count)?;
+    let mut remaining = length;
+    for (first_block, second_block) in first_blocks.into_iter().zip(second_blocks) {
+        let block_length = remaining.min(BLOCK_SIZE) as usize;
+        if first_block != second_block {
+            let first_view = provider.segment(first_block.segment)?;
+            let second_view = provider.segment(second_block.segment)?;
+            let first_bytes = first_view.read_bytes(first_block.record_number, 0, block_length)?;
+            let second_bytes =
+                second_view.read_bytes(second_block.record_number, 0, block_length)?;
+            if first_bytes != second_bytes {
+                return Ok(false);
+            }
+        }
+        remaining -= block_length as u64;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

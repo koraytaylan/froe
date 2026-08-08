@@ -33,7 +33,7 @@ use crate::segment::parsed_segment::ParsedSegment;
 use crate::segment::record::RecordIdentifier;
 use crate::segment::view::SegmentView;
 use crate::tar_archive::archive::TarArchiveReader;
-use crate::tar_archive::file_name::select_newest_file_generations;
+use crate::tar_archive::file_name::group_file_generations_newest_first;
 
 /// The highest store version this reader understands
 /// (`store.version` in the manifest; 2 since Oak 1.8).
@@ -75,13 +75,7 @@ impl Repository {
         let archive_file_names = list_archive_file_names(directory)?;
         check_manifest(directory, !archive_file_names.is_empty())?;
 
-        let selected = select_newest_file_generations(&archive_file_names)?;
-        let mut archives = Vec::with_capacity(selected.len());
-        for archive_file_name in &selected {
-            archives.push(TarArchiveReader::open(
-                &directory.join(&archive_file_name.file_name),
-            )?);
-        }
+        let archives = open_archives_newest_valid_first(directory, &archive_file_names)?;
 
         let mut segment_locations = HashMap::new();
         for (archive_position, archive) in archives.iter().enumerate() {
@@ -363,16 +357,62 @@ impl SegmentProvider for ArchiveSet {
 
 /// Opens every archive in a directory read-only, selecting the newest
 /// generation letter of each archive number. Unlike [`Repository::open`]
-/// this needs no journal or manifest, so recovery can read segments
-/// before a head exists.
+/// this needs no journal, so recovery can read segments before a head
+/// exists — but the manifest is validated exactly like Java's read-only
+/// store open: a legacy or newer-versioned store gets the categorical
+/// refusal, never segment-level parse noise.
 pub fn open_all_archives(directory: &Path) -> Result<Vec<TarArchiveReader>> {
     let file_names = list_archive_file_names(directory)?;
-    let selected = select_newest_file_generations(&file_names)?;
-    let mut archives = Vec::with_capacity(selected.len());
-    for archive_file_name in &selected {
-        archives.push(TarArchiveReader::open(
-            &directory.join(&archive_file_name.file_name),
-        )?);
+    check_manifest(directory, !file_names.is_empty())?;
+    open_archives_newest_valid_first(directory, &file_names)
+}
+
+/// Opens one archive per number read-only: the highest generation letter
+/// whose *index is valid* wins — a partial next-letter file left by an
+/// interrupted sweep must never shadow the complete previous letter
+/// beside it. This is Java's *read-write* selection rule (its read-only
+/// open considers only the highest letter and recover-scans it); froe
+/// deliberately uses the stricter rule on the read side too, as it never
+/// serves fewer segments. When no letter of a number has a valid index,
+/// the recovered in-memory views of every letter are served, newest
+/// letter first, so all segments stay reachable through the probe order.
+/// Zero-length files are skipped: a live writer creates its next archive
+/// lazily, and the empty file is that creation's race window.
+fn open_archives_newest_valid_first(
+    directory: &Path,
+    file_names: &[String],
+) -> Result<Vec<TarArchiveReader>> {
+    let groups = group_file_generations_newest_first(file_names)?;
+    let mut archives = Vec::new();
+    for group in groups {
+        let mut recovered: Vec<TarArchiveReader> = Vec::new();
+        let mut winner: Option<TarArchiveReader> = None;
+        let mut first_error: Option<Error> = None;
+        for candidate in &group {
+            let path = directory.join(&candidate.file_name);
+            if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+                continue;
+            }
+            match TarArchiveReader::open(&path) {
+                Ok(reader) if !reader.is_recovered() => {
+                    winner = Some(reader);
+                    break;
+                }
+                Ok(reader) => recovered.push(reader),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(winner) = winner {
+            archives.push(winner);
+        } else if !recovered.is_empty() {
+            archives.extend(recovered);
+        } else if let Some(error) = first_error {
+            return Err(error);
+        }
     }
     Ok(archives)
 }
@@ -435,11 +475,13 @@ pub(crate) fn check_manifest(directory: &Path, archives_exist: bool) -> Result<(
 /// implemented: comments, blank lines, and `key=value` / `key:value` /
 /// `key value` pairs without escape sequences — including Java's rule
 /// that whitespace after the key may be followed by one optional `=` or
-/// `:` before the value. The version is parsed as a Java `int`; an
-/// absent or unparseable value defaults to the maximum supported
-/// version, like the Java reader.
+/// `:` before the value, and that of duplicate keys the *last* one wins
+/// (`Properties.load` overwrites earlier entries). The version is parsed
+/// as a Java `int`; an absent or unparseable value defaults to the
+/// maximum supported version, like the Java reader.
 fn read_manifest_store_version(manifest_path: &Path) -> Result<i64> {
     let content = std::fs::read_to_string(manifest_path)?;
+    let mut version = MAXIMUM_STORE_VERSION;
     for line in content.lines() {
         let line = line.trim_start();
         if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
@@ -460,13 +502,12 @@ fn read_manifest_store_version(manifest_path: &Path) -> Result<i64> {
                 .strip_prefix(['=', ':'])
                 .unwrap_or(after_whitespace);
         }
-        let parsed: i64 = value
+        version = value
             .trim()
             .parse::<i32>()
             .map_or(MAXIMUM_STORE_VERSION, i64::from);
-        return Ok(parsed);
     }
-    Ok(MAXIMUM_STORE_VERSION)
+    Ok(version)
 }
 
 /// A cache bounded by entry count with first-in-first-out eviction.

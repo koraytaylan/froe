@@ -26,6 +26,12 @@ use crate::output::{append_json_string, append_json_values};
 /// real content trees are nowhere near this deep.
 const MAXIMUM_TRAVERSAL_DEPTH: usize = 16_384;
 
+/// The total nodes one extraction may emit. A depth bound alone cannot
+/// stop corrupt records shaped as a wide DAG, whose distinct paths grow
+/// exponentially while staying shallow; real repositories stay far below
+/// this.
+const MAXIMUM_EXTRACTED_NODES: u64 = 1_000_000_000;
+
 /// One unit of traversal work.
 enum WorkItem<'repository> {
     /// Emit this node and schedule its children.
@@ -88,6 +94,14 @@ pub(crate) fn extract_json_lines(
 
         write_node_line(&node, &path_buffer, sink, &mut line_buffer)?;
         written += 1;
+        if written > MAXIMUM_EXTRACTED_NODES {
+            return Err(froe::Error::InvalidFormat {
+                details: format!(
+                    "extraction exceeds {MAXIMUM_EXTRACTED_NODES} nodes; \
+                     the node records probably form a pathological graph"
+                ),
+            });
+        }
 
         let descend = match depth {
             Some(limit) => node_depth < limit,

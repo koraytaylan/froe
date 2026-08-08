@@ -166,12 +166,24 @@ mod tests {
         }
     }
 
+    /// Removes the test directory even when an assertion panics.
+    struct TestDirectory {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn reads_journal_newest_first_with_tolerant_parsing() {
-        let directory =
-            std::env::temp_dir().join(format!("froe-journal-test-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("create test directory");
-        let journal_path = directory.join("journal.log");
+        let directory = TestDirectory {
+            path: std::env::temp_dir().join(format!("froe-journal-test-{}", std::process::id())),
+        };
+        std::fs::create_dir_all(&directory.path).expect("create test directory");
+        let journal_path = directory.path.join("journal.log");
         std::fs::write(
             &journal_path,
             "11111111-1111-4111-a111-111111111111:100 root 1000\n\
@@ -199,8 +211,6 @@ mod tests {
         );
         assert_eq!(entries[3].timestamp_milliseconds, 1000);
         assert!(entries[0].record_identifier().is_some());
-
-        std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
     #[test]

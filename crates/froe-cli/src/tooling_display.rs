@@ -10,7 +10,9 @@ use froe::tooling::{check_consistency, diff_revisions, node_history, search_node
 
 use crate::output::{append_json_values, format_timestamp};
 
-/// `froe check`: report the newest consistent revision.
+/// `froe check`: each path's latest good revision, Oak-style. Succeeds
+/// (exit 0) when any path found a good revision — Java's default,
+/// fail-fast off.
 pub(crate) fn print_check(
     repository: &Path,
     paths: &[String],
@@ -18,21 +20,52 @@ pub(crate) fn print_check(
     revision_limit: usize,
 ) -> froe::Result<bool> {
     let report = check_consistency(repository, paths, check_binaries, revision_limit)?;
-    for revision in &report.revisions {
-        println!("revision {}", revision.revision);
-        for path in &revision.consistent_paths {
-            println!("  consistent    {path}");
-        }
-        for (path, reason) in &revision.inconsistent_paths {
-            println!("  inconsistent  {path}: {reason}");
+    println!(
+        "searched through {} revisions and {} checkpoints",
+        report.checked_revisions,
+        report.checkpoints.len()
+    );
+    println!("head");
+    for verdict in &report.head_paths {
+        print_path_verdict(verdict, "  ");
+    }
+    if !report.checkpoints.is_empty() {
+        println!("checkpoints");
+        for (checkpoint, verdicts) in &report.checkpoint_paths {
+            println!("- {checkpoint}");
+            for verdict in verdicts {
+                print_path_verdict(verdict, "    ");
+            }
         }
     }
-    if let Some(revision) = &report.good_revision {
-        println!("newest consistent revision: {revision}");
+    println!("overall");
+    match &report.overall_revision {
+        Some(revision) => println!("  latest good revision for all checked paths is {revision}"),
+        None => println!("  latest good revision for all checked paths is none"),
+    }
+    if report.has_good_revision() {
         Ok(true)
     } else {
-        println!("no fully consistent revision found");
+        println!("no good revision found");
         Ok(false)
+    }
+}
+
+fn print_path_verdict(verdict: &froe::tooling::PathVerdict, indent: &str) {
+    if let Some(revision) = &verdict.latest_good_revision {
+        let timestamp = verdict
+            .latest_good_timestamp_milliseconds
+            .map_or_else(|| "unknown time".to_owned(), format_timestamp);
+        println!(
+            "{indent}latest good revision for path {} is {revision} from {timestamp}",
+            verdict.path
+        );
+    } else {
+        let reason = verdict.newest_failure.as_deref().unwrap_or("never checked");
+        println!(
+            "{indent}latest good revision for path {} is none ({reason})",
+            verdict.path
+        );
     }
 }
 
@@ -123,16 +156,25 @@ pub(crate) fn print_search(
         property_values: property_values.to_vec(),
     };
     if query.is_empty() {
-        eprintln!("froe: search-nodes needs at least one predicate");
-        return Ok(());
+        // An error, not a quiet return: scripts must see a failure exit
+        // code when the search never ran.
+        return Err(froe::Error::InvalidFormat {
+            details: "search-nodes needs at least one predicate".to_owned(),
+        });
     }
-    let matches = search_nodes(repository, &query, limit)?;
-    for node_match in &matches {
+    let outcome = search_nodes(repository, &query, limit)?;
+    for node_match in &outcome.matches {
         println!(
             "{}  stable {}",
             node_match.record, node_match.stable_identifier
         );
     }
-    println!("{} matching nodes", matches.len());
+    println!("{} matching nodes", outcome.matches.len());
+    if outcome.unreadable_nodes > 0 {
+        eprintln!(
+            "froe: {} record table entries could not be read and were skipped",
+            outcome.unreadable_nodes
+        );
+    }
     Ok(())
 }

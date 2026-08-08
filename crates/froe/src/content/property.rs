@@ -183,11 +183,11 @@ pub fn read_property_value(
             PropertyValue::Double(text.parse().map_err(|_| corrupt("double"))?)
         }
         PropertyType::Date => PropertyValue::Date(text),
-        PropertyType::Boolean => match text.as_str() {
-            "true" => PropertyValue::Boolean(true),
-            "false" => PropertyValue::Boolean(false),
-            _ => return Err(corrupt("boolean")),
-        },
+        // Java reads booleans with `Boolean.parseBoolean`, which never
+        // fails: any string other than a case-insensitive "true" is
+        // `false`. Being stricter would call content corrupt that a real
+        // AEM instance reads without complaint.
+        PropertyType::Boolean => PropertyValue::Boolean(text.eq_ignore_ascii_case("true")),
         PropertyType::Name => PropertyValue::Name(text),
         PropertyType::Path => PropertyValue::Path(text),
         PropertyType::Reference => PropertyValue::Reference(text),
@@ -276,7 +276,46 @@ mod tests {
         );
         let record = RecordIdentifier::new(segment, 0);
         assert!(read_property_value(&provider, record, PropertyType::Long).is_err());
-        assert!(read_property_value(&provider, record, PropertyType::Boolean).is_err());
+        // Booleans never fail: Java's Boolean.parseBoolean reads any
+        // string other than a case-insensitive "true" as false.
+        assert_eq!(
+            read_property_value(&provider, record, PropertyType::Boolean).expect("boolean"),
+            PropertyValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn booleans_decode_like_java_parse_boolean() {
+        let segment = data_segment_identifier(1);
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (0, 4, small_string_record("TRUE")),
+                    (1, 8, small_string_record("false")),
+                ],
+            ),
+        );
+        assert_eq!(
+            read_property_value(
+                &provider,
+                RecordIdentifier::new(segment, 0),
+                PropertyType::Boolean
+            )
+            .expect("case-insensitive true"),
+            PropertyValue::Boolean(true)
+        );
+        assert_eq!(
+            read_property_value(
+                &provider,
+                RecordIdentifier::new(segment, 1),
+                PropertyType::Boolean
+            )
+            .expect("false"),
+            PropertyValue::Boolean(false)
+        );
     }
 
     #[test]

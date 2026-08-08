@@ -8,12 +8,16 @@
 //! of every identifier come *directly* from the operating system's
 //! cryptographic entropy source — matching Oak's use of `SecureRandom` —
 //! never from a seeded pseudo-random stream whose whole output a single
-//! seed determines.
+//! seed determines. Without that source there is no safe way to write:
+//! the writable store refuses to open, and a failure after a successful
+//! open fails the write with a panic rather than degrade — equivalent to
+//! a crash, which the store's durability ordering already tolerates.
 
 use std::io::Read;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+use crate::error::{Error, Result};
 use crate::segment::identifier::SegmentIdentifier;
 
 /// A process-wide buffered reader over the operating system entropy
@@ -29,27 +33,24 @@ struct EntropyBuffer {
     source: Option<std::fs::File>,
     buffer: [u8; ENTROPY_CHUNK],
     position: usize,
-    /// Fallback stream state used only when no entropy source is available.
-    fallback_state: u64,
 }
 
 impl EntropyBuffer {
     fn new() -> Self {
-        let source = std::fs::File::open("/dev/urandom").ok();
         Self {
-            source,
+            source: std::fs::File::open("/dev/urandom").ok(),
             buffer: [0u8; ENTROPY_CHUNK],
             position: ENTROPY_CHUNK,
-            fallback_state: fallback_seed(),
         }
     }
 
-    /// Fills `target` with entropy, refilling the buffer as needed.
-    fn fill(&mut self, target: &mut [u8]) {
+    /// Fills `target` with entropy, refilling the buffer as needed. Fails
+    /// when the operating system entropy source is unavailable.
+    fn try_fill(&mut self, target: &mut [u8]) -> std::io::Result<()> {
         let mut written = 0;
         while written < target.len() {
             if self.position >= ENTROPY_CHUNK {
-                self.refill();
+                self.try_refill()?;
             }
             let available = ENTROPY_CHUNK - self.position;
             let take = available.min(target.len() - written);
@@ -58,52 +59,58 @@ impl EntropyBuffer {
             self.position += take;
             written += take;
         }
+        Ok(())
     }
 
-    /// Refills the buffer from the entropy source, or from the fallback
-    /// stream when no source is available (non-Unix, or a sandbox without
-    /// `/dev/urandom`).
-    fn refill(&mut self) {
-        let filled = self
-            .source
-            .as_mut()
-            .and_then(|source| source.read_exact(&mut self.buffer).ok())
-            .is_some();
-        if !filled {
-            // splitmix64 fallback; weaker, but every process still seeds it
-            // from a distinct clock/pid/address mixture.
-            self.source = None;
-            for chunk in self.buffer.chunks_exact_mut(8) {
-                self.fallback_state = self.fallback_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                let mut mixed = self.fallback_state;
-                mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                chunk.copy_from_slice(&(mixed ^ (mixed >> 31)).to_be_bytes());
-            }
-        }
+    /// Refills the buffer from the entropy source.
+    fn try_refill(&mut self) -> std::io::Result<()> {
+        let source = self.source.as_mut().ok_or_else(|| {
+            std::io::Error::other("no operating system entropy source is available")
+        })?;
+        source.read_exact(&mut self.buffer)?;
         self.position = 0;
+        Ok(())
     }
 }
 
-/// Seeds the fallback stream from the clock, the process identifier, and a
-/// stack address.
-fn fallback_seed() -> u64 {
-    let nanoseconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    let process = u64::from(std::process::id());
-    let stack_address = std::ptr::from_ref(&nanoseconds) as u64;
-    nanoseconds ^ process.rotate_left(32) ^ stack_address.rotate_left(17)
+/// Runs `operation` on the process-wide entropy buffer.
+fn with_entropy_buffer<T>(operation: impl FnOnce(&mut EntropyBuffer) -> T) -> T {
+    let buffer = ENTROPY.get_or_init(|| Mutex::new(EntropyBuffer::new()));
+    operation(
+        &mut buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Confirms the operating system entropy source works, drawing a probe
+/// from it. The writable store calls this at open and refuses to proceed
+/// without it: segment identifiers from anything weaker could collide and
+/// silently alias two different segments.
+pub(crate) fn verify_entropy_source() -> Result<()> {
+    let mut probe = [0u8; 16];
+    with_entropy_buffer(|buffer| buffer.try_fill(&mut probe)).map_err(|source| {
+        Error::InvalidFormat {
+            details: format!(
+                "cannot open a store for writing: the operating system entropy source \
+                 needed for safe segment identifiers is unavailable ({source})"
+            ),
+        }
+    })
 }
 
 /// Draws sixteen fresh entropy bytes as two 64-bit halves.
+///
+/// The entropy source was verified when the writable store opened; a
+/// failure here means it broke mid-session, and failing the write with a
+/// panic is the only response that cannot corrupt the repository (no
+/// journal line ever references a segment that was not durably written).
 fn draw_uuid_halves() -> (u64, u64) {
-    let buffer = ENTROPY.get_or_init(|| Mutex::new(EntropyBuffer::new()));
     let mut bytes = [0u8; 16];
-    buffer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .fill(&mut bytes);
+    with_entropy_buffer(|buffer| buffer.try_fill(&mut bytes)).expect(
+        "the operating system entropy source failed; refusing to generate segment \
+         identifiers from anything weaker",
+    );
     (
         u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes")),
         u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes")),

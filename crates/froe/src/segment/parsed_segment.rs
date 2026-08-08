@@ -36,10 +36,21 @@ const RECORD_REFERENCE_SIZE: usize = 9;
 pub struct RecordTableEntry {
     /// The logical record number.
     pub record_number: u32,
-    /// The record's type tag.
-    pub record_type: RecordType,
+    /// The raw record type byte. Java resolves it to a record type only
+    /// when *iterating* records (throwing on unknown bytes there); plain
+    /// record lookup by number never consults it, so an unknown byte must
+    /// not fail the segment parse — that would lose content Java serves.
+    pub type_byte: u8,
     /// The record's offset within the virtual 256 KiB segment.
     pub offset: u32,
+}
+
+impl RecordTableEntry {
+    /// The record's type, when the type byte is a known ordinal.
+    #[must_use]
+    pub const fn record_type(&self) -> Option<RecordType> {
+        RecordType::from_byte(self.type_byte)
+    }
 }
 
 /// The parsed structure of one segment (metadata only — the segment bytes
@@ -205,11 +216,6 @@ impl ParsedSegment {
                     "data segment {identifier} contains negative record number {record_number}"
                 )));
             }
-            let record_type = RecordType::from_byte(type_byte).ok_or_else(|| {
-                invalid(format!(
-                    "data segment {identifier} contains unknown record type byte {type_byte}"
-                ))
-            })?;
             if offset < 0 || offset as usize >= MAXIMUM_SEGMENT_SIZE {
                 return Err(invalid(format!(
                     "data segment {identifier} contains out-of-range record offset {offset}"
@@ -226,7 +232,7 @@ impl ParsedSegment {
             previous_record_number = Some(record_number);
             record_table.push(RecordTableEntry {
                 record_number,
-                record_type,
+                type_byte,
                 offset: offset as u32,
             });
         }
@@ -255,13 +261,14 @@ impl ParsedSegment {
         }
     }
 
-    /// The type of a record, when the record table knows it.
+    /// The type of a record, when the record table knows it and its type
+    /// byte is a known ordinal.
     #[must_use]
     pub fn record_type(&self, record_number: u32) -> Option<RecordType> {
         self.record_table
             .binary_search_by_key(&record_number, |entry| entry.record_number)
             .ok()
-            .map(|position| self.record_table[position].record_type)
+            .and_then(|position| self.record_table[position].record_type())
     }
 
     /// Converts a virtual offset to a position in the stored buffer:
@@ -397,7 +404,10 @@ pub(crate) mod tests {
         assert!(segment.is_compacted);
         assert_eq!(segment.referenced_segments, vec![referenced]);
         assert_eq!(segment.record_table().len(), 1);
-        assert_eq!(segment.record_table()[0].record_type, RecordType::Value);
+        assert_eq!(
+            segment.record_table()[0].record_type(),
+            Some(RecordType::Value)
+        );
     }
 
     #[test]

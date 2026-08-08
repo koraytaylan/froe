@@ -17,6 +17,12 @@ use crate::store::{ArchiveSet, open_all_archives};
 /// cycle in a corrupt store, and the diff walk stops.
 const MAXIMUM_DIFF_DEPTH: usize = 4000;
 
+/// The total node pairs one diff may visit. A depth bound alone cannot
+/// stop corrupt records shaped as a wide DAG, whose distinct paths grow
+/// exponentially while staying shallow; real diffs — even a whole-tree
+/// diff across a compaction — stay far below this.
+const MAXIMUM_DIFF_VISITS: u64 = 1_000_000_000;
+
 /// A property-level change within a node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropertyChange {
@@ -78,6 +84,7 @@ pub fn diff_revisions(
 
     let base_path = normalized_filter_path(filter_path);
     let mut differences = Vec::new();
+    let mut visits = 0u64;
     diff_nodes(
         &provider,
         before_node.as_ref(),
@@ -85,6 +92,7 @@ pub fn diff_revisions(
         &base_path,
         0,
         &mut differences,
+        &mut visits,
     )?;
     Ok(differences)
 }
@@ -138,6 +146,10 @@ fn normalized_filter_path(path: &str) -> String {
 }
 
 /// Diffs two node states, appending differences.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the walk threads its path, depth, output, and work budget"
+)]
 fn diff_nodes(
     provider: &dyn SegmentProvider,
     before: Option<&NodeState<'_>>,
@@ -145,11 +157,21 @@ fn diff_nodes(
     path: &str,
     depth: usize,
     differences: &mut Vec<NodeDifference>,
+    visits: &mut u64,
 ) -> Result<()> {
     if depth > MAXIMUM_DIFF_DEPTH {
         return Err(crate::error::Error::InvalidFormat {
             details: format!(
                 "node tree exceeds depth {MAXIMUM_DIFF_DEPTH}; the records probably form a cycle"
+            ),
+        });
+    }
+    *visits += 1;
+    if *visits > MAXIMUM_DIFF_VISITS {
+        return Err(crate::error::Error::InvalidFormat {
+            details: format!(
+                "diff exceeds {MAXIMUM_DIFF_VISITS} visited nodes; \
+                 the records probably form a pathological graph"
             ),
         });
     }
@@ -166,8 +188,16 @@ fn diff_nodes(
             if before_node.record_identifier() == after_node.record_identifier() {
                 return Ok(());
             }
-            diff_properties(before_node, after_node, path, differences)?;
-            diff_children(provider, before_node, after_node, path, depth, differences)?;
+            diff_properties(provider, before_node, after_node, path, differences)?;
+            diff_children(
+                provider,
+                before_node,
+                after_node,
+                path,
+                depth,
+                differences,
+                visits,
+            )?;
         }
     }
     Ok(())
@@ -175,6 +205,7 @@ fn diff_nodes(
 
 /// Diffs the properties of two nodes.
 fn diff_properties(
+    provider: &dyn SegmentProvider,
     before: &NodeState<'_>,
     after: &NodeState<'_>,
     path: &str,
@@ -192,7 +223,13 @@ fn diff_properties(
                 path: display_path(path),
                 change: PropertyChange::Added(after_property.clone()),
             }),
-            Some(before_property) if before_property.values != after_property.values => {
+            Some(before_property)
+                if !property_values_equal(
+                    provider,
+                    &before_property.values,
+                    &after_property.values,
+                )? =>
+            {
                 differences.push(NodeDifference::PropertyChanged {
                     path: display_path(path),
                     change: PropertyChange::Changed {
@@ -220,6 +257,10 @@ fn diff_properties(
 }
 
 /// Diffs the children of two nodes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the walk threads its path, depth, output, and work budget"
+)]
 fn diff_children(
     provider: &dyn SegmentProvider,
     before: &NodeState<'_>,
@@ -227,6 +268,7 @@ fn diff_children(
     path: &str,
     depth: usize,
     differences: &mut Vec<NodeDifference>,
+    visits: &mut u64,
 ) -> Result<()> {
     let before_children = before.child_node_entries()?;
     let after_children = after.child_node_entries()?;
@@ -244,6 +286,7 @@ fn diff_children(
             &child_path,
             depth + 1,
             differences,
+            visits,
         )?;
     }
     for (name, before_child) in &before_children {
@@ -259,10 +302,71 @@ fn diff_children(
                 &child_path,
                 depth + 1,
                 differences,
+                visits,
             )?;
         }
     }
     Ok(())
+}
+
+/// Whether two property value sets are equal by *content*. Oak compares
+/// binaries by bytes with a same-record fast path, so byte-identical
+/// binaries that compaction rewrote to different records must not be
+/// reported as changed. Everything else compares structurally.
+fn property_values_equal(
+    provider: &dyn SegmentProvider,
+    before: &PropertyValues,
+    after: &PropertyValues,
+) -> Result<bool> {
+    match (before, after) {
+        (PropertyValues::Single(before_value), PropertyValues::Single(after_value)) => {
+            property_value_equal(provider, before_value, after_value)
+        }
+        (PropertyValues::Multiple(before_values), PropertyValues::Multiple(after_values)) => {
+            if before_values.len() != after_values.len() {
+                return Ok(false);
+            }
+            for (before_value, after_value) in before_values.iter().zip(after_values) {
+                if !property_value_equal(provider, before_value, after_value)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Whether two single property values are equal by content.
+fn property_value_equal(
+    provider: &dyn SegmentProvider,
+    before: &crate::content::property::PropertyValue,
+    after: &crate::content::property::PropertyValue,
+) -> Result<bool> {
+    use crate::content::property::PropertyValue;
+    use crate::content::value::BinaryValue;
+    if let (
+        PropertyValue::Binary(BinaryValue::Inline {
+            length: before_length,
+            record_identifier: before_record,
+        }),
+        PropertyValue::Binary(BinaryValue::Inline {
+            length: after_length,
+            record_identifier: after_record,
+        }),
+    ) = (before, after)
+    {
+        if before_length != after_length {
+            return Ok(false);
+        }
+        return crate::content::value::inline_binary_contents_equal(
+            provider,
+            *before_record,
+            *after_record,
+            *before_length,
+        );
+    }
+    Ok(before == after)
 }
 
 /// Renders a path, using `/` for the empty root path.

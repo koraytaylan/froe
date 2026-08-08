@@ -11,7 +11,7 @@ pub mod diff;
 pub mod history;
 pub mod search;
 
-pub use check::{ConsistencyReport, RevisionCheck, check_consistency};
+pub use check::{ConsistencyReport, PathVerdict, check_consistency};
 pub use diff::{NodeDifference, PropertyChange, diff_revisions};
 pub use history::{NodeHistoryEntry, node_history};
 pub use search::{NodeMatch, SearchQuery, search_nodes};

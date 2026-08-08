@@ -138,11 +138,13 @@ fn build_synthetic_repository() -> SyntheticRepository {
     tree.add_record(tree_records::TEMPLATE_EMPTY, TYPE_TEMPLATE, template_empty);
 
     // Template of /content: primary type, many children, three properties
-    // (title STRING, count LONG, active BOOLEAN).
+    // in the mandatory on-disk order — sorted by signed Java
+    // `String.hashCode`, so active (-1422950650) before count (94851343)
+    // before title (110371416) — with types BOOLEAN, LONG, STRING.
     let mut property_name_bucket = Vec::new();
-    property_name_bucket.extend(value_identifier(value_records::TITLE_NAME));
-    property_name_bucket.extend(value_identifier(value_records::COUNT_NAME));
     property_name_bucket.extend(value_identifier(value_records::ACTIVE_NAME));
+    property_name_bucket.extend(value_identifier(value_records::COUNT_NAME));
+    property_name_bucket.extend(value_identifier(value_records::TITLE_NAME));
     tree.add_record(
         tree_records::PROPERTY_NAME_BUCKET,
         TYPE_LIST_BUCKET,
@@ -151,7 +153,7 @@ fn build_synthetic_repository() -> SyntheticRepository {
     let mut template_content = ((1u32 << 31) | (1 << 28) | 3).to_be_bytes().to_vec();
     template_content.extend(value_identifier(value_records::PRIMARY_TYPE_VALUE));
     template_content.extend(own_identifier(tree_records::PROPERTY_NAME_BUCKET));
-    template_content.extend([1u8, 3, 6]);
+    template_content.extend([6u8, 3, 1]);
     tree.add_record(
         tree_records::TEMPLATE_CONTENT,
         TYPE_TEMPLATE,
@@ -173,9 +175,11 @@ fn build_synthetic_repository() -> SyntheticRepository {
 
     // Checkpoint template: single child "root", properties created and
     // timestamp (both LONG).
+    // On-disk order by signed hash: timestamp (55126294) before
+    // created (1028554472).
     let mut checkpoint_property_names = Vec::new();
-    checkpoint_property_names.extend(value_identifier(value_records::CREATED_NAME));
     checkpoint_property_names.extend(value_identifier(value_records::TIMESTAMP_NAME));
+    checkpoint_property_names.extend(value_identifier(value_records::CREATED_NAME));
     tree.add_record(
         tree_records::CHECKPOINT_PROPERTY_NAME_BUCKET,
         TYPE_LIST_BUCKET,
@@ -240,9 +244,9 @@ fn build_synthetic_repository() -> SyntheticRepository {
 
     // /content: property values bucket, then the node.
     let mut content_values_bucket = Vec::new();
-    content_values_bucket.extend(value_identifier(value_records::TITLE_VALUE));
-    content_values_bucket.extend(value_identifier(value_records::COUNT_VALUE));
     content_values_bucket.extend(value_identifier(value_records::ACTIVE_VALUE));
+    content_values_bucket.extend(value_identifier(value_records::COUNT_VALUE));
+    content_values_bucket.extend(value_identifier(value_records::TITLE_VALUE));
     let content_values_record = allocate();
     tree.add_record(
         content_values_record,
@@ -301,8 +305,8 @@ fn build_synthetic_repository() -> SyntheticRepository {
 
     // The checkpoint: its root child SHARES the content root record.
     let mut checkpoint_values_bucket = Vec::new();
-    checkpoint_values_bucket.extend(value_identifier(value_records::CREATED_VALUE));
     checkpoint_values_bucket.extend(value_identifier(value_records::TIMESTAMP_VALUE));
+    checkpoint_values_bucket.extend(value_identifier(value_records::CREATED_VALUE));
     let checkpoint_values_record = allocate();
     tree.add_record(
         checkpoint_values_record,
@@ -457,7 +461,9 @@ fn reads_typed_properties() {
         .iter()
         .map(|property| property.name.as_str())
         .collect();
-    assert_eq!(names, ["jcr:primaryType", "title", "count", "active"]);
+    // Stored order is the template's on-disk order: sorted by signed Java
+    // `String.hashCode`, negative hashes ("active") first.
+    assert_eq!(names, ["jcr:primaryType", "active", "count", "title"]);
 
     let title = content.property("title").expect("read").expect("present");
     assert_eq!(title.property_type, PropertyType::String);
@@ -624,6 +630,22 @@ fn spreads_segments_across_archives_and_selects_newest_generation() {
     );
 }
 
+/// Every file in a directory with its full content — the read-only
+/// invariant check: an open must neither create, nor delete, nor modify
+/// anything, not even with a same-length rewrite.
+fn directory_snapshot(path: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(path)
+        .expect("list directory")
+        .map(|entry| {
+            let entry = entry.expect("directory entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("read file"),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn recovers_archives_without_an_index() {
     let directory = TestDirectory::new("recovers-without-index");
@@ -657,6 +679,11 @@ fn recovers_archives_without_an_index() {
         std::slice::from_ref(&repository_data.journal_line),
     );
 
+    // This is the exact scenario where Java's read-only open writes a
+    // `.ro.bak` recovery file; froe promises the recovery stays in
+    // memory — the directory must be untouched, and there must be no
+    // lock file.
+    let snapshot_before = directory_snapshot(&directory.path);
     let repository = Repository::open(&directory.path).expect("open repository");
     assert!(repository.archives()[0].is_recovered());
     assert!(!repository.archives()[1].is_recovered());
@@ -672,6 +699,16 @@ fn recovers_archives_without_an_index() {
             .expect("present")
             .values,
         PropertyValues::Single(PropertyValue::String("Hello World".to_owned()))
+    );
+    drop(repository);
+    assert_eq!(
+        directory_snapshot(&directory.path),
+        snapshot_before,
+        "a read-only open must not create, delete, or modify any file"
+    );
+    assert!(
+        !directory.path.join("repo.lock").exists(),
+        "a read-only open must never touch the repository lock"
     );
 }
 

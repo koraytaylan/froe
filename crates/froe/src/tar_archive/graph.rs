@@ -99,7 +99,15 @@ pub fn parse_segment_graph(archive_bytes: &[u8], index: &SegmentIndex) -> Option
         let source = SegmentIdentifier::new(read_u64(data, position), read_u64(data, position + 8));
         let reference_count = read_u32(data, position + 16) as i32;
         position += 20;
-        if reference_count < 0 || position + reference_count as usize * 16 > data.len() {
+        if reference_count < 0 {
+            return None;
+        }
+        // Checked: on 32-bit targets a huge reference count could
+        // otherwise wrap this bound and pass.
+        let references_end = (reference_count as usize)
+            .checked_mul(16)
+            .and_then(|references_size| position.checked_add(references_size));
+        if references_end.is_none_or(|end| end > data.len()) {
             return None;
         }
         let mut references = Vec::with_capacity(reference_count as usize);

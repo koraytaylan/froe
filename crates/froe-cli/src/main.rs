@@ -109,7 +109,7 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Find the newest fully consistent revision (read-only).
+    /// Find each path's newest consistent revision (read-only).
     Check {
         /// The segment store directory.
         repository: PathBuf,
@@ -119,9 +119,10 @@ enum Command {
         /// Also read binary content, not only resolve its records.
         #[arg(long)]
         binaries: bool,
-        /// Examine at most this many revisions.
-        #[arg(long, default_value_t = 100)]
-        revisions: usize,
+        /// Examine at most this many revisions; omit to examine all,
+        /// like oak-run.
+        #[arg(long)]
+        revisions: Option<usize>,
     },
     /// Show the differences between two revisions (read-only).
     Difference {
@@ -356,7 +357,9 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             binaries,
             revisions,
         } => {
-            if !tooling_display::print_check(&repository, &paths, binaries, revisions)? {
+            // Absent limit = examine every revision, oak-run's default.
+            let revision_limit = revisions.unwrap_or(usize::MAX);
+            if !tooling_display::print_check(&repository, &paths, binaries, revision_limit)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -441,7 +444,9 @@ fn run(command: Command) -> froe::Result<ExitCode> {
 fn run_checkpoint(action: CheckpointAction) -> froe::Result<bool> {
     match action {
         CheckpointAction::List { repository } => {
-            mutation::run_checkpoint_list(&repository)?;
+            // Read-only, exactly like `froe checkpoints`: listing must
+            // never take the lock or touch the manifest.
+            inspection::print_checkpoints(&Repository::open(&repository)?)?;
             Ok(true)
         }
         CheckpointAction::Create {

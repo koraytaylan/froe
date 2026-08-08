@@ -82,6 +82,10 @@ impl WritableRepository {
             .open(directory.join("journal.log"))?;
         let repository_lock = RepositoryLock::acquire(directory)?;
 
+        // Writing needs collision-safe segment identifiers; without the
+        // operating system entropy source there is no safe way to write.
+        crate::writer::identifier_generator::verify_entropy_source()?;
+
         check_and_update_manifest(directory)?;
 
         let base_archives = initialize_archives_for_writing(directory)?;
@@ -110,8 +114,11 @@ impl WritableRepository {
         };
 
         // Bind: newest journal revision whose segment exists, or the
-        // initial-node bootstrap for a fresh store.
-        let journal_entries = read_journal(&directory.join("journal.log")).unwrap_or_default();
+        // initial-node bootstrap for a fresh store. A journal that cannot
+        // be *read* is a loud failure — silently bootstrapping would
+        // append a head line pointing at a fresh empty root on top of a
+        // populated store.
+        let journal_entries = read_journal(&directory.join("journal.log"))?;
         let persisted = journal_entries
             .iter()
             .filter_map(JournalEntry::record_identifier)
@@ -244,7 +251,14 @@ impl WritableRepository {
         Ok(())
     }
 
-    /// Applies the reclaim predicate to one base archive.
+    /// Applies the reclaim predicate to one base archive — Oak's
+    /// `TarReader.sweep`: entries are judged and rewritten in original
+    /// file-position order, the generation triple comes from the index
+    /// entry, sub-25% savings keep the file untouched, and the graph and
+    /// binary-references trailers are *filtered* from the existing ones,
+    /// never recomputed — a raw segment scan cannot see every catalog
+    /// entry, and dropping one would let AEM's blob garbage collection
+    /// delete a still-referenced binary.
     fn reclaim_one_archive(
         &self,
         archive_name: &ArchiveFileName,
@@ -253,20 +267,52 @@ impl WritableRepository {
     ) -> Result<()> {
         let path = self.directory.join(&archive_name.file_name);
         let reader = TarArchiveReader::open(&path)?;
-        let mut survivors: Vec<(SegmentIdentifier, Vec<u8>)> = Vec::new();
-        for identifier in reader.segment_identifiers() {
-            let generation = archive_segment_generation(&reader, identifier)?;
-            if !is_reclaimable(reference, generation, full) {
-                if let Some(bytes) = reader.segment_data(identifier) {
-                    survivors.push((identifier, bytes.to_vec()));
-                }
+        let Some(index) = reader.index() else {
+            // Archives are recovered (rewritten with an index) at open,
+            // so a base archive always has one; leave it untouched if a
+            // later corruption made it unreadable anyway.
+            return Ok(());
+        };
+
+        // Judge every entry in file-position order, accumulating Oak's
+        // sweep arithmetic (`i64` cannot wrap where Java's `int` could
+        // not either: entries are position-bounded below 2 GiB).
+        let mut entries: Vec<_> = index.entries().to_vec();
+        entries.sort_by_key(|entry| entry.position);
+        let mut survivors = Vec::new();
+        let mut cleaned: std::collections::HashSet<SegmentIdentifier> =
+            std::collections::HashSet::new();
+        let mut size_before: i64 = 0;
+        let mut size_after: i64 = 0;
+        for entry in entries {
+            let entry_size = 512
+                + i64::from(entry.size)
+                + crate::writer::tar_writer::padding_size(entry.size as usize) as i64;
+            size_before += entry_size;
+            let generation = GarbageCollectionGeneration {
+                generation: entry.generation,
+                full_generation: entry.full_generation,
+                is_compacted: entry.is_compacted,
+            };
+            if is_reclaimable(reference, generation, full) {
+                cleaned.insert(entry.segment_identifier);
+            } else {
+                size_after += entry_size;
+                survivors.push(entry);
             }
         }
-        let survivor_count = survivors.len();
-        drop(reader);
 
-        if survivor_count == 0 {
-            std::fs::remove_file(&path)?;
+        if survivors.is_empty() {
+            drop(reader);
+            // Deletion failures are never fatal, matching Oak's retrying
+            // FileReaper: both letters coexisting is a state the next
+            // open resolves safely (newest valid index wins).
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+        // Oak's savings gate: below 25% reclaimed, the file is kept as-is
+        // rather than rewritten.
+        if size_after >= size_before * 3 / 4 {
             return Ok(());
         }
         // A file already at generation `z` is never rewritten (Oak stops
@@ -274,45 +320,65 @@ impl WritableRepository {
         if archive_name.file_generation >= 'z' {
             return Ok(());
         }
+
+        let trailers = FilteredTrailers::from_archive(&reader, &cleaned);
+
         // Rewrite the survivors to the next generation letter, then delete
         // the original — matching Oak's sweep.
         let next_letter = char::from(archive_name.file_generation as u8 + 1);
         let swept_name = format!("data{:05}{next_letter}.tar", archive_name.archive_number);
         let mut writer = TarArchiveWriter::new(&self.directory, &swept_name);
-        for (identifier, bytes) in &survivors {
-            let (generation, references, binary_references) = if identifier.is_data_segment() {
-                let parsed = ParsedSegment::parse(*identifier, bytes)?;
-                let binary_references = read_segment_blob_identifiers(&parsed, bytes)?;
-                (
-                    GarbageCollectionGeneration {
-                        generation: parsed.generation,
-                        full_generation: parsed.full_generation,
-                        is_compacted: parsed.is_compacted,
-                    },
-                    parsed.referenced_segments.clone(),
-                    binary_references,
-                )
+        if let Some(catalog_entries) = &trailers.catalog {
+            for (generation, segment, references) in catalog_entries {
+                writer.add_binary_references(*generation, *segment, references.iter().cloned());
+            }
+        }
+        for entry in &survivors {
+            let identifier = entry.segment_identifier;
+            let Some(bytes) = reader.segment_data(identifier) else {
+                return Err(Error::SegmentNotFound {
+                    segment_identifier: identifier,
+                });
+            };
+            let generation = GarbageCollectionGeneration {
+                generation: entry.generation,
+                full_generation: entry.full_generation,
+                is_compacted: entry.is_compacted,
+            };
+            let (references, binary_references) = if identifier.is_data_segment() {
+                trailers.for_segment(identifier, bytes, &cleaned)?
             } else {
-                (
-                    GarbageCollectionGeneration {
-                        generation: 0,
-                        full_generation: 0,
-                        is_compacted: false,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                )
+                (Vec::new(), Vec::new())
             };
             writer.write_segment(
-                *identifier,
+                identifier,
                 bytes,
                 generation,
                 &references,
                 &binary_references,
             )?;
         }
+        drop(reader);
         writer.close()?;
-        std::fs::remove_file(&path)?;
+        // The swept file and its directory entry must be durable, and the
+        // swept file must re-open with a valid index, *before* the
+        // original is deleted — a crash in between must never leave both
+        // generations unusable, and a bad rewrite must never destroy the
+        // only good copy.
+        crate::writer::compaction::fsync_directory(&self.directory);
+        let swept_path = self.directory.join(&swept_name);
+        let swept_is_valid =
+            TarArchiveReader::open(&swept_path).is_ok_and(|swept| !swept.is_recovered());
+        if swept_is_valid {
+            // Deletion failures are never fatal, matching Oak's retrying
+            // FileReaper: both letters coexisting is resolved safely at
+            // the next open (newest valid index wins).
+            let _ = std::fs::remove_file(&path);
+        } else {
+            // Keep the original untouched; discard the bad rewrite, as
+            // Java falls back to the original reader on a failed re-open.
+            let _ = std::fs::remove_file(&swept_path);
+        }
         Ok(())
     }
 
@@ -610,39 +676,6 @@ fn is_reclaimable(
     }
 }
 
-/// The generation of a segment in an archive: from its index entry when
-/// present, otherwise parsed from the segment header.
-fn archive_segment_generation(
-    reader: &TarArchiveReader,
-    identifier: SegmentIdentifier,
-) -> Result<GarbageCollectionGeneration> {
-    if let Some(entry) = reader.index_entry(identifier) {
-        return Ok(GarbageCollectionGeneration {
-            generation: entry.generation,
-            full_generation: entry.full_generation,
-            is_compacted: entry.is_compacted,
-        });
-    }
-    if identifier.is_bulk_segment() {
-        return Ok(GarbageCollectionGeneration {
-            generation: 0,
-            full_generation: 0,
-            is_compacted: false,
-        });
-    }
-    let bytes = reader
-        .segment_data(identifier)
-        .ok_or(Error::SegmentNotFound {
-            segment_identifier: identifier,
-        })?;
-    let parsed = ParsedSegment::parse(identifier, bytes)?;
-    Ok(GarbageCollectionGeneration {
-        generation: parsed.generation,
-        full_generation: parsed.full_generation,
-        is_compacted: parsed.is_compacted,
-    })
-}
-
 /// Rewrites the manifest with `store.version=2` after validating it with
 /// the same rules as the read path (archives without a manifest are the
 /// legacy format; versions above 2 are from a newer Oak).
@@ -764,9 +797,9 @@ fn recover_archive_number(
     let mut writer = TarArchiveWriter::new(directory, target_name);
     for (identifier, bytes) in &recovered {
         let (generation, references, binary_references) = if identifier.is_data_segment() {
-            let parsed = ParsedSegment::parse(*identifier, bytes)?;
+            let parsed = Arc::new(ParsedSegment::parse(*identifier, bytes)?);
             let references = parsed.referenced_segments.clone();
-            let binary_references = read_segment_blob_identifiers(&parsed, bytes)?;
+            let binary_references = read_segment_blob_identifiers(&parsed, bytes);
             (
                 GarbageCollectionGeneration {
                     generation: parsed.generation,
@@ -816,36 +849,167 @@ fn backup_path(directory: &Path, file_name: &str) -> PathBuf {
     }
 }
 
-/// Extracts every external blob identifier recorded in a segment, for
-/// the archive's binary references catalog. Large blob identifiers may
-/// reference a string record in another segment; those cannot be read
-/// here and recovery preserves only same-segment identifiers, which is
-/// what a raw segment scan can see.
-pub(crate) fn read_segment_blob_identifiers(
-    parsed: &ParsedSegment,
-    bytes: &[u8],
-) -> Result<Vec<String>> {
-    let mut identifiers = Vec::new();
-    for entry in parsed.record_table() {
-        if entry.record_type != RecordType::ExternalBlobIdentifier {
-            continue;
-        }
-        let position = parsed.buffer_position(entry.offset)?;
-        if position >= bytes.len() {
-            continue;
-        }
-        let head = bytes[position];
-        if head & 0xF0 == 0xE0 && position + 2 <= bytes.len() {
-            let length = ((usize::from(head) & 0x0F) << 8) | usize::from(bytes[position + 1]);
-            if position + 2 + length <= bytes.len() {
-                identifiers.push(
-                    String::from_utf8_lossy(&bytes[position + 2..position + 2 + length])
-                        .into_owned(),
+/// The graph and binary-references trailers of an archive being swept,
+/// filtered to the surviving segments — Oak filters the existing
+/// trailers, never recomputes them; only a missing trailer falls back to
+/// a per-segment header scan.
+struct FilteredTrailers {
+    graph_present: bool,
+    /// The surviving catalog entries with their original generation
+    /// triples, which the swept archive preserves verbatim; `None` when
+    /// the original archive had no readable catalog.
+    catalog: Option<Vec<(GarbageCollectionGeneration, SegmentIdentifier, Vec<String>)>>,
+    graph_by_source: HashMap<SegmentIdentifier, Vec<SegmentIdentifier>>,
+}
+
+impl FilteredTrailers {
+    fn from_archive(
+        reader: &TarArchiveReader,
+        cleaned: &std::collections::HashSet<SegmentIdentifier>,
+    ) -> Self {
+        let graph = reader.segment_graph();
+        let mut graph_by_source: HashMap<SegmentIdentifier, Vec<SegmentIdentifier>> =
+            HashMap::new();
+        if let Some(graph) = &graph {
+            for (source, targets) in &graph.adjacency {
+                graph_by_source.insert(
+                    *source,
+                    targets
+                        .iter()
+                        .filter(|target| !cleaned.contains(target))
+                        .copied()
+                        .collect(),
                 );
             }
         }
+        let catalog = reader.binary_references().map(|catalog| {
+            let mut entries = Vec::new();
+            for generation_references in catalog.generations {
+                let generation = GarbageCollectionGeneration {
+                    generation: generation_references.generation,
+                    full_generation: generation_references.full_generation,
+                    is_compacted: generation_references.is_compacted,
+                };
+                for (segment, references) in generation_references.segments {
+                    if !cleaned.contains(&segment) {
+                        entries.push((generation, segment, references));
+                    }
+                }
+            }
+            entries
+        });
+        Self {
+            graph_present: graph.is_some(),
+            catalog,
+            graph_by_source,
+        }
     }
-    Ok(identifiers)
+
+    /// The filtered graph edges and — only when the original archive had
+    /// no catalog to carry over — scan-derived binary references of one
+    /// surviving data segment.
+    fn for_segment(
+        &self,
+        identifier: SegmentIdentifier,
+        bytes: &[u8],
+        cleaned: &std::collections::HashSet<SegmentIdentifier>,
+    ) -> Result<(Vec<SegmentIdentifier>, Vec<String>)> {
+        let references = match self.graph_by_source.get(&identifier) {
+            Some(filtered) => filtered.clone(),
+            None if !self.graph_present => ParsedSegment::parse(identifier, bytes)?
+                .referenced_segments
+                .iter()
+                .filter(|target| !cleaned.contains(target))
+                .copied()
+                .collect(),
+            None => Vec::new(),
+        };
+        let binary_references = if self.catalog.is_some() {
+            // Carried over with original triples via
+            // `TarArchiveWriter::add_binary_references` instead.
+            Vec::new()
+        } else {
+            let parsed = Arc::new(ParsedSegment::parse(identifier, bytes)?);
+            read_segment_blob_identifiers(&parsed, bytes)
+        };
+        Ok((references, binary_references))
+    }
+}
+
+/// A provider over one segment's bytes, for record reads confined to that
+/// segment during archive recovery.
+struct SingleSegmentProvider<'bytes> {
+    structure: Arc<ParsedSegment>,
+    bytes: &'bytes [u8],
+}
+
+impl SegmentProvider for SingleSegmentProvider<'_> {
+    fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+        if segment_identifier == self.structure.identifier {
+            Ok(SegmentView {
+                structure: Arc::clone(&self.structure),
+                bytes: self.bytes.into(),
+            })
+        } else {
+            Err(Error::SegmentNotFound { segment_identifier })
+        }
+    }
+
+    fn string(&self, record_identifier: RecordIdentifier) -> Result<Arc<str>> {
+        read_string(self, record_identifier).map(Arc::from)
+    }
+
+    fn template(&self, record_identifier: RecordIdentifier) -> Result<Arc<Template>> {
+        read_template(self, record_identifier).map(Arc::new)
+    }
+}
+
+/// Extracts every external blob identifier a raw scan of one segment can
+/// see, for rebuilding a recovered archive's binary references catalog:
+/// small (`0xE0`-class) identifiers inline, and large (`0xF0`-class)
+/// identifiers whose string record — including its block list — lives in
+/// this same segment. Identifiers whose string spills into *another*
+/// segment are invisible to a single-segment scan and are skipped; the
+/// sweep path never relies on this function when the original catalog is
+/// available to filter instead.
+pub(crate) fn read_segment_blob_identifiers(
+    structure: &Arc<ParsedSegment>,
+    bytes: &[u8],
+) -> Vec<String> {
+    let provider = SingleSegmentProvider {
+        structure: Arc::clone(structure),
+        bytes,
+    };
+    let mut identifiers = Vec::new();
+    for entry in structure.record_table() {
+        if entry.record_type() != Some(RecordType::ExternalBlobIdentifier) {
+            continue;
+        }
+        let Ok(view) = provider.segment(structure.identifier) else {
+            continue;
+        };
+        let Ok(head) = view.read_u8(entry.record_number, 0) else {
+            continue;
+        };
+        if head & 0xF0 == 0xE0 {
+            let Ok(stored) = view.read_u16(entry.record_number, 0) else {
+                continue;
+            };
+            let length = usize::from(stored & 0x0FFF);
+            if let Ok(reference_bytes) = view.read_bytes(entry.record_number, 2, length) {
+                identifiers.push(String::from_utf8_lossy(reference_bytes).into_owned());
+            }
+        } else if head & 0xF8 == 0xF0 {
+            let Ok(string_identifier) = view.read_record_identifier(entry.record_number, 1, 0)
+            else {
+                continue;
+            };
+            if let Ok(reference) = read_string(&provider, string_identifier) {
+                identifiers.push(reference);
+            }
+        }
+    }
+    identifiers
 }
 
 #[cfg(test)]
@@ -897,6 +1061,50 @@ mod tests {
         let content_root = repository.content_root().expect("content root exists");
         assert_eq!(content_root.child_node_count().expect("count"), 0);
         assert!(content_root.properties().expect("properties").is_empty());
+    }
+
+    #[test]
+    fn every_written_segment_starts_with_a_segment_info_record() {
+        let directory = TestDirectory::new("segment-info");
+        let store = WritableRepository::open(&directory.path).expect("open fresh store");
+        store.close().expect("close");
+
+        let repository = Repository::open(&directory.path).expect("reader opens");
+        let mut data_segments_seen = 0usize;
+        for segment_identifier in repository.segment_identifiers() {
+            if segment_identifier.is_bulk_segment() {
+                continue;
+            }
+            data_segments_seen += 1;
+            let view = repository.segment(segment_identifier).expect("segment");
+            let first_record = view
+                .structure
+                .record_table()
+                .first()
+                .expect("a data segment has records")
+                .record_number;
+            let info = crate::content::value::read_string(
+                &repository,
+                crate::segment::record::RecordIdentifier::new(segment_identifier, first_record),
+            )
+            .expect("record 0 is a readable string");
+            // The exact shape backup timestamp parsing and Java-side
+            // diagnostics rely on: {"wid":"...","sno":N,"t":T}.
+            assert!(
+                info.starts_with("{\"wid\":\""),
+                "unexpected info record {info:?}"
+            );
+            assert!(
+                info.contains("\",\"sno\":"),
+                "unexpected info record {info:?}"
+            );
+            assert!(info.contains(",\"t\":"), "unexpected info record {info:?}");
+            assert!(info.ends_with('}'), "unexpected info record {info:?}");
+        }
+        assert!(
+            data_segments_seen > 0,
+            "a bootstrapped store must hold at least one data segment"
+        );
     }
 
     #[test]

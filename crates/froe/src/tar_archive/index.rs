@@ -145,9 +145,11 @@ pub fn parse_segment_index(archive_bytes: &[u8]) -> Result<SegmentIndex> {
     }
     let entry_count = entry_count as usize;
     // Deliberate quirk kept from IndexLoaderV2: the minimum size is computed
-    // with the version 1 entry size for both versions.
-    let minimum_size = entry_count * INDEX_VERSION_1_ENTRY_SIZE + FOOTER_SIZE;
-    if declared_size < 0 || (declared_size as usize) < minimum_size {
+    // with the version 1 entry size for both versions. The arithmetic is
+    // 64-bit so a huge file-supplied count cannot wrap it on 32-bit
+    // targets.
+    let minimum_size = entry_count as u64 * INDEX_VERSION_1_ENTRY_SIZE as u64 + FOOTER_SIZE as u64;
+    if declared_size < 0 || (declared_size as u64) < minimum_size {
         return Err(invalid(format!("invalid index size {declared_size}")));
     }
     if declared_size % 512 != 0 {
@@ -156,7 +158,13 @@ pub fn parse_segment_index(archive_bytes: &[u8]) -> Result<SegmentIndex> {
         )));
     }
 
-    let entries_size = entry_count * entry_size;
+    // Checked: on 32-bit targets a huge entry count could otherwise wrap
+    // past the bounds check below.
+    let entries_size = entry_count.checked_mul(entry_size).ok_or_else(|| {
+        invalid(format!(
+            "index with {entry_count} entries does not fit the archive"
+        ))
+    })?;
     let entries_end = anchor - FOOTER_SIZE;
     let entries_start = entries_end.checked_sub(entries_size).ok_or_else(|| {
         invalid(format!(
@@ -377,6 +385,26 @@ mod tests {
                 .find_entry(SegmentIdentifier::new(1, 0xA000_0000_0000_0001))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn version_2_size_check_keeps_the_version_1_constant_quirk() {
+        // Load-bearing quirk (tar-layer.md §4.4): the version 2 loader
+        // validates the footer's size field against the version *1* entry
+        // size (28), so a declared size in
+        // [count*28 + 16, count*33 + 16) passes — Java accepts such a
+        // file, and a "corrected" implementation using 33 would reject
+        // it. With 32 entries the window is [912, 1072); 1024 is the one
+        // 512-aligned value inside it.
+        let entries: Vec<(u64, u64, u32, u32, i32, i32, bool)> = (1..=32u64)
+            .map(|seed| (seed, 0xA000_0000_0000_0000 | seed, 0, 512, 0, 0, true))
+            .collect();
+        let mut archive = synthetic_archive(&entries, 2);
+        let size_field_position = archive.len() - 1024 - 8;
+        archive[size_field_position..size_field_position + 4]
+            .copy_from_slice(&1024u32.to_be_bytes());
+        let index = parse_segment_index(&archive).expect("the quirky size is accepted");
+        assert_eq!(index.entries().len(), 32);
     }
 
     #[test]

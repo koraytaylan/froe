@@ -3,8 +3,10 @@
 //! These builders serialize segments, archives, indexes, journals, and
 //! manifests from scratch, sharing no code with the reader under test
 //! (except the CRC32 function, which is itself verified against published
-//! test vectors). Round-tripping through an independent encoder guards
-//! against bugs that a self-consistent reader/writer pair would hide.
+//! test vectors; the map hash below is likewise its own implementation,
+//! verified against externally computed vectors). Round-tripping through
+//! an independent encoder guards against bugs that a self-consistent
+//! reader/writer pair would hide.
 
 #![allow(
     unreachable_pub,
@@ -14,7 +16,33 @@
 use std::path::{Path, PathBuf};
 
 use froe::checksum::crc32;
-use froe::hashing::map_entry_hash;
+
+/// The map-entry hash, implemented independently of the production
+/// `froe::hashing` module: `(String.hashCode(name) ^ M) * M + A` with the
+/// `MapRecord` constants and wrapping 32-bit arithmetic over UTF-16 code
+/// units. Verified against externally computed vectors in
+/// `independent_map_hash_matches_external_vectors`.
+pub fn independent_map_entry_hash(name: &str) -> u32 {
+    let mut string_hash = 0u32;
+    for code_unit in name.encode_utf16() {
+        string_hash = string_hash
+            .wrapping_mul(31)
+            .wrapping_add(u32::from(code_unit));
+    }
+    (string_hash ^ 0xDEEC_E66D)
+        .wrapping_mul(0xDEEC_E66D)
+        .wrapping_add(0xB)
+}
+
+#[test]
+fn independent_map_hash_matches_external_vectors() {
+    assert_eq!(independent_map_entry_hash(""), 0xB460_0A74);
+    assert_eq!(independent_map_entry_hash("a"), 0x3C9C_BB27);
+    assert_eq!(independent_map_entry_hash("root"), 0xC289_24EE);
+    assert_eq!(independent_map_entry_hash("content"), 0x9646_6A8F);
+    assert_eq!(independent_map_entry_hash("Aa"), 0x6059_D734);
+    assert_eq!(independent_map_entry_hash("BB"), 0x6059_D734);
+}
 
 /// A UUID as its two 64-bit halves.
 pub type SegmentUuid = (u64, u64);
@@ -159,7 +187,7 @@ pub fn build_child_map(
     // of their hash.
     let mut buckets: Vec<Vec<MapEntryFixture>> = vec![Vec::new(); 32];
     for (name, key, value) in entries {
-        let bucket_index = ((map_entry_hash(name) >> 27) & 0x1F) as usize;
+        let bucket_index = ((independent_map_entry_hash(name) >> 27) & 0x1F) as usize;
         buckets[bucket_index].push((name.clone(), key.clone(), value.clone()));
     }
     let mut bitmap = 0u32;
@@ -184,19 +212,21 @@ pub fn build_child_map(
     record_number
 }
 
-/// Serializes a leaf map record at the given level: head, sorted hashes,
-/// then interleaved key/value identifiers.
+/// Serializes a leaf map record at the given level: head, hashes sorted
+/// as unsigned values with ties broken by name in UTF-16 code unit order
+/// (Java's `String.compareTo`, which differs from Rust byte order for
+/// supplementary characters), then interleaved key/value identifiers.
 fn leaf_map_record(level: u32, entries: &[MapEntryFixture]) -> Vec<u8> {
     let mut sorted: Vec<&MapEntryFixture> = entries.iter().collect();
     sorted.sort_by(|first, second| {
-        map_entry_hash(&first.0)
-            .cmp(&map_entry_hash(&second.0))
-            .then_with(|| first.0.cmp(&second.0))
+        independent_map_entry_hash(&first.0)
+            .cmp(&independent_map_entry_hash(&second.0))
+            .then_with(|| first.0.encode_utf16().cmp(second.0.encode_utf16()))
     });
     let head = (level << 29) | entries.len() as u32;
     let mut bytes = head.to_be_bytes().to_vec();
     for (name, _, _) in &sorted {
-        bytes.extend_from_slice(&map_entry_hash(name).to_be_bytes());
+        bytes.extend_from_slice(&independent_map_entry_hash(name).to_be_bytes());
     }
     for (_, key, value) in &sorted {
         bytes.extend_from_slice(key);

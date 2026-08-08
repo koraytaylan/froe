@@ -8,9 +8,11 @@
 //!   becomes the new head.
 //! * **Recover-journal** rebuilds `journal.log` when it is missing or
 //!   unusable by scanning every data segment for candidate super-roots
-//!   (nodes with a `root` child), verifying each is fully traversable,
-//!   and writing a journal line for the newest consistent one — ordered
-//!   by the timestamp in each segment's info record.
+//!   (nodes with both a `root` and a `checkpoints` child), verifying the
+//!   newest one is fully traversable, and rewriting the journal with the
+//!   surviving candidates oldest first — ordered by the timestamp in
+//!   each segment's info record — so the consistent head is the last
+//!   line.
 //!
 //! All three run under the target's repository lock, so they can never
 //! race a running AEM instance, and all leave the store in a state a
@@ -27,6 +29,8 @@ use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::RecordIdentifier;
 use crate::store::Repository;
 use crate::writer::compaction::deep_copy_tree;
+use crate::writer::repository_lock::RepositoryLock;
+use crate::writer::segment_builder::GarbageCollectionGeneration;
 use crate::writer::store_writer::WritableRepository;
 
 /// Copies the source repository's head into `target_directory`,
@@ -50,19 +54,47 @@ pub fn restore(backup_directory: &Path, target_directory: &Path) -> Result<()> {
 }
 
 /// Deep-copies `source_head` from `source` into `target`, advances the
-/// target head, and flushes.
+/// target head, and flushes. Copied segments carry the source head's
+/// exact garbage collection generation triple, never the target's — Oak
+/// stamps `sourceHead.getSegmentId().getGcGeneration()` verbatim, and a
+/// later Java cleanup pass reclaims by generation distance, so an
+/// invented triple could make it delete segments the head still needs.
 fn copy_head_between(
     source: &Repository,
     source_head: RecordIdentifier,
     target: &WritableRepository,
     writer_identifier: &str,
 ) -> Result<()> {
-    let generation = target.writing_generation()?;
+    let generation = source_head_generation(source, source_head)?;
     let mut writer = target.record_writer_with_identifier(generation, writer_identifier);
     let (new_head, _) = deep_copy_tree(source, &mut writer, source_head)?;
     writer.finish()?;
     target.replace_head(new_head);
     target.flush()
+}
+
+/// The garbage collection generation triple of the source head's segment,
+/// from the archive index or — for a recovered archive without index
+/// metadata — the segment header itself.
+fn source_head_generation(
+    source: &Repository,
+    source_head: RecordIdentifier,
+) -> Result<GarbageCollectionGeneration> {
+    for archive in source.archives() {
+        if let Some(entry) = archive.index_entry(source_head.segment) {
+            return Ok(GarbageCollectionGeneration {
+                generation: entry.generation,
+                full_generation: entry.full_generation,
+                is_compacted: entry.is_compacted,
+            });
+        }
+    }
+    let view = source.segment(source_head.segment)?;
+    Ok(GarbageCollectionGeneration {
+        generation: view.structure.generation,
+        full_generation: view.structure.full_generation,
+        is_compacted: view.structure.is_compacted,
+    })
 }
 
 /// The outcome of a journal recovery.
@@ -80,18 +112,30 @@ pub struct RecoveryOutcome {
 struct Candidate {
     record: RecordIdentifier,
     timestamp_milliseconds: i64,
-    /// Whether the super-root has a `checkpoints` child, Oak's stronger
-    /// candidate signal.
-    has_checkpoints: bool,
 }
 
 /// Rebuilds `journal.log` from the segments on disk. Scans every data
-/// segment for super-root candidates, keeps those that are fully
-/// traversable, and rewrites the journal to a single line naming the
-/// newest one. Backs up any existing journal to `journal.log.bak.NNN`.
+/// segment for super-root candidates, verifies the newest one is fully
+/// traversable, and rewrites the journal with the surviving candidates
+/// oldest first, so the verified head is the last (winning) line. Backs
+/// up any existing journal to `journal.log.bak.NNN`.
+///
+/// Deliberate deviation from Java, which refuses to recover unless the
+/// existing journal already has a resolvable line: this recovery also
+/// works when `journal.log` is missing or fully unresolvable — the
+/// candidates come from the segments, not the journal, and the newest
+/// one must still pass the full consistency gate before anything is
+/// written.
 pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
-    // A read-only view of every archive, opened without the lock and
-    // without needing a resolvable journal.
+    // Deliberate deviation from Java, which recovers locklessly: hold the
+    // exclusive repository lock for the whole recovery, so a running AEM
+    // instance can never append to a journal this function is about to
+    // replace. Strictly safer — the tool fails fast instead of losing the
+    // instance's subsequent commits.
+    let _repository_lock = RepositoryLock::acquire(directory)?;
+
+    // A read-only view of every archive, opened without needing a
+    // resolvable journal.
     let archives = crate::store::open_all_archives(directory)?;
 
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -105,13 +149,19 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
         let Ok(view) = provider.segment(segment_identifier) else {
             continue;
         };
-        let timestamp = read_segment_info_timestamp(&provider, segment_identifier).unwrap_or(-1);
+        // A segment without a parseable info timestamp is skipped whole,
+        // as in Java ("No timestamp found in segment ..."); Java aborts
+        // the entire run on malformed info JSON, which is folded into the
+        // same skip here — strictly safer, recovery proceeds on the rest.
+        let Some(timestamp) = read_segment_info_timestamp(&provider, segment_identifier) else {
+            continue;
+        };
         // Every NODE record of the segment is a potential super-root.
         let node_records: Vec<u32> = view
             .structure
             .record_table()
             .iter()
-            .filter(|entry| entry.record_type == crate::segment::record::RecordType::Node)
+            .filter(|entry| entry.record_type() == Some(crate::segment::record::RecordType::Node))
             .map(|entry| entry.record_number)
             .collect();
         for record_number in node_records {
@@ -119,58 +169,64 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
             if !seen.insert(record) {
                 continue;
             }
-            if let Some(has_checkpoints) = super_root_kind(&provider, record) {
+            if is_super_root(&provider, record) {
                 candidates.push(Candidate {
                     record,
                     timestamp_milliseconds: timestamp,
-                    has_checkpoints,
                 });
             }
         }
     }
     let candidates_examined = candidates.len();
 
-    // Order candidates newest first — Oak's ordering — so the first
-    // consistent one is the true head, never an older super-root that
-    // happens to reach more content (which would resurrect deleted
-    // content). Prefer a super-root that also has a checkpoints child
-    // (Oak requires both), then the latest timestamp, then a deterministic
-    // record order so the result never depends on random segment
-    // identifiers. The write-order signal within a segment is the record
-    // number: a higher number was allocated later, hence newer.
+    // Order candidates newest first — the exact reverse of Oak's
+    // ascending sort (timestamp, then segment UUID compared as signed
+    // halves like Java's UUID.compareTo, then record number), which Oak
+    // then iterates backwards from the newest.
     candidates.sort_by(|first, second| {
         second
-            .has_checkpoints
-            .cmp(&first.has_checkpoints)
-            .then_with(|| {
-                second
-                    .timestamp_milliseconds
-                    .cmp(&first.timestamp_milliseconds)
-            })
+            .timestamp_milliseconds
+            .cmp(&first.timestamp_milliseconds)
+            .then_with(|| signed_uuid_key(second.record).cmp(&signed_uuid_key(first.record)))
             .then_with(|| second.record.record_number.cmp(&first.record.record_number))
-            .then_with(|| record_order_key(second.record).cmp(&record_order_key(first.record)))
     });
 
     // Take the newest fully consistent candidate. Consistency is checked
-    // lazily in newest-first order, so a healthy store stops at the first
-    // candidate rather than walking every historical revision.
-    let recovered_head = candidates
+    // lazily in newest-first order — with Oak's shared corrupt-path
+    // memory: a path found corrupt at a newer candidate is re-probed at
+    // every older one and must exist and pass a shallow check there, so
+    // a candidate that merely *predates* the corrupted node is rejected
+    // exactly as Java rejects it. Matching Oak, only the inconsistent
+    // newest suffix is dropped: the surviving older candidates are
+    // written below the verified head, unverified, as the fallback lines
+    // head resolution skips to when a segment of the last line later
+    // goes missing.
+    let mut corrupt_memory: Vec<String> = Vec::new();
+    let consistent_position = candidates
         .iter()
-        .find(|candidate| is_fully_consistent(&provider, candidate.record))
-        .map(|candidate| candidate.record)
+        .position(|candidate| is_fully_consistent(&provider, candidate.record, &mut corrupt_memory))
         .ok_or_else(|| Error::InvalidFormat {
             details: format!(
                 "no consistent super-root found among {candidates_examined} candidates in {}",
                 directory.display()
             ),
         })?;
+    let survivors = &candidates[consistent_position..];
+    let recovered_head = survivors[0].record;
 
     let previous_journal_backup = back_up_existing_journal(directory)?;
-    // Roll the journal backup back if writing the new journal fails, so a
-    // failure never leaves the store without a journal.
-    if let Err(error) = write_recovered_journal(directory, recovered_head) {
-        if let Some(backup_path) = &previous_journal_backup {
-            let _ = std::fs::rename(backup_path, directory.join("journal.log"));
+    // The backup is a copy and the new journal arrives by atomic rename,
+    // so `journal.log` exists — old or new — at every moment. On failure,
+    // the copy is removed only when the recovered journal was *not*
+    // installed (the temporary file still exists); after a successful
+    // rename the copy is the sole pre-recovery journal and must survive.
+    if let Err(error) = write_recovered_journal(directory, survivors) {
+        let temporary_path = directory.join("journal.log.recovered");
+        if temporary_path.exists() {
+            let _ = std::fs::remove_file(&temporary_path);
+            if let Some(backup_path) = &previous_journal_backup {
+                let _ = std::fs::remove_file(backup_path);
+            }
         }
         return Err(error);
     }
@@ -182,27 +238,23 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
     })
 }
 
-/// Classifies a node as a super-root candidate: `Some(has_checkpoints)`
-/// when it has a `root` child, where the flag reports whether it also has
-/// a `checkpoints` child (Oak's stronger signal). `None` when it is not a
-/// super-root or cannot be read.
-fn super_root_kind(provider: &dyn SegmentProvider, record: RecordIdentifier) -> Option<bool> {
+/// Whether a node looks like a super-root: Oak's recovery keeps a
+/// candidate iff it has *both* a `root` and a `checkpoints` child —
+/// requiring only `root` would let ordinary content nodes (every page
+/// with a child named `root`) flood the candidate list and even become
+/// the recovered head.
+fn is_super_root(provider: &dyn SegmentProvider, record: RecordIdentifier) -> bool {
     let node = NodeState::new(provider, record);
-    let has_root = node.child_node("root").ok()?.is_some();
-    if !has_root {
-        return None;
-    }
-    let has_checkpoints = node.child_node("checkpoints").ok()?.is_some();
-    Some(has_checkpoints)
+    matches!(node.child_node("root"), Ok(Some(_)))
+        && matches!(node.child_node("checkpoints"), Ok(Some(_)))
 }
 
-/// A total, deterministic ordering key for a record identifier, so
-/// recovery never depends on random segment identifiers.
-fn record_order_key(record: RecordIdentifier) -> (u64, u64, u32) {
+/// The segment UUID as Java's `UUID.compareTo` orders it: most then least
+/// significant half, compared as *signed* 64-bit values.
+fn signed_uuid_key(record: RecordIdentifier) -> (i64, i64) {
     (
-        record.segment.most_significant_bits,
-        record.segment.least_significant_bits,
-        record.record_number,
+        record.segment.most_significant_bits as i64,
+        record.segment.least_significant_bits as i64,
     )
 }
 
@@ -210,45 +262,203 @@ fn record_order_key(record: RecordIdentifier) -> (u64, u64, u32) {
 /// corrupt data. Bounded below the stack-overflow threshold.
 const MAXIMUM_RECOVERY_DEPTH: usize = 4000;
 
-/// Whether the entire tree under a candidate super-root can be traversed
-/// without a missing segment or malformed record — the consistency gate.
-/// Inline binaries are materialized so a head whose binary bulk segments
-/// are missing fails the gate (Oak would reject such a revision).
-fn is_fully_consistent(provider: &dyn SegmentProvider, record: RecordIdentifier) -> bool {
+/// Whether a candidate super-root passes Oak's consistency gate: the
+/// tree under its `root` child and the tree under every checkpoint's
+/// `root` snapshot must traverse without a missing segment or malformed
+/// record, and a checkpoint *without* a root snapshot fails the revision
+/// (Java's null `retrieve`). Checkpoint metadata is not verified — Java
+/// never reads it here, and being stricter could reject a head a real
+/// AEM instance serves fine. Inline binaries have every block resolved
+/// and read (without being materialized) so a head whose binary bulk
+/// segments are missing fails the gate.
+///
+/// `corrupt_memory` is Java's shared `corruptedPaths` set — flat and
+/// unkeyed: every remembered path must exist and pass a shallow check
+/// under the head's content root *and* under every checkpoint root this
+/// candidate has (a checkpoint the candidate lacks is simply never
+/// probed), or the candidate is rejected without a full traversal.
+///
+/// Deliberate deviation from Java: errors while *enumerating* a
+/// candidate's checkpoints reject only that candidate, where Java aborts
+/// the whole run with the journal untouched. Nothing is lost — the
+/// original journal survives as the `.bak` copy — and recovery still
+/// finds the newest candidate whose trees all verify.
+fn is_fully_consistent(
+    provider: &dyn SegmentProvider,
+    record: RecordIdentifier,
+    corrupt_memory: &mut Vec<String>,
+) -> bool {
+    let super_root = NodeState::new(provider, record);
+    let mut visited = HashSet::new();
+
+    // Java's per-tree interleave, order included: the head is probed and
+    // walked first — recording its corrupt path before any checkpoint is
+    // even resolved — then each checkpoint in stored order is resolved
+    // (a missing root snapshot rejects, Java's null retrieve), probed,
+    // and walked. The interleave matters: a rejection must not skip the
+    // recording a preceding tree's walk would have made, because older
+    // candidates consume that memory.
+    let Ok(Some(content_root)) = super_root.child_node("root") else {
+        return false;
+    };
+    if !probe_corrupt_paths(provider, &content_root, corrupt_memory) {
+        return false;
+    }
+    if let Err(corrupt_path) = verify_tree(provider, content_root.record_identifier(), &mut visited)
+    {
+        remember_corrupt(corrupt_memory, corrupt_path);
+        return false;
+    }
+
+    let Ok(Some(checkpoints)) = super_root.child_node("checkpoints") else {
+        return false;
+    };
+    let Ok(checkpoint_entries) = checkpoints.child_node_entries() else {
+        return false;
+    };
+    for (_, checkpoint) in checkpoint_entries {
+        let Ok(Some(snapshot_root)) = checkpoint.child_node("root") else {
+            return false;
+        };
+        if !probe_corrupt_paths(provider, &snapshot_root, corrupt_memory) {
+            return false;
+        }
+        if let Err(corrupt_path) =
+            verify_tree(provider, snapshot_root.record_identifier(), &mut visited)
+        {
+            remember_corrupt(corrupt_memory, corrupt_path);
+            return false;
+        }
+    }
+    true
+}
+
+/// Re-probes the remembered corrupt paths under one tree root, in
+/// insertion order: each must exist and pass a shallow check — a missing
+/// path counts as still corrupt (this candidate may simply predate the
+/// corrupted node), exactly like Java.
+fn probe_corrupt_paths(
+    provider: &dyn SegmentProvider,
+    tree_root: &NodeState<'_>,
+    corrupt_memory: &[String],
+) -> bool {
+    for corrupt_path in corrupt_memory {
+        let Ok(Some(corrupt_node)) = resolve_descendant(tree_root, corrupt_path) else {
+            return false;
+        };
+        if check_node_shallow(provider, corrupt_node.record_identifier()).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Resolves a relative path (empty = the node itself) under a node.
+fn resolve_descendant<'provider>(
+    node: &NodeState<'provider>,
+    relative_path: &str,
+) -> Result<Option<NodeState<'provider>>> {
+    let mut current = *node;
+    for name in relative_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        match current.child_node(name)? {
+            Some(child) => current = child,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(current))
+}
+
+/// Records a newly found corrupt path once.
+fn remember_corrupt(corrupt_memory: &mut Vec<String>, corrupt_path: String) {
+    if !corrupt_memory.contains(&corrupt_path) {
+        corrupt_memory.push(corrupt_path);
+    }
+}
+
+/// Checks one node without recursing: every property is decoded and
+/// every inline binary read — the recovery gate always verifies
+/// binaries.
+fn check_node_shallow(provider: &dyn SegmentProvider, record: RecordIdentifier) -> Result<()> {
+    let node = NodeState::new(provider, record);
+    for property in node.properties()? {
+        match &property.values {
+            crate::content::node::PropertyValues::Single(value) => {
+                verify_inline_binary(provider, value)?;
+            }
+            crate::content::node::PropertyValues::Multiple(values) => {
+                for value in values {
+                    verify_inline_binary(provider, value)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fully traverses one tree, sharing the visited set across trees so
+/// records the checkpoints share with the live content verify once. On
+/// failure returns the relative path of the corrupt node (empty for the
+/// tree root itself).
+fn verify_tree(
+    provider: &dyn SegmentProvider,
+    record: RecordIdentifier,
+    visited: &mut HashSet<RecordIdentifier>,
+) -> std::result::Result<(), String> {
     fn walk(
         provider: &dyn SegmentProvider,
         record: RecordIdentifier,
         visited: &mut HashSet<RecordIdentifier>,
+        ancestors: &mut HashSet<RecordIdentifier>,
         depth: usize,
-    ) -> Result<()> {
-        if depth > MAXIMUM_RECOVERY_DEPTH || !visited.insert(record) {
+        path: &mut String,
+    ) -> std::result::Result<(), String> {
+        // A tree deeper than the cap cannot be verified within bounded
+        // stack; treating it as consistent would let recovery install a
+        // head with an unchecked subtree, so it fails the gate instead.
+        if depth > MAXIMUM_RECOVERY_DEPTH {
+            return Err(path.clone());
+        }
+        // A node inside its own subtree is corruption and fails the gate;
+        // meeting an already-completed node again is ordinary shared-
+        // subtree deduplication and verifies for free.
+        if ancestors.contains(&record) {
+            return Err(path.clone());
+        }
+        if !visited.insert(record) {
             return Ok(());
         }
+        ancestors.insert(record);
+        check_node_shallow(provider, record).map_err(|_| path.clone())?;
         let node = NodeState::new(provider, record);
-        for property in node.properties()? {
-            match &property.values {
-                crate::content::node::PropertyValues::Single(value) => {
-                    materialize_inline_binary(provider, value)?;
-                }
-                crate::content::node::PropertyValues::Multiple(values) => {
-                    for value in values {
-                        materialize_inline_binary(provider, value)?;
-                    }
-                }
-            }
+        let children = node.child_node_entries().map_err(|_| path.clone())?;
+        for (name, child) in children {
+            let parent_length = path.len();
+            path.push('/');
+            path.push_str(&name);
+            walk(
+                provider,
+                child.record_identifier(),
+                visited,
+                ancestors,
+                depth + 1,
+                path,
+            )?;
+            path.truncate(parent_length);
         }
-        for (_, child) in node.child_node_entries()? {
-            walk(provider, child.record_identifier(), visited, depth + 1)?;
-        }
+        ancestors.remove(&record);
         Ok(())
     }
-    let mut visited = HashSet::new();
-    walk(provider, record, &mut visited, 0).is_ok()
+    let mut ancestors = HashSet::new();
+    let mut path = String::new();
+    walk(provider, record, visited, &mut ancestors, 0, &mut path)
 }
 
-/// Reads an inline binary's content to force its blocks (possibly in bulk
-/// segments) to resolve; external binaries have no local content.
-fn materialize_inline_binary(
+/// Resolves and reads every block of an inline binary without holding the
+/// content in memory; external binaries have no local content.
+fn verify_inline_binary(
     provider: &dyn SegmentProvider,
     value: &crate::content::property::PropertyValue,
 ) -> Result<()> {
@@ -258,7 +468,7 @@ fn materialize_inline_binary(
         record_identifier, ..
     }) = value
     {
-        crate::content::value::read_binary_content(provider, *record_identifier)?;
+        crate::content::value::verify_binary_content(provider, *record_identifier)?;
     }
     Ok(())
 }
@@ -288,7 +498,9 @@ fn parse_info_timestamp(info: &str) -> Option<i64> {
 }
 
 /// Backs up an existing `journal.log` to the first free
-/// `journal.log.bak.NNN` (000–999).
+/// `journal.log.bak.NNN` (000–999). Deliberate deviation from Java's
+/// plain rename: the backup is a *copy*, so `journal.log` never
+/// disappears — the recovered journal later replaces it atomically.
 fn back_up_existing_journal(directory: &Path) -> Result<Option<std::path::PathBuf>> {
     let journal_path = directory.join("journal.log");
     if !journal_path.exists() {
@@ -297,7 +509,8 @@ fn back_up_existing_journal(directory: &Path) -> Result<Option<std::path::PathBu
     for counter in 0..1000 {
         let backup = directory.join(format!("journal.log.bak.{counter:03}"));
         if !backup.exists() {
-            std::fs::rename(&journal_path, &backup)?;
+            std::fs::copy(&journal_path, &backup)?;
+            std::fs::File::open(&backup)?.sync_all()?;
             return Ok(Some(backup));
         }
     }
@@ -306,18 +519,29 @@ fn back_up_existing_journal(directory: &Path) -> Result<Option<std::path::PathBu
     })
 }
 
-/// Writes the recovered journal: a single line naming `head`, fsynced.
-fn write_recovered_journal(directory: &Path, head: RecordIdentifier) -> Result<()> {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    let line = format!(
-        "{}:{} root {timestamp}\n",
-        head.segment, head.record_number as i32
-    );
-    let mut file = std::fs::File::create(directory.join("journal.log"))?;
-    file.write_all(line.as_bytes())?;
-    file.sync_all()?;
+/// Writes the recovered journal: the surviving candidates oldest first,
+/// each line `<uuid>:<record-number> root <segment-info-timestamp>`,
+/// exactly as Oak's recovery writes them. The file is assembled beside
+/// the journal, fsynced, renamed into place atomically, and the
+/// directory entry is fsynced — Java fsyncs nothing here; a crash can
+/// therefore never leave the store without a journal.
+fn write_recovered_journal(directory: &Path, survivors: &[Candidate]) -> Result<()> {
+    let temporary_path = directory.join("journal.log.recovered");
+    {
+        let mut file = std::fs::File::create(&temporary_path)?;
+        for candidate in survivors.iter().rev() {
+            let line = format!(
+                "{}:{} root {}\n",
+                candidate.record.segment,
+                candidate.record.record_number as i32,
+                candidate.timestamp_milliseconds
+            );
+            file.write_all(line.as_bytes())?;
+        }
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary_path, directory.join("journal.log"))?;
+    std::fs::File::open(directory)?.sync_all()?;
     Ok(())
 }
 
@@ -569,6 +793,67 @@ mod tests {
         );
         assert!(directory.path.join("journal.log.bak.000").exists());
         assert_content(&directory.path, "Backup Source");
+    }
+
+    #[test]
+    fn recover_journal_requires_the_repository_lock() {
+        let directory = TestDirectory::new("recover-locked");
+        populate(&directory.path);
+        let held_lock =
+            crate::writer::repository_lock::RepositoryLock::acquire(&directory.path).expect("lock");
+        assert!(
+            recover_journal(&directory.path).is_err(),
+            "recovery must refuse to run while another process holds repo.lock"
+        );
+        drop(held_lock);
+        recover_journal(&directory.path).expect("recovery succeeds once the lock is free");
+    }
+
+    #[test]
+    fn backup_stamps_the_source_head_generation_verbatim() {
+        let source = TestDirectory::new("backup-generation-source");
+        let target = TestDirectory::new("backup-generation-target");
+        populate(&source.path);
+        // Advance the source's generation so the stamp is distinguishable
+        // from a fresh target's (0, 0, false).
+        {
+            let mut store = WritableRepository::open(&source.path).expect("open");
+            crate::writer::compaction::compact(
+                &mut store,
+                crate::writer::compaction::CompactionKind::Full,
+            )
+            .expect("compact");
+            store.close().expect("close");
+        }
+        let source_head_generation = {
+            let repository = Repository::open(&source.path).expect("reader");
+            let head_segment = repository.head_record_identifier().segment;
+            repository
+                .archives()
+                .iter()
+                .find_map(|archive| archive.index_entry(head_segment))
+                .map(|entry| (entry.generation, entry.full_generation, entry.is_compacted))
+                .expect("head segment is indexed")
+        };
+        assert_ne!(
+            source_head_generation.0, 0,
+            "compaction advanced the source generation"
+        );
+
+        backup(&source.path, &target.path).expect("backup");
+
+        let repository = Repository::open(&target.path).expect("target reader");
+        let head_segment = repository.head_record_identifier().segment;
+        let stamped = repository
+            .archives()
+            .iter()
+            .find_map(|archive| archive.index_entry(head_segment))
+            .map(|entry| (entry.generation, entry.full_generation, entry.is_compacted))
+            .expect("target head segment is indexed");
+        assert_eq!(
+            stamped, source_head_generation,
+            "the source head's generation triple is stamped verbatim"
+        );
     }
 
     #[test]

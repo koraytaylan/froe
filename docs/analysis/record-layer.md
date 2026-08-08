@@ -286,7 +286,9 @@ through `writeString`; huge streams only exist as binaries.
 
 Segment-info string: the first record of every data segment (lowest record
 number in table order) is a small/medium string value with segment metadata
-`"{wid=W,sno=S,gc=G,t=T}"` (`Segment.getSegmentInfo`).
+as JSON — `{"wid":"W","sno":S,"t":T}` (`SegmentBufferWriter.newSegment`;
+`Segment.getSegmentInfo` merely reads the stored string back — see
+`write-segment-buffer.md` §2.1 for the authoritative shape).
 
 ---
 

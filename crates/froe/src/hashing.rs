@@ -94,10 +94,18 @@ mod tests {
     }
 
     #[test]
-    fn map_entry_hash_applies_the_map_record_scramble() {
-        // (0 ^ M) * M + A for the empty string, computed with 32-bit wrapping.
-        let multiplier = 0xDEEC_E66Du32 as i32;
-        let expected = multiplier.wrapping_mul(multiplier).wrapping_add(0xB) as u32;
-        assert_eq!(map_entry_hash(""), expected);
+    fn map_entry_hash_matches_externally_computed_vectors() {
+        // Literal outputs computed outside this codebase from
+        // `(String.hashCode(name) ^ 0xDEECE66D) * 0xDEECE66D + 0xB` with
+        // wrapping 32-bit arithmetic — never recomputed here, so a
+        // mistranscribed constant cannot hide by agreeing with itself.
+        assert_eq!(map_entry_hash(""), 0xB460_0A74);
+        assert_eq!(map_entry_hash("a"), 0x3C9C_BB27);
+        assert_eq!(map_entry_hash("root"), 0xC289_24EE);
+        assert_eq!(map_entry_hash("content"), 0x9646_6A8F);
+        assert_eq!(map_entry_hash("jcr:content"), 0x88CE_F29C);
+        // The Java string-hash collision carries into the scrambled hash.
+        assert_eq!(map_entry_hash("Aa"), 0x6059_D734);
+        assert_eq!(map_entry_hash("BB"), 0x6059_D734);
     }
 }

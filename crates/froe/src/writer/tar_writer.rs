@@ -109,6 +109,36 @@ impl TarArchiveWriter {
         self.index_entries.len()
     }
 
+    /// Registers binary references under an explicit generation triple —
+    /// the sweep carries the original catalog's triples over verbatim
+    /// instead of re-stamping them with the segment's index generation,
+    /// exactly as Oak's `TarReader.sweep` preserves them.
+    ///
+    /// References registered here reach the disk only when at least one
+    /// segment is written afterwards: the file is created lazily by
+    /// [`Self::write_segment`], and closing a segmentless writer writes
+    /// nothing.
+    pub fn add_binary_references(
+        &mut self,
+        generation: GarbageCollectionGeneration,
+        source: SegmentIdentifier,
+        references: impl IntoIterator<Item = String>,
+    ) {
+        let segment_references = self
+            .binary_references
+            .entry((
+                generation.generation,
+                generation.full_generation,
+                generation.is_compacted,
+            ))
+            .or_default()
+            .entry((source.most_significant_bits, source.least_significant_bits))
+            .or_default();
+        for reference in references {
+            segment_references.insert(reference);
+        }
+    }
+
     /// Whether the archive holds the given segment.
     #[must_use]
     pub fn contains_segment(&self, identifier: SegmentIdentifier) -> bool {
@@ -351,7 +381,7 @@ fn write_trailer_entry(file: &mut File, entry_name: &str, payload: &[u8]) -> Res
 }
 
 /// The zero padding needed after `size` payload bytes.
-fn padding_size(size: usize) -> usize {
+pub(crate) fn padding_size(size: usize) -> usize {
     match size % BLOCK_SIZE {
         0 => 0,
         remainder => BLOCK_SIZE - remainder,

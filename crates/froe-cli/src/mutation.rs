@@ -10,14 +10,11 @@ use std::io::Write;
 use std::path::Path;
 
 use froe::writer::commit::{
-    create_checkpoint, list_checkpoints, release_checkpoint, remove_all_checkpoints,
-    remove_unreferenced_checkpoints,
+    create_checkpoint, release_checkpoint, remove_all_checkpoints, remove_unreferenced_checkpoints,
 };
 use froe::writer::compaction::CompactionKind;
 use froe::writer::store_writer::WritableRepository;
 use froe::{backup, compact, recover_journal, restore};
-
-use crate::output::format_timestamp;
 
 /// Asks for confirmation before a mutating operation, unless `assume_yes`.
 fn confirm(action: &str, assume_yes: bool) -> bool {
@@ -137,25 +134,6 @@ pub(crate) fn run_recover_journal(repository: &Path, assume_yes: bool) -> froe::
         println!("previous journal backed up at {}", backup_path.display());
     }
     Ok(true)
-}
-
-/// `froe checkpoint list`: the store's checkpoints.
-pub(crate) fn run_checkpoint_list(repository: &Path) -> froe::Result<()> {
-    let store = WritableRepository::open(repository)?;
-    let checkpoints = list_checkpoints(&store)?;
-    if checkpoints.is_empty() {
-        println!("no checkpoints");
-    }
-    for checkpoint in &checkpoints {
-        let created = checkpoint
-            .created_milliseconds
-            .map_or_else(|| "unknown".to_owned(), format_timestamp);
-        let expires = checkpoint
-            .expires_milliseconds
-            .map_or_else(|| "unknown".to_owned(), format_timestamp);
-        println!("{}  created {created}  expires {expires}", checkpoint.name);
-    }
-    store.close()
 }
 
 /// `froe checkpoint create`: create a checkpoint.

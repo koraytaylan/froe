@@ -65,34 +65,62 @@ impl ArchiveFileName {
 /// Two files mapping to the same number *and* letter (possible because a
 /// missing letter means `'a'`, so `data00000.tar` and `data00000a.tar`
 /// collide) are a fatal state error, exactly as in the Java store —
-/// silently picking one of them would make opens nondeterministic.
+/// silently picking one of them would make opens nondeterministic. The
+/// check covers every pair, not only the currently winning letter, and
+/// never depends on directory listing order.
 pub fn select_newest_file_generations(
     file_names: &[String],
 ) -> crate::error::Result<Vec<ArchiveFileName>> {
-    let mut newest_per_number: BTreeMap<u32, ArchiveFileName> = BTreeMap::new();
+    Ok(group_file_generations_newest_first(file_names)?
+        .into_iter()
+        .filter_map(|mut group| {
+            if group.is_empty() {
+                None
+            } else {
+                Some(group.remove(0))
+            }
+        })
+        .collect())
+}
+
+/// Groups every archive file by number — newest number first, and within
+/// each number the generation letters newest first — after the same
+/// duplicate validation as [`select_newest_file_generations`]. A reader
+/// walks each group in order and takes the first file whose index is
+/// valid.
+pub fn group_file_generations_newest_first(
+    file_names: &[String],
+) -> crate::error::Result<Vec<Vec<ArchiveFileName>>> {
+    let mut seen_names: BTreeMap<(u32, char), String> = BTreeMap::new();
+    let mut by_number: BTreeMap<u32, Vec<ArchiveFileName>> = BTreeMap::new();
     for file_name in file_names {
         let Some(parsed) = ArchiveFileName::parse(file_name) else {
             continue;
         };
-        match newest_per_number.get(&parsed.archive_number) {
-            Some(existing) if existing.file_generation == parsed.file_generation => {
-                return Err(crate::error::Error::InvalidFormat {
-                    details: format!(
-                        "archives {} and {} both claim number {} generation {:?}",
-                        existing.file_name,
-                        parsed.file_name,
-                        parsed.archive_number,
-                        parsed.file_generation
-                    ),
-                });
-            }
-            Some(existing) if existing.file_generation > parsed.file_generation => {}
-            _ => {
-                newest_per_number.insert(parsed.archive_number, parsed);
-            }
+        if let Some(existing_name) = seen_names.insert(
+            (parsed.archive_number, parsed.file_generation),
+            parsed.file_name.clone(),
+        ) {
+            return Err(crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archives {} and {} both claim number {} generation {:?}",
+                    existing_name, parsed.file_name, parsed.archive_number, parsed.file_generation
+                ),
+            });
         }
+        by_number
+            .entry(parsed.archive_number)
+            .or_default()
+            .push(parsed);
     }
-    Ok(newest_per_number.into_values().rev().collect())
+    Ok(by_number
+        .into_values()
+        .rev()
+        .map(|mut group| {
+            group.sort_by_key(|name| std::cmp::Reverse(name.file_generation));
+            group
+        })
+        .collect())
 }
 
 #[cfg(test)]
