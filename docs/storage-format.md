@@ -233,3 +233,51 @@ reproduced by `froe`:
 8. The long-value length mask differs between the string reader
    (62 bits) and the blob reader (61 bits); both agree for every length
    a writer can produce.
+
+## 7. Writing
+
+`froe` writes stores byte-for-byte compatible with what Oak produces.
+The write path preserves every invariant a subsequent Oak (or AEM) start
+depends on:
+
+* **Locking.** A write session takes an exclusive lock on `repo.lock`
+  before anything else — a POSIX `fcntl` record lock, the same lock space
+  Oak's `FileChannel.lock()` uses, so it genuinely excludes a running
+  instance. The lock file is never written or deleted.
+* **Manifest.** The manifest is rewritten with `store.version=2` on every
+  write open; a directory with archives but no manifest is rejected.
+* **Durability ordering.** Segment bytes are appended and fsynced before
+  the journal line referencing them is appended and fdatasynced, and a
+  journal line is written only when the head actually moved. A crash
+  therefore never leaves the journal pointing at unwritten segments.
+* **Segment building.** Segments carry the `0aK` magic, version 13, the
+  correct generation triple in the header, a segment-info string
+  (`{"wid":…,"sno":…,"t":…}`) as record 0, referenced-segment and
+  record-reference tables, and 16-byte-aligned length — everything the
+  reader validates.
+* **Archives.** New archives are named `data%05da.tar`; each holds its
+  segments followed by the `.brf`, `.gph`, and `.idx` trailers and two
+  zero blocks, with index entries sorted by signed UUID halves. The graph
+  lists every data segment's references and the binary references catalog
+  lists every external binary — cleanup and blob garbage collection trust
+  these.
+* **Generations.** Normal writes carry the head's generation with the
+  compacted flag cleared; full compaction advances generation and full
+  generation; tail compaction advances only the generation; bulk segments
+  are stamped `(0, 0, false)`.
+* **Bootstrap.** A fresh store is created with the exact initial node —
+  a super-root whose only child is an empty `root` — at generation
+  `(0, 0, false)`, matching `FileStore.initialNode`.
+* **Compaction.** Offline compaction deep-copies the reachable tree
+  (content root and every checkpoint) into a fresh generation, reclaims
+  the old generations with Oak's reclaim predicate, and rewrites the
+  journal to a single line. Checkpoints and their shared root snapshots
+  survive.
+* **Never in place.** Existing archives with an index are immutable;
+  every rewrite goes to a new file, and `journal.log` and `gc.log` are
+  append-only (compaction's journal rewrite writes a fresh file and
+  renames it into place). Damaged archives are backed up to `.bak` names,
+  never truncated.
+
+The full write-path contract, with the AEM safety invariant checklist for
+each subsystem, is in [`analysis/`](analysis/) (`write-*.md`).

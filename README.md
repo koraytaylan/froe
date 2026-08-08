@@ -1,29 +1,48 @@
 # froe
 
-Fast, read-only access to Apache Jackrabbit Oak `segment-tar` ("TarMK")
-repositories — the storage format used by Apache Jackrabbit Oak and Adobe
-Experience Manager — implemented in Rust.
+A fast, dependency-light Rust implementation of Apache Jackrabbit Oak's
+`segment-tar` ("TarMK") storage format — the repository format used by
+Apache Jackrabbit Oak and Adobe Experience Manager.
 
-`froe` opens a segment store directly from disk, resolves the current head
-state from the journal, and lets you traverse and extract node data without a
-running Oak instance and without the startup and garbage collection overhead
-of the JVM. It never takes the repository lock and never writes to the store,
-so it is safe to point at a live repository or a backup.
+`froe` opens a segment store directly from disk, without a running Oak
+instance and without the JVM's startup and garbage collection overhead:
+
+* **Reading** is read-only and safe against a *live* repository — it never
+  takes the repository lock and never writes. Traverse the content tree,
+  extract node data as JSON, inspect archives and segments, check
+  consistency, diff revisions, trace node history, and search nodes.
+* **Writing** takes the exclusive repository lock and produces stores
+  byte-for-byte compatible with what Oak writes, so a subsequent AEM start
+  consumes the result cleanly. Compact offline, back up and restore,
+  recover a lost journal, and manage checkpoints — against a *stopped*
+  repository.
+
+The writing path reproduces every invariant Oak depends on — locking,
+durability ordering, generation arithmetic, archive and trailer layout —
+verified against byte-exact specifications extracted from the Oak sources.
 
 ## Quick start
 
 ```console
 $ cargo build --release
 
+# Read-only — safe against a live repository:
 $ target/release/froe summary /path/to/segmentstore
 $ target/release/froe tree /path/to/segmentstore /content --depth 2
 $ target/release/froe extract /path/to/segmentstore --path /content --output content.jsonl
+$ target/release/froe check /path/to/segmentstore
+
+# Maintenance — stopped repository only (each asks for confirmation):
+$ target/release/froe compact /path/to/segmentstore
+$ target/release/froe backup /path/to/segmentstore /path/to/backup
+$ target/release/froe recover-journal /path/to/segmentstore
 ```
 
 Every command takes the segment store directory (the one containing
 `journal.log` and the `data*.tar` archives). `froe extract` streams one
-JSON object per node — typed property values included — which is the
-fast path for pulling content out of a repository.
+JSON object per node — typed property values included — which is the fast
+path for pulling content out of a repository. `froe --help` lists every
+command.
 
 As a library:
 

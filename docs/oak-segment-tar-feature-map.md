@@ -12,14 +12,14 @@ Every entry carries one of four statuses:
 | Status | Meaning |
 | --- | --- |
 | **Implemented** | Available in `froe` today (crate `froe`, binary `froe`). |
-| **Planned** | Read-only feature that fits `froe`'s scope; a natural next step. |
-| **Write path** | Mutates the store. Out of scope while `froe` is read-only by design. |
+| **Planned** | Fits `froe`'s scope; a natural next step. |
 | **Not applicable** | JVM-, OSGi-, or cluster-specific machinery with no Rust counterpart. |
 
-`froe`'s initial goal is deliberately narrow and deep: open an existing
-TarMK repository *read-only* — including a live one, since no lock is
-taken and no file is ever written — resolve the head state, and traverse
-and extract node data fast.
+`froe` reads and writes TarMK repositories. The reading API is read-only
+and safe against a live repository (no lock, no writes). The writing API
+takes the exclusive repository lock and produces stores byte-for-byte
+compatible with what Oak writes, so it must run only against a *stopped*
+repository — after which a normal AEM start consumes the result cleanly.
 
 ## 1. Core library
 
@@ -30,12 +30,12 @@ and extract node data fast.
 | Root access | `SegmentNodeStore.getRoot()` | `Repository::content_root` | **Implemented** |
 | Node traversal | `SegmentNodeState`, `getChildNode`, `getChildNodeEntries` | `NodeState::child_node`, `NodeState::child_node_entries` | **Implemented** |
 | Properties | `SegmentPropertyState`, typed accessors | `NodeState::properties`, `NodeState::property`, typed `PropertyValue` | **Implemented** |
-| `jcr:primaryType` / `jcr:mixinTypes` synthesis from templates | `Template` head fields | `Template::primary_type`, `Template::mixin_types`, synthesized in `NodeState::properties` | **Implemented** |
-| Checkpoint listing and reading | `checkpoints()`, `retrieve(String)` | `Repository::checkpoints` (each checkpoint's `root` child is a full snapshot) | **Implemented** |
-| Checkpoint create/release | `checkpoint(long)`, `release(String)` | — | **Write path** |
-| Commits, rebase, reset | `merge`, `rebase`, `reset` | — | **Write path** |
-| Observation | `Observable.addObserver` | — | **Write path** (only meaningful on a mutating store) |
-| Blob creation | `createBlob(InputStream)` | — | **Write path** |
+| `jcr:primaryType` / `jcr:mixinTypes` synthesis from templates | `Template` head fields | synthesized in `NodeState::properties` | **Implemented** |
+| Checkpoint listing and reading | `checkpoints()`, `retrieve(String)` | `Repository::checkpoints`, `writer::list_checkpoints` | **Implemented** |
+| Checkpoint create / release / remove | `checkpoint(long)`, `release(String)` | `writer::create_checkpoint`, `release_checkpoint`, `remove_all_checkpoints`, `remove_unreferenced_checkpoints` | **Implemented** |
+| Commit (content mutation) | `merge` | `writer::commit::rewrite_node_with_child_edits` and the record writer (single-writer, hookless) | **Implemented** |
+| Rebase / reset, commit hooks, observation | `rebase`, `reset`, `EditorHook`, `Observable` | — | **Not applicable** (offline single-writer tooling applies no hooks; there is no concurrent committer to rebase against or observer to notify) |
+| Blob creation | `createBlob(InputStream)` | `RecordWriter::write_binary_content` / `write_external_binary_identifier` | **Implemented** |
 | Blob reading (inline) | `SegmentBlob`, `SegmentStream` | `BinaryValue::Inline`, `content::value::read_binary_content` | **Implemented** |
 | Blob reading (external blob store) | `BlobStore` integration | `BinaryValue::External` exposes the blob identifier; content requires the external store | **Implemented** (identifier surface); external blob store connectors **Planned** |
 
@@ -44,28 +44,32 @@ and extract node data fast.
 | Feature | Java | froe | Status |
 | --- | --- | --- | --- |
 | Read-only store over tar archives | `ReadOnlyFileStore` + `ReadOnlyRevisions` | `Repository::open` | **Implemented** |
-| Head resolution with journal rewind | `FileStoreUtil.findPersistedRecordId` | journal scan in `Repository::open` | **Implemented** |
-| Manifest validation (`store.version` 1 and 2) | `ManifestChecker` (read-only semantics) | `store::check_manifest` | **Implemented** |
-| Tar file generation selection (highest letter per archive number) | `TarReader.openRO` | `tar_archive::select_newest_file_generations` | **Implemented** |
-| Recovery of archives without a valid index | `TarReader.openRO` third strategy (writes `.ro.bak`) | in-memory recovery scan — same algorithm, but never writes into the repository | **Implemented** (deliberate improvement: strictly no writes) |
-| Time travel to an arbitrary revision | `ReadOnlyFileStore.setRevision` | `Repository::node` accepts any record identifier; journal entries are exposed | **Implemented** (as a library primitive; a `--revision` command option is **Planned**) |
-| Writable store, flushing | `FileStore` | — | **Write path** |
+| Read-write store lifecycle | `FileStore` | `writer::WritableRepository::open` | **Implemented** |
+| Head resolution with journal rewind | `FileStoreUtil.findPersistedRecordId` | journal scan in both stores | **Implemented** |
+| Manifest validation and update | `ManifestChecker` | `store::check_manifest` (read); rewrite on write open | **Implemented** |
+| Tar generation selection (destructive on write) | `TarReader.open` / `openRO` | `tar_archive::select_newest_file_generations`; write-mode deletes stale letters | **Implemented** |
+| Recovery of archives without a valid index | `TarReader` recovery (writes `.ro.bak`) | in-memory on read; write-mode backs up to `.bak` and regenerates | **Implemented** |
+| Repository lock | `TarPersistence.lockRepository` (blocking `FileChannel.lock`) | `writer::RepositoryLock` (`fcntl` OFD lock, fails fast) | **Implemented** |
+| Durability ordering (segment fsync before journal append) | `FileStore.doFlush` | `WritableRepository::flush` | **Implemented** |
+| Initial-node bootstrap for a fresh store | `FileStore.initialNode` | `WritableRepository::write_initial_node` | **Implemented** |
+| Segment identifier generation | `SegmentTracker.newSegmentId` | `writer::identifier_generator` (version-4 UUID, kind nibble) | **Implemented** |
 | Memory mapping | `FileStoreBuilder.withMemoryMapping` | always memory-mapped (`memmap2`) | **Implemented** |
-| In-memory store for tests | `memory/MemoryStore` | `SegmentProvider` trait; tests use an in-memory implementation | **Implemented** |
-| Pluggable persistence (Azure, AWS) | `spi/persistence` | the `SegmentProvider` trait is the seam a remote backend would implement | **Planned** |
+| In-memory store for tests | `memory/MemoryStore` | the `SegmentProvider` / `SegmentSink` traits | **Implemented** |
+| Pluggable persistence (Azure, AWS) | `spi/persistence` | the `SegmentProvider` / `SegmentSink` traits are the seam | **Planned** |
 
-### 1.3 Reading and caching
+### 1.3 Reading, writing, and caching
 
 | Feature | Java | froe | Status |
 | --- | --- | --- | --- |
 | Segment parsing (versions 12 and 13) | `Segment`, `SegmentDataV12/V13` | `segment::ParsedSegment` | **Implemented** |
+| Segment building and flushing | `SegmentBufferWriter` | `writer::SegmentBufferBuilder` | **Implemented** |
 | Record decoding (values, lists, maps, templates, nodes) | `CachingSegmentReader`, `MapRecord`, `ListRecord`, `Template` | `content` module | **Implemented** |
-| Segment cache | `SegmentCache` (256 MB default) | bounded parsed-segment cache | **Implemented** |
-| String cache | `StringCache` | bounded string cache on `Repository` | **Implemented** |
-| Template cache | `TemplateCache` | bounded template cache on `Repository` | **Implemented** |
-| Streaming reads of large binaries | `SegmentStream` | `read_binary_content` materializes; streaming reader | **Planned** |
-| Record-level visitor / grammar walker | `SegmentParser` | record readers are public functions usable the same way | **Implemented** |
-| Record space usage analysis | `RecordUsageAnalyser` | — | **Planned** (`froe segment` prints per-type record counts today) |
+| Record serialization (all record kinds, HAMT maps, bulk block lists) | `RecordWriters`, `DefaultSegmentWriter` | `writer::RecordWriter` | **Implemented** |
+| Segment-info record (`{"wid","sno","t"}`) | `SegmentBufferWriter.newSegment` | written as record 0 by `RecordWriter` | **Implemented** |
+| Deduplication caches | `WriterCacheManager`, `PriorityCache` | source-record cache during compaction; content preservation by identity during commit | **Implemented** (correctness; a global write-side dedup cache is **Planned** as a size optimization) |
+| Segment, string, and template caches | `SegmentCache`, `StringCache`, `TemplateCache` | bounded caches on `Repository` | **Implemented** |
+| Streaming reads of large binaries | `SegmentStream` | `read_binary_content` materializes | **Planned** (streaming reader) |
+| Record space usage analysis | `RecordUsageAnalyser` | `froe segment` prints per-type record counts | **Implemented** (summary form) |
 | Segment hex dump | `SegmentDump` | — | **Planned** |
 
 ### 1.4 Journal and metadata files
@@ -73,86 +77,99 @@ and extract node data fast.
 | Feature | Java | froe | Status |
 | --- | --- | --- | --- |
 | Journal reading (backwards, tolerant) | `JournalReader` | `journal::read_journal` | **Implemented** |
-| Record identifier string forms (`uuid:decimal` and `uuid.hex8`) | `RecordId.fromString` | `journal::parse_record_identifier_text` | **Implemented** |
-| `gc.log` parsing | `GCJournal` | — | **Planned** (informational display) |
-| Repository lock | `TarPersistence.lockRepository` | never taken — `froe` is read-only | **Implemented** (by design) |
+| Journal append and rewrite | `TarRevisions.doFlush`, `Compact` rewrite | `WritableRepository::flush`, compaction journal rewrite | **Implemented** |
+| Record identifier string forms | `RecordId.fromString`/`toString10` | `journal::parse_record_identifier_text` | **Implemented** |
+| `gc.log` parsing / writing | `GCJournal` | — | **Planned** (informational; not required for AEM safety) |
 
 ## 2. Garbage collection and compaction
 
-The entire garbage collection subsystem mutates the store and is out of
-scope for a read-only reader. What a reader *must* understand — and
-`froe` does — is the residue garbage collection leaves behind:
-
 | Feature | Java | froe | Status |
 | --- | --- | --- | --- |
-| Reading generation metadata (generation, full generation, compacted flag) | segment headers, index entries | `ParsedSegment` and `SegmentIndexEntry` expose all three | **Implemented** |
-| Tolerating mixed generations after partial compaction | reader-side invariants | no generation homogeneity is assumed anywhere | **Implemented** |
-| Stable identifiers across compaction | `SegmentNodeState.getStableId` | `NodeState::stable_identifier` | **Implemented** |
-| Estimation, compaction (full/tail; classic/diff/parallel), cleanup, `Reclaimers`, `FileReaper`, GC monitoring | `compaction/`, `file/GarbageCollector` | — | **Write path** |
+| Reading generation metadata | segment headers, index entries | `ParsedSegment`, `SegmentIndexEntry` | **Implemented** |
+| Tolerating mixed generations | reader-side invariants | no generation homogeneity assumed | **Implemented** |
+| Stable identifiers across compaction | `SegmentNodeState.getStableId` | `NodeState::stable_identifier`, preserved through the tree copier | **Implemented** |
+| Generation arithmetic (full/tail transitions) | `GCGeneration.nextFull/nextTail` | `writer::compaction` | **Implemented** |
+| Offline compaction (deep copy into a fresh generation) | `Compact` + `ClassicCompactor` | `writer::compact` (`CompactionKind::Full` / `Tail`) | **Implemented** |
+| Cleanup / reclaim predicate | `Reclaimers`, `DefaultCleanupStrategy`, `FileReaper` | `WritableRepository::reclaim_old_generations` (Oak's `newOldReclaimer` with one retained generation) | **Implemented** |
+| Online GC, estimation, parallel/checkpoint compactors, memory barrier | `GarbageCollector`, `ParallelCompactor` | — | **Planned** (throughput optimizations; the offline deep copy produces an equivalent result) |
 
 ## 3. Tooling (oak-run segment commands)
 
 | oak-run command | Java | froe command | Status |
 | --- | --- | --- | --- |
-| — (overview) | — | `froe summary` | **Implemented** (no direct oak-run equivalent; closest is `FileStoreStats`) |
-| `tarmkdiff --list` (revisions) | `tool/Revisions` | `froe journal` | **Implemented** |
-| `debug PATH` (store statistics) | `tool/DebugStore` | `froe archives`, `froe segments` | **Implemented** (per-archive and per-segment statistics; reachability analysis **Planned**) |
-| `debug PATH file.tar` | `tool/DebugTars` | `froe archives` (graph and binary references parsing exist in the library) | Partially **Implemented**; path-to-tar attribution **Planned** |
-| `debug PATH uuid:record/path` | `tool/DebugSegments` | `froe segment`, `froe node` | **Implemented** (segment structure and node display; node-record diffing **Planned**) |
-| `check` | `tool/Check` | — | **Planned** (`froe check`: walk revisions newest to oldest, verify full traversability, report the newest consistent revision) |
-| `history` | `tool/History` | — | **Planned** (`froe history`: a node's states across journal revisions) |
-| `tarmkdiff --diff` | `tool/Diff` | — | **Planned** (`froe difference` between two revisions) |
-| `search-nodes` | `tool/SearchNodes` | — | **Planned** (scan all node records matching property/child filters) |
+| `check` | `tool/Check` | `froe check` | **Implemented** |
+| `tarmkdiff --diff` | `tool/Diff` | `froe difference` | **Implemented** |
+| `tarmkdiff --list` | `tool/Revisions` | `froe journal` | **Implemented** |
+| `history` | `tool/History` | `froe history` | **Implemented** |
+| `search-nodes` | `tool/SearchNodes` | `froe search-nodes` | **Implemented** |
+| `compact` | `tool/Compact` | `froe compact` | **Implemented** |
+| `backup` / `restore` | `tool/Backup`, `tool/Restore` | `froe backup`, `froe restore` (plus content export via `froe extract`) | **Implemented** |
+| `recover-journal` | `tool/RecoverJournal` | `froe recover-journal` | **Implemented** |
+| `checkpoints` | `oak-run checkpoints` | `froe checkpoint list/create/remove/remove-all/remove-unreferenced` | **Implemented** |
+| `debug PATH` (store statistics) | `tool/DebugStore` | `froe summary`, `froe archives`, `froe segments` | **Implemented** (reachability analysis **Planned**) |
+| `debug PATH uuid:record/path` | `tool/DebugSegments` | `froe segment`, `froe node` | **Implemented** |
+| `explore` (GUI) | `oak-run` + `file/proc/Proc` | `froe tree`, `froe node` | **Implemented** (terminal form) |
+| `debug PATH file.tar` | `tool/DebugTars` | graph and binary references parsing exist in the library | **Planned** (path-to-tar attribution) |
 | `iotrace` | `tool/iotrace` | — | **Not applicable** (measures the Java store's IO behavior) |
-| `recover-journal` | `tool/RecoverJournal` | — | **Write path** (rewrites `journal.log`); a dry-run variant that only *reports* recoverable revisions is **Planned** |
-| `compact` | `tool/Compact` | — | **Write path** |
-| `backup` / `restore` | `tool/Backup`, `tool/Restore` | `froe extract` covers content-level export; store-level backup is a file copy | **Write path** (store-level); content export **Implemented** |
-| `explore` (GUI) | `oak-run` + `file/proc/Proc` | terminal equivalents: `froe tree`, `froe node` | **Implemented** (terminal form) |
 | `segment-copy` (remote persistences) | `oak-segment-azure` tooling | — | **Planned** alongside remote persistence support |
 
-### The `froe` command surface today
+### The `froe` command surface
+
+Read-only (safe against a live repository):
 
 | Command | Purpose |
 | --- | --- |
-| `froe summary REPOSITORY` | Archives, segment counts, journal size, head revision, checkpoints. |
+| `froe summary REPOSITORY` | Archives, segment counts, journal size, head, checkpoints. |
 | `froe journal REPOSITORY [--limit N]` | Revisions newest first, with validity annotations. |
 | `froe archives REPOSITORY` | Per-archive size, segment count, index version or recovery state. |
 | `froe segments REPOSITORY` | Every segment with kind, size, and generation data. |
-| `froe segment REPOSITORY UUID` | One segment's header, referenced segments, record statistics. |
+| `froe segment REPOSITORY UUID` | One segment's header, references, and record statistics. |
 | `froe node REPOSITORY PATH` | One node: record identifiers, typed properties, children. |
 | `froe tree REPOSITORY [PATH] [--depth N]` | Indented content tree with primary types. |
 | `froe checkpoints REPOSITORY` | Checkpoint names with creation and expiry times. |
-| `froe extract REPOSITORY [--path P] [--depth N] [--output FILE]` | Stream the subtree as JSON lines, one node per line. |
+| `froe extract REPOSITORY [--path P] [--depth N] [--output FILE]` | Stream the subtree as JSON lines. |
+| `froe check REPOSITORY [--path P]… [--binaries]` | The newest fully consistent revision. |
+| `froe difference REPOSITORY BEFORE AFTER [--path P]` | Changes between two revisions. |
+| `froe history REPOSITORY PATH` | A node's record across journal revisions. |
+| `froe search-nodes REPOSITORY [--has-property N]… [--value N=V]…` | Nodes matching predicates, over every segment. |
+
+Mutating (stopped repository only; each confirms before proceeding):
+
+| Command | Purpose |
+| --- | --- |
+| `froe compact REPOSITORY [--tail]` | Offline full or tail compaction with cleanup and journal rewrite. |
+| `froe backup SOURCE TARGET` | Copy a repository's head into a target store. |
+| `froe restore BACKUP TARGET` | Copy a backup's head into an existing store. |
+| `froe recover-journal REPOSITORY` | Rebuild `journal.log` from the segments. |
+| `froe checkpoint create/remove/remove-all/remove-unreferenced REPOSITORY` | Manage checkpoints. |
 
 ## 4. Replication and cold standby
 
 The `standby/` package (Netty-based primary/standby segment streaming,
-TLS, JMX status beans) exists to keep a second *writing* store in sync.
+TLS, JMX status beans) keeps a second *writing* store in sync.
 
 | Feature | Status |
 | --- | --- |
-| Standby client (writes segments into a local store) | **Write path** |
-| Standby server (serves segments from a primary) | **Planned** — serving segments read-only fits `froe`'s model and would let a Rust process act as a seed/mirror source; low priority |
+| Standby client (writes segments into a local store) | **Planned** (the writer and segment provider are the building blocks) |
+| Standby server (serves segments from a primary) | **Planned** — serving segments read-only fits `froe`'s model |
 
 ## 5. Monitoring
 
-JMX beans (`SegmentNodeStoreStats`, `FileStoreStats`, `SegmentRevisionGC`,
-checkpoint and standby beans) instrument a running Java store.
-**Not applicable** as JMX; the equivalent *facts* a reader can compute —
-archive counts and sizes, segment counts, journal length — are exposed by
-the `froe` library API and `froe summary`.
+JMX beans (`SegmentNodeStoreStats`, `FileStoreStats`, `SegmentRevisionGC`)
+instrument a running Java store. **Not applicable** as JMX; the equivalent
+*facts* — archive counts and sizes, segment counts, journal length,
+compaction outcomes — are exposed by the `froe` library API and by
+`froe summary` and `froe compact`.
 
 ## 6. Using `froe` as a Rust dependency
+
+Reading:
 
 ```rust
 use froe::store::Repository;
 
 fn main() -> froe::Result<()> {
     let repository = Repository::open(std::path::Path::new("/path/to/segmentstore"))?;
-    let content_root = repository.content_root()?;
-    for (name, child) in content_root.child_node_entries()? {
-        println!("{name}: {} children", child.child_node_count()?);
-    }
     if let Some(node) = repository.node_at_path("/content")? {
         for property in node.properties()? {
             println!("{} = {:?}", property.name, property.values);
@@ -162,9 +179,23 @@ fn main() -> froe::Result<()> {
 }
 ```
 
+Writing (against a stopped repository):
+
+```rust
+use froe::{compact, CompactionKind, WritableRepository};
+
+fn main() -> froe::Result<()> {
+    let mut store = WritableRepository::open(std::path::Path::new("/path/to/segmentstore"))?;
+    let outcome = compact(&mut store, CompactionKind::Full)?;
+    println!("reclaimed {} bytes", outcome.size_before - outcome.size_after);
+    store.close()
+}
+```
+
 The crate exposes each layer independently: `tar_archive` (archives,
-indexes, graphs, binary reference catalogs), `segment` (segment parsing
-and addressing), `content` (records to node states), `journal`, and
-`store` (the assembled repository). Custom stores — in-memory fixtures,
-remote backends — implement the `SegmentProvider` trait and reuse the
-whole content layer unchanged.
+indexes, graphs, binary reference catalogs), `segment` (segment parsing,
+addressing, and building), `content` (records to node states), `journal`,
+`store` (the read-only repository), `writer` (the write path), and
+`tooling` (check, diff, history, search). Custom backends implement the
+`SegmentProvider` and `SegmentSink` traits and reuse the whole content and
+writer layers unchanged.

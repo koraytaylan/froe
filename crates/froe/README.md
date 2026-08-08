@@ -1,15 +1,25 @@
 # froe
 
-Reader for Apache Jackrabbit Oak `segment-tar` ("TarMK") repositories — the
-storage format used by Apache Jackrabbit Oak and Adobe Experience Manager.
+A Rust implementation of Apache Jackrabbit Oak's `segment-tar` ("TarMK")
+storage format — the repository format used by Apache Jackrabbit Oak and
+Adobe Experience Manager.
 
-This crate opens a segment store directly from disk, resolves the current
-head state from the journal, and exposes the content tree for traversal and
-extraction — without a running Oak instance. It is read-only by design: it
-never takes the repository lock and never modifies any file, so it is safe to
-point at a live repository or a backup.
+This crate opens a segment store directly from disk, without a running Oak
+instance. The reading API ([`store`], [`content`], [`tooling`]) is
+read-only and safe against a live repository — it never takes the lock and
+never writes. The writing API ([`writer`]) — commits, checkpoints,
+compaction, backup, restore, journal recovery — takes the exclusive
+repository lock and produces stores byte-for-byte compatible with what Oak
+writes, so a subsequent AEM start consumes the result cleanly; run it only
+against a *stopped* repository.
 
-See the workspace repository for the complete feature map and storage format
-documentation, and the `froe-cli` crate for the command-line interface.
+See the workspace repository for the complete feature map and storage
+format documentation, and the `froe-cli` crate for the command-line
+interface.
+
+[`store`]: https://docs.rs/froe/latest/froe/store/
+[`content`]: https://docs.rs/froe/latest/froe/content/
+[`tooling`]: https://docs.rs/froe/latest/froe/tooling/
+[`writer`]: https://docs.rs/froe/latest/froe/writer/
 
 Licensed under the Apache License, Version 2.0.
