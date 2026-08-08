@@ -15,7 +15,7 @@ use crate::store::{ArchiveSet, open_all_archives};
 
 /// A content tree is never this deep; beyond it the node records form a
 /// cycle in a corrupt store, and the diff walk stops.
-const MAXIMUM_DIFF_DEPTH: usize = 100_000;
+const MAXIMUM_DIFF_DEPTH: usize = 4000;
 
 /// A property-level change within a node.
 #[derive(Debug, Clone, PartialEq)]

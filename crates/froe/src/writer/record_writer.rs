@@ -180,15 +180,28 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
         );
         self.segment_sequence = self.segment_sequence.wrapping_add(1);
         let bytes = info.as_bytes();
-        // The info string is always well under the 128-byte small-value
-        // limit for reasonable writer identifiers.
-        let record = self
-            .current
-            .allocate(RecordType::Value, 1 + bytes.len(), &[])
-            .expect("the segment-info record always fits an empty segment");
-        let target = self.current.record_bytes_mut(record);
-        target[0] = bytes.len() as u8;
-        target[1..=bytes.len()].copy_from_slice(bytes);
+        // Short identifiers keep the info string under the 128-byte small
+        // limit; a pathologically long identifier falls back to the medium
+        // encoding so record 0 is always a valid string.
+        if bytes.len() < SMALL_VALUE_LIMIT {
+            let record = self
+                .current
+                .allocate(RecordType::Value, 1 + bytes.len(), &[])
+                .expect("the segment-info record always fits an empty segment");
+            let target = self.current.record_bytes_mut(record);
+            target[0] = bytes.len() as u8;
+            target[1..=bytes.len()].copy_from_slice(bytes);
+        } else {
+            let truncated = &bytes[..bytes.len().min(MEDIUM_VALUE_LIMIT - 1)];
+            let record = self
+                .current
+                .allocate(RecordType::Value, 2 + truncated.len(), &[])
+                .expect("the segment-info record always fits an empty segment");
+            let stored = (truncated.len() - SMALL_VALUE_LIMIT) as u16 | 0x8000;
+            let target = self.current.record_bytes_mut(record);
+            target[0..2].copy_from_slice(&stored.to_be_bytes());
+            target[2..2 + truncated.len()].copy_from_slice(truncated);
+        }
     }
 
     /// Allocates a record, rolling to a fresh segment when full.
@@ -246,6 +259,56 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     /// Writes an inline binary value record and returns its identifier.
     pub fn write_binary_content(&mut self, content: &[u8]) -> Result<RecordIdentifier> {
         self.write_value_bytes(content)
+    }
+
+    /// Copies an inline binary value from `source` into a fresh value
+    /// record without holding the whole binary in memory: short and medium
+    /// binaries are materialized (they are small by definition), while a
+    /// long binary is streamed 4 KiB block at a time into new block
+    /// records and indexed by a fresh list. This lets compaction and
+    /// backup re-copy multi-gigabyte inline binaries in bounded memory.
+    pub fn copy_binary_value(
+        &mut self,
+        source: &dyn crate::content::provider::SegmentProvider,
+        source_value: RecordIdentifier,
+    ) -> Result<RecordIdentifier> {
+        let length = crate::content::value::read_value_length(source, source_value)?;
+        if length < MEDIUM_VALUE_LIMIT as u64 {
+            // Small or medium: materializing at most ~16 KiB is fine.
+            let content = crate::content::value::read_binary_content(source, source_value)?;
+            return self.write_binary_content(&content);
+        }
+
+        // Long: stream the source's blocks into fresh block records.
+        let block_count = length.div_ceil(BLOCK_SIZE as u64);
+        let source_view = source.segment(source_value.segment)?;
+        let list_identifier =
+            source_view.read_record_identifier(source_value.record_number, 8, 0)?;
+        let source_blocks =
+            crate::content::list::uncounted_list_entries(source, list_identifier, block_count)?;
+
+        let mut block_identifiers = Vec::with_capacity(source_blocks.len());
+        let mut remaining = length;
+        for source_block in source_blocks {
+            let block_length = remaining.min(BLOCK_SIZE as u64) as usize;
+            let block_view = source.segment(source_block.segment)?;
+            let block_bytes = block_view.read_bytes(source_block.record_number, 0, block_length)?;
+            let record = self.allocate(RecordType::Block, block_length, &[])?;
+            self.current.record_bytes_mut(record)[..block_length].copy_from_slice(block_bytes);
+            block_identifiers.push(self.identifier_of(record));
+            remaining -= block_length as u64;
+        }
+
+        let body =
+            self.write_list_body(&block_identifiers)?
+                .ok_or_else(|| Error::InvalidFormat {
+                    details: "a long binary always has at least one block".to_owned(),
+                })?;
+        let record = self.allocate(RecordType::Value, 8 + 6, &[body])?;
+        let stored = (length - MEDIUM_VALUE_LIMIT as u64) | (0b11 << 62);
+        self.current.record_bytes_mut(record)[0..8].copy_from_slice(&stored.to_be_bytes());
+        self.write_identifier_at(record, 8, body);
+        Ok(self.identifier_of(record))
     }
 
     /// Writes a value record: inline below 16512 bytes, block-backed
@@ -616,6 +679,37 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
         child_nodes: &ChildNodesToWrite,
         properties: &[PropertyToWrite],
     ) -> Result<RecordIdentifier> {
+        self.write_node_with_stable_identifier(
+            primary_type,
+            mixin_types,
+            child_nodes,
+            properties,
+            None,
+        )
+    }
+
+    /// Writes a node, preserving an existing stable identifier when one is
+    /// given. A stable identifier survives compaction: when it differs
+    /// from the node's own record identifier, it is stored as a 20-byte
+    /// block (`msb`, `lsb`, record number) and slot 0 points at it;
+    /// otherwise slot 0 is a self reference. Preserving it lets Oak's
+    /// stable-identifier fast path keep matching a node across rewrites.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on internal allocation invariants, never on input.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "record slice indexing is in-bounds by construction of the allocation"
+    )]
+    pub fn write_node_with_stable_identifier(
+        &mut self,
+        primary_type: Option<&str>,
+        mixin_types: &[String],
+        child_nodes: &ChildNodesToWrite,
+        properties: &[PropertyToWrite],
+        stable_identifier: Option<[u8; 20]>,
+    ) -> Result<RecordIdentifier> {
         let template_identifier =
             self.write_template(primary_type, mixin_types, child_nodes, properties)?;
 
@@ -644,20 +738,58 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
             )
         };
 
+        // A preserved stable identifier is stored as a 20-byte block that
+        // slot 0 references, unless it happens to name the node itself.
+        let stable_block = match stable_identifier {
+            Some(bytes) => {
+                let record = self.allocate(RecordType::Block, 20, &[])?;
+                self.current.record_bytes_mut(record)[..20].copy_from_slice(&bytes);
+                Some(self.identifier_of(record))
+            }
+            None => None,
+        };
+
         let mut slots: Vec<RecordIdentifier> = vec![template_identifier];
         slots.extend(child_identifier);
         slots.extend(property_list_identifier);
 
+        let mut referenced = slots.clone();
+        referenced.extend(stable_block);
         let size = 6 + slots.len() * 6;
-        let record = self.allocate(RecordType::Node, size, &slots)?;
-        // Slot 0: the stable identifier as a self reference.
+        let record = self.allocate(RecordType::Node, size, &referenced)?;
         let own_identifier = self.identifier_of(record);
-        self.write_identifier_at(record, 0, own_identifier);
+        // Slot 0: the preserved stable-id block, or a self reference.
+        let slot_zero = match stable_block {
+            Some(block) => {
+                // A stable identifier equal to the node's own record would
+                // be redundant; the self-reference marker covers it.
+                if stable_identifier_names(stable_identifier, own_identifier) {
+                    own_identifier
+                } else {
+                    block
+                }
+            }
+            None => own_identifier,
+        };
+        self.write_identifier_at(record, 0, slot_zero);
         for (position, identifier) in slots.iter().enumerate() {
             self.write_identifier_at(record, 6 + position * 6, *identifier);
         }
         Ok(own_identifier)
     }
+}
+
+/// Whether a 20-byte stable identifier names exactly `record`.
+fn stable_identifier_names(stable_identifier: Option<[u8; 20]>, record: RecordIdentifier) -> bool {
+    let Some(bytes) = stable_identifier else {
+        return false;
+    };
+    let most = u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes"));
+    let least = u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes"));
+    let number = u32::from_be_bytes(bytes[16..20].try_into().expect("4 bytes"));
+    most == record.segment.most_significant_bits
+        && least == record.segment.least_significant_bits
+        && number == record.record_number
 }
 
 /// Sorts properties into the on-disk template order: by Java string hash

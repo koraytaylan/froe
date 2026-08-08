@@ -108,6 +108,28 @@ impl<'provider> NodeState<'provider> {
         Ok(format!("{segment}:{record_number}"))
     }
 
+    /// The node's 20-byte stable identifier: the serialized (`msb`, `lsb`,
+    /// record number) of the record its identity descends from. When slot 0
+    /// is a self reference, this is the node's own record identifier
+    /// serialized. Rewriters propagate these bytes so a node keeps its
+    /// identity across compaction.
+    pub fn stable_identifier_bytes(&self) -> Result<[u8; 20]> {
+        let view = self.provider.segment(self.record_identifier.segment)?;
+        let slot = view.read_record_identifier(self.record_identifier.record_number, 0, 0)?;
+        if slot == self.record_identifier {
+            let mut bytes = [0u8; 20];
+            bytes[0..8].copy_from_slice(&slot.segment.most_significant_bits.to_be_bytes());
+            bytes[8..16].copy_from_slice(&slot.segment.least_significant_bits.to_be_bytes());
+            bytes[16..20].copy_from_slice(&slot.record_number.to_be_bytes());
+            return Ok(bytes);
+        }
+        let target = self.provider.segment(slot.segment)?;
+        let stored = target.read_bytes(slot.record_number, 0, 20)?;
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(stored);
+        Ok(bytes)
+    }
+
     /// The number of child nodes.
     pub fn child_node_count(&self) -> Result<u64> {
         match self.template()?.child_arity {
@@ -188,6 +210,21 @@ impl<'provider> NodeState<'provider> {
                 ),
             });
         }
+        for property_index in 0..template.properties.len() {
+            properties.push(self.property_at(&template, property_index)?);
+        }
+        Ok(properties)
+    }
+
+    /// The node's *stored* properties, in template order, **without** the
+    /// synthesized `jcr:primaryType` and `jcr:mixinTypes`. Rewriting a node
+    /// must use this together with the template's primary type and mixin
+    /// types, never [`Self::properties`] filtered by name — a property
+    /// literally named `jcr:primaryType` of a non-name type is a real
+    /// stored property and would otherwise be lost.
+    pub fn stored_properties(&self) -> Result<Vec<PropertyState>> {
+        let template = self.template()?;
+        let mut properties = Vec::with_capacity(template.properties.len());
         for property_index in 0..template.properties.len() {
             properties.push(self.property_at(&template, property_index)?);
         }

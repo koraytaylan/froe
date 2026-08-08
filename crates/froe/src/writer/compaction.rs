@@ -76,9 +76,11 @@ pub fn deep_copy_tree<Sink: SegmentSink>(
     Ok((root, copier.compacted_nodes))
 }
 
-/// A content tree is never this deep; a greater depth means the source
-/// node records form a cycle in a corrupt store.
-const MAXIMUM_COMPACTION_DEPTH: usize = 100_000;
+/// A content tree is never this deep — JCR paths in even the largest AEM
+/// repositories stay under a few hundred levels. A greater depth means the
+/// source node records form a cycle in a corrupt store. The bound is set
+/// well below the point where recursion would overflow the stack.
+const MAXIMUM_COMPACTION_DEPTH: usize = 4000;
 
 /// Deep-copies nodes into a fresh generation, sharing rewritten records
 /// through a source-record cache.
@@ -111,6 +113,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         }
         let node = NodeState::new(self.source, source_node);
         let template = node.template()?;
+        let stable_identifier = node.stable_identifier_bytes()?;
 
         // Rewrite children first so the node record can reference them.
         let mut child_entries = Vec::new();
@@ -129,23 +132,22 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
             _ => ChildNodesToWrite::Many(child_entries),
         };
 
-        // Rewrite property values into fresh records.
+        // Rewrite the *stored* property values into fresh records — never
+        // the synthesized jcr:primaryType/jcr:mixinTypes, and never a
+        // name filter (which would drop an ordinary property of one of
+        // those names). The head types come from the template.
         let mut properties = Vec::new();
-        for property in node.properties()? {
-            // jcr:primaryType and jcr:mixinTypes are synthesized from the
-            // template head, not stored as properties.
-            if property.name == "jcr:primaryType" || property.name == "jcr:mixinTypes" {
-                continue;
-            }
+        for property in node.stored_properties()? {
             properties.push(self.rewrite_property(&property)?);
         }
         sort_properties_for_template(&mut properties);
 
-        let rewritten = self.writer.write_node(
+        let rewritten = self.writer.write_node_with_stable_identifier(
             template.primary_type.as_deref(),
             &template.mixin_types,
             &children,
             &properties,
+            Some(stable_identifier),
         )?;
         self.rewritten_nodes.insert(source_node, rewritten);
         self.compacted_nodes += 1;
@@ -187,11 +189,11 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
                 PropertyValue::Binary(BinaryValue::Inline {
                     record_identifier, ..
                 }) => {
-                    let content = crate::content::value::read_binary_content(
-                        self.source,
-                        *record_identifier,
-                    )?;
-                    self.writer.write_binary_content(&content)
+                    // Copy the binary streaming, block by block, so a
+                    // multi-gigabyte inline binary never has to fit in
+                    // memory at once.
+                    self.writer
+                        .copy_binary_value(self.source, *record_identifier)
                 }
                 _ => Err(Error::InvalidFormat {
                     details: "binary property did not decode to a binary value".to_owned(),
@@ -249,11 +251,49 @@ pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<C
     rewrite_journal_to_head(store, new_head)?;
 
     let size_after = store.archive_size_on_disk()?;
+    // Append the gc.log line Oak's cleanup writes, so a later Oak tail
+    // compaction against this store finds its previous-compaction record.
+    append_gc_log(
+        store,
+        size_after,
+        size_before.saturating_sub(size_after),
+        target_generation,
+        compacted_nodes,
+        new_head,
+    )?;
+
     Ok(CompactionOutcome {
         size_before,
         size_after,
         compacted_nodes,
     })
+}
+
+/// Appends one line to `gc.log`:
+/// `repoSize,reclaimedSize,timestamp,generation,fullGeneration,nodes,root`.
+fn append_gc_log(
+    store: &WritableRepository,
+    repository_size: u64,
+    reclaimed_size: u64,
+    generation: GarbageCollectionGeneration,
+    compacted_nodes: u64,
+    root: RecordIdentifier,
+) -> Result<()> {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let line = format!(
+        "{repository_size},{reclaimed_size},{timestamp},{},{},{compacted_nodes},{}:{}\n",
+        generation.generation, generation.full_generation, root.segment, root.record_number as i32,
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.directory().join("gc.log"))?;
+    file.write_all(line.as_bytes())?;
+    file.sync_data()?;
+    Ok(())
 }
 
 /// Rewrites `journal.log` to a single line naming `head`, matching the
@@ -276,8 +316,23 @@ fn rewrite_journal_to_head(store: &WritableRepository, head: RecordIdentifier) -
         file.sync_all()?;
     }
     std::fs::rename(&temporary_path, &journal_path)?;
-    store.reset_persisted_head(head);
+    // fsync the directory so the rename (and the deletion of the old
+    // archives during the preceding reclaim) is durable before the caller
+    // considers compaction complete.
+    fsync_directory(store.directory());
+    store.reset_persisted_head(head)?;
     Ok(())
+}
+
+/// Forces a directory's metadata to disk, so renames and deletions within
+/// it survive a power failure. A no-op on platforms where a directory
+/// cannot be opened as a file.
+pub(crate) fn fsync_directory(directory: &std::path::Path) {
+    if let Ok(handle) = std::fs::File::open(directory) {
+        // Directories cannot be data-synced on every filesystem; ignore an
+        // error from sync while still opening the handle where possible.
+        let _ = handle.sync_all();
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +484,242 @@ mod tests {
         // The journal is a single line and the reader opens cleanly.
         let journal = std::fs::read_to_string(directory.path.join("journal.log")).expect("journal");
         assert_eq!(journal.lines().count(), 1, "journal rewritten to one line");
+        // A gc.log line was appended.
+        let gc_log = std::fs::read_to_string(directory.path.join("gc.log")).expect("gc.log");
+        assert_eq!(gc_log.lines().count(), 1);
+        assert_eq!(gc_log.split(',').count(), 7, "seven gc.log fields");
+    }
+
+    #[test]
+    fn compaction_preserves_stable_identifiers() {
+        let directory = TestDirectory::new("stable-ids");
+        build_populated_store(&directory);
+
+        // Record the content node's stable identifier before compaction.
+        let before = {
+            let repository = Repository::open(&directory.path).expect("reader");
+            repository
+                .node_at_path("/content")
+                .expect("resolve")
+                .expect("present")
+                .stable_identifier()
+                .expect("stable id")
+        };
+        {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            compact(&mut store, CompactionKind::Full).expect("compact");
+            store.close().expect("close");
+        }
+        let after = {
+            let repository = Repository::open(&directory.path).expect("reader");
+            repository
+                .node_at_path("/content")
+                .expect("resolve")
+                .expect("present")
+                .stable_identifier()
+                .expect("stable id")
+        };
+        assert_eq!(
+            before, after,
+            "the stable identifier survives compaction so Oak's fast path keeps matching"
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_infinite_doubles_and_type_named_properties() {
+        let directory = TestDirectory::new("edge-values");
+        {
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            // A DOUBLE property holding positive infinity, and a STRING
+            // property literally named jcr:primaryType (a non-name-typed
+            // reserved name, stored as an ordinary property by Oak).
+            let infinity_value = writer.write_string("Infinity").expect("value");
+            let odd_name_value = writer.write_string("literal").expect("value");
+            // No synthesized (Name-typed) primary type, so the String
+            // property literally named jcr:primaryType is the only carrier
+            // of that name — exactly the shape Oak stores as an ordinary
+            // property and that a name filter would drop.
+            let content = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::Zero,
+                    &[
+                        PropertyToWrite {
+                            name: "ratio".to_owned(),
+                            property_type: crate::content::property::PropertyType::Double,
+                            values: PropertyValuesToWrite::Single(infinity_value),
+                        },
+                        PropertyToWrite {
+                            name: "jcr:primaryType".to_owned(),
+                            property_type: crate::content::property::PropertyType::String,
+                            values: PropertyValuesToWrite::Single(odd_name_value),
+                        },
+                    ],
+                )
+                .expect("content");
+            let root = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "content".to_owned(),
+                        node: content,
+                    },
+                    &[],
+                )
+                .expect("root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("super root");
+            writer.finish().expect("finish");
+            let previous = store.head();
+            assert!(store.set_head(previous, head));
+            store.close().expect("close");
+        }
+        {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            compact(&mut store, CompactionKind::Full).expect("compact");
+            store.close().expect("close");
+        }
+        let repository = Repository::open(&directory.path).expect("reader");
+        let content = repository
+            .node_at_path("/content")
+            .expect("resolve")
+            .expect("present");
+        // The infinite double survives with a value AEM can parse.
+        let ratio = content.property("ratio").expect("read").expect("present");
+        assert_eq!(
+            ratio.values,
+            PropertyValues::Single(PropertyValue::Double(f64::INFINITY))
+        );
+        // The oddly-typed jcr:primaryType survives as a String property,
+        // not silently dropped.
+        let odd = content
+            .property("jcr:primaryType")
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            odd.property_type,
+            crate::content::property::PropertyType::String
+        );
+        assert_eq!(
+            odd.values,
+            PropertyValues::Single(PropertyValue::String("literal".to_owned()))
+        );
+    }
+
+    #[test]
+    fn compaction_streams_long_binaries_through_bulk_segments() {
+        let directory = TestDirectory::new("long-binary");
+        // A binary spanning multiple 4 KiB blocks plus a full 256 KiB bulk
+        // run, so the streaming copy path (not the inline materialization)
+        // is exercised.
+        let content: Vec<u8> = (0..300 * 1024).map(|index| (index % 251) as u8).collect();
+        {
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let binary_value = writer.write_binary_content(&content).expect("binary");
+            let content_node = writer
+                .write_node(
+                    Some("nt:file"),
+                    &[],
+                    &ChildNodesToWrite::Zero,
+                    &[PropertyToWrite {
+                        name: "data".to_owned(),
+                        property_type: crate::content::property::PropertyType::Binary,
+                        values: PropertyValuesToWrite::Single(binary_value),
+                    }],
+                )
+                .expect("content");
+            let root = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "content".to_owned(),
+                        node: content_node,
+                    },
+                    &[],
+                )
+                .expect("root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("super root");
+            writer.finish().expect("finish");
+            let previous = store.head();
+            assert!(store.set_head(previous, head));
+            store.close().expect("close");
+        }
+        {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            compact(&mut store, CompactionKind::Full).expect("compact");
+            store.close().expect("close");
+        }
+        // The binary content survives compaction byte for byte.
+        let repository = Repository::open(&directory.path).expect("reader");
+        let content_node = repository
+            .node_at_path("/content")
+            .expect("resolve")
+            .expect("present");
+        let data = content_node
+            .property("data")
+            .expect("read")
+            .expect("present");
+        let record = match &data.values {
+            PropertyValues::Single(PropertyValue::Binary(
+                crate::content::value::BinaryValue::Inline {
+                    record_identifier, ..
+                },
+            )) => *record_identifier,
+            other => panic!("expected an inline binary, got {other:?}"),
+        };
+        let read_back =
+            crate::content::value::read_binary_content(&repository, record).expect("content");
+        assert_eq!(
+            read_back, content,
+            "the long binary round-trips through compaction"
+        );
+    }
+
+    #[test]
+    fn committing_after_compaction_in_one_session_persists_the_journal() {
+        let directory = TestDirectory::new("commit-after-compact");
+        build_populated_store(&directory);
+        {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            compact(&mut store, CompactionKind::Full).expect("compact");
+            // A checkpoint create moves the head; its journal line must
+            // reach the live journal, not the orphaned pre-rewrite inode.
+            create_checkpoint(&store, 10_000_000, &[]).expect("checkpoint");
+            store.close().expect("close");
+        }
+        // The reader resolves the post-compaction checkpoint head.
+        let repository = Repository::open(&directory.path).expect("reader");
+        assert_eq!(
+            repository.checkpoints().expect("checkpoints").len(),
+            2,
+            "the checkpoint created after compaction is visible in the journal"
+        );
     }
 
     #[test]

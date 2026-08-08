@@ -18,6 +18,10 @@ use crate::journal::read_journal;
 use crate::segment::record::RecordIdentifier;
 use crate::store::{ArchiveSet, open_all_archives};
 
+/// The maximum content tree depth checked before assuming a cycle; set
+/// well below the stack-overflow threshold. Real trees are far shallower.
+const MAXIMUM_CHECK_DEPTH: usize = 4000;
+
 /// The result of checking one revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionCheck {
@@ -181,7 +185,7 @@ fn verify_subtree(
         visited: &mut HashSet<RecordIdentifier>,
         depth: usize,
     ) -> Result<()> {
-        if depth > 100_000 || !visited.insert(record) {
+        if depth > MAXIMUM_CHECK_DEPTH || !visited.insert(record) {
             return Ok(());
         }
         let node = NodeState::new(provider, record);

@@ -163,13 +163,20 @@ impl WritableRepository {
         self.lock_write_state().head = new_head;
     }
 
-    /// Marks `head` as the persisted head, so the next flush does not
-    /// re-append a journal line. Used after an out-of-band journal
-    /// rewrite (compaction).
-    pub fn reset_persisted_head(&self, head: RecordIdentifier) {
+    /// Marks `head` as the persisted head after an out-of-band journal
+    /// rewrite (compaction), so the next flush does not re-append a line —
+    /// and reopens the journal handle onto the freshly written file, so a
+    /// later head-moving flush in the same session appends to the live
+    /// journal rather than the unlinked old inode.
+    pub fn reset_persisted_head(&self, head: RecordIdentifier) -> Result<()> {
         let mut state = self.lock_write_state();
         state.head = head;
         state.persisted_head = Some(head);
+        state.journal_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.directory.join("journal.log"))?;
+        Ok(())
     }
 
     /// The head node state (the super-root).
@@ -231,6 +238,9 @@ impl WritableRepository {
         for archive_name in archive_files {
             self.reclaim_one_archive(&archive_name, reference_generation, full)?;
         }
+        // Make the archive deletions and any swept replacements durable
+        // before the caller proceeds to the journal rewrite.
+        crate::writer::compaction::fsync_directory(&self.directory);
         Ok(())
     }
 
@@ -257,6 +267,11 @@ impl WritableRepository {
 
         if survivor_count == 0 {
             std::fs::remove_file(&path)?;
+            return Ok(());
+        }
+        // A file already at generation `z` is never rewritten (Oak stops
+        // garbage collection at `z`); leave its survivors in place.
+        if archive_name.file_generation >= 'z' {
             return Ok(());
         }
         // Rewrite the survivors to the next generation letter, then delete
@@ -446,13 +461,17 @@ impl WritableRepository {
     }
 
     /// Closes the session: flush (journal line before trailers, like
-    /// Oak), then finalize the open archive with its trailer entries.
+    /// Oak), then finalize the open archive with its trailer entries, and
+    /// fsync the directory so newly created archive files and the journal
+    /// are durably linked.
     pub fn close(self) -> Result<()> {
         self.flush()?;
         let mut state = self.lock_write_state();
         if let Some(tar_writer) = state.tar_writer.take() {
             tar_writer.close()?;
         }
+        drop(state);
+        crate::writer::compaction::fsync_directory(&self.directory);
         Ok(())
     }
 
@@ -575,11 +594,18 @@ fn is_reclaimable(
     full: bool,
 ) -> bool {
     const RETAINED: i32 = 1;
+    // Wrapping subtraction matches Java's `GCGeneration.compareWith`, which
+    // uses plain int subtraction; it also cannot panic on the pathological
+    // generation values a corrupt archive index might carry.
     if full {
-        reference.full_generation - segment.full_generation >= RETAINED
-            || (reference.generation - segment.generation >= RETAINED && !segment.is_compacted)
+        reference
+            .full_generation
+            .wrapping_sub(segment.full_generation)
+            >= RETAINED
+            || (reference.generation.wrapping_sub(segment.generation) >= RETAINED
+                && !segment.is_compacted)
     } else {
-        reference.generation - segment.generation >= RETAINED
+        reference.generation.wrapping_sub(segment.generation) >= RETAINED
             && !(segment.is_compacted && segment.full_generation == reference.full_generation)
     }
 }

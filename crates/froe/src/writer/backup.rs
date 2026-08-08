@@ -83,9 +83,6 @@ struct Candidate {
     /// Whether the super-root has a `checkpoints` child, Oak's stronger
     /// candidate signal.
     has_checkpoints: bool,
-    /// The number of nodes reachable from the candidate; the true head
-    /// reaches the most content. `None` until consistency is checked.
-    reachable_nodes: Option<usize>,
 }
 
 /// Rebuilds `journal.log` from the segments on disk. Scans every data
@@ -127,24 +124,20 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
                     record,
                     timestamp_milliseconds: timestamp,
                     has_checkpoints,
-                    reachable_nodes: None,
                 });
             }
         }
     }
     let candidates_examined = candidates.len();
 
-    // Keep only fully traversable candidates, recording how many nodes
-    // each reaches.
-    for candidate in &mut candidates {
-        candidate.reachable_nodes = count_reachable_nodes(&provider, candidate.record);
-    }
-    candidates.retain(|candidate| candidate.reachable_nodes.is_some());
-
-    // The true head is the newest, richest super-root: prefer one with a
-    // checkpoints child, then the latest timestamp, then the most
-    // reachable content, then a deterministic identifier order so the
-    // result never depends on random segment identifiers.
+    // Order candidates newest first — Oak's ordering — so the first
+    // consistent one is the true head, never an older super-root that
+    // happens to reach more content (which would resurrect deleted
+    // content). Prefer a super-root that also has a checkpoints child
+    // (Oak requires both), then the latest timestamp, then a deterministic
+    // record order so the result never depends on random segment
+    // identifiers. The write-order signal within a segment is the record
+    // number: a higher number was allocated later, hence newer.
     candidates.sort_by(|first, second| {
         second
             .has_checkpoints
@@ -154,12 +147,16 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
                     .timestamp_milliseconds
                     .cmp(&first.timestamp_milliseconds)
             })
-            .then_with(|| second.reachable_nodes.cmp(&first.reachable_nodes))
+            .then_with(|| second.record.record_number.cmp(&first.record.record_number))
             .then_with(|| record_order_key(second.record).cmp(&record_order_key(first.record)))
     });
 
+    // Take the newest fully consistent candidate. Consistency is checked
+    // lazily in newest-first order, so a healthy store stops at the first
+    // candidate rather than walking every historical revision.
     let recovered_head = candidates
-        .first()
+        .iter()
+        .find(|candidate| is_fully_consistent(&provider, candidate.record))
         .map(|candidate| candidate.record)
         .ok_or_else(|| Error::InvalidFormat {
             details: format!(
@@ -169,7 +166,14 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
         })?;
 
     let previous_journal_backup = back_up_existing_journal(directory)?;
-    write_recovered_journal(directory, recovered_head)?;
+    // Roll the journal backup back if writing the new journal fails, so a
+    // failure never leaves the store without a journal.
+    if let Err(error) = write_recovered_journal(directory, recovered_head) {
+        if let Some(backup_path) = &previous_journal_backup {
+            let _ = std::fs::rename(backup_path, directory.join("journal.log"));
+        }
+        return Err(error);
+    }
 
     Ok(RecoveryOutcome {
         recovered_head,
@@ -202,33 +206,61 @@ fn record_order_key(record: RecordIdentifier) -> (u64, u64, u32) {
     )
 }
 
-/// Counts the nodes reachable from a candidate super-root, returning
-/// `None` when the tree cannot be fully traversed (a missing segment or a
-/// malformed record) — the consistency gate.
-fn count_reachable_nodes(
-    provider: &dyn SegmentProvider,
-    record: RecordIdentifier,
-) -> Option<usize> {
+/// A candidate tree is never this deep; a greater depth means a cycle in
+/// corrupt data. Bounded below the stack-overflow threshold.
+const MAXIMUM_RECOVERY_DEPTH: usize = 4000;
+
+/// Whether the entire tree under a candidate super-root can be traversed
+/// without a missing segment or malformed record — the consistency gate.
+/// Inline binaries are materialized so a head whose binary bulk segments
+/// are missing fails the gate (Oak would reject such a revision).
+fn is_fully_consistent(provider: &dyn SegmentProvider, record: RecordIdentifier) -> bool {
     fn walk(
         provider: &dyn SegmentProvider,
         record: RecordIdentifier,
         visited: &mut HashSet<RecordIdentifier>,
         depth: usize,
     ) -> Result<()> {
-        if depth > 4096 || !visited.insert(record) {
+        if depth > MAXIMUM_RECOVERY_DEPTH || !visited.insert(record) {
             return Ok(());
         }
         let node = NodeState::new(provider, record);
-        // Reading properties forces their value records to resolve.
-        let _ = node.properties()?;
+        for property in node.properties()? {
+            match &property.values {
+                crate::content::node::PropertyValues::Single(value) => {
+                    materialize_inline_binary(provider, value)?;
+                }
+                crate::content::node::PropertyValues::Multiple(values) => {
+                    for value in values {
+                        materialize_inline_binary(provider, value)?;
+                    }
+                }
+            }
+        }
         for (_, child) in node.child_node_entries()? {
             walk(provider, child.record_identifier(), visited, depth + 1)?;
         }
         Ok(())
     }
     let mut visited = HashSet::new();
-    walk(provider, record, &mut visited, 0).ok()?;
-    Some(visited.len())
+    walk(provider, record, &mut visited, 0).is_ok()
+}
+
+/// Reads an inline binary's content to force its blocks (possibly in bulk
+/// segments) to resolve; external binaries have no local content.
+fn materialize_inline_binary(
+    provider: &dyn SegmentProvider,
+    value: &crate::content::property::PropertyValue,
+) -> Result<()> {
+    use crate::content::property::PropertyValue;
+    use crate::content::value::BinaryValue;
+    if let PropertyValue::Binary(BinaryValue::Inline {
+        record_identifier, ..
+    }) = value
+    {
+        crate::content::value::read_binary_content(provider, *record_identifier)?;
+    }
+    Ok(())
 }
 
 /// Reads the `"t"` timestamp from a segment's info record (record 0).
@@ -390,6 +422,86 @@ mod tests {
                 .values,
             PropertyValues::Single(PropertyValue::String(expected_title.to_owned()))
         );
+    }
+
+    /// Writes one `/content` revision whose child count is `child_count`,
+    /// then a checkpoint so it is a full super-root candidate.
+    fn write_revision_with_children(directory: &std::path::Path, child_count: usize) {
+        let store = WritableRepository::open(directory).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let mut children = Vec::new();
+        for index in 0..child_count {
+            let child = writer
+                .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+                .expect("child");
+            children.push((format!("child-{index}"), child));
+        }
+        let child_structure = if children.is_empty() {
+            ChildNodesToWrite::Zero
+        } else {
+            ChildNodesToWrite::Many(children)
+        };
+        let content = writer
+            .write_node(Some("nt:unstructured"), &[], &child_structure, &[])
+            .expect("content");
+        let root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "content".to_owned(),
+                    node: content,
+                },
+                &[],
+            )
+            .expect("root");
+        let head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: root,
+                },
+                &[],
+            )
+            .expect("super root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, head));
+        create_checkpoint(&store, 10_000_000, &[]).expect("checkpoint");
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn recovery_picks_the_newest_revision_even_when_it_has_fewer_nodes() {
+        // A recovery must return the newest committed state, never an older
+        // one that happens to reach more content — otherwise a commit that
+        // deleted content would be silently reverted.
+        let directory = TestDirectory::new("recover-newest");
+        write_revision_with_children(&directory.path, 8); // older, larger
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_revision_with_children(&directory.path, 2); // newer, smaller
+
+        let newest_head = {
+            let repository = Repository::open(&directory.path).expect("reader");
+            repository.head_record_identifier()
+        };
+
+        std::fs::remove_file(directory.path.join("journal.log")).expect("remove journal");
+        let outcome = recover_journal(&directory.path).expect("recover");
+        assert_eq!(
+            outcome.recovered_head, newest_head,
+            "recovery returns the newest revision, not the larger older one"
+        );
+        // The recovered content has the newer, smaller child set.
+        let repository = Repository::open(&directory.path).expect("reader");
+        let content = repository
+            .node_at_path("/content")
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(content.child_node_count().expect("count"), 2);
     }
 
     #[test]

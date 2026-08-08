@@ -130,10 +130,29 @@ impl PropertyValue {
             | Self::Uri(text)
             | Self::Decimal(text) => Some(text.clone()),
             Self::Long(value) => Some(value.to_string()),
-            Self::Double(value) => Some(value.to_string()),
+            Self::Double(value) => Some(java_double_to_string(*value)),
             Self::Boolean(value) => Some(value.to_string()),
             Self::Binary(_) => None,
         }
+    }
+}
+
+/// Renders a double the way `java.lang.Double::toString` does, so a value
+/// re-stored by the writer round-trips through Oak's `Double.parseDouble`.
+/// The only meaningful differences from Rust's `f64::Display` are the
+/// non-finite spellings.
+#[must_use]
+pub fn java_double_to_string(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value.is_infinite() {
+        if value.is_sign_positive() {
+            "Infinity".to_owned()
+        } else {
+            "-Infinity".to_owned()
+        }
+    } else {
+        value.to_string()
     }
 }
 
