@@ -10,6 +10,8 @@ use froe::content::value::BinaryValue;
 use froe::content::{PropertyValue, PropertyValues};
 
 /// Appends `text` to `buffer` as a JSON string literal with escaping.
+/// C1 controls and DEL are escaped too — JSON permits them literally,
+/// but terminals interpret C1 bytes as control sequences.
 pub(crate) fn append_json_string(buffer: &mut String, text: &str) {
     buffer.push('"');
     for character in text.chars() {
@@ -19,7 +21,7 @@ pub(crate) fn append_json_string(buffer: &mut String, text: &str) {
             '\n' => buffer.push_str("\\n"),
             '\r' => buffer.push_str("\\r"),
             '\t' => buffer.push_str("\\t"),
-            control if (control as u32) < 0x20 => {
+            control if control.is_control() => {
                 let _ = write!(buffer, "\\u{:04x}", control as u32);
             }
             other => buffer.push(other),

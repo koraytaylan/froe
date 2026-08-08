@@ -13,8 +13,11 @@ place); a process mutating archives outside that protocol would disturb
 froe and a running Oak instance alike. The writing API ([`writer`]) — commits, checkpoints,
 compaction, backup, restore, journal recovery — takes the exclusive
 repository lock and produces stores byte-for-byte compatible with what Oak
-writes, so a subsequent AEM start consumes the result cleanly; run it only
-against a *stopped* repository.
+writes (one documented rendering residue: extreme-subnormal doubles; see
+`double_to_text`), so a subsequent AEM start consumes the result cleanly.
+Run it only against a *stopped* repository — and note that the writer
+currently requires a Unix operating system entropy source, so it refuses
+to open on Windows.
 
 See the workspace repository for the complete feature map and storage
 format documentation, and the `froe-cli` crate for the command-line

@@ -38,9 +38,11 @@ fn locked_directories() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
 
 /// An exclusive lock on a repository, released on drop.
 pub struct RepositoryLock {
-    /// Held for the lifetime of the lock; dropping the file releases the
-    /// operating system lock.
-    _lock_file: File,
+    /// Held for the lifetime of the lock; closing the file releases the
+    /// operating system lock. An `Option` so [`Drop`] can close it
+    /// *before* unregistering the directory, inside one registry
+    /// critical section.
+    lock_file: Option<File>,
     /// The canonical directory registered in [`LOCKED_DIRECTORIES`].
     registered_directory: PathBuf,
 }
@@ -90,7 +92,7 @@ impl RepositoryLock {
             });
         }
         Ok(Self {
-            _lock_file: lock_file,
+            lock_file: Some(lock_file),
             registered_directory: canonical_directory,
         })
     }
@@ -98,7 +100,17 @@ impl RepositoryLock {
 
 impl Drop for RepositoryLock {
     fn drop(&mut self) {
-        locked_directories().remove(&self.registered_directory);
+        // The operating system lock is released *before* the directory is
+        // unregistered, and both happen inside one registry critical
+        // section. The reverse order would open a race on classic
+        // process-associated POSIX locks: a same-process acquire slipping
+        // in between unregister and close would take a lock that this
+        // descriptor's close then silently releases (closing any
+        // descriptor of a file drops all of the process's record locks
+        // on it).
+        let mut registry = locked_directories();
+        drop(self.lock_file.take());
+        registry.remove(&self.registered_directory);
     }
 }
 

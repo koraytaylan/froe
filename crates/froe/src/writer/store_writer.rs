@@ -241,10 +241,10 @@ impl WritableRepository {
     /// copy guarantees.
     ///
     /// Scope: only the archives that existed when this session opened are
-    /// swept. Archives written earlier in the *same* session are left for
-    /// the next compaction run, which sees them as base archives — the
-    /// CLI always compacts in a fresh session, so this only concerns
-    /// library callers interleaving commits and compaction.
+    /// swept. Archives written during this session participate in the
+    /// *mark* — their retained data segments protect the bulk segments
+    /// they reference, wherever those live — but are never swept
+    /// themselves; the next compaction run sees them as base archives.
     pub fn reclaim_old_generations(
         &mut self,
         reference_generation: GarbageCollectionGeneration,
@@ -269,17 +269,46 @@ impl WritableRepository {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
 
+        // Archives this session wrote (now closed and complete on disk):
+        // newer than every base archive, so they open the mark. Their
+        // data segments carry the reference generation and are retained,
+        // seeding the references set with every bulk segment they point
+        // at — including pre-existing bulk segments in base archives,
+        // which the empty seed alone would miss.
+        let base_names: std::collections::HashSet<&str> = base_archives
+            .iter()
+            .map(TarArchiveReader::file_name)
+            .collect();
+        let mut session_archives = Vec::new();
+        for file_name in crate::store::list_archive_file_names(&self.directory)? {
+            if !base_names.contains(file_name.as_str()) {
+                session_archives.push(TarArchiveReader::open(&self.directory.join(&file_name))?);
+            }
+        }
+        session_archives.sort_by_key(|archive| {
+            std::cmp::Reverse(
+                ArchiveFileName::parse(archive.file_name())
+                    .map_or(0, |parsed| parsed.archive_number),
+            )
+        });
+
         // Oak's mark phase (§3 of the cleanup specification): archives
         // newest first, entries within each archive in reverse file
         // order, one references set shared across all archives so a kept
         // data segment in a newer archive protects bulk segments in
-        // older ones. The seed set is empty — sanctioned for an offline
-        // tool on a quiescent store, which the exclusive repository lock
-        // guarantees — and the dangling-future rule runs with a null
-        // compacted root, i.e. disabled, which the specification calls
-        // always safe.
+        // older ones. The seed set is otherwise empty — sanctioned for an
+        // offline tool on a quiescent store, which the exclusive
+        // repository lock guarantees — and the dangling-future rule runs
+        // with a null compacted root, i.e. disabled, which the
+        // specification calls always safe.
         let mut references: std::collections::HashSet<SegmentIdentifier> =
             std::collections::HashSet::new();
+        for archive in &session_archives {
+            // Mark only: session archives are never swept, so their
+            // reclaim sets are discarded.
+            let _ = mark_one_archive(archive, reference_generation, full, &mut references)?;
+        }
+        drop(session_archives);
         let mut reclaim_sets = Vec::with_capacity(base_archives.len());
         for archive in &base_archives {
             reclaim_sets.push(mark_one_archive(
@@ -903,7 +932,9 @@ fn initialize_archives_for_writing(directory: &Path) -> Result<Vec<TarArchiveRea
 /// recovered segments as a fresh archive, and only after that archive is
 /// written, fsynced, and re-validated are the originals retired to
 /// `.bak` names and the replacement installed under the lowest letter's
-/// file name — a failure at any point leaves every original in place.
+/// file name. A failure before installation leaves every original in
+/// place; a failure during installation rolls back best-effort (see
+/// [`install_recovered_archive`]).
 fn recover_archive_number(
     directory: &Path,
     generations: &[ArchiveFileName],
@@ -1046,11 +1077,13 @@ fn scan_recoverable_segments(
 /// original is preserved through a hard link (or, on filesystems without
 /// hard links, a full copy), so a `.tar` under the target name exists at
 /// every instant; the other letters are plain renames. An *error* at any
-/// step — including the final re-open — rolls every completed step back
-/// (best effort: rollback I/O errors cannot be recovered further and are
-/// dropped), so an error leaves the originals under their own names. A
-/// *crash* mid-installation can still leave a mix of `.bak` and
-/// installed states, the inherent limit of multi-file replacement.
+/// step — including the final re-open — rolls every completed step back,
+/// normally leaving the originals under their own names. The rollback is
+/// best effort: a rollback rename that itself fails cannot be recovered
+/// further, is dropped in favor of reporting the primary error, and can
+/// leave a mix of `.bak` and installed states — as can a *crash*
+/// mid-installation, the inherent limit of multi-file replacement. The
+/// `.bak` copies always preserve the original bytes for manual repair.
 fn install_recovered_archive(
     directory: &Path,
     generations: &[ArchiveFileName],
@@ -1236,16 +1269,21 @@ impl FilteredTrailers {
 /// Parses every segment of the given archives — data and bulk — into a
 /// provider, so blob identifier strings (including block lists spilling
 /// into bulk segments, or strings stored in another archive) resolve
-/// during catalog reconstruction.
+/// during catalog reconstruction. `readers` must be ordered newest
+/// archive first; a segment duplicated across archives resolves to the
+/// newest copy, the repository's lookup contract.
 fn archive_segments_provider(readers: &[TarArchiveReader]) -> Result<ArchiveSegmentsProvider<'_>> {
     let mut segments = HashMap::new();
     for reader in readers {
         for identifier in reader.segment_identifiers() {
             if let Some(bytes) = reader.segment_data(identifier) {
-                segments.insert(
-                    identifier,
-                    (Arc::new(ParsedSegment::parse(identifier, bytes)?), bytes),
-                );
+                // First insertion wins: with newest-first iteration this
+                // keeps the newest copy of a duplicated segment.
+                if let std::collections::hash_map::Entry::Vacant(vacant) =
+                    segments.entry(identifier)
+                {
+                    vacant.insert((Arc::new(ParsedSegment::parse(identifier, bytes)?), bytes));
+                }
             }
         }
     }
@@ -1312,10 +1350,14 @@ impl SegmentProvider for ArchiveSegmentsProvider<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::WritableRepository;
+    use super::{WritableRepository, archive_segments_provider};
     use crate::content::provider::SegmentProvider;
+    use crate::segment::record::RecordType;
     use crate::store::Repository;
+    use crate::tar_archive::archive::TarArchiveReader;
     use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::segment_builder::{GarbageCollectionGeneration, SegmentBufferBuilder};
+    use crate::writer::tar_writer::TarArchiveWriter;
 
     struct TestDirectory {
         path: std::path::PathBuf,
@@ -1359,6 +1401,114 @@ mod tests {
         let content_root = repository.content_root().expect("content root exists");
         assert_eq!(content_root.child_node_count().expect("count"), 0);
         assert!(content_root.properties().expect("properties").is_empty());
+    }
+
+    #[test]
+    fn catalog_provider_resolves_duplicate_segments_to_the_newest_archive() {
+        let directory = TestDirectory::new("provider-newest-wins");
+        std::fs::create_dir_all(&directory.path).expect("create directory");
+        let bulk = crate::writer::identifier_generator::new_bulk_segment_identifier();
+        let generation = GarbageCollectionGeneration {
+            generation: 0,
+            full_generation: 0,
+            is_compacted: false,
+        };
+        let write_archive = |name: &str, content: &[u8]| {
+            let mut writer = TarArchiveWriter::new(&directory.path, name);
+            writer
+                .write_segment(bulk, content, generation, &[], &[])
+                .expect("write segment");
+            writer.close().expect("close archive");
+        };
+        write_archive("data00000a.tar", b"old-archive-copy");
+        write_archive("data00001a.tar", b"new-archive-copy");
+
+        // Newest archive first, the order `base_archives` maintains.
+        let readers = vec![
+            TarArchiveReader::open(&directory.path.join("data00001a.tar")).expect("open newest"),
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open oldest"),
+        ];
+        let provider = archive_segments_provider(&readers).expect("provider");
+        let view = provider.segment(bulk).expect("duplicate resolves");
+        assert_eq!(
+            &view.bytes[..],
+            b"new-archive-copy",
+            "a duplicated segment resolves to the newest archive's copy"
+        );
+    }
+
+    #[test]
+    fn reclaim_marks_session_archives_so_referenced_base_bulk_survives() {
+        let directory = TestDirectory::new("session-mark");
+        // Session A: a bulk-backed value, so the next session's base
+        // archives hold a format-mandated (0, 0, false) bulk segment.
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            writer
+                .write_string(&"bulk-payload ".repeat(25_000))
+                .expect("large value");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+        }
+        let bulk_identifier = {
+            let repository = Repository::open(&directory.path).expect("reader");
+            repository
+                .segment_identifiers()
+                .find(|identifier| identifier.is_bulk_segment())
+                .expect("the large value produced a bulk segment")
+        };
+
+        // Session B: persist one generation-2 data segment whose
+        // reference table names the pre-existing bulk segment, then
+        // reclaim at generation 2. The session archive is outside the
+        // base snapshot, so only the session-archive mark can protect
+        // the bulk segment.
+        {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            let generation_two = GarbageCollectionGeneration {
+                generation: 2,
+                full_generation: 2,
+                is_compacted: false,
+            };
+            let mut builder = SegmentBufferBuilder::new(
+                crate::writer::identifier_generator::new_data_segment_identifier(),
+                generation_two,
+            );
+            let record = builder
+                .allocate(RecordType::Value, 6, &[bulk_identifier])
+                .expect("fits");
+            let reference = builder.reference_for(bulk_identifier);
+            let mut identifier_bytes = [0u8; 6];
+            SegmentBufferBuilder::write_record_identifier_bytes(
+                reference,
+                0,
+                &mut identifier_bytes,
+            );
+            builder
+                .record_bytes_mut(record)
+                .copy_from_slice(&identifier_bytes);
+            store.persist_segment(builder.finish()).expect("persist");
+            store
+                .reclaim_old_generations(generation_two, false)
+                .expect("reclaim");
+        }
+
+        // The bulk segment must survive in some archive on disk: the
+        // retained session data segment references it.
+        let mut bulk_survives = false;
+        for file_name in crate::store::list_archive_file_names(&directory.path).expect("list") {
+            if let Ok(reader) = TarArchiveReader::open(&directory.path.join(&file_name))
+                && reader.contains_segment(bulk_identifier)
+            {
+                bulk_survives = true;
+            }
+        }
+        assert!(
+            bulk_survives,
+            "the session archive's reference must keep the base bulk segment alive"
+        );
     }
 
     #[test]

@@ -119,6 +119,12 @@ fn draw_uuid_halves() -> (u64, u64) {
 
 /// Generates a fresh *data* segment identifier:
 /// `xxxxxxxx-xxxx-4xxx-Axxx-xxxxxxxxxxxx`.
+///
+/// # Panics
+///
+/// Panics when the operating system entropy source fails mid-session;
+/// [`WritableRepository::open`](crate::writer::store_writer::WritableRepository::open)
+/// verifies the source up front, so this is unreachable in normal use.
 #[must_use]
 pub fn new_data_segment_identifier() -> SegmentIdentifier {
     new_segment_identifier(0xA)
@@ -126,6 +132,12 @@ pub fn new_data_segment_identifier() -> SegmentIdentifier {
 
 /// Generates a fresh *bulk* segment identifier:
 /// `xxxxxxxx-xxxx-4xxx-Bxxx-xxxxxxxxxxxx`.
+///
+/// # Panics
+///
+/// Panics when the operating system entropy source fails mid-session;
+/// [`WritableRepository::open`](crate::writer::store_writer::WritableRepository::open)
+/// verifies the source up front, so this is unreachable in normal use.
 #[must_use]
 pub fn new_bulk_segment_identifier() -> SegmentIdentifier {
     new_segment_identifier(0xB)

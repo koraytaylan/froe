@@ -16,10 +16,13 @@ Every entry carries one of four statuses:
 | **Not applicable** | JVM-, OSGi-, or cluster-specific machinery with no Rust counterpart. |
 
 `froe` reads and writes TarMK repositories. The reading API is read-only
-and safe against a live repository (no lock, no writes). The writing API
-takes the exclusive repository lock and produces stores byte-for-byte
-compatible with what Oak writes, so it must run only against a *stopped*
-repository — after which a normal AEM start consumes the result cleanly.
+and safe against a live repository (no lock, no writes; like Oak it
+memory-maps archives and relies on the store's never-modify-in-place file
+protocol). The writing API takes the exclusive repository lock and
+produces stores byte-for-byte compatible with what Oak writes (one
+documented rendering residue: extreme-subnormal doubles; see
+`double_to_text`), so it must run only against a *stopped* repository —
+after which a normal AEM start consumes the result cleanly.
 
 ## 1. Core library
 

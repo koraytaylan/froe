@@ -17,8 +17,11 @@
 //! writing API ([`writer`]) — commits, checkpoints, compaction, backup,
 //! restore, journal recovery — takes the exclusive repository lock first,
 //! so it can never race a running instance, and produces stores byte-for-byte
-//! compatible with what Oak itself writes. Only run the writing API against a
-//! *stopped* repository.
+//! compatible with what Oak itself writes (one documented rendering
+//! residue: extreme-subnormal doubles; see
+//! [`content::property::double_to_text`]). Only run the writing API against
+//! a *stopped* repository; it requires a Unix operating system entropy
+//! source and refuses to open on Windows.
 //!
 //! # Example
 //!

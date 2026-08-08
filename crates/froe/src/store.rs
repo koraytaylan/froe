@@ -13,7 +13,9 @@
 //!    exists, which becomes the head.
 //!
 //! The repository never takes the repository lock and never writes, so it
-//! can safely open a live repository or a backup. It implements
+//! can safely open a live repository or a backup (like Oak it memory-maps
+//! archives, relying on the store's never-modify-in-place file protocol —
+//! see [`crate::tar_archive::archive`]). It implements
 //! [`SegmentProvider`] with bounded caches for parsed segments, strings,
 //! and templates — the hot metadata of any traversal.
 
@@ -422,7 +424,7 @@ fn open_archives_newest_valid_first(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "the Java reader filters archives with a case-sensitive \".tar\" suffix"
 )]
-fn list_archive_file_names(directory: &Path) -> Result<Vec<String>> {
+pub(crate) fn list_archive_file_names(directory: &Path) -> Result<Vec<String>> {
     let mut file_names = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let file_name = entry?.file_name();

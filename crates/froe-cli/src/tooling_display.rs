@@ -61,14 +61,14 @@ fn print_path_verdict(verdict: &froe::tooling::PathVerdict, indent: &str) {
             .map_or_else(|| "unknown time".to_owned(), format_timestamp);
         println!(
             "{indent}latest good revision for path {} is {} from {timestamp}",
-            verdict.path,
+            sanitize_terminal_text(&verdict.path),
             sanitize_terminal_text(revision)
         );
     } else {
         let reason = verdict.newest_failure.as_deref().unwrap_or("never checked");
         println!(
             "{indent}latest good revision for path {} is none ({})",
-            verdict.path,
+            sanitize_terminal_text(&verdict.path),
             sanitize_terminal_text(reason)
         );
     }

@@ -236,9 +236,11 @@ reproduced by `froe`:
 
 ## 7. Writing
 
-`froe` writes stores byte-for-byte compatible with what Oak produces.
-The write path preserves every invariant a subsequent Oak (or AEM) start
-depends on:
+`froe` writes stores byte-for-byte compatible with what Oak produces
+(one documented rendering residue: extreme-subnormal doubles re-render
+during compaction to a different — equally round-tripping — shortest
+form; see `double_to_text`). The write path preserves every invariant a
+subsequent Oak (or AEM) start depends on:
 
 * **Locking.** A write session takes an exclusive lock on `repo.lock`
   before anything else — a POSIX `fcntl` record lock, the same lock space

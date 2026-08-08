@@ -2,7 +2,9 @@
 //! Apache Jackrabbit Oak `segment-tar` (`TarMK`) repositories.
 //!
 //! Inspection and extraction commands are read-only: the repository lock
-//! is never taken, so they are safe against a live repository. The
+//! is never taken, so they are safe against a live repository (archives
+//! are memory-mapped under the store's never-modify-in-place file
+//! protocol, the same reliance a running Oak instance has). The
 //! maintenance commands — `compact`, `backup`, `restore`,
 //! `recover-journal`, and `checkpoint` — take the exclusive repository
 //! lock and modify the store, so they must only be run against a *stopped*
