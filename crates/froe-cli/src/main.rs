@@ -330,38 +330,31 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             inspection::print_checkpoints(&Repository::open(&repository)?)?;
         }
         Command::Extract {
-            repository,
+            repository: repository_path,
             path,
             depth,
             output,
         } => {
-            let repository = Repository::open(&repository)?;
+            let repository = Repository::open(&repository_path)?;
             let written = if let Some(output_path) = output {
-                // Refuse to touch an existing file: an output path
-                // pointing at the repository itself (journal.log, an
-                // archive, or an alias of one) must never be truncated,
-                // and unrelated files must never be silently overwritten.
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&output_path)
-                    .map_err(|error| {
-                        if error.kind() == std::io::ErrorKind::AlreadyExists {
-                            froe::Error::InvalidFormat {
-                                details: format!(
-                                    "output file {} already exists; extraction never \
-                                     overwrites — choose a fresh path or remove the file first",
-                                    output_path.display()
-                                ),
-                            }
-                        } else {
-                            froe::Error::InputOutput(error)
-                        }
-                    })?;
+                let file = extraction::create_extraction_output(&repository_path, &output_path)?;
                 let mut sink = std::io::BufWriter::with_capacity(1 << 20, file);
-                let written = extraction::extract_json_lines(&repository, &path, depth, &mut sink)?;
-                sink.flush()?;
-                written
+
+                match extraction::extract_json_lines(&repository, &path, depth, &mut sink).and_then(
+                    |written| {
+                        sink.flush()?;
+                        Ok(written)
+                    },
+                ) {
+                    Ok(written) => written,
+                    Err(error) => {
+                        // The file was freshly created above; a partial
+                        // extraction must not linger as if complete.
+                        drop(sink);
+                        let _ = std::fs::remove_file(&output_path);
+                        return Err(error);
+                    }
+                }
             } else {
                 let standard_output = std::io::stdout();
                 let mut sink = std::io::BufWriter::with_capacity(1 << 20, standard_output.lock());

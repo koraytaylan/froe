@@ -461,7 +461,14 @@ fn verify_subtree(
             return Ok(());
         }
         ancestors.insert(record);
-        check_node_shallow(provider, record, check_binaries).map_err(&corrupt_here)?;
+        // Not `map_err(corrupt_here)`: different clippy versions disagree
+        // about the borrow there, and an explicit struct keeps both quiet.
+        if let Err(reason) = check_node_shallow(provider, record, check_binaries) {
+            return Err(CorruptLocation {
+                path: path.clone(),
+                reason,
+            });
+        }
         let node = NodeState::new(provider, record);
         let children = node
             .child_node_entries()

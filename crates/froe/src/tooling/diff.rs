@@ -381,9 +381,23 @@ fn property_value_equal(
     if let (PropertyValue::Double(before_value), PropertyValue::Double(after_value)) =
         (before, after)
     {
-        return Ok(before_value.to_bits() == after_value.to_bits());
+        return Ok(
+            double_bits_for_equality(*before_value) == double_bits_for_equality(*after_value)
+        );
     }
     Ok(before == after)
+}
+
+/// The bit pattern Java's `Double.equals` compares: `doubleToLongBits`,
+/// which collapses every NaN payload to the canonical quiet NaN. Stored
+/// text can only ever parse to the canonical NaN, but exactness costs
+/// nothing.
+fn double_bits_for_equality(value: f64) -> u64 {
+    if value.is_nan() {
+        0x7FF8_0000_0000_0000
+    } else {
+        value.to_bits()
+    }
 }
 
 /// Renders a path, using `/` for the empty root path.

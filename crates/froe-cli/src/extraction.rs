@@ -15,12 +15,65 @@
 //! guards against node cycles in corrupt repositories.
 
 use std::io::Write;
+use std::path::Path;
 
 use froe::content::node::NodeState;
 use froe::store::Repository;
 
 use crate::content_display::normalized_path;
 use crate::output::{append_json_string, append_json_values};
+
+/// Creates the extraction output file. Never an existing file — an
+/// output path aimed at the repository itself (`journal.log`, an
+/// archive, or an alias of one) must never be truncated, and unrelated
+/// files must never be silently overwritten — and never a fresh file
+/// *inside* the repository directory, where the next open would mistake
+/// it for a damaged archive. On Unix the file is created
+/// owner-accessible only, regardless of the ambient umask.
+pub(crate) fn create_extraction_output(
+    repository_path: &Path,
+    output_path: &Path,
+) -> froe::Result<std::fs::File> {
+    // Canonical paths, so symlinks and relative forms cannot smuggle the
+    // output into the repository directory. A nonexistent parent skips
+    // the check and fails file creation below instead.
+    let repository_directory = std::fs::canonicalize(repository_path)?;
+    let output_parent = match output_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if let Ok(canonical_parent) = std::fs::canonicalize(output_parent)
+        && canonical_parent.starts_with(&repository_directory)
+    {
+        return Err(froe::Error::InvalidFormat {
+            details: format!(
+                "output file {} is inside the repository directory; a stray file there \
+                     could be mistaken for a damaged archive at the next open",
+                output_path.display()
+            ),
+        });
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(output_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            froe::Error::InvalidFormat {
+                details: format!(
+                    "output file {} already exists; extraction never overwrites — choose a \
+                     fresh path or remove the file first",
+                    output_path.display()
+                ),
+            }
+        } else {
+            froe::Error::InputOutput(error)
+        }
+    })
+}
 
 /// Nodes deeper than this indicate a cycle in a corrupt repository;
 /// real content trees are nowhere near this deep.

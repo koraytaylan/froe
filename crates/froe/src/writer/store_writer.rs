@@ -348,6 +348,18 @@ impl WritableRepository {
         }
 
         let trailers = FilteredTrailers::from_archive(&reader, &cleaned);
+        // When the original archive has no readable catalog, survivor
+        // references are reconstructed by a strict scan resolving across
+        // *every* segment of the archive — and the sweep fails closed on
+        // an unresolvable identifier rather than publish an incomplete
+        // catalog that could let blob garbage collection delete
+        // referenced binaries. (Java would publish an *empty* catalog
+        // here; the scan is a strict superset of that.)
+        let scan_provider = if trailers.catalog.is_none() {
+            Some(archive_segments_provider(&reader)?)
+        } else {
+            None
+        };
 
         // Rewrite the survivors to the next generation letter, then delete
         // the original — matching Oak's sweep.
@@ -372,7 +384,7 @@ impl WritableRepository {
                 is_compacted: entry.is_compacted,
             };
             let (references, binary_references) = if identifier.is_data_segment() {
-                trailers.for_segment(identifier, bytes, &cleaned)?
+                trailers.for_segment(identifier, bytes, &cleaned, scan_provider.as_ref())?
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -806,19 +818,19 @@ fn recover_archive_number(
 ) -> Result<TarArchiveReader> {
     let recovered = scan_recoverable_segments(directory, generations);
 
-    // Parse every data segment once; the parsed structures also back the
-    // provider that resolves blob identifier strings across the recovered
-    // segments of this archive number.
+    // Parse every segment once — data *and* bulk, so blob identifier
+    // strings whose block lists spill into bulk segments resolve too.
+    // The parsed structures also back the provider that resolves blob
+    // identifier strings across the recovered segments of this archive
+    // number.
     let mut parsed_segments: HashMap<SegmentIdentifier, Arc<ParsedSegment>> = HashMap::new();
     for (identifier, bytes) in &recovered {
-        if identifier.is_data_segment() {
-            parsed_segments.insert(
-                *identifier,
-                Arc::new(ParsedSegment::parse(*identifier, bytes)?),
-            );
-        }
+        parsed_segments.insert(
+            *identifier,
+            Arc::new(ParsedSegment::parse(*identifier, bytes)?),
+        );
     }
-    let provider = RecoveredSegmentsProvider {
+    let provider = ArchiveSegmentsProvider {
         segments: recovered
             .iter()
             .filter_map(|(identifier, bytes)| {
@@ -894,14 +906,19 @@ fn recover_archive_number(
         return Err(error);
     }
     crate::writer::compaction::fsync_directory(directory);
-    let validated = TarArchiveReader::open(&temporary_path)?;
-    if validated.is_recovered() {
-        let _ = std::fs::remove_file(&temporary_path);
-        return Err(Error::InvalidFormat {
-            details: format!("the rebuilt archive {temporary_name} failed index validation"),
-        });
+    match TarArchiveReader::open(&temporary_path) {
+        Ok(validated) if !validated.is_recovered() => drop(validated),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(Error::InvalidFormat {
+                details: format!("the rebuilt archive {temporary_name} failed index validation"),
+            });
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error);
+        }
     }
-    drop(validated);
     install_recovered_archive(directory, generations, target_name, &temporary_path)
 }
 
@@ -934,30 +951,48 @@ fn scan_recoverable_segments(
 
 /// Retires the original generation letters to `.bak` names and installs
 /// the validated replacement under the target name. The target's own
-/// original is preserved through a hard link first, so a `.tar` under
-/// the target name exists at every instant; the other letters are plain
-/// renames.
+/// original is preserved through a hard link (or, on filesystems without
+/// hard links, a full copy), so a `.tar` under the target name exists at
+/// every instant; the other letters are plain renames. A failure at any
+/// step rolls every completed rename back, so an error always leaves the
+/// originals under their own names.
 fn install_recovered_archive(
     directory: &Path,
     generations: &[ArchiveFileName],
     target_name: &str,
     temporary_path: &Path,
 ) -> Result<TarArchiveReader> {
+    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let roll_back = |renamed: &[(PathBuf, PathBuf)]| {
+        for (original, backup) in renamed.iter().rev() {
+            let _ = std::fs::rename(backup, original);
+        }
+    };
     for generation in generations {
         let path = directory.join(&generation.file_name);
         let backup = backup_path(directory, &generation.file_name);
         if generation.file_name == *target_name {
-            if std::fs::hard_link(&path, &backup).is_err() {
-                // No hard links on this filesystem: fall back to a rename
-                // with its momentary no-target window.
-                std::fs::rename(&path, &backup)?;
+            // The target keeps its directory entry: the backup is a
+            // second link (or a copy) of the same content, never a
+            // rename away.
+            if std::fs::hard_link(&path, &backup).is_err()
+                && let Err(error) = std::fs::copy(&path, &backup)
+            {
+                roll_back(&renamed);
+                return Err(error.into());
             }
+        } else if let Err(error) = std::fs::rename(&path, &backup) {
+            roll_back(&renamed);
+            return Err(error.into());
         } else {
-            std::fs::rename(&path, &backup)?;
+            renamed.push((path, backup));
         }
     }
     let target_path = directory.join(target_name);
-    std::fs::rename(temporary_path, &target_path)?;
+    if let Err(error) = std::fs::rename(temporary_path, &target_path) {
+        roll_back(&renamed);
+        return Err(error.into());
+    }
     crate::writer::compaction::fsync_directory(directory);
     TarArchiveReader::open(&target_path)
 }
@@ -1036,13 +1071,16 @@ impl FilteredTrailers {
     }
 
     /// The filtered graph edges and — only when the original archive had
-    /// no catalog to carry over — scan-derived binary references of one
-    /// surviving data segment.
+    /// no catalog to carry over — strictly scan-derived binary references
+    /// of one surviving data segment, resolved through `scan_provider`
+    /// (every segment of the archive). An unresolvable identifier fails
+    /// the sweep rather than publish an incomplete catalog.
     fn for_segment(
         &self,
         identifier: SegmentIdentifier,
         bytes: &[u8],
         cleaned: &std::collections::HashSet<SegmentIdentifier>,
+        scan_provider: Option<&ArchiveSegmentsProvider<'_>>,
     ) -> Result<(Vec<SegmentIdentifier>, Vec<String>)> {
         let references = match self.graph_by_source.get(&identifier) {
             Some(filtered) => filtered.clone(),
@@ -1054,63 +1092,47 @@ impl FilteredTrailers {
                 .collect(),
             None => Vec::new(),
         };
-        let binary_references = if self.catalog.is_some() {
+        let binary_references = match scan_provider {
             // Carried over with original triples via
             // `TarArchiveWriter::add_binary_references` instead.
-            Vec::new()
-        } else {
-            let parsed = Arc::new(ParsedSegment::parse(identifier, bytes)?);
-            read_segment_blob_identifiers(&parsed, bytes)
+            None => Vec::new(),
+            Some(provider) => {
+                let parsed = provider
+                    .segments
+                    .get(&identifier)
+                    .map(|(parsed, _)| Arc::clone(parsed))
+                    .ok_or(Error::SegmentNotFound {
+                        segment_identifier: identifier,
+                    })?;
+                read_blob_identifiers(provider, &parsed).map_err(|error| Error::InvalidFormat {
+                    details: format!(
+                        "cannot rebuild the binary references catalog while sweeping: an \
+                             external blob identifier in segment {identifier} does not resolve \
+                             within the archive ({error}); refusing to publish an incomplete \
+                             catalog, which could let blob garbage collection delete referenced \
+                             binaries"
+                    ),
+                })?
+            }
         };
         Ok((references, binary_references))
     }
 }
 
-/// A provider over one segment's bytes, for record reads confined to that
-/// segment during archive recovery.
-struct SingleSegmentProvider<'bytes> {
-    structure: Arc<ParsedSegment>,
-    bytes: &'bytes [u8],
-}
-
-impl SegmentProvider for SingleSegmentProvider<'_> {
-    fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
-        if segment_identifier == self.structure.identifier {
-            Ok(SegmentView {
-                structure: Arc::clone(&self.structure),
-                bytes: self.bytes.into(),
-            })
-        } else {
-            Err(Error::SegmentNotFound { segment_identifier })
+/// Parses every segment of an archive — data and bulk — into a provider,
+/// so blob identifier strings (including block lists spilling into bulk
+/// segments) resolve during catalog reconstruction.
+fn archive_segments_provider(reader: &TarArchiveReader) -> Result<ArchiveSegmentsProvider<'_>> {
+    let mut segments = HashMap::new();
+    for identifier in reader.segment_identifiers() {
+        if let Some(bytes) = reader.segment_data(identifier) {
+            segments.insert(
+                identifier,
+                (Arc::new(ParsedSegment::parse(identifier, bytes)?), bytes),
+            );
         }
     }
-
-    fn string(&self, record_identifier: RecordIdentifier) -> Result<Arc<str>> {
-        read_string(self, record_identifier).map(Arc::from)
-    }
-
-    fn template(&self, record_identifier: RecordIdentifier) -> Result<Arc<Template>> {
-        read_template(self, record_identifier).map(Arc::new)
-    }
-}
-
-/// Extracts every external blob identifier a raw scan of one segment can
-/// see, for rebuilding a recovered archive's binary references catalog:
-/// small (`0xE0`-class) identifiers inline, and large (`0xF0`-class)
-/// identifiers whose string record — including its block list — lives in
-/// this same segment. Identifiers whose string spills into *another*
-/// segment are invisible to a single-segment scan and are skipped; the
-/// sweep path never relies on this function when the original catalog is
-/// available to filter instead.
-pub(crate) fn read_segment_blob_identifiers(
-    structure: &Arc<ParsedSegment>,
-    bytes: &[u8],
-) -> Vec<String> {
-    let provider = SingleSegmentProvider {
-        structure: Arc::clone(structure),
-        bytes,
-    };
-    read_blob_identifiers(&provider, structure).unwrap_or_default()
+    Ok(ArchiveSegmentsProvider { segments })
 }
 
 /// Extracts every external blob identifier recorded in one segment,
@@ -1143,14 +1165,14 @@ fn read_blob_identifiers(
     Ok(identifiers)
 }
 
-/// A provider over the segments recovered for one archive number, so
-/// blob identifier strings referenced across segments of the same
-/// archive resolve during catalog reconstruction.
-struct RecoveredSegmentsProvider<'bytes> {
+/// A provider over the segments of one archive (recovered or read from
+/// an open reader), so blob identifier strings referenced across
+/// segments of the same archive resolve during catalog reconstruction.
+struct ArchiveSegmentsProvider<'bytes> {
     segments: HashMap<SegmentIdentifier, (Arc<ParsedSegment>, &'bytes [u8])>,
 }
 
-impl SegmentProvider for RecoveredSegmentsProvider<'_> {
+impl SegmentProvider for ArchiveSegmentsProvider<'_> {
     fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
         let (structure, bytes) = self
             .segments

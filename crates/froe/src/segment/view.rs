@@ -130,7 +130,16 @@ impl SegmentView<'_> {
         raw_offset: usize,
         identifier_index: usize,
     ) -> Result<RecordIdentifier> {
-        let offset = raw_offset + identifier_index * 6;
+        // Checked arithmetic: hostile offsets must error, not overflow.
+        let offset = identifier_index
+            .checked_mul(6)
+            .and_then(|identifiers_offset| raw_offset.checked_add(identifiers_offset))
+            .ok_or_else(|| Error::InvalidFormat {
+                details: format!(
+                    "record identifier offset overflows in record {record_number} of segment {}",
+                    self.structure.identifier
+                ),
+            })?;
         let reference = self.read_u16(record_number, offset)?;
         let target_record_number = self.read_u32(record_number, offset + 2)?;
         let segment = self.structure.resolve_segment_reference(reference)?;
@@ -200,6 +209,11 @@ mod tests {
         let view = provider.segment(identifier).expect("segment exists");
         assert!(view.read_u64(0, usize::MAX - 4).is_err());
         assert!(view.read_bytes(0, 0, usize::MAX).is_err());
+        assert!(
+            view.read_record_identifier(0, usize::MAX, usize::MAX)
+                .is_err(),
+            "overflowing identifier offsets are errors, not panics"
+        );
         assert!(view.read_u8(999, 0).is_err(), "unknown record number");
     }
 

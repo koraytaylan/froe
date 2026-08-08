@@ -40,7 +40,10 @@ pub(crate) fn print_check(
     }
     println!("overall");
     match &report.overall_revision {
-        Some(revision) => println!("  latest good revision for all checked paths is {revision}"),
+        Some(revision) => println!(
+            "  latest good revision for all checked paths is {}",
+            sanitize_terminal_text(revision)
+        ),
         None => println!("  latest good revision for all checked paths is none"),
     }
     if report.has_good_revision() {
@@ -57,8 +60,9 @@ fn print_path_verdict(verdict: &froe::tooling::PathVerdict, indent: &str) {
             .latest_good_timestamp_milliseconds
             .map_or_else(|| "unknown time".to_owned(), format_timestamp);
         println!(
-            "{indent}latest good revision for path {} is {revision} from {timestamp}",
-            verdict.path
+            "{indent}latest good revision for path {} is {} from {timestamp}",
+            verdict.path,
+            sanitize_terminal_text(revision)
         );
     } else {
         let reason = verdict.newest_failure.as_deref().unwrap_or("never checked");
@@ -147,7 +151,7 @@ pub(crate) fn print_history(repository: &Path, path: &str) -> froe::Result<()> {
         println!(
             "{}  {}  {record}",
             format_timestamp(entry.timestamp_milliseconds),
-            entry.revision,
+            sanitize_terminal_text(&entry.revision),
         );
     }
     Ok(())

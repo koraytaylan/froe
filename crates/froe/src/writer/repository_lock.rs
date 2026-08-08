@@ -61,10 +61,29 @@ impl RepositoryLock {
 #[cfg(unix)]
 fn lock_exclusively(file: &File) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    // An open-file-description record lock over the entire file: the same
-    // lock space as Java's FileChannel.lock(), with ownership tied to the
-    // file handle (released when the handle closes) rather than the
-    // process.
+    // An fcntl record lock over the entire file: the same lock space as
+    // Java's FileChannel.lock(), so a running Oak instance is genuinely
+    // excluded. Where the operating system offers open-file-description
+    // locks (Linux, Android, macOS, iOS), ownership is tied to the file
+    // handle; other Unixes fall back to a classic process-associated
+    // POSIX lock — the same lock space, safe here because this process
+    // opens `repo.lock` exactly once and holds that handle for the
+    // lock's lifetime.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    const SET_LOCK_COMMAND: libc::c_int = libc::F_OFD_SETLK;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    const SET_LOCK_COMMAND: libc::c_int = libc::F_SETLK;
+
     let mut lock = libc::flock {
         l_type: libc::F_WRLCK as libc::c_short,
         l_whence: libc::SEEK_SET as libc::c_short,
@@ -72,9 +91,9 @@ fn lock_exclusively(file: &File) -> std::io::Result<()> {
         l_len: 0, // zero length means "to the end of the file, however it grows"
         l_pid: 0,
     };
-    // SAFETY: fcntl with F_OFD_SETLK reads the flock structure we own and
-    // has no other memory effects.
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut lock) };
+    // SAFETY: fcntl with a record-lock command reads the flock structure
+    // we own and has no other memory effects.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), SET_LOCK_COMMAND, &raw mut lock) };
     if result == 0 {
         Ok(())
     } else {

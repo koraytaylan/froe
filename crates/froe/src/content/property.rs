@@ -145,7 +145,10 @@ impl PropertyValue {
 /// `[10^-3, 10^7)`, and `d.dddEn` computerized scientific notation
 /// outside that range. Digit selection is the shortest representation
 /// that round-trips, like modern Java; a handful of extreme subnormals
-/// pick a different (equally round-tripping) shortest form.
+/// pick a different — equally round-tripping — shortest form (known
+/// residue: `Double.MIN_VALUE` renders `5.0E-324` here where Java prints
+/// `4.9E-324`; both parse to the identical bits, and a later Java
+/// compaction would re-render its own spelling).
 #[must_use]
 pub fn double_to_text(value: f64) -> String {
     if value.is_nan() {

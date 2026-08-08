@@ -29,18 +29,18 @@ pub struct TarEntryHeader {
 }
 
 impl TarEntryHeader {
-    /// Parses one 512-byte header block; `block` must hold at least
-    /// [`BLOCK_SIZE`] bytes.
+    /// Parses one 512-byte header block.
     ///
-    /// Returns `None` for a block of all zero bytes (tar uses two such
-    /// blocks to terminate the archive). Malformed content never fails:
-    /// the name decodes lossily and the size accumulates octal digits from
-    /// the size field until the first non-octal byte, exactly like the Java
-    /// recovery scanner — entries with nonsense names or sizes are later
-    /// skipped by the caller's pattern matching and bounds checks.
+    /// Returns `None` for a block shorter than [`BLOCK_SIZE`] bytes or of
+    /// all zero bytes (tar uses two such blocks to terminate the
+    /// archive). Malformed content never fails: the name decodes lossily
+    /// and the size accumulates octal digits from the size field until
+    /// the first non-octal byte, exactly like the Java recovery scanner —
+    /// entries with nonsense names or sizes are later skipped by the
+    /// caller's pattern matching and bounds checks.
     #[must_use]
     pub fn parse(block: &[u8]) -> Option<Self> {
-        let block = &block[..BLOCK_SIZE as usize];
+        let block = block.get(..BLOCK_SIZE as usize)?;
         if block.iter().all(|&byte| byte == 0) {
             return None;
         }
@@ -94,6 +94,16 @@ mod tests {
     #[test]
     fn zero_block_yields_none() {
         assert_eq!(TarEntryHeader::parse(&vec![0u8; BLOCK_SIZE as usize]), None);
+    }
+
+    #[test]
+    fn short_blocks_yield_none_instead_of_panicking() {
+        assert_eq!(TarEntryHeader::parse(&[]), None);
+        assert_eq!(TarEntryHeader::parse(&[0x41u8; 100]), None);
+        assert_eq!(
+            TarEntryHeader::parse(&vec![0u8; BLOCK_SIZE as usize - 1]),
+            None
+        );
     }
 
     #[test]

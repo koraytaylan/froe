@@ -131,12 +131,21 @@ impl SegmentBufferBuilder {
         if self.referenced_segments.len() + new_references > MAXIMUM_SEGMENT_REFERENCES {
             return false;
         }
-        let aligned_size = size.div_ceil(4) * 4;
-        let data_length = (MAXIMUM_SEGMENT_SIZE - self.data_start) + aligned_size;
+        // Checked arithmetic: a caller-supplied size near `usize::MAX`
+        // must report "does not fit", not overflow.
+        let Some(aligned_size) = size.checked_next_multiple_of(4) else {
+            return false;
+        };
+        let Some(data_length) = (MAXIMUM_SEGMENT_SIZE - self.data_start).checked_add(aligned_size)
+        else {
+            return false;
+        };
         let tables_length = HEADER_SIZE
             + (self.referenced_segments.len() + new_references) * SEGMENT_REFERENCE_SIZE
             + (self.record_table.len() + 1) * RECORD_REFERENCE_SIZE;
-        tables_length + data_length <= MAXIMUM_SEGMENT_SIZE
+        tables_length
+            .checked_add(data_length)
+            .is_some_and(|total| total <= MAXIMUM_SEGMENT_SIZE)
     }
 
     /// Allocates a record of `size` bytes, declaring the foreign segments
@@ -352,6 +361,14 @@ mod tests {
         builder
             .allocate(RecordType::Block, 4, &[])
             .expect("small record fits");
+    }
+
+    #[test]
+    fn absurd_sizes_report_not_fitting_instead_of_overflowing() {
+        let identifier = new_data_segment_identifier();
+        let builder = SegmentBufferBuilder::new(identifier, test_generation());
+        assert!(!builder.fits(usize::MAX, &[]));
+        assert!(!builder.fits(usize::MAX - 3, &[]));
     }
 
     #[test]
