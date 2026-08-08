@@ -60,7 +60,7 @@ mod tests {
     }
 
     #[test]
-    fn single_byte_matches_java_implementation() {
+    fn single_byte_matches_reference_value() {
         // Value produced by java.util.zip.CRC32 for a single zero byte.
         assert_eq!(crc32(&[0]), 0xD202_EF8D);
     }

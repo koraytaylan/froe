@@ -21,7 +21,7 @@
 
 use crate::content::property::PropertyType;
 use crate::error::{Error, Result};
-use crate::hashing::{java_compare_strings, map_entry_hash};
+use crate::hashing::{compare_utf16_strings, map_entry_hash};
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::parsed_segment::MAXIMUM_SEGMENT_SIZE;
 use crate::segment::record::{RecordIdentifier, RecordType};
@@ -535,7 +535,7 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
             first
                 .0
                 .cmp(&second.0)
-                .then_with(|| java_compare_strings(&first.1, &second.1))
+                .then_with(|| compare_utf16_strings(&first.1, &second.1))
         });
         let all_identifiers: Vec<RecordIdentifier> = entries
             .iter()
@@ -797,9 +797,9 @@ fn stable_identifier_names(stable_identifier: Option<[u8; 20]>, record: RecordId
 /// order `Template`'s constructor establishes in Java.
 pub fn sort_properties_for_template(properties: &mut [PropertyToWrite]) {
     properties.sort_by(|first, second| {
-        crate::hashing::java_string_hash(&first.name)
-            .cmp(&crate::hashing::java_string_hash(&second.name))
-            .then_with(|| java_compare_strings(&first.name, &second.name))
+        crate::hashing::utf16_string_hash(&first.name)
+            .cmp(&crate::hashing::utf16_string_hash(&second.name))
+            .then_with(|| compare_utf16_strings(&first.name, &second.name))
             .then_with(|| (first.property_type as u8).cmp(&(second.property_type as u8)))
     });
 }

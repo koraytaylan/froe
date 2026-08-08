@@ -130,7 +130,7 @@ impl PropertyValue {
             | Self::Uri(text)
             | Self::Decimal(text) => Some(text.clone()),
             Self::Long(value) => Some(value.to_string()),
-            Self::Double(value) => Some(java_double_to_string(*value)),
+            Self::Double(value) => Some(double_to_text(*value)),
             Self::Boolean(value) => Some(value.to_string()),
             Self::Binary(_) => None,
         }
@@ -142,7 +142,7 @@ impl PropertyValue {
 /// The only meaningful differences from Rust's `f64::Display` are the
 /// non-finite spellings.
 #[must_use]
-pub fn java_double_to_string(value: f64) -> String {
+pub fn double_to_text(value: f64) -> String {
     if value.is_nan() {
         "NaN".to_owned()
     } else if value.is_infinite() {

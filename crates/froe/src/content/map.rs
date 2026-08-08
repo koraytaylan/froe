@@ -11,7 +11,7 @@
 //! * a *leaf* holds the entries directly: a sorted array of hashes
 //!   followed by interleaved key and value record identifiers.
 //!
-//! The hash is `(java_string_hash(name) ^ M) * M + A` with Java's wrapping
+//! The hash is `(utf16_string_hash(name) ^ M) * M + A` with Java's wrapping
 //! 32-bit arithmetic, and hashes compare as *unsigned* values in leaf
 //! ordering. Branch bucket selection at level 6 relies on Java masking
 //! shift distances to five bits — the shift becomes `29`, re-reading the
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn level_six_shift_masks_like_java() {
+    fn level_six_shift_masks_to_five_bits() {
         // At level 6 the Java shift distance is 32 - 35 = -3, masked to 29.
         // Verify our branch head helper agrees a level-6 record can branch
         // and the lookup math cannot panic for any hash.

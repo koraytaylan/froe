@@ -160,7 +160,7 @@ a bucket of up to 255 record identifiers, nested recursively (at most
 ### Maps (child nodes)
 
 A hash array mapped trie keyed by
-`hash = (java_string_hash(name) ^ 0xDEECE66D) * 0xDEECE66D + 0xB`
+`hash = (utf16_string_hash(name) ^ 0xDEECE66D) * 0xDEECE66D + 0xB`
 with wrapping 32-bit arithmetic over UTF-16 code units. The head word:
 `size` in the low **29** bits, `level` in the top **3** (the Java
 source comments claim 28/4; the computed constants — and the official

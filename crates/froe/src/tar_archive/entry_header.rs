@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_octal_sizes_wrap_like_java_integers() {
+    fn oversized_octal_sizes_wrap_at_32_bits() {
         // 0o77777777777 = 0x1FFFFFFFFF wraps to -1 in a 32-bit integer.
         let wrapped = header_block("entry", b"77777777777\0");
         assert_eq!(TarEntryHeader::parse(&wrapped).expect("header").size, -1);

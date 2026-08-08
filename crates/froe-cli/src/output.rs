@@ -48,7 +48,7 @@ pub(crate) fn append_json_value(buffer: &mut String, value: &PropertyValue) {
             } else {
                 // JSON has no NaN or infinity; fall back to the Java
                 // spellings as strings.
-                append_json_string(buffer, &java_double_text(*number));
+                append_json_string(buffer, &non_finite_double_text(*number));
             }
         }
         PropertyValue::Boolean(truth) => buffer.push_str(if *truth { "true" } else { "false" }),
@@ -83,7 +83,7 @@ pub(crate) fn append_json_values(buffer: &mut String, values: &PropertyValues) {
 }
 
 /// The Java spelling of a non-finite double.
-fn java_double_text(number: f64) -> String {
+fn non_finite_double_text(number: f64) -> String {
     if number.is_nan() {
         "NaN".to_owned()
     } else if number.is_sign_positive() {
