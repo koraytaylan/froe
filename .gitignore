@@ -1,1 +1,4 @@
 /target/
+
+# Claude Code worktrees
+/.claude/worktrees
