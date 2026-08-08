@@ -224,14 +224,20 @@ impl SegmentProvider for Repository {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&segment_identifier)
         {
-            return Ok(SegmentView { structure, bytes });
+            return Ok(SegmentView {
+                structure,
+                bytes: bytes.into(),
+            });
         }
         let structure = Arc::new(ParsedSegment::parse(segment_identifier, bytes)?);
         self.parsed_segment_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(segment_identifier, Arc::clone(&structure));
-        Ok(SegmentView { structure, bytes })
+        Ok(SegmentView {
+            structure,
+            bytes: bytes.into(),
+        })
     }
 
     fn string(&self, record_identifier: RecordIdentifier) -> Result<Arc<str>> {
@@ -303,7 +309,7 @@ fn list_archive_file_names(directory: &Path) -> Result<Vec<String>> {
 /// Validates the `manifest` file with read-only semantics: never writes,
 /// accepts store versions 1 and 2, and rejects a store that has archives
 /// but no manifest (that is the legacy pre-tar format).
-fn check_manifest(directory: &Path, archives_exist: bool) -> Result<()> {
+pub(crate) fn check_manifest(directory: &Path, archives_exist: bool) -> Result<()> {
     let manifest_path = directory.join("manifest");
     if !manifest_path.exists() {
         if archives_exist {

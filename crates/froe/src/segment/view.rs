@@ -12,13 +12,41 @@ use crate::error::{Error, Result};
 use crate::segment::parsed_segment::ParsedSegment;
 use crate::segment::record::RecordIdentifier;
 
+/// The bytes backing a segment view: borrowed from a memory-mapped
+/// archive on the read path, or shared ownership of a buffer for
+/// segments written in the current session that have no mapping yet.
+#[derive(Clone)]
+pub enum SegmentBytes<'provider> {
+    /// A slice of a memory-mapped archive.
+    Borrowed(&'provider [u8]),
+    /// A shared in-memory buffer.
+    Shared(Arc<Vec<u8>>),
+}
+
+impl std::ops::Deref for SegmentBytes<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            SegmentBytes::Borrowed(bytes) => bytes,
+            SegmentBytes::Shared(bytes) => bytes,
+        }
+    }
+}
+
+impl<'provider> From<&'provider [u8]> for SegmentBytes<'provider> {
+    fn from(bytes: &'provider [u8]) -> Self {
+        SegmentBytes::Borrowed(bytes)
+    }
+}
+
 /// One segment's parsed structure together with its raw bytes.
 #[derive(Clone)]
 pub struct SegmentView<'provider> {
     /// The parsed header and tables.
     pub structure: Arc<ParsedSegment>,
     /// The segment's stored bytes.
-    pub bytes: &'provider [u8],
+    pub bytes: SegmentBytes<'provider>,
 }
 
 impl std::fmt::Debug for SegmentView<'_> {
@@ -32,7 +60,7 @@ impl std::fmt::Debug for SegmentView<'_> {
     }
 }
 
-impl<'provider> SegmentView<'provider> {
+impl SegmentView<'_> {
     /// Resolves a record number to a position in [`Self::bytes`].
     pub fn record_position(&self, record_number: u32) -> Result<usize> {
         let offset =
@@ -48,12 +76,7 @@ impl<'provider> SegmentView<'provider> {
     }
 
     /// Reads `length` bytes starting `offset` bytes into the record.
-    pub fn read_bytes(
-        &self,
-        record_number: u32,
-        offset: usize,
-        length: usize,
-    ) -> Result<&'provider [u8]> {
+    pub fn read_bytes(&self, record_number: u32, offset: usize, length: usize) -> Result<&[u8]> {
         let overrun = || Error::InvalidFormat {
             details: format!(
                 "read of {length} bytes at offset {offset} of record {record_number} \

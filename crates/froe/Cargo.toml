@@ -13,5 +13,12 @@ categories = ["filesystem", "parser-implementations"]
 [dependencies]
 memmap2 = "0.9"
 
+[target.'cfg(unix)'.dependencies]
+# The repository lock must interoperate with Oak's FileChannel.lock(),
+# which uses POSIX record locks on Linux — flock-style locks would not
+# conflict with a running AEM instance. Already in the dependency graph
+# through memmap2.
+libc = "0.2"
+
 [lints]
 workspace = true

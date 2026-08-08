@@ -72,7 +72,7 @@ pub(crate) mod tests {
                 .ok_or(Error::SegmentNotFound { segment_identifier })?;
             Ok(SegmentView {
                 structure: Arc::clone(structure),
-                bytes,
+                bytes: bytes.as_slice().into(),
             })
         }
 

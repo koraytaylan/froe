@@ -38,9 +38,19 @@ pub fn map_entry_hash(name: &str) -> u32 {
         .wrapping_add(MAP_HASH_INCREMENT) as u32
 }
 
+/// Compares two strings the way `java.lang.String::compareTo` does: by
+/// UTF-16 code units. This differs from Rust's `str` ordering for
+/// supplementary characters, which sort *after* the basic multilingual
+/// plane in Rust but *between* U+D7FF and U+E000 (as surrogates) in Java.
+/// Map leaf entries and template properties are ordered this way on disk.
+#[must_use]
+pub fn java_compare_strings(first: &str, second: &str) -> std::cmp::Ordering {
+    first.encode_utf16().cmp(second.encode_utf16())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{java_string_hash, map_entry_hash};
+    use super::{java_compare_strings, java_string_hash, map_entry_hash};
 
     #[test]
     fn matches_java_string_hash_code() {
@@ -57,6 +67,30 @@ mod tests {
         // U+1D54A is encoded as the surrogate pair D835 DD4A, so the hash is
         // 31 * 0xD835 + 0xDD4A = 1772469.
         assert_eq!(java_string_hash("\u{1D54A}"), 1_772_469);
+    }
+
+    #[test]
+    fn java_string_order_differs_from_rust_for_supplementary_characters() {
+        // U+FFFD (basic plane) versus U+1D54A (supplementary): Rust orders
+        // by code point, Java by UTF-16 units where the surrogate pair of
+        // U+1D54A (starting 0xD835) sorts *before* 0xFFFD.
+        assert_eq!(
+            java_compare_strings("\u{1D54A}", "\u{FFFD}"),
+            std::cmp::Ordering::Less,
+            "Java sorts the surrogate pair first"
+        );
+        assert!(
+            "\u{1D54A}" > "\u{FFFD}",
+            "Rust sorts the supplementary character last"
+        );
+        assert_eq!(
+            java_compare_strings("alpha", "beta"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            java_compare_strings("same", "same"),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
