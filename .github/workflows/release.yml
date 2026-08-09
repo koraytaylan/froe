@@ -1,8 +1,8 @@
 # Tag-driven releases: pushing a tag `vX.Y.Z` verifies the tag matches
 # the workspace version and the tests pass, generates the changelog from
 # the conventional-commit history with git-cliff, builds the CLI for the
-# most compatible target of each platform (static musl on Linux, both
-# Apple architectures, MSVC on Windows — where the read-only commands
+# most compatible target of each platform (static musl on Linux, Apple
+# silicon on macOS, MSVC on Windows — where the read-only commands
 # work and the maintenance commands refuse), publishes a GitHub release
 # with the binaries and checksums, and then publishes both crates to
 # crates.io (docs.rs builds documentation automatically from there).
@@ -79,9 +79,6 @@ jobs:
             archive: tar.gz
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-            archive: tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-13
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
