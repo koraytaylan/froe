@@ -1,6 +1,6 @@
 [package]
 name = "froe-export"
-description = "Export Apache Jackrabbit Oak segment-tar (TarMK) content trees: one traversal, pluggable output formats, JSON lines today."
+description = "Export Apache Jackrabbit Oak segment-tar (TarMK) content trees: one traversal, pluggable output formats — JSON lines, and Parquet behind the parquet feature."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true

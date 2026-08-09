@@ -98,6 +98,10 @@ enum Command {
         repository: PathBuf,
     },
     /// Export node data as JSON lines or Parquet tables.
+    // `extract` shipped in v0.1.0 as the JSON lines exporter and maps
+    // exactly onto `export --format json-lines`, so it lives on as a
+    // hidden compatibility alias; `export` is the documented spelling.
+    #[command(alias = "extract")]
     Export {
         /// The segment store directory.
         repository: PathBuf,
@@ -219,7 +223,7 @@ enum Command {
 }
 
 /// The formats `froe export` writes.
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 enum ExportFormat {
     /// One JSON object per node.
     JsonLines,
@@ -598,5 +602,57 @@ fn run_checkpoint(action: CheckpointAction) -> froe::Result<bool> {
         CheckpointAction::RemoveUnreferenced { repository, yes } => {
             mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::Unreferenced, yes)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Command, CommandLine, ExportFormat};
+
+    #[test]
+    fn extract_parses_as_the_hidden_export_alias() {
+        let parsed = CommandLine::try_parse_from([
+            "froe",
+            "extract",
+            "/store",
+            "--path",
+            "/content",
+            "--depth",
+            "2",
+            "--output",
+            "out.jsonl",
+        ])
+        .expect("the v0.1.0 extract invocation must keep parsing");
+        let Command::Export {
+            repository,
+            path,
+            depth,
+            format,
+            output,
+        } = parsed.command
+        else {
+            panic!("extract must dispatch to export");
+        };
+        assert_eq!(repository, std::path::PathBuf::from("/store"));
+        assert_eq!(path, "/content");
+        assert_eq!(depth, Some(2));
+        assert_eq!(format, ExportFormat::JsonLines);
+        assert_eq!(output, Some(std::path::PathBuf::from("out.jsonl")));
+    }
+
+    #[test]
+    fn the_alias_stays_out_of_the_help_text() {
+        let mut help = Vec::new();
+        <CommandLine as clap::CommandFactory>::command()
+            .write_long_help(&mut help)
+            .expect("render help");
+        let help = String::from_utf8(help).expect("valid UTF-8");
+        assert!(help.contains("export"));
+        assert!(
+            !help.contains("extract"),
+            "the compatibility alias must stay undocumented"
+        );
     }
 }
