@@ -58,6 +58,8 @@ jobs:
             echo "- Linux binaries are statically linked (musl) and run on any distribution."
             echo "- The Windows binary supports the read-only commands; maintenance"
             echo "  commands refuse to run there (a Unix entropy source is required)."
+            echo "- Maintenance commands are beta: not yet validated end-to-end against"
+            echo "  a real Oak/AEM instance — copy your repository before using them."
             echo "- \`sha256sum --check SHA256SUMS\` verifies any downloaded archive."
           } >> RELEASE_NOTES.md
       - uses: actions/upload-artifact@v4
