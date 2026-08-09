@@ -24,9 +24,15 @@ jobs:
         rust: [stable, "1.89"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt,clippy
       - run: rustup default ${{ matrix.rust }}
+      # Caches built dependencies keyed by lockfile and toolchain; the
+      # shared key lets the release workflow's ubuntu/stable jobs restore
+      # the cache this job saves on develop (the default branch).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate-${{ matrix.os }}-${{ matrix.rust }}
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: cargo test --workspace --release
@@ -36,7 +42,10 @@ jobs:
   windows-build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.89 --profile minimal --component clippy
       - run: rustup default 1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-1.89
       - run: cargo check --workspace --all-targets
