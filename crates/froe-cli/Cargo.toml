@@ -1,11 +1,12 @@
 [package]
 name = "froe-cli"
-description = "Command-line interface for inspecting and extracting data from Apache Jackrabbit Oak segment-tar (TarMK) repositories."
+description = "Command line for Apache Jackrabbit Oak segment-tar (TarMK) repositories: inspect, extract, and check read-only; compact, back up, and recover offline."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories = ["command-line-utilities"]

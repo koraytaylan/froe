@@ -1,0 +1,162 @@
+# Tag-driven releases: pushing a tag `vX.Y.Z` verifies the tag matches
+# the workspace version and the tests pass, generates the changelog from
+# the conventional-commit history with git-cliff, builds the CLI for the
+# most compatible target of each platform (static musl on Linux, both
+# Apple architectures, MSVC on Windows — where the read-only commands
+# work and the maintenance commands refuse), publishes a GitHub release
+# with the binaries and checksums, and then publishes both crates to
+# crates.io (docs.rs builds documentation automatically from there).
+#
+# Requires one repository secret: CARGO_REGISTRY_TOKEN, a crates.io API
+# token with publish scope.
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the workspace version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest_version" >&2
+            exit 1
+          fi
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo test --workspace
+      - run: cargo test --workspace --release
+
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install stable --profile minimal
+      - name: Install git-cliff
+        run: cargo install git-cliff --locked
+      - name: Generate the full changelog and this release's notes
+        run: |
+          git-cliff --output CHANGELOG.md
+          git-cliff --latest --strip header --output RELEASE_NOTES.md
+          {
+            echo ""
+            echo "### Platform notes"
+            echo ""
+            echo "- Linux binaries are statically linked (musl) and run on any distribution."
+            echo "- The Windows binary supports the read-only commands; maintenance"
+            echo "  commands refuse to run there (a Unix entropy source is required)."
+            echo "- \`sha256sum --check SHA256SUMS\` verifies any downloaded archive."
+          } >> RELEASE_NOTES.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: |
+            CHANGELOG.md
+            RELEASE_NOTES.md
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release -p froe-cli --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="froe-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/froe.exe" "$name/"
+          else
+            cp "target/${{ matrix.target }}/release/froe" "$name/"
+          fi
+          cp README.md LICENSE "$name/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$name.zip" "$name"
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            froe-*.tar.gz
+            froe-*.zip
+
+  release:
+    needs: [verify, changelog, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum froe-*.tar.gz froe-*.zip > SHA256SUMS
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "froe $GITHUB_REF_NAME" \
+            --notes-file artifacts/RELEASE_NOTES.md \
+            artifacts/froe-*.tar.gz \
+            artifacts/froe-*.zip \
+            artifacts/SHA256SUMS \
+            artifacts/CHANGELOG.md
+
+  publish-crates:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      # The core crate first; cargo waits until it is visible in the
+      # index before returning, so the CLI's version dependency on it
+      # resolves. docs.rs builds documentation automatically once the
+      # publish lands — no separate step needed.
+      - run: cargo publish -p froe
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - run: cargo publish -p froe-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

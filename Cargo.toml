@@ -10,6 +10,7 @@ edition = "2024"
 # Android, macOS), the same lock space as Oak's FileChannel.lock().
 rust-version = "1.89"
 license = "Apache-2.0"
+repository = "https://github.com/koraytaylan/froe"
 authors = ["Koray Taylan Davgana <koraytaylan@gmail.com>"]
 keywords = ["jackrabbit", "oak", "tarmk", "aem", "segment"]
 categories = ["filesystem", "parser-implementations", "command-line-utilities"]
@@ -31,3 +32,6 @@ module_name_repetitions = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Released binaries carry no debug symbols; panics still show messages
+# and the release test profile is unaffected.
+strip = "symbols"

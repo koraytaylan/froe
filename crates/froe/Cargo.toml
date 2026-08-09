@@ -1,11 +1,12 @@
 [package]
 name = "froe"
-description = "Reader for Apache Jackrabbit Oak segment-tar (TarMK) repositories: parses tar archives, segments, and records, and extracts node data."
+description = "Reader and offline maintenance toolkit for Apache Jackrabbit Oak segment-tar (TarMK) repositories: parse archives and records, extract node data, compact, back up, and recover."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories = ["filesystem", "parser-implementations"]
