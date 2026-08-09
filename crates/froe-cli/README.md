@@ -17,4 +17,12 @@ exclusive repository lock and modify the store, so they must run against a
 commands require a Unix operating system entropy source and refuse to run
 on Windows; the read-only commands work everywhere.
 
+**Maintenance commands are beta**: the write path is verified against
+byte-exact specifications extracted from the Oak sources and an extensive
+test suite, but has not yet been validated end-to-end against stores
+produced by — or consumed by — a real Oak/AEM instance. Until that
+interoperability round-trip lands, take a copy of your repository before
+running any maintenance command against data you care about. The
+read-only commands carry no such caveat.
+
 Licensed under the Apache License, Version 2.0.

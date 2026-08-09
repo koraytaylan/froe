@@ -23,6 +23,14 @@
 //! a *stopped* repository; it requires a Unix operating system entropy
 //! source and refuses to open on Windows.
 //!
+//! **The writing API is beta**: it is verified against byte-exact
+//! specifications extracted from the Oak sources and an extensive test
+//! suite, but has not yet been validated end-to-end against stores
+//! produced by — or consumed by — a real Oak/AEM instance. Until that
+//! interoperability round-trip lands, take a copy of your repository
+//! before writing to data you care about. The reading API carries no
+//! such caveat.
+//!
 //! # Example
 //!
 //! ```no_run

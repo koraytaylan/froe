@@ -28,6 +28,14 @@ verified against byte-exact specifications extracted from the Oak sources.
 re-render during compaction to a different — equally round-tripping —
 shortest form than Java's; see `double_to_text`.)
 
+> **Maintenance commands are beta.** The write path is verified against
+> byte-exact specifications extracted from the Oak sources and an
+> extensive test suite, but has not yet been validated end-to-end against
+> stores produced by — or consumed by — a real Oak/AEM instance. Until
+> that interoperability round-trip lands, take a copy of your repository
+> before running any maintenance command against data you care about.
+> The read-only commands never write anything and carry no such caveat.
+
 ## Platform support
 
 Rust 1.89 or newer. Linux and macOS are fully supported and CI-tested;
