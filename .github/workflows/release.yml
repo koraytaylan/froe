@@ -4,8 +4,10 @@
 # most compatible target of each platform (static musl on Linux, Apple
 # silicon on macOS, MSVC on Windows — where the read-only commands
 # work and the maintenance commands refuse), publishes a GitHub release
-# with the binaries and checksums, and then publishes both crates to
+# with the binaries and checksums, and then publishes the crates to
 # crates.io (docs.rs builds documentation automatically from there).
+# Every step converges on re-runs, so a partially failed release can be
+# finished by pushing the tag again.
 #
 # Requires one repository secret: CARGO_REGISTRY_TOKEN, a crates.io API
 # token with publish scope.
@@ -145,17 +147,30 @@ jobs:
         run: |
           cd artifacts
           sha256sum froe-*.tar.gz froe-*.zip > SHA256SUMS
-      - name: Create the GitHub release
+      - name: Create or update the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # A re-run after a partial release must refresh the existing
+        # release rather than die on the duplicate.
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "froe $GITHUB_REF_NAME" \
-            --notes-file artifacts/RELEASE_NOTES.md \
-            artifacts/froe-*.tar.gz \
-            artifacts/froe-*.zip \
-            artifacts/SHA256SUMS \
-            artifacts/CHANGELOG.md
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "froe $GITHUB_REF_NAME" \
+              --notes-file artifacts/RELEASE_NOTES.md
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              artifacts/froe-*.tar.gz \
+              artifacts/froe-*.zip \
+              artifacts/SHA256SUMS \
+              artifacts/CHANGELOG.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "froe $GITHUB_REF_NAME" \
+              --notes-file artifacts/RELEASE_NOTES.md \
+              artifacts/froe-*.tar.gz \
+              artifacts/froe-*.zip \
+              artifacts/SHA256SUMS \
+              artifacts/CHANGELOG.md
+          fi
 
   publish-crates:
     needs: release
@@ -167,13 +182,22 @@ jobs:
         with:
           shared-key: gate-ubuntu-latest-stable
           save-if: false
-      # The core crate first; cargo waits until it is visible in the
-      # index before returning, so the CLI's version dependency on it
-      # resolves. docs.rs builds documentation automatically once the
-      # publish lands — no separate step needed.
-      - run: cargo publish -p froe
+      # In dependency order; cargo waits until each publish is visible
+      # in the index before returning, so downstream version
+      # dependencies resolve. Versions already in the index are skipped,
+      # so a re-run after a partial publish converges instead of dying
+      # on the duplicate. docs.rs builds documentation automatically
+      # once a publish lands — no separate step needed.
+      - name: Publish the crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - run: cargo publish -p froe-cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          for crate in froe froe-export froe-cli; do
+            if curl --silent --fail \
+              "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null; then
+              echo "${crate} ${version} is already on crates.io; skipping"
+            else
+              cargo publish -p "$crate"
+            fi
+          done
