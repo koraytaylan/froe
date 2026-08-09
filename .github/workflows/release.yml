@@ -194,8 +194,13 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
           for crate in froe froe-export froe-cli; do
-            if curl --silent --fail \
-              "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null; then
+            # Existence is checked against the sparse index — the same
+            # source cargo reads — because the crates.io API rejects
+            # requests without a browser-like User-Agent. The index path
+            # for names of four or more characters is
+            # <first two>/<next two>/<name>.
+            index_url="https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}"
+            if curl --silent --fail "$index_url" | grep --quiet "\"vers\":\"${version}\""; then
               echo "${crate} ${version} is already on crates.io; skipping"
             else
               cargo publish -p "$crate"
