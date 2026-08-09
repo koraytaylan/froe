@@ -9,7 +9,7 @@ instance and without the JVM's startup and garbage collection overhead:
 
 * **Reading** is read-only and safe against a *live* repository — it never
   takes the repository lock and never writes. Traverse the content tree,
-  extract node data as JSON, inspect archives and segments, check
+  export node data as JSON lines or Parquet, inspect archives and segments, check
   consistency, diff revisions, trace node history, and search nodes.
   Like Oak itself, the reader memory-maps archives and relies on the
   store's file protocol (existing archive bytes are never modified in
@@ -53,7 +53,8 @@ $ cargo build --release
 # Read-only — safe against a live repository:
 $ target/release/froe summary /path/to/segmentstore
 $ target/release/froe tree /path/to/segmentstore /content --depth 2
-$ target/release/froe extract /path/to/segmentstore --path /content --output content.jsonl
+$ target/release/froe export /path/to/segmentstore --path /content --output content.jsonl
+$ target/release/froe export /path/to/segmentstore --path /content --format parquet --output ./export
 $ target/release/froe check /path/to/segmentstore
 
 # Maintenance — stopped repository only (each asks for confirmation):
@@ -63,10 +64,22 @@ $ target/release/froe recover-journal /path/to/segmentstore
 ```
 
 Every command takes the segment store directory (the one containing
-`journal.log` and the `data*.tar` archives). `froe extract` streams one
-JSON object per node — typed property values included — which is the fast
-path for pulling content out of a repository. `froe --help` lists every
-command.
+`journal.log` and the `data*.tar` archives). `froe export` is the fast
+path for pulling content out of a repository. Its default format,
+`json-lines`, streams one JSON object per node — typed property values
+included — to a file or standard output; `--format parquet` writes two
+zstd-compressed Parquet tables (`nodes.parquet` and `properties.parquet`)
+ready for analytical SQL in DuckDB, DataFusion, or Polars:
+
+```console
+$ duckdb -c "
+  SELECT primary_type, count(*) AS nodes,
+         rank() OVER (ORDER BY count(*) DESC) AS rank
+  FROM './export/nodes.parquet'
+  GROUP BY primary_type ORDER BY nodes DESC LIMIT 10;"
+```
+
+`froe --help` lists every command.
 
 As a library:
 
@@ -89,6 +102,7 @@ fn main() -> froe::Result<()> {
 | Crate | Purpose |
 | --- | --- |
 | [`crates/froe`](crates/froe) | The core library: tar archive parsing, segment and record decoding, journal handling, and the node traversal API. Published to crates.io as `froe`. |
+| [`crates/froe-export`](crates/froe-export) | Content tree export: one traversal, pluggable format sinks — JSON lines, and Parquet behind the `parquet` feature. |
 | [`crates/froe-cli`](crates/froe-cli) | The `froe` command-line interface built on the core library. |
 
 ## Documentation

@@ -1,0 +1,25 @@
+[package]
+name = "froe-export"
+description = "Export Apache Jackrabbit Oak segment-tar (TarMK) content trees: one traversal, pluggable output formats, JSON lines today."
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories = ["filesystem", "encoding"]
+
+[dependencies]
+froe = { version = "0.1.0", path = "../froe" }
+parquet = { version = "59.2.0", default-features = false, features = ["zstd"], optional = true }
+
+[features]
+parquet = ["dep:parquet"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

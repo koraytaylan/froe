@@ -106,7 +106,7 @@ after which a normal AEM start consumes the result cleanly.
 | `history` | `tool/History` | `froe history` | **Implemented** |
 | `search-nodes` | `tool/SearchNodes` | `froe search-nodes` | **Implemented** |
 | `compact` | `tool/Compact` | `froe compact` | **Implemented** |
-| `backup` / `restore` | `tool/Backup`, `tool/Restore` | `froe backup`, `froe restore` (plus content export via `froe extract`) | **Implemented** |
+| `backup` / `restore` | `tool/Backup`, `tool/Restore` | `froe backup`, `froe restore` (plus content export via `froe export`) | **Implemented** |
 | `recover-journal` | `tool/RecoverJournal` | `froe recover-journal` | **Implemented** |
 | `checkpoints` | `oak-run checkpoints` | `froe checkpoint list/create/remove/remove-all/remove-unreferenced` | **Implemented** |
 | `debug PATH` (store statistics) | `tool/DebugStore` | `froe summary`, `froe archives`, `froe segments` | **Implemented** (reachability analysis **Planned**) |
@@ -132,7 +132,7 @@ introduction above):
 | `froe node REPOSITORY PATH` | One node: record identifiers, typed properties, children. |
 | `froe tree REPOSITORY [PATH] [--depth N]` | Indented content tree with primary types. |
 | `froe checkpoints REPOSITORY` | Checkpoint names with creation and expiry times. |
-| `froe extract REPOSITORY [--path P] [--depth N] [--output FILE]` | Stream the subtree as JSON lines. |
+| `froe export REPOSITORY [--path P] [--depth N] [--format json-lines\|parquet] [--output FILE\|DIRECTORY]` | Export the subtree as JSON lines (default) or Parquet tables. |
 | `froe check REPOSITORY [--path P]… [--binaries]` | The newest fully consistent revision. |
 | `froe difference REPOSITORY BEFORE AFTER [--path P]` | Changes between two revisions. |
 | `froe history REPOSITORY PATH` | A node's record across journal revisions. |

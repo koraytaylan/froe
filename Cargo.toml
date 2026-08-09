@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/froe", "crates/froe-cli"]
+members = ["crates/froe", "crates/froe-export", "crates/froe-cli"]
 resolver = "3"
 
 [workspace.package]

@@ -8,7 +8,9 @@ use froe::tooling::diff::{NodeDifference, PropertyChange};
 use froe::tooling::search::SearchQuery;
 use froe::tooling::{check_consistency, diff_revisions, node_history, search_nodes};
 
-use crate::output::{append_json_values, format_timestamp, sanitize_terminal_text};
+use froe_export::json::append_json_values;
+
+use crate::output::{format_timestamp, sanitize_terminal_text};
 
 /// `froe check`: each path's latest good revision, Oak-style. Succeeds
 /// (exit 0) when any path found a good revision — Java's default,

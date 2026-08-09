@@ -1,12 +1,12 @@
 # froe-cli
 
-The `froe` command line: inspect, extract from, and maintain Apache
+The `froe` command line: inspect, export from, and maintain Apache
 Jackrabbit Oak `segment-tar` ("TarMK") repositories, as used by Apache
 Jackrabbit Oak and Adobe Experience Manager.
 
 Built on the [`froe`](https://crates.io/crates/froe) core library.
-Inspection, extraction, and diagnostic commands (`summary`, `tree`,
-`extract`, `check`, `difference`, `history`, `search-nodes`, …) are
+Inspection, export, and diagnostic commands (`summary`, `tree`,
+`export`, `check`, `difference`, `history`, `search-nodes`, …) are
 read-only and safe against a live repository (like Oak, archives are
 memory-mapped under the store's never-modify-in-place file protocol; a
 process mutating archives outside that protocol would disturb froe and a

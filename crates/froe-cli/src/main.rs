@@ -1,7 +1,7 @@
-//! Command-line interface for inspecting, extracting from, and maintaining
+//! Command-line interface for inspecting, exporting from, and maintaining
 //! Apache Jackrabbit Oak `segment-tar` (`TarMK`) repositories.
 //!
-//! Inspection and extraction commands are read-only: the repository lock
+//! Inspection and export commands are read-only: the repository lock
 //! is never taken, so they are safe against a live repository (archives
 //! are memory-mapped under the store's never-modify-in-place file
 //! protocol, the same reliance a running Oak instance has). The
@@ -11,14 +11,12 @@
 //! repository, and each asks for confirmation first.
 
 mod content_display;
-mod extraction;
 mod inspection;
 mod mutation;
 mod output;
 mod tooling_display;
 
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -33,7 +31,7 @@ use crate::mutation::CheckpointRemoval;
     about = "Tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories",
     long_about = "Tooling for Apache Jackrabbit Oak segment-tar (TarMK) repositories, the storage \
                   format of Apache Jackrabbit Oak and Adobe Experience Manager. Inspection and \
-                  extraction commands are read-only and safe against a live repository (archives \
+                  export commands are read-only and safe against a live repository (archives \
                   are memory-mapped under the store's never-modify-in-place file protocol, the \
                   same reliance a running Oak instance has); the compact, backup, restore, \
                   recover-journal, and checkpoint commands modify the store and must be run \
@@ -99,18 +97,23 @@ enum Command {
         /// The segment store directory.
         repository: PathBuf,
     },
-    /// Extract node data as JSON lines (one object per node).
-    Extract {
+    /// Export node data as JSON lines or Parquet tables.
+    Export {
         /// The segment store directory.
         repository: PathBuf,
-        /// The content path to extract from.
+        /// The content path to export from.
         #[arg(long, default_value = "/")]
         path: String,
-        /// Bound the extraction depth; omit to extract the whole subtree.
+        /// Bound the export depth; omit to export the whole subtree.
         #[arg(long)]
         depth: Option<usize>,
-        /// Write to this file instead of standard output. The file must
-        /// not exist yet; extraction never overwrites.
+        /// The output format.
+        #[arg(long, value_enum, default_value = "json-lines")]
+        format: ExportFormat,
+        /// Where the export goes; never an existing file — the export
+        /// never overwrites. For json-lines a file (standard output when
+        /// omitted); for parquet the directory receiving nodes.parquet
+        /// and properties.parquet (created if absent, required).
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -213,6 +216,16 @@ enum Command {
         #[command(subcommand)]
         action: CheckpointAction,
     },
+}
+
+/// The formats `froe export` writes.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ExportFormat {
+    /// One JSON object per node.
+    JsonLines,
+    /// Two Parquet tables for analytical SQL: nodes.parquet and
+    /// properties.parquet.
+    Parquet,
 }
 
 #[derive(Subcommand)]
@@ -333,48 +346,36 @@ fn run(command: Command) -> froe::Result<ExitCode> {
         Command::Checkpoints { repository } => {
             inspection::print_checkpoints(&Repository::open(&repository)?)?;
         }
-        Command::Extract {
+        Command::Export {
             repository: repository_path,
             path,
             depth,
+            format,
             output,
         } => {
-            let repository = Repository::open(&repository_path)?;
-            let written = if let Some(output_path) = output {
-                let file = extraction::create_extraction_output(&repository_path, &output_path)?;
-                let mut sink = std::io::BufWriter::with_capacity(1 << 20, file);
-
-                match extraction::extract_json_lines(&repository, &path, depth, &mut sink).and_then(
-                    |written| {
-                        sink.flush()?;
-                        Ok(written)
-                    },
-                ) {
-                    Ok(Some(node_count)) => Some(node_count),
-                    Ok(None) => {
-                        // Nothing was extracted: the freshly created,
-                        // empty output file must not linger either.
-                        drop(sink);
-                        let _ = std::fs::remove_file(&output_path);
-                        None
-                    }
-                    Err(error) => {
-                        // The file was freshly created above; a partial
-                        // extraction must not linger as if complete.
-                        drop(sink);
-                        let _ = std::fs::remove_file(&output_path);
-                        return Err(error);
-                    }
+            let written = match format {
+                ExportFormat::JsonLines => {
+                    run_json_lines_export(&repository_path, &path, depth, output.as_deref())?
                 }
-            } else {
-                let standard_output = std::io::stdout();
-                let mut sink = std::io::BufWriter::with_capacity(1 << 20, standard_output.lock());
-                let written = extraction::extract_json_lines(&repository, &path, depth, &mut sink)?;
-                sink.flush()?;
-                written
+                ExportFormat::Parquet => {
+                    let Some(output_directory) = output.as_deref() else {
+                        eprintln!(
+                            "froe: the parquet format writes nodes.parquet and \
+                             properties.parquet; pass --output <directory>"
+                        );
+                        return Ok(ExitCode::FAILURE);
+                    };
+                    run_parquet_export(&repository_path, &path, depth, output_directory)?
+                }
             };
             if let Some(node_count) = written {
-                eprintln!("froe: extracted {node_count} nodes");
+                match &output {
+                    Some(destination) => eprintln!(
+                        "froe: exported {node_count} nodes to {}",
+                        destination.display()
+                    ),
+                    None => eprintln!("froe: exported {node_count} nodes"),
+                }
             } else {
                 eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
                 return Ok(ExitCode::FAILURE);
@@ -467,6 +468,109 @@ fn run(command: Command) -> froe::Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Streams a JSON lines export to `output`, or to standard output when
+/// `output` is `None`. Returns the node count, or `None` when the path
+/// does not exist; a freshly created output file never lingers after
+/// either failure shape.
+fn run_json_lines_export(
+    repository_path: &Path,
+    path: &str,
+    depth: Option<usize>,
+    output: Option<&Path>,
+) -> froe::Result<Option<u64>> {
+    let repository = Repository::open(repository_path)?;
+    if let Some(output_path) = output {
+        let file = froe_export::create_export_output(repository_path, output_path)?;
+        let mut sink =
+            froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(1 << 20, file));
+        match froe_export::export_subtree(&repository, path, depth, &mut sink) {
+            Ok(written) => {
+                if written.is_none() {
+                    // Nothing was exported: the freshly created, empty
+                    // output file must not linger either.
+                    drop(sink);
+                    let _ = std::fs::remove_file(output_path);
+                }
+                Ok(written)
+            }
+            Err(error) => {
+                // The file was freshly created above; a partial export
+                // must not linger as if complete.
+                drop(sink);
+                let _ = std::fs::remove_file(output_path);
+                Err(error)
+            }
+        }
+    } else {
+        let standard_output = std::io::stdout();
+        let mut sink = froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(
+            1 << 20,
+            standard_output.lock(),
+        ));
+        froe_export::export_subtree(&repository, path, depth, &mut sink)
+    }
+}
+
+/// Exports the Parquet tables into `output_directory` (created if
+/// absent). Returns the node count, or `None` when the path does not
+/// exist; freshly created files never linger after either failure shape.
+fn run_parquet_export(
+    repository_path: &Path,
+    path: &str,
+    depth: Option<usize>,
+    output_directory: &Path,
+) -> froe::Result<Option<u64>> {
+    let repository = Repository::open(repository_path)?;
+    froe_export::create_export_directory(repository_path, output_directory)?;
+    let nodes_path = output_directory.join("nodes.parquet");
+    let properties_path = output_directory.join("properties.parquet");
+    let remove_outputs = || {
+        let _ = std::fs::remove_file(&nodes_path);
+        let _ = std::fs::remove_file(&properties_path);
+    };
+
+    let nodes_file = froe_export::create_export_output(repository_path, &nodes_path)?;
+    let properties_file = match froe_export::create_export_output(repository_path, &properties_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            // Only the nodes file is fresh; the properties path
+            // holds someone else's data and must stay.
+            let _ = std::fs::remove_file(&nodes_path);
+            return Err(error);
+        }
+    };
+    let mut sink = match froe_export::ParquetSink::new(
+        std::io::BufWriter::with_capacity(1 << 20, nodes_file),
+        std::io::BufWriter::with_capacity(1 << 20, properties_file),
+        &froe_export::ParquetExportOptions::default(),
+    ) {
+        Ok(sink) => sink,
+        Err(error) => {
+            remove_outputs();
+            return Err(error);
+        }
+    };
+    match froe_export::export_subtree(&repository, path, depth, &mut sink) {
+        Ok(written) => {
+            if written.is_none() {
+                // Nothing was exported: the freshly created files must
+                // not linger.
+                drop(sink);
+                remove_outputs();
+            }
+            Ok(written)
+        }
+        Err(error) => {
+            // The files were freshly created above; a partial export
+            // must not linger as if complete.
+            drop(sink);
+            remove_outputs();
+            Err(error)
+        }
+    }
 }
 
 /// Dispatches a checkpoint subcommand. Returns whether it succeeded.

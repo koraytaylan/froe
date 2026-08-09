@@ -2,10 +2,12 @@
 
 use froe::content::PropertyValues;
 use froe::content::node::NodeState;
+use froe::content::path::normalized_path;
 use froe::content::property::PropertyValue;
 use froe::store::Repository;
+use froe_export::json::append_json_values;
 
-use crate::output::{append_json_values, sanitize_terminal_text};
+use crate::output::sanitize_terminal_text;
 
 /// `froe node`: one node's properties and child names.
 pub(crate) fn print_node(repository: &Repository, path: &str) -> froe::Result<bool> {
@@ -80,17 +82,4 @@ fn render_values(values: &PropertyValues) -> String {
     let mut buffer = String::new();
     append_json_values(&mut buffer, values);
     buffer
-}
-
-/// Displays `/` for the root and strips duplicate slashes elsewhere.
-pub(crate) fn normalized_path(path: &str) -> String {
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.is_empty() {
-        "/".to_owned()
-    } else {
-        format!("/{}", segments.join("/"))
-    }
 }
