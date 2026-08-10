@@ -9,8 +9,9 @@ instance and without the JVM's startup and garbage collection overhead:
 
 * **Reading** is read-only and safe against a *live* repository — it never
   takes the repository lock and never writes. Traverse the content tree,
-  export node data as JSON lines or Parquet, inspect archives and segments, check
-  consistency, diff revisions, trace node history, and search nodes.
+  export node data as JSON lines, Parquet, or SQLite, inspect archives and
+  segments, check consistency, diff revisions, trace node history, and
+  search nodes.
   Like Oak itself, the reader memory-maps archives and relies on the
   store's file protocol (existing archive bytes are never modified in
   place); a process that truncates or rewrites archives outside that
@@ -69,7 +70,10 @@ path for pulling content out of a repository. Its default format,
 `json-lines`, streams one JSON object per node — typed property values
 included — to a file or standard output; `--format parquet` writes two
 zstd-compressed Parquet tables (`nodes.parquet` and `properties.parquet`)
-ready for analytical SQL in DuckDB, DataFusion, or Polars:
+ready for analytical SQL in DuckDB, DataFusion, or Polars; `--format sqlite`
+writes a single SQLite database (interned `nodes`/`properties` tables with
+`node_paths` and `properties_expanded` views on top) for querying with any
+SQLite client:
 
 ```console
 $ duckdb -c "
@@ -102,7 +106,7 @@ fn main() -> froe::Result<()> {
 | Crate | Purpose |
 | --- | --- |
 | [`crates/froe`](crates/froe) | The core library: tar archive parsing, segment and record decoding, journal handling, and the node traversal API. Published to crates.io as `froe`. |
-| [`crates/froe-export`](crates/froe-export) | Content tree export: one traversal, pluggable format sinks — JSON lines, and Parquet behind the `parquet` feature. |
+| [`crates/froe-export`](crates/froe-export) | Content tree export: one traversal, pluggable format sinks — JSON lines, Parquet behind the `parquet` feature, SQLite behind the `sqlite` feature. |
 | [`crates/froe-cli`](crates/froe-cli) | The `froe` command-line interface built on the core library. |
 
 ## Documentation

@@ -97,11 +97,16 @@ enum Command {
         /// The segment store directory.
         repository: PathBuf,
     },
-    /// Export node data as JSON lines or Parquet tables.
+    /// Export node data as JSON lines, Parquet tables, or a SQLite
+    /// database.
     // `extract` shipped in v0.1.0 as the JSON lines exporter and maps
     // exactly onto `export --format json-lines`, so it lives on as a
     // hidden compatibility alias; `export` is the documented spelling.
     #[command(alias = "extract")]
+    #[allow(
+        clippy::doc_markdown,
+        reason = "SQLite is a proper noun; this doc comment doubles as the --help text"
+    )]
     Export {
         /// The segment store directory.
         repository: PathBuf,
@@ -117,7 +122,8 @@ enum Command {
         /// Where the export goes; never an existing file — the export
         /// never overwrites. For json-lines a file (standard output when
         /// omitted); for parquet the directory receiving nodes.parquet
-        /// and properties.parquet (created if absent, required).
+        /// and properties.parquet (created if absent, required); for
+        /// sqlite the database file (required).
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -230,6 +236,13 @@ enum ExportFormat {
     /// Two Parquet tables for analytical SQL: nodes.parquet and
     /// properties.parquet.
     Parquet,
+    /// One SQLite database file: interned nodes and properties tables
+    /// with node_paths and properties_expanded views on top.
+    #[allow(
+        clippy::doc_markdown,
+        reason = "SQLite is a proper noun; this doc comment doubles as the --help text"
+    )]
+    Sqlite,
 }
 
 #[derive(Subcommand)]
@@ -370,6 +383,16 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                         return Ok(ExitCode::FAILURE);
                     };
                     run_parquet_export(&repository_path, &path, depth, output_directory)?
+                }
+                ExportFormat::Sqlite => {
+                    let Some(output_path) = output.as_deref() else {
+                        eprintln!(
+                            "froe: the sqlite format writes a single database file; \
+                             pass --output <file>"
+                        );
+                        return Ok(ExitCode::FAILURE);
+                    };
+                    run_sqlite_export(&repository_path, &path, depth, output_path)?
                 }
             };
             if let Some(node_count) = written {
@@ -575,6 +598,25 @@ fn run_parquet_export(
             Err(error)
         }
     }
+}
+
+/// Exports the `SQLite` database into the single file `output_path`.
+/// Returns the node count, or `None` when the path does not exist; a
+/// freshly created file never lingers after either failure shape — the
+/// sink's drop implementation owns that cleanup.
+fn run_sqlite_export(
+    repository_path: &Path,
+    path: &str,
+    depth: Option<usize>,
+    output_path: &Path,
+) -> froe::Result<Option<u64>> {
+    let repository = Repository::open(repository_path)?;
+    let mut sink = froe_export::SqliteSink::create(
+        repository_path,
+        output_path,
+        froe_export::SqliteExportOptions::default(),
+    )?;
+    froe_export::export_subtree(&repository, path, depth, &mut sink)
 }
 
 /// Dispatches a checkpoint subcommand. Returns whether it succeeded.

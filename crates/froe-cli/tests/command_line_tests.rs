@@ -123,3 +123,82 @@ fn the_extract_alias_writes_output_files() {
         "{\"path\":\"/content\",\"properties\":{\"jcr:primaryType\":\"nt:unstructured\"}}\n"
     );
 }
+
+#[test]
+fn the_sqlite_format_writes_a_database_file() {
+    let directory = TestDirectory::new("sqlite-format");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    let output = directory.path.join("content.db");
+
+    let export = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "export",
+            store.to_str().expect("path"),
+            "--format",
+            "sqlite",
+            "--output",
+            output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run export");
+    assert!(
+        export.status.success(),
+        "export --format sqlite must succeed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let written = std::fs::read(&output).expect("read output");
+    assert!(
+        written.starts_with(b"SQLite format 3\0"),
+        "the output must be a SQLite database file"
+    );
+
+    // A second export to the same path must refuse: the export never
+    // overwrites.
+    let rerun = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "export",
+            store.to_str().expect("path"),
+            "--format",
+            "sqlite",
+            "--output",
+            output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("re-run export");
+    assert!(!rerun.status.success());
+    assert!(
+        String::from_utf8_lossy(&rerun.stderr).contains("never overwrites"),
+        "the rerun must refuse to overwrite: {}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+}
+
+#[test]
+fn the_sqlite_format_leaves_an_existing_file_untouched() {
+    let directory = TestDirectory::new("sqlite-never-overwrites");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    let output = directory.path.join("victim.db");
+    std::fs::write(&output, b"someone else's database").expect("seed");
+
+    let export = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "export",
+            store.to_str().expect("path"),
+            "--format",
+            "sqlite",
+            "--output",
+            output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run export");
+    assert!(!export.status.success());
+    assert_eq!(
+        std::fs::read(&output).expect("read"),
+        b"someone else's database",
+        "the existing file must be untouched, not opened and modified"
+    );
+}

@@ -17,6 +17,10 @@
 //!   zstd-compressed tables built for analytical SQL: one row per node
 //!   and one row per property value. See the [`parquet`]
 //!   module.
+//! * `SqliteSink` (behind the `sqlite` feature) — a single `.db` file
+//!   with interned strings, a clustered properties table, and a view
+//!   layer presenting flat, directly queryable rows. See the [`sqlite`]
+//!   module.
 //!
 //! Exporting is read-only and safe against a live repository — it shares
 //! the core's reading guarantees. [`create_export_output`] is the one
@@ -46,9 +50,13 @@ pub mod json_lines;
 pub mod output_file;
 #[cfg(feature = "parquet")]
 pub mod parquet;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 #[cfg(feature = "parquet")]
 pub use crate::parquet::{ParquetExportOptions, ParquetSink};
+#[cfg(feature = "sqlite")]
+pub use crate::sqlite::{SqliteExportOptions, SqliteSink};
 pub use export::{ExportSink, ExportedNode, export_subtree};
 pub use json_lines::JsonLinesSink;
 pub use output_file::{create_export_directory, create_export_output};

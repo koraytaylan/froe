@@ -40,6 +40,13 @@ pub fn create_export_directory(repository_path: &Path, directory: &Path) -> froe
 /// damaged archive. On Unix the file is created with mode 0600 before
 /// the umask applies — never *broader* than owner-only, though a
 /// restrictive umask can narrow it further.
+///
+/// The file is opened for reading and writing: sinks that re-open the
+/// file through the descriptor (the `SQLite` sink on Unix) need both.
+/// On Windows the file is created without delete-share, so the pathname
+/// cannot be repointed (renamed or deleted away) while the export holds
+/// the file — the identity checks the `SQLite` sink performs then always
+/// refer to the created file.
 pub fn create_export_output(
     repository_path: &Path,
     output_path: &Path,
@@ -64,11 +71,19 @@ pub fn create_export_output(
         });
     }
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately without
+        // FILE_SHARE_DELETE: while the export holds the file, nobody can
+        // rename or delete it out from under the pathname.
+        options.share_mode(0x0001 | 0x0002);
     }
     options.open(output_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
