@@ -381,6 +381,10 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             full,
             quiet,
         } => {
+            if full && format != ExportFormat::Parquet {
+                eprintln!("froe: --full applies only to the parquet format");
+                return Ok(ExitCode::FAILURE);
+            }
             let run = match format {
                 ExportFormat::JsonLines => {
                     run_json_lines_export(&repository_path, &path, depth, output.as_deref(), quiet)?
@@ -657,7 +661,20 @@ fn run_parquet_export(
                 );
                 return Ok(ExportRun::Reported);
             }
-            froe_export::ParquetRefresh::NotReusable { reason } => {
+            froe_export::ParquetRefresh::NotReusable {
+                reason,
+                replaceable,
+            } => {
+                if !replaceable {
+                    // Foreign data and other scopes are never replaced
+                    // uninvited — the same hard refusal the streaming
+                    // formats give an existing output file.
+                    return Err(froe::Error::InvalidFormat {
+                        details: format!(
+                            "{reason}; refusing to replace it — pass --full to rebuild anyway"
+                        ),
+                    });
+                }
                 // A first export is the quiet case; anything present
                 // but unusable deserves the reason before it is
                 // replaced.
@@ -680,7 +697,8 @@ fn run_parquet_export(
 /// The new files are written under temporary names and atomically
 /// moved over any existing export only once complete, so a failed
 /// export never disturbs a good one — and the temporary files never
-/// linger after either failure shape.
+/// linger after either failure shape. The directory's export lock is
+/// held throughout, serializing concurrent writers.
 fn run_full_parquet_export(
     repository: &Repository,
     path: &str,
@@ -688,6 +706,7 @@ fn run_full_parquet_export(
     output_directory: &Path,
     quiet: bool,
 ) -> froe::Result<ExportRun> {
+    let _lock = froe_export::lock_export_directory(output_directory)?;
     for file_name in [
         froe_export::NODES_FILE_NAME,
         froe_export::PROPERTIES_FILE_NAME,
@@ -750,15 +769,23 @@ fn run_full_parquet_export(
                 remove_temporaries();
                 return Ok(ExportRun::Missing);
             };
-            froe_export::replace_export_output(
+            let renamed = froe_export::replace_export_output(
                 &nodes_temporary,
                 &output_directory.join(froe_export::NODES_FILE_NAME),
-            )?;
-            froe_export::replace_export_output(
-                &properties_temporary,
-                &output_directory.join(froe_export::PROPERTIES_FILE_NAME),
-            )?;
-            Ok(ExportRun::Exported { nodes, elapsed })
+            )
+            .and_then(|()| {
+                froe_export::replace_export_output(
+                    &properties_temporary,
+                    &output_directory.join(froe_export::PROPERTIES_FILE_NAME),
+                )
+            });
+            match renamed {
+                Ok(()) => Ok(ExportRun::Exported { nodes, elapsed }),
+                Err(error) => {
+                    remove_temporaries();
+                    Err(error)
+                }
+            }
         }
         Err(error) => {
             // The temporary files hold a partial export; the existing

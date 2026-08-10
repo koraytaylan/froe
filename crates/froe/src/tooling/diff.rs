@@ -30,14 +30,15 @@ pub enum PropertyChange {
     Added(PropertyState),
     /// A property present only in the older state.
     Removed(PropertyState),
-    /// A property whose value changed.
+    /// A property whose value or type changed. The states carry the
+    /// type as well as the values: a `String` retyped to a `Name`, or
+    /// an empty `String[]` to an empty `Long[]`, changes no value bytes
+    /// but is a change — the exported type column depends on it.
     Changed {
-        /// The property name.
-        name: String,
-        /// The value in the older state.
-        before: PropertyValues,
-        /// The value in the newer state.
-        after: PropertyValues,
+        /// The property in the older state.
+        before: PropertyState,
+        /// The property in the newer state.
+        after: PropertyState,
     },
 }
 
@@ -232,18 +233,18 @@ fn diff_properties(
                 change: PropertyChange::Added(after_property.clone()),
             }),
             Some(before_property)
-                if !property_values_equal(
-                    provider,
-                    &before_property.values,
-                    &after_property.values,
-                )? =>
+                if before_property.property_type != after_property.property_type
+                    || !property_values_equal(
+                        provider,
+                        &before_property.values,
+                        &after_property.values,
+                    )? =>
             {
                 differences.push(NodeDifference::PropertyChanged {
                     path: display_path(path),
                     change: PropertyChange::Changed {
-                        name: after_property.name.clone(),
-                        before: before_property.values.clone(),
-                        after: after_property.values.clone(),
+                        before: before_property.clone(),
+                        after: after_property.clone(),
                     },
                 });
             }
@@ -510,11 +511,13 @@ mod tests {
             matches!(
                 difference,
                 NodeDifference::PropertyChanged {
-                    change: PropertyChange::Changed { name, before, after },
+                    change: PropertyChange::Changed { before, after },
                     ..
-                } if name == "title"
-                    && *before == PropertyValues::Single(PropertyValue::String("original".to_owned()))
-                    && *after == PropertyValues::Single(PropertyValue::String("updated".to_owned()))
+                } if before.name == "title"
+                    && before.values
+                        == PropertyValues::Single(PropertyValue::String("original".to_owned()))
+                    && after.values
+                        == PropertyValues::Single(PropertyValue::String("updated".to_owned()))
             )
         });
         assert!(
@@ -536,6 +539,98 @@ mod tests {
         let differences =
             diff_revisions(&directory.path, &revision, &revision, "/content").expect("diff");
         assert!(differences.is_empty(), "no differences: {differences:?}");
+    }
+
+    /// Writes a `/content` node carrying one single-valued property
+    /// (`single_prop = "x"`) and one empty multi-valued property
+    /// (`multi_prop`), both of the given types.
+    fn write_typed_revision(
+        directory: &std::path::Path,
+        single_type: crate::content::property::PropertyType,
+        multiple_type: crate::content::property::PropertyType,
+    ) -> String {
+        let store = WritableRepository::open(directory).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let single_value = writer.write_string("x").expect("value");
+        let content = writer
+            .write_node(
+                Some("nt:unstructured"),
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[
+                    PropertyToWrite {
+                        name: "single_prop".to_owned(),
+                        property_type: single_type,
+                        values: PropertyValuesToWrite::Single(single_value),
+                    },
+                    PropertyToWrite {
+                        name: "multi_prop".to_owned(),
+                        property_type: multiple_type,
+                        values: PropertyValuesToWrite::Multiple(Vec::new()),
+                    },
+                ],
+            )
+            .expect("content");
+        let root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "content".to_owned(),
+                    node: content,
+                },
+                &[],
+            )
+            .expect("root");
+        let head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: root,
+                },
+                &[],
+            )
+            .expect("super root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, head));
+        store.close().expect("close");
+        format!("{}:{}", head.segment, head.record_number as i32)
+    }
+
+    #[test]
+    fn detects_type_only_property_changes() {
+        use crate::content::property::PropertyType;
+        let directory = TestDirectory::new("type-changes");
+        let before =
+            write_typed_revision(&directory.path, PropertyType::String, PropertyType::String);
+        let after = write_typed_revision(&directory.path, PropertyType::Name, PropertyType::Long);
+
+        let differences =
+            diff_revisions(&directory.path, &before, &after, "/content").expect("diff");
+
+        let type_of = |name: &str| {
+            differences.iter().find_map(|difference| match difference {
+                NodeDifference::PropertyChanged {
+                    change: PropertyChange::Changed { before, after },
+                    ..
+                } if before.name == name => Some((before.property_type, after.property_type)),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            type_of("single_prop"),
+            Some((PropertyType::String, PropertyType::Name)),
+            "a same-bytes String-to-Name retype is reported: {differences:?}"
+        );
+        assert_eq!(
+            type_of("multi_prop"),
+            Some((PropertyType::String, PropertyType::Long)),
+            "an empty String[]-to-Long[] retype is reported: {differences:?}"
+        );
     }
 
     #[test]

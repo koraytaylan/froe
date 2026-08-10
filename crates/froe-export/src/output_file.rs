@@ -105,9 +105,9 @@ pub fn create_export_output(
 /// `.nodes.parquet.4173.tmp`. Hidden, unmistakably transient, and unique
 /// per process — a crashed run's leftover never blocks the next run,
 /// which sweeps same-pattern files before starting (see
-/// [`sweep_temporary_outputs`]). Concurrent exports into one directory
-/// still race on the final rename, last writer winning — exactly like
-/// two concurrent exports into two fresh names would.
+/// [`sweep_temporary_outputs`]). Cross-process safety comes from the
+/// export directory lock ([`lock_export_directory`]): with it held, no
+/// live writer owns a file the sweep can match.
 #[must_use]
 pub fn temporary_output_name(file_name: &str) -> String {
     format!(".{file_name}.{}.tmp", std::process::id())
@@ -128,6 +128,8 @@ fn is_temporary_output(file_name: &str, candidate: &str) -> bool {
 /// Removes leftover [`temporary_output_name`] files of `file_name` from
 /// `directory` — residue of crashed runs. Only our own hidden, clearly
 /// transient pattern matches; real output files and foreign files stay.
+/// Call only with the export directory lock held: without it a live
+/// concurrent writer's in-flight temporary would be swept away.
 pub fn sweep_temporary_outputs(directory: &Path, file_name: &str) -> froe::Result<()> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -147,26 +149,122 @@ pub fn sweep_temporary_outputs(directory: &Path, file_name: &str) -> froe::Resul
     Ok(())
 }
 
+/// The lock file serializing exports into one output directory.
+const EXPORT_LOCK_FILE_NAME: &str = ".froe-export.lock";
+
+/// A held exclusive lock on an export output directory. The lock is
+/// advisory — it serializes froe processes, not other software — and
+/// releases itself when the guard drops. The empty lock file stays in
+/// the directory; deleting it after release would race the next locker.
+pub struct ExportDirectoryLock {
+    _file: std::fs::File,
+}
+
+/// Takes the exclusive lock on the export output `directory`, refusing
+/// to wait: a contended lock means another export is writing there, and
+/// proceeding would let concurrent runs sweep each other's temporaries
+/// and rename over each other's results.
+///
+/// # Errors
+///
+/// Fails with [`std::io::ErrorKind::WouldBlock`] while another export
+/// holds the lock.
+pub fn lock_export_directory(directory: &Path) -> froe::Result<ExportDirectoryLock> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(directory.join(EXPORT_LOCK_FILE_NAME))?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => froe::Error::InputOutput(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "another export is writing to {}; wait for it to finish",
+                directory.display()
+            ),
+        )),
+        std::fs::TryLockError::Error(error) => froe::Error::InputOutput(error),
+    })?;
+    Ok(ExportDirectoryLock { _file: file })
+}
+
 /// Moves a fully written temporary output over `target`. On POSIX, and
 /// on Windows through Rust's `MoveFileEx`-based `rename`, replacing an
 /// existing target is atomic: a concurrent reader sees either the old
-/// or the new file, never a mixture. The remove-and-retry branch covers
-/// filesystems where renaming over an existing file fails outright —
-/// there a crash can leave the target missing, which the Parquet
-/// refresh's provenance validation tolerates: an interrupted
-/// replacement simply fails the next run's validation and is rebuilt.
+/// or the new file, never a mixture.
+///
+/// The temporary's bytes are forced to disk before the rename and the
+/// directory entry after, so the replacement survives a power loss. On
+/// Unix an existing target's permission bits carry over to the
+/// replacement (ownership and ACLs cannot, portably).
+///
+/// The remove-and-retry branch runs only when the rename failed
+/// *because* replacing is unsupported ([`std::io::ErrorKind::AlreadyExists`],
+/// with both paths intact): any other failure — a missing temporary, a
+/// read-only filesystem — must leave a good target untouched.
 pub fn replace_export_output(temporary: &Path, target: &Path) -> froe::Result<()> {
+    preserve_permissions(temporary, target)?;
+    std::fs::File::open(temporary)?.sync_all()?;
     match std::fs::rename(temporary, target) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(error) => {
-            if !target.exists() {
+            let replace_refusal = error.kind() == std::io::ErrorKind::AlreadyExists
+                && temporary.exists()
+                && target.exists();
+            if !replace_refusal {
                 return Err(froe::Error::InputOutput(error));
             }
             std::fs::remove_file(target)?;
             std::fs::rename(temporary, target)?;
-            Ok(())
         }
     }
+    sync_parent_directory(target)
+}
+
+/// Carries an existing target's permission bits over to its replacement
+/// on Unix; a missing target keeps the temporary's fresh mode.
+#[cfg(unix)]
+fn preserve_permissions(temporary: &Path, target: &Path) -> froe::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(target) {
+        Ok(metadata) => {
+            std::fs::set_permissions(
+                temporary,
+                std::fs::Permissions::from_mode(metadata.permissions().mode()),
+            )?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(froe::Error::InputOutput(error)),
+    }
+}
+
+/// No permission model to translate on other platforms.
+#[cfg(not(unix))]
+fn preserve_permissions(_temporary: &Path, _target: &Path) -> froe::Result<()> {
+    Ok(())
+}
+
+/// Forces the directory entry of a renamed file to disk. Directory
+/// handles open like files only on Unix; elsewhere the file's own sync
+/// is what we have.
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> froe::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// See the Unix variant.
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> froe::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -262,6 +360,74 @@ mod tests {
         std::fs::write(&temporary, b"first").expect("write");
         replace_export_output(&temporary, &fresh).expect("replace");
         assert_eq!(std::fs::read(&fresh).expect("read"), b"first");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_failed_replacement_preserves_the_target() {
+        let directory =
+            std::env::temp_dir().join(format!("froe-output-preserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create");
+        let target = directory.join("target");
+        std::fs::write(&target, b"good data").expect("write");
+
+        // The temporary is missing: the rename fails, and the target
+        // must survive untouched.
+        let missing = directory.join("missing-temporary");
+        assert!(replace_export_output(&missing, &target).is_err());
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            b"good data",
+            "a failed rename never costs the good target"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_replacement_keeps_the_targets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("froe-output-permissions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create");
+        let temporary = directory.join("temporary");
+        let target = directory.join("target");
+        std::fs::write(&temporary, b"new").expect("write");
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        std::fs::write(&target, b"old").expect("write");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o440)).expect("chmod");
+
+        replace_export_output(&temporary, &target).expect("replace");
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o440,
+            "the replacement carries the target's permissions, not the temporary's"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_export_directory_lock_serializes_writers() {
+        let directory =
+            std::env::temp_dir().join(format!("froe-output-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create");
+
+        let lock = super::lock_export_directory(&directory).expect("lock");
+        let contention = super::lock_export_directory(&directory);
+        assert!(
+            contention.is_err(),
+            "a held lock refuses a second writer, even in-process"
+        );
+        drop(lock);
+        super::lock_export_directory(&directory).expect("the released lock relocks");
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

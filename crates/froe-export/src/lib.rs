@@ -15,13 +15,13 @@
 //!   `{"binary_reference":"..."}`.
 //! * `ParquetSink` (behind the `parquet` feature) — two flat,
 //!   zstd-compressed tables built for analytical SQL: one row per node
-//!   and one row per property value. See the [`parquet`]
-//!   module. [`refresh_parquet_export`] brings an existing Parquet
+//!   and one row per property value. See the `parquet`
+//!   module. `refresh_parquet_export` brings an existing Parquet
 //!   export up to date by decoding only what changed since it was
-//!   taken; see the [`refresh`] module.
+//!   taken; see the `refresh` module.
 //! * `SqliteSink` (behind the `sqlite` feature) — a single `.db` file
 //!   with interned strings, a clustered properties table, and a view
-//!   layer presenting flat, directly queryable rows. See the [`sqlite`]
+//!   layer presenting flat, directly queryable rows. See the `sqlite`
 //!   module.
 //!
 //! Exporting is read-only and safe against a live repository — it shares
@@ -73,6 +73,6 @@ pub use crate::sqlite::{SqliteExportOptions, SqliteSink};
 pub use export::{ExportSink, ExportedNode, export_node, export_subtree};
 pub use json_lines::JsonLinesSink;
 pub use output_file::{
-    create_export_directory, create_export_output, replace_export_output, sweep_temporary_outputs,
-    temporary_output_name,
+    ExportDirectoryLock, create_export_directory, create_export_output, lock_export_directory,
+    replace_export_output, sweep_temporary_outputs, temporary_output_name,
 };

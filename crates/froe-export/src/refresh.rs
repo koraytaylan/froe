@@ -3,36 +3,54 @@
 //! A full export decodes the whole content tree; a refresh decodes only
 //! what changed since the export was taken. The mechanism:
 //!
-//! 1. **Validate.** Both files of an existing export carry an
+//! 1. **Lock.** The output directory's advisory lock
+//!    ([`lock_export_directory`]) serializes concurrent froe exports,
+//!    so no live writer's temporaries are swept and no rival's renames
+//!    interleave the refresh.
+//! 2. **Validate.** Both files of an existing export carry an
 //!    [`ExportProvenance`] stamp in their footers. The files are a
 //!    usable base when both stamps exist, agree with each other, and
 //!    match the requested root path and depth limit. Anything else —
 //!    missing files, foreign Parquet files, disagreeing stamps (the
 //!    residue of an interrupted refresh) — makes the export
-//!    [`ParquetRefresh::NotReusable`], and the caller falls back to a
-//!    full export.
-//! 2. **Diff.** The store's head is pinned once
+//!    [`ParquetRefresh::NotReusable`]; its `replaceable` flag records
+//!    whether a full export may replace the files without being asked
+//!    (they are absent or verifiably froe's own at the requested
+//!    scope) or must wait for an explicit rebuild.
+//! 3. **Diff.** The store's head is pinned once
 //!    ([`Repository::head_record_identifier`]), so a live repository
 //!    cannot tear the refresh, and [`diff_revisions`] between the
 //!    stamped and the pinned revision yields the changed paths. The
 //!    diff prunes unchanged subtrees by record identifier, so this
 //!    walks only the divergent spine.
-//! 3. **Delta.** Changed paths become *dirty ranges*: an added node
+//! 4. **Delta.** Changed paths become *dirty ranges*: an added node
 //!    re-exports its whole subtree, a removed node excises its subtree's
 //!    rows, a property change re-exports just that node's rows. The
 //!    replacements are exported — at the pinned revision — into
 //!    temporary delta files.
-//! 4. **Merge.** Old rows and delta rows merge into fresh files:
-//!    old rows inside a dirty range are dropped, the range's
-//!    replacement rows are written in their place. Rows stay nearly
-//!    document-ordered, keeping path-column statistics selective.
-//! 5. **Swap.** The merged files atomically replace the old ones
-//!    ([`replace_export_output`]). A crash between the two renames
-//!    leaves disagreeing stamps, which step 1 treats as not reusable —
-//!    the next run simply rebuilds.
+//! 5. **Merge.** The base files' stamps are revalidated (a writer
+//!    outside the lock could have replaced them), then old rows and
+//!    delta rows merge into fresh files: old rows inside a dirty range
+//!    are dropped, the range's replacement rows are written in their
+//!    place. Rows stay nearly document-ordered, keeping path-column
+//!    statistics selective.
+//! 6. **Swap.** The merged files replace the old ones
+//!    ([`replace_export_output`]), each rename atomic and durable.
+//!    The *pair* is not one transaction — a crash or a concurrent
+//!    reader between the two renames can observe new nodes with old
+//!    properties — so the stamps exist in both files: a later froe run
+//!    detects the disagreement and rebuilds, and query-side tooling
+//!    can compare the two footers' `froe.revision` for a consistent
+//!    pair before trusting a result.
 //!
 //! The result is exactly the row set a full export of the pinned
 //! revision would produce; a refresh never leaves stale rows behind.
+//!
+//! When the stamp already names the head, the export is
+//! [`ParquetRefresh::Current`] on the strength of the footers alone —
+//! validating row payloads would mean reading the whole dataset, the
+//! very cost a refresh avoids. A footer-intact but row-corrupt file is
+//! therefore reported current; the repair for that is a full export.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -46,8 +64,8 @@ use froe::tooling::diff::{NodeDifference, diff_revisions};
 
 use crate::export::{ExportSink, ExportedNode, export_node};
 use crate::output_file::{
-    create_export_directory, create_export_output, replace_export_output, sweep_temporary_outputs,
-    temporary_output_name,
+    create_export_directory, create_export_output, lock_export_directory, replace_export_output,
+    sweep_temporary_outputs, temporary_output_name,
 };
 use crate::parquet::{
     ExportProvenance, NodeRow, ParquetExportOptions, ParquetSink, PropertyRow,
@@ -84,11 +102,18 @@ pub enum ParquetRefresh {
         /// How many nodes the delta re-exported.
         nodes: u64,
     },
-    /// The existing files cannot serve as a refresh base; the caller
-    /// should run a full export, which replaces them.
+    /// The existing files cannot serve as a refresh base.
     NotReusable {
         /// Why the files are unusable, phrased for the operator.
         reason: String,
+        /// Whether a full export may replace the files without being
+        /// explicitly asked: they are absent, or they validated as this
+        /// tool's own export of the requested subtree (stale, partial,
+        /// or corrupt refresh residue). Foreign files and exports of a
+        /// different scope stay untouched until the caller passes the
+        /// explicit rebuild flag — replacing them uninvited could
+        /// destroy data froe does not own.
+        replaceable: bool,
     },
 }
 
@@ -114,9 +139,15 @@ pub fn refresh_parquet_export(
     on_node: &mut dyn FnMut(u64),
 ) -> froe::Result<ParquetRefresh> {
     create_export_directory(repository.directory(), output_directory)?;
+    let _lock = lock_export_directory(output_directory)?;
     let provenance = match validate(output_directory, root_path, depth) {
         Ok(provenance) => provenance,
-        Err(reason) => return Ok(ParquetRefresh::NotReusable { reason }),
+        Err(rejection) => {
+            return Ok(ParquetRefresh::NotReusable {
+                reason: rejection.reason,
+                replaceable: rejection.replaceable,
+            });
+        }
     };
     let revision = repository.head_record_identifier();
     let revision_text = revision.to_string();
@@ -139,9 +170,29 @@ pub fn refresh_parquet_export(
                      the store was likely compacted since the export",
                     provenance.revision()
                 ),
+                replaceable: true,
             });
         }
     };
+    // A removed export root is not refreshable to an empty dataset: the
+    // full export's contract for a missing path is a failure, and the
+    // refresh follows it — the caller's full-export attempt reports the
+    // missing path and leaves the existing tables untouched.
+    let root_removed = differences.iter().any(|difference| {
+        matches!(
+            difference,
+            NodeDifference::NodeRemoved { path } if path == provenance.root_path()
+        )
+    });
+    if root_removed {
+        return Ok(ParquetRefresh::NotReusable {
+            reason: format!(
+                "the exported path {} no longer exists at the head revision",
+                provenance.root_path()
+            ),
+            replaceable: true,
+        });
+    }
     let ranges = dirty_ranges(&differences, provenance.root_path(), depth);
     if ranges.is_empty() {
         // The head moved without touching the exported subtree — a
@@ -151,7 +202,36 @@ pub fn refresh_parquet_export(
             revision: revision_text,
         });
     }
+    apply_ranges(
+        repository,
+        &provenance,
+        revision,
+        &revision_text,
+        &ranges,
+        depth,
+        output_directory,
+        options,
+        on_node,
+    )
+}
 
+/// The back half of a refresh: delta export, base revalidation, merge,
+/// and the atomic swap, under the caller's export lock.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the phases thread their source, ranges, scope, and destination"
+)]
+fn apply_ranges(
+    repository: &Repository,
+    provenance: &ExportProvenance,
+    revision: RecordIdentifier,
+    revision_text: &str,
+    ranges: &[DirtyRange],
+    depth: Option<usize>,
+    output_directory: &Path,
+    options: &ParquetExportOptions,
+    on_node: &mut dyn FnMut(u64),
+) -> froe::Result<ParquetRefresh> {
     for file_name in [
         NODES_FILE_NAME,
         PROPERTIES_FILE_NAME,
@@ -174,14 +254,19 @@ pub fn refresh_parquet_export(
         repository,
         revision,
         provenance.root_path(),
-        &ranges,
+        ranges,
         &delta_nodes,
         &delta_properties,
         options,
         on_node,
     )?;
+    // The lock rules out another froe writer, but nothing stops outside
+    // software from having replaced the base files mid-refresh; applying
+    // ranges computed against the validated base to a silently swapped
+    // one would produce a falsely stamped export.
+    revalidate(output_directory, provenance)?;
     let new_provenance =
-        ExportProvenance::new(revision_text.clone(), provenance.root_path(), depth);
+        ExportProvenance::new(revision_text.to_owned(), provenance.root_path(), depth);
     match merge_tables(
         repository,
         &output_directory.join(NODES_FILE_NAME),
@@ -190,13 +275,16 @@ pub fn refresh_parquet_export(
         &output_directory.join(PROPERTIES_FILE_NAME),
         &delta_properties,
         &merged_properties,
-        &ranges,
+        ranges,
         &new_provenance,
         options,
     )? {
         MergeVerdict::Done => {}
         MergeVerdict::Unusable(reason) => {
-            return Ok(ParquetRefresh::NotReusable { reason });
+            return Ok(ParquetRefresh::NotReusable {
+                reason,
+                replaceable: true,
+            });
         }
     }
     replace_export_output(&merged_nodes, &output_directory.join(NODES_FILE_NAME))?;
@@ -205,31 +293,61 @@ pub fn refresh_parquet_export(
         &output_directory.join(PROPERTIES_FILE_NAME),
     )?;
     Ok(ParquetRefresh::Refreshed {
-        revision: revision_text,
+        revision: revision_text.to_owned(),
         ranges: ranges.len() as u64,
         nodes,
     })
 }
 
+/// Why an existing export is not a refresh base, classified for the
+/// caller's replace decision.
+struct Rejection {
+    /// The operator-facing reason.
+    reason: String,
+    /// Whether a full export may replace the files uninvited: they are
+    /// absent, or verifiably froe's own export (possibly interrupted).
+    /// Foreign files and other scopes require the explicit rebuild flag.
+    replaceable: bool,
+}
+
+impl Rejection {
+    /// A rejection after which replacing the files is safe.
+    fn replaceable(reason: String) -> Self {
+        Self {
+            reason,
+            replaceable: true,
+        }
+    }
+
+    /// A rejection whose files belong to someone else's data — or to a
+    /// different export scope — and must not be replaced uninvited.
+    fn foreign(reason: String) -> Self {
+        Self {
+            reason,
+            replaceable: false,
+        }
+    }
+}
+
 /// Validates an existing export as a refresh base: both files present,
 /// stamped, stamps agreeing, root path and depth limit matching the
-/// request. Every failure is a reason string, not an error — nothing
+/// request. Every failure is a [`Rejection`], not an error — nothing
 /// about a reusable-or-not verdict is exceptional.
 fn validate(
     output_directory: &Path,
     root_path: &str,
     depth: Option<usize>,
-) -> Result<ExportProvenance, String> {
+) -> Result<ExportProvenance, Rejection> {
     let mut provenances = Vec::with_capacity(2);
     for file_name in [NODES_FILE_NAME, PROPERTIES_FILE_NAME] {
         let path = output_directory.join(file_name);
         let provenance = match read_export_provenance(&path) {
             Ok(Some(provenance)) => provenance,
             Ok(None) => {
-                return Err(format!(
+                return Err(Rejection::foreign(format!(
                     "{} is a Parquet file, but not a froe export — it carries no export stamp",
                     path.display()
-                ));
+                )));
             }
             Err(error) => {
                 let missing = matches!(
@@ -237,12 +355,12 @@ fn validate(
                     froe::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::NotFound
                 );
                 return Err(if missing {
-                    format!("{} does not exist", path.display())
+                    Rejection::replaceable(format!("{} does not exist", path.display()))
                 } else {
-                    format!(
+                    Rejection::foreign(format!(
                         "{} is not readable as a Parquet export: {error}",
                         path.display()
-                    )
+                    ))
                 });
             }
         };
@@ -250,32 +368,55 @@ fn validate(
     }
     let [nodes_provenance, properties_provenance] = provenances.try_into().expect("two files");
     if nodes_provenance != properties_provenance {
-        return Err(
+        // Both files are stamped, so this is froe's own output — the
+        // residue of an interrupted refresh.
+        return Err(Rejection::replaceable(
             "the export's two files carry different stamps; an earlier refresh must \
              have been interrupted"
                 .to_owned(),
-        );
+        ));
     }
     let provenance = nodes_provenance;
     let requested = ExportProvenance::new(String::new(), root_path, depth);
     if provenance.root_path() != requested.root_path() {
-        return Err(format!(
+        return Err(Rejection::foreign(format!(
             "the existing export covers {}, not {}",
             provenance.root_path(),
             requested.root_path()
-        ));
+        )));
     }
     if provenance.depth_limit() != depth {
         let describe = |limit: Option<usize>| {
             limit.map_or_else(|| "unlimited".to_owned(), |limit| format!("depth {limit}"))
         };
-        return Err(format!(
+        return Err(Rejection::foreign(format!(
             "the existing export was {}, this request is {}",
             describe(provenance.depth_limit()),
             describe(depth)
-        ));
+        )));
     }
     Ok(provenance)
+}
+
+/// Re-reads the base files' stamps and demands they still equal the
+/// validated provenance. Between validation and merge only a writer
+/// outside the export lock could have replaced them; failing hard —
+/// rather than refreshing against a swapped base — keeps a falsely
+/// stamped export impossible, and a re-run simply starts over.
+fn revalidate(output_directory: &Path, provenance: &ExportProvenance) -> froe::Result<()> {
+    for file_name in [NODES_FILE_NAME, PROPERTIES_FILE_NAME] {
+        let path = output_directory.join(file_name);
+        let current = read_export_provenance(&path)?;
+        if current.as_ref() != Some(provenance) {
+            return Err(froe::Error::InvalidFormat {
+                details: format!(
+                    "the export at {} changed underneath the refresh; re-run to start over",
+                    output_directory.display()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// One dirty path range: the old rows it replaces and the replacement
@@ -332,9 +473,15 @@ fn dirty_ranges(
             }
         };
         let range_depth = path_depth(path).saturating_sub(root_depth);
+        // Rows beyond the export's depth limit exist in neither the old
+        // file nor a full re-export, whatever the change — dropping the
+        // range here keeps a deep removal from rewriting both tables
+        // for zero effect.
+        if depth_limit.is_some_and(|limit| range_depth > limit) {
+            continue;
+        }
         let replacement = match (replacement, depth_limit) {
             (Replacement::Excise, _) => Replacement::Excise,
-            (Replacement::ReExport { .. }, Some(limit)) if range_depth > limit => continue,
             (Replacement::ReExport { depth: None }, Some(limit)) => Replacement::ReExport {
                 depth: Some(limit - range_depth),
             },
@@ -553,18 +700,39 @@ fn merge_tables(
 ) -> froe::Result<MergeVerdict> {
     use ::parquet::file::reader::SerializedFileReader;
 
-    let open = |path: &Path| -> froe::Result<SerializedFileReader<std::fs::File>> {
+    // The old files opened cleanly during validation and revalidation,
+    // but a reader failing here — or mid-stream, below — only ever
+    // means the base is unusable, never that the refresh must die:
+    // report Unusable and let the caller rebuild. The delta files are
+    // this run's own output; their failures stay hard errors.
+    let open_old = |path: &Path| -> Result<SerializedFileReader<std::fs::File>, MergeVerdict> {
+        let reader = std::fs::File::open(path)
+            .and_then(|file| SerializedFileReader::new(file).map_err(std::io::Error::other));
+        reader.map_err(|error| {
+            MergeVerdict::Unusable(format!(
+                "{} is not readable as a Parquet export: {error}",
+                path.display()
+            ))
+        })
+    };
+    let old_nodes_reader = match open_old(old_nodes) {
+        Ok(reader) => reader,
+        Err(verdict) => return Ok(verdict),
+    };
+    let old_properties_reader = match open_old(old_properties) {
+        Ok(reader) => reader,
+        Err(verdict) => return Ok(verdict),
+    };
+    let open_delta = |path: &Path| -> froe::Result<SerializedFileReader<std::fs::File>> {
         SerializedFileReader::new(std::fs::File::open(path)?).map_err(parquet_read_error)
     };
-    let old_nodes_reader = open(old_nodes)?;
-    let delta_nodes_reader = open(delta_nodes)?;
-    let old_properties_reader = open(old_properties)?;
-    let delta_properties_reader = open(delta_properties)?;
+    let delta_nodes_reader = open_delta(delta_nodes)?;
+    let delta_properties_reader = open_delta(delta_properties)?;
 
-    // A decode failure does not abort the merge; it ends the affected
-    // stream, and the flag turns the verdict into Unusable afterwards —
-    // the partial merged files are then discarded and a full export
-    // replaces the unparseable base.
+    // A decode or read failure inside an old stream does not abort the
+    // merge; it ends the affected stream, and the flag turns the
+    // verdict into Unusable afterwards — the partial merged files are
+    // then discarded and a full export replaces the unparseable base.
     let failure = RefCell::new(None::<String>);
 
     let nodes_out = create_export_output(repository.directory(), merged_nodes)?;
@@ -577,8 +745,8 @@ fn merge_tables(
     )?;
     let index = RangeIndex::new(ranges);
     merge_row_streams(
-        NodeRows::new(&old_nodes_reader, &failure)?,
-        NodeRows::new(&delta_nodes_reader, &failure)?,
+        NodeRows::new(&old_nodes_reader, &failure, true)?,
+        NodeRows::new(&delta_nodes_reader, &failure, false)?,
         ranges,
         &index,
         |row| {
@@ -592,8 +760,8 @@ fn merge_tables(
         },
     )?;
     merge_row_streams(
-        PropertyRows::new(&old_properties_reader, &failure)?,
-        PropertyRows::new(&delta_properties_reader, &failure)?,
+        PropertyRows::new(&old_properties_reader, &failure, true)?,
+        PropertyRows::new(&delta_properties_reader, &failure, false)?,
         ranges,
         &index,
         |row| {
@@ -704,11 +872,13 @@ fn take_error<R, I: Iterator<Item = froe::Result<R>>>(
     }
 }
 
-/// An iterator decoding nodes-table rows, recording the first decode
-/// failure in `failure` and ending the stream there.
+/// An iterator decoding nodes-table rows. A decode failure records in
+/// `failure` and ends the stream. A read error is hard, except on a
+/// lenient (old, maybe-corrupt) stream, where it records instead.
 struct NodeRows<'a> {
     inner: ::parquet::record::reader::RowIter<'a>,
     failure: &'a RefCell<Option<String>>,
+    lenient: bool,
 }
 
 impl<'a> NodeRows<'a> {
@@ -716,11 +886,13 @@ impl<'a> NodeRows<'a> {
     fn new(
         reader: &'a ::parquet::file::reader::SerializedFileReader<std::fs::File>,
         failure: &'a RefCell<Option<String>>,
+        lenient: bool,
     ) -> froe::Result<Self> {
         use ::parquet::file::reader::FileReader;
         Ok(Self {
             inner: reader.get_row_iter(None).map_err(parquet_read_error)?,
             failure,
+            lenient,
         })
     }
 }
@@ -734,20 +906,36 @@ impl Iterator for NodeRows<'_> {
                 if let Some(decoded) = NodeRow::decode(&row) {
                     Some(Ok(decoded))
                 } else {
-                    record_decode_failure(self.failure);
+                    record_read_failure(
+                        self.failure,
+                        "an export file's rows do not match the export schema; \
+                         the files were not written by this export"
+                            .to_owned(),
+                    );
                     None
                 }
             }
-            Err(error) => Some(Err(parquet_read_error(error))),
+            Err(error) => {
+                if self.lenient {
+                    record_read_failure(
+                        self.failure,
+                        format!("the existing export's rows are not readable: {error}"),
+                    );
+                    None
+                } else {
+                    Some(Err(parquet_read_error(error)))
+                }
+            }
         }
     }
 }
 
-/// An iterator decoding properties-table rows, recording the first
-/// decode failure in `failure` and ending the stream there.
+/// An iterator decoding properties-table rows; behaves like
+/// [`NodeRows`].
 struct PropertyRows<'a> {
     inner: ::parquet::record::reader::RowIter<'a>,
     failure: &'a RefCell<Option<String>>,
+    lenient: bool,
 }
 
 impl<'a> PropertyRows<'a> {
@@ -755,11 +943,13 @@ impl<'a> PropertyRows<'a> {
     fn new(
         reader: &'a ::parquet::file::reader::SerializedFileReader<std::fs::File>,
         failure: &'a RefCell<Option<String>>,
+        lenient: bool,
     ) -> froe::Result<Self> {
         use ::parquet::file::reader::FileReader;
         Ok(Self {
             inner: reader.get_row_iter(None).map_err(parquet_read_error)?,
             failure,
+            lenient,
         })
     }
 }
@@ -773,25 +963,36 @@ impl Iterator for PropertyRows<'_> {
                 if let Some(decoded) = PropertyRow::decode(&row) {
                     Some(Ok(decoded))
                 } else {
-                    record_decode_failure(self.failure);
+                    record_read_failure(
+                        self.failure,
+                        "an export file's rows do not match the export schema; \
+                         the files were not written by this export"
+                            .to_owned(),
+                    );
                     None
                 }
             }
-            Err(error) => Some(Err(parquet_read_error(error))),
+            Err(error) => {
+                if self.lenient {
+                    record_read_failure(
+                        self.failure,
+                        format!("the existing export's rows are not readable: {error}"),
+                    );
+                    None
+                } else {
+                    Some(Err(parquet_read_error(error)))
+                }
+            }
         }
     }
 }
 
-/// Records the first decode failure; later failures keep the first's
-/// message.
-fn record_decode_failure(failure: &RefCell<Option<String>>) {
+/// Records the first read or decode failure; later failures keep the
+/// first's message.
+fn record_read_failure(failure: &RefCell<Option<String>>, message: String) {
     let mut failure = failure.borrow_mut();
     if failure.is_none() {
-        *failure = Some(
-            "an export file's rows do not match the export schema; \
-             the files were not written by this export"
-                .to_owned(),
-        );
+        *failure = Some(message);
     }
 }
 
@@ -1176,14 +1377,25 @@ mod tests {
             "the refreshed export stamps the new revision"
         );
         // No refresh residue may linger in the export directory.
-        let leftovers: Vec<_> = std::fs::read_dir(directory.export())
+        let mut leftovers: Vec<String> = std::fs::read_dir(directory.export())
             .expect("read dir")
-            .map(|entry| entry.expect("entry").file_name())
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
+        leftovers.sort();
         assert_eq!(
-            leftovers.len(),
-            2,
-            "only the two tables remain: {leftovers:?}"
+            leftovers,
+            vec![
+                ".froe-export.lock".to_owned(),
+                "nodes.parquet".to_owned(),
+                "properties.parquet".to_owned(),
+            ],
+            "only the two tables and the lock file remain"
         );
     }
 
@@ -1235,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_export_root_refreshes_to_empty_tables() {
+    fn a_removed_export_root_is_not_reusable() {
         let directory = TestDirectory::new("root-removed");
         populate_first(&directory.store());
         full_export(
@@ -1247,16 +1459,24 @@ mod tests {
         );
 
         revise(&directory.store(), |writer| writer.leaf(&[]));
-        assert_eq!(
-            refresh(&directory.store(), "/content", None, &directory.export()),
-            ParquetRefresh::Refreshed {
-                revision: head_revision(&directory.store()),
-                ranges: 1,
-                nodes: 0,
-            },
+        let outcome = refresh(&directory.store(), "/content", None, &directory.export());
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
+            panic!("a vanished export root follows the missing-path contract: {outcome:?}");
+        };
+        assert!(reason.contains("no longer exists"), "the reason: {reason}");
+        assert!(
+            replaceable,
+            "the caller's full export reports the missing path"
         );
-        assert!(node_rows(&directory.export()).is_empty());
-        assert!(property_rows(&directory.export()).is_empty());
+        assert_eq!(
+            node_rows(&directory.export()).len(),
+            6,
+            "the existing export stays untouched"
+        );
     }
 
     #[test]
@@ -1300,10 +1520,15 @@ mod tests {
         let directory = TestDirectory::new("missing");
         populate_first(&directory.store());
         let outcome = refresh(&directory.store(), "/content", None, &directory.export());
-        let ParquetRefresh::NotReusable { reason } = outcome else {
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
             panic!("no files, no refresh: {outcome:?}");
         };
         assert!(reason.contains("does not exist"), "the reason: {reason}");
+        assert!(replaceable, "there is nothing to destroy");
     }
 
     #[test]
@@ -1312,10 +1537,18 @@ mod tests {
         populate_first(&directory.store());
         full_export_without_stamp(&directory.store(), "/content", &directory.export());
         let outcome = refresh(&directory.store(), "/content", None, &directory.export());
-        let ParquetRefresh::NotReusable { reason } = outcome else {
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
             panic!("an unstamped file is no refresh base: {outcome:?}");
         };
         assert!(reason.contains("no export stamp"), "the reason: {reason}");
+        assert!(
+            !replaceable,
+            "foreign files wait for the explicit rebuild flag"
+        );
     }
 
     #[test]
@@ -1346,10 +1579,15 @@ mod tests {
         .expect("copy");
 
         let outcome = refresh(&directory.store(), "/content", None, &directory.export());
-        let ParquetRefresh::NotReusable { reason } = outcome else {
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
             panic!("disagreeing stamps are no refresh base: {outcome:?}");
         };
         assert!(reason.contains("different stamps"), "the reason: {reason}");
+        assert!(replaceable, "interrupted-refresh residue is froe's own");
     }
 
     #[test]
@@ -1366,12 +1604,20 @@ mod tests {
             Some("00000000-0000-0000-0000-000000000000.00000001".to_owned()),
         );
         let outcome = refresh(&directory.store(), "/content", None, &directory.export());
-        let ParquetRefresh::NotReusable { reason } = outcome else {
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
             panic!("an unresolvable base revision is no refresh base: {outcome:?}");
         };
         assert!(
             reason.contains("no longer resolves"),
             "the reason: {reason}"
+        );
+        assert!(
+            replaceable,
+            "a stale but froe-owned export rebuilds uninvited"
         );
     }
 
@@ -1387,10 +1633,18 @@ mod tests {
             None,
         );
         let outcome = refresh(&directory.store(), "/", None, &directory.export());
-        let ParquetRefresh::NotReusable { reason } = outcome else {
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
             panic!("a different subtree is no refresh base: {outcome:?}");
         };
         assert!(reason.contains("covers /content"), "the reason: {reason}");
+        assert!(
+            !replaceable,
+            "a different scope waits for the explicit rebuild flag"
+        );
     }
 
     #[test]
@@ -1405,10 +1659,124 @@ mod tests {
             None,
         );
         let outcome = refresh(&directory.store(), "/content", Some(2), &directory.export());
-        let ParquetRefresh::NotReusable { reason } = outcome else {
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
             panic!("a different depth limit is no refresh base: {outcome:?}");
         };
         assert!(reason.contains("unlimited"), "the reason: {reason}");
+        assert!(
+            !replaceable,
+            "a different scope waits for the explicit rebuild flag"
+        );
+    }
+
+    #[test]
+    fn an_out_of_depth_removal_reports_current() {
+        let directory = TestDirectory::new("deep-removal");
+        populate_first(&directory.store());
+        full_export(
+            &directory.store(),
+            "/content",
+            Some(1),
+            &directory.export(),
+            None,
+        );
+        let before = std::fs::read(directory.export().join("nodes.parquet")).expect("read");
+
+        // Remove only /content/kept/leaf — depth 2, outside the export.
+        revise(&directory.store(), |writer| {
+            let ratio = writer.property("ratio", PropertyType::Double, "2.5");
+            let jcr_content = writer.leaf(&[ratio]);
+            let kept = writer.leaf(&[]);
+            let x = writer.leaf(&[]);
+            let flag = writer.property("flag", PropertyType::Boolean, "true");
+            let subtree = writer.child("x", x, &[flag]);
+            let title = writer.property("title", PropertyType::String, "Hello");
+            let count = writer.property("count", PropertyType::Long, "42");
+            let data = writer.binary("data", &[1, 2, 3]);
+            let content = writer.node(
+                &[title, count, data],
+                &ChildNodesToWrite::Many(vec![
+                    ("jcr:content".to_owned(), jcr_content),
+                    ("kept".to_owned(), kept),
+                    ("subtree".to_owned(), subtree),
+                ]),
+            );
+            writer.child("content", content, &[])
+        });
+        let outcome = refresh(&directory.store(), "/content", Some(1), &directory.export());
+        assert!(
+            matches!(outcome, ParquetRefresh::Current { .. }),
+            "a removal outside the depth limit is a no-op: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(directory.export().join("nodes.parquet")).expect("read"),
+            before,
+            "and the tables are not rewritten"
+        );
+    }
+
+    #[test]
+    fn a_type_only_property_change_refreshes() {
+        let directory = TestDirectory::new("type-only");
+        let populate = |directory: &Path, property_type: PropertyType| {
+            revise(directory, |writer| {
+                let tags = PropertyToWrite {
+                    name: "tags".to_owned(),
+                    property_type,
+                    values: PropertyValuesToWrite::Multiple(Vec::new()),
+                };
+                let content = writer.leaf(&[tags]);
+                writer.child("content", content, &[])
+            });
+        };
+        populate(&directory.store(), PropertyType::String);
+        full_export(
+            &directory.store(),
+            "/content",
+            None,
+            &directory.export(),
+            None,
+        );
+
+        populate(&directory.store(), PropertyType::Long);
+        let outcome = refresh(&directory.store(), "/content", None, &directory.export());
+        assert!(
+            matches!(outcome, ParquetRefresh::Refreshed { .. }),
+            "an empty String[] to Long[] retype is a change: {outcome:?}"
+        );
+        let rows = property_rows(&directory.export());
+        let tags: Vec<_> = rows.iter().filter(|row| row.name == "tags").collect();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].property_type, "Long", "the retyped property row");
+    }
+
+    #[test]
+    fn revalidation_catches_a_swapped_base() {
+        let directory = TestDirectory::new("revalidate");
+        populate_first(&directory.store());
+        let revision = full_export(
+            &directory.store(),
+            "/content",
+            None,
+            &directory.export(),
+            None,
+        );
+        let provenance = ExportProvenance::new(revision, "/content", None);
+        super::revalidate(&directory.export(), &provenance)
+            .expect("the untouched base revalidates");
+        let swapped = ExportProvenance::new(
+            "00000000-0000-0000-0000-000000000000.00000001".to_owned(),
+            "/content",
+            None,
+        );
+        assert!(
+            super::revalidate(&directory.export(), &swapped).is_err(),
+            "a base replaced underneath the refresh aborts it"
+        );
     }
 
     // ---- pure-logic unit tests --------------------------------------
@@ -1479,6 +1847,22 @@ mod tests {
                 ("/root/a/b", true, Replacement::ReExport { depth: Some(0) }),
             ],
             "additions inside the limit re-export with their remaining depth"
+        );
+    }
+
+    #[test]
+    fn dirty_ranges_drop_out_of_depth_removals() {
+        let differences = vec![NodeDifference::NodeRemoved {
+            path: "/root/a/b".to_owned(),
+        }];
+        assert!(
+            dirty_ranges(&differences, "/root", Some(1)).is_empty(),
+            "a removal beyond the limit touches no exported row"
+        );
+        assert_eq!(
+            range_paths(&dirty_ranges(&differences, "/root", Some(2))),
+            vec![("/root/a/b", true, Replacement::Excise)],
+            "at the limit it excises"
         );
     }
 

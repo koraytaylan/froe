@@ -86,12 +86,30 @@ $ duckdb -c "
 Re-running a Parquet export into the same directory does not start
 over: the tables carry the head revision they were built from, so froe
 diffs that revision against the current head and decodes only the
-changed subtrees, rewriting the two files atomically in place — a kept
-export stays queryable at Parquet speed for the price of the delta.
-Anything the existing files cannot support (a first run, a different
-root path or depth, a revision compacted away since) falls back to a
-full export automatically; `--full` forces one. The `json-lines` and
-`sqlite` formats keep the strict never-overwrite contract instead.
+changed subtrees — a kept export stays queryable at Parquet speed for
+the price of the delta. Each file is written out completely and
+swapped in atomically (durably, permissions preserved), and a lock
+file serializes concurrent exports into the same directory. The two
+files are swapped one after the other — a completed run always leaves
+their stamps agreeing, but a crash or a query mid-swap can observe a
+mixed pair; the next froe run detects the disagreement and rebuilds,
+and a query-side check can demand it up front:
+
+```console
+$ duckdb -c "
+  SELECT (SELECT value FROM parquet_kv_metadata('./export/nodes.parquet')
+          WHERE key = 'froe.revision')
+       = (SELECT value FROM parquet_kv_metadata('./export/properties.parquet')
+          WHERE key = 'froe.revision')
+       AS consistent_pair;"
+```
+
+A stale base (a revision compacted away, an interrupted earlier
+refresh) rebuilds from scratch automatically; files froe did not
+write, or an export of a different root path or depth, are never
+replaced uninvited — rebuilding those takes an explicit `--full`. The
+`json-lines` and `sqlite` formats keep the strict never-overwrite
+contract instead.
 
 `froe --help` lists every command.
 

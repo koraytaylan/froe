@@ -122,18 +122,29 @@ fn print_property_change(path: &str, change: &PropertyChange) {
                 render(&property.values)
             );
         }
-        PropertyChange::Changed {
-            name,
-            before,
-            after,
-        } => {
+        PropertyChange::Changed { before, after } => {
             println!(
                 "  ^ {}/{}",
                 sanitize_terminal_text(path),
-                sanitize_terminal_text(name)
+                sanitize_terminal_text(&before.name)
             );
-            println!("      - {}", render(before));
-            println!("      + {}", render(after));
+            if before.property_type == after.property_type {
+                println!("      - {}", render(&before.values));
+                println!("      + {}", render(&after.values));
+            } else {
+                // A type-only change would otherwise print two
+                // identical lines.
+                println!(
+                    "      - {} {}",
+                    before.property_type.jcr_name(),
+                    render(&before.values)
+                );
+                println!(
+                    "      + {} {}",
+                    after.property_type.jcr_name(),
+                    render(&after.values)
+                );
+            }
         }
     }
 }
