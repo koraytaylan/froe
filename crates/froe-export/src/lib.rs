@@ -66,7 +66,8 @@ pub use crate::parquet::{
 };
 #[cfg(feature = "parquet")]
 pub use crate::refresh::{
-    NODES_FILE_NAME, PROPERTIES_FILE_NAME, ParquetRefresh, refresh_parquet_export,
+    ExportReplacement, NODES_FILE_NAME, PROPERTIES_FILE_NAME, ParquetRefresh,
+    assess_export_replacement, refresh_parquet_export,
 };
 #[cfg(feature = "sqlite")]
 pub use crate::sqlite::{SqliteExportOptions, SqliteSink};

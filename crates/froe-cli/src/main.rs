@@ -690,23 +690,44 @@ fn run_parquet_export(
             }
         }
     }
-    run_full_parquet_export(&repository, path, depth, output_directory, quiet)
+    run_full_parquet_export(&repository, path, depth, output_directory, full, quiet)
 }
 
 /// Exports the Parquet tables from scratch into `output_directory`.
 /// The new files are written under temporary names and atomically
-/// moved over any existing export only once complete, so a failed
-/// export never disturbs a good one — and the temporary files never
-/// linger after either failure shape. The directory's export lock is
-/// held throughout, serializing concurrent writers.
+/// moved over any existing export only once complete: a failure before
+/// the swap leaves the previous export untouched, and a failure between
+/// the two swaps leaves disagreeing stamps, which the next refresh
+/// rebuilds from. The directory's export lock is held throughout,
+/// serializing concurrent writers.
+///
+/// Unless `forced`, the replacement is authorized afresh under the
+/// lock — a verdict the earlier refresh attempt reached before its own
+/// lock was released cannot be trusted by the time this lock is held.
 fn run_full_parquet_export(
     repository: &Repository,
     path: &str,
     depth: Option<usize>,
     output_directory: &Path,
+    forced: bool,
     quiet: bool,
 ) -> froe::Result<ExportRun> {
     let _lock = froe_export::lock_export_directory(output_directory)?;
+    if !forced {
+        match froe_export::assess_export_replacement(output_directory, path, depth) {
+            froe_export::ExportReplacement::Authorized => {}
+            froe_export::ExportReplacement::NeedsForce { reason } => {
+                // The same hard refusal the refresh attempt gives — but
+                // decided against the files as they are now, under the
+                // replacement lock.
+                return Err(froe::Error::InvalidFormat {
+                    details: format!(
+                        "{reason}; refusing to replace it — pass --full to rebuild anyway"
+                    ),
+                });
+            }
+        }
+    }
     for file_name in [
         froe_export::NODES_FILE_NAME,
         froe_export::PROPERTIES_FILE_NAME,

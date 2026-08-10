@@ -191,36 +191,24 @@ pub fn lock_export_directory(directory: &Path) -> froe::Result<ExportDirectoryLo
     Ok(ExportDirectoryLock { _file: file })
 }
 
-/// Moves a fully written temporary output over `target`. On POSIX, and
-/// on Windows through Rust's `MoveFileEx`-based `rename`, replacing an
-/// existing target is atomic: a concurrent reader sees either the old
-/// or the new file, never a mixture.
+/// Moves a fully written temporary output over `target`, atomically:
+/// POSIX `rename` replaces by definition, and Rust's `MoveFileEx`-based
+/// `rename` does the same on Windows, so a concurrent reader sees
+/// either the old or the new file, never a mixture. A platform or
+/// filesystem that refuses to replace reports the error instead — the
+/// target is never unlinked to make room, so a failed replacement
+/// always leaves it intact.
 ///
 /// The temporary's bytes are forced to disk before the rename and the
 /// directory entry after, so the replacement survives a power loss. On
 /// Unix an existing target's permission bits carry over to the
-/// replacement (ownership and ACLs cannot, portably).
-///
-/// The remove-and-retry branch runs only when the rename failed
-/// *because* replacing is unsupported ([`std::io::ErrorKind::AlreadyExists`],
-/// with both paths intact): any other failure — a missing temporary, a
-/// read-only filesystem — must leave a good target untouched.
+/// replacement (ownership and ACLs cannot, portably); the permission
+/// transfer runs after the sync, since a target mode without owner-read
+/// would otherwise make the temporary unreadable before it is synced.
 pub fn replace_export_output(temporary: &Path, target: &Path) -> froe::Result<()> {
-    preserve_permissions(temporary, target)?;
     std::fs::File::open(temporary)?.sync_all()?;
-    match std::fs::rename(temporary, target) {
-        Ok(()) => {}
-        Err(error) => {
-            let replace_refusal = error.kind() == std::io::ErrorKind::AlreadyExists
-                && temporary.exists()
-                && target.exists();
-            if !replace_refusal {
-                return Err(froe::Error::InputOutput(error));
-            }
-            std::fs::remove_file(target)?;
-            std::fs::rename(temporary, target)?;
-        }
-    }
+    preserve_permissions(temporary, target)?;
+    std::fs::rename(temporary, target).map_err(froe::Error::InputOutput)?;
     sync_parent_directory(target)
 }
 

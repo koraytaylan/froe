@@ -154,12 +154,26 @@ impl ExportProvenance {
 /// Reads the provenance stamped into one Parquet export file's footer,
 /// or `Ok(None)` when the file carries none.
 pub fn read_export_provenance(path: &std::path::Path) -> froe::Result<Option<ExportProvenance>> {
-    use ::parquet::file::reader::{FileReader, SerializedFileReader};
+    use ::parquet::file::reader::SerializedFileReader;
 
     let file = std::fs::File::open(path)?;
     let reader = SerializedFileReader::new(file).map_err(parquet_error)?;
-    let metadata = reader.metadata().file_metadata().key_value_metadata();
-    Ok(metadata.and_then(|pairs| ExportProvenance::from_metadata(pairs)))
+    Ok(provenance_of(&reader))
+}
+
+/// The provenance of an already open reader — validating a file on the
+/// exact handle its rows will be consumed from, so no pathname swap can
+/// slip between check and use.
+pub(crate) fn provenance_of(
+    reader: &::parquet::file::reader::SerializedFileReader<std::fs::File>,
+) -> Option<ExportProvenance> {
+    use ::parquet::file::reader::FileReader;
+
+    reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|pairs| ExportProvenance::from_metadata(pairs))
 }
 
 /// The nodes table: one row per node.

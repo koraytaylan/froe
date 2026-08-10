@@ -87,21 +87,28 @@ Re-running a Parquet export into the same directory does not start
 over: the tables carry the head revision they were built from, so froe
 diffs that revision against the current head and decodes only the
 changed subtrees — a kept export stays queryable at Parquet speed for
-the price of the delta. Each file is written out completely and
-swapped in atomically (durably, permissions preserved), and a lock
-file serializes concurrent exports into the same directory. The two
-files are swapped one after the other — a completed run always leaves
-their stamps agreeing, but a crash or a query mid-swap can observe a
-mixed pair; the next froe run detects the disagreement and rebuilds,
-and a query-side check can demand it up front:
+the price of the delta. Each file is written out completely, forced to
+disk, and swapped in atomically, keeping the previous file's Unix
+permission bits, and a lock file serializes concurrent exports into
+the same directory. The two files are swapped one after the other — a
+completed run always leaves their stamps agreeing, but a crash or a
+query mid-swap can observe a mixed pair. The next froe run detects the
+disagreement and rebuilds; a query-side sanity check (diagnostic, not
+a snapshot guarantee) compares every stamp key:
 
 ```console
 $ duckdb -c "
-  SELECT (SELECT value FROM parquet_kv_metadata('./export/nodes.parquet')
-          WHERE key = 'froe.revision')
-       = (SELECT value FROM parquet_kv_metadata('./export/properties.parquet')
-          WHERE key = 'froe.revision')
-       AS consistent_pair;"
+  WITH stamps AS (
+    SELECT 'nodes' AS file, CAST(key AS VARCHAR) AS key, CAST(value AS VARCHAR) AS value
+    FROM parquet_kv_metadata('./export/nodes.parquet')
+    UNION ALL
+    SELECT 'properties', CAST(key AS VARCHAR), CAST(value AS VARCHAR)
+    FROM parquet_kv_metadata('./export/properties.parquet')
+  ), per_key AS (
+    SELECT key, count(DISTINCT value) AS values FROM stamps
+    WHERE key LIKE 'froe.%' GROUP BY key
+  )
+  SELECT count(*) = 4 AND max(values) = 1 AS consistent_pair FROM per_key;"
 ```
 
 A stale base (a revision compacted away, an interrupted earlier
