@@ -14,6 +14,7 @@ mod content_display;
 mod inspection;
 mod mutation;
 mod output;
+mod progress;
 mod tooling_display;
 
 use std::path::{Path, PathBuf};
@@ -126,6 +127,9 @@ enum Command {
         /// sqlite the database file (required).
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Suppress the progress reports on standard error.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Find each path's newest consistent revision (read-only). Exits 0
     /// when ANY checked path found a good revision — oak-run's contract
@@ -369,10 +373,11 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             depth,
             format,
             output,
+            quiet,
         } => {
             let written = match format {
                 ExportFormat::JsonLines => {
-                    run_json_lines_export(&repository_path, &path, depth, output.as_deref())?
+                    run_json_lines_export(&repository_path, &path, depth, output.as_deref(), quiet)?
                 }
                 ExportFormat::Parquet => {
                     let Some(output_directory) = output.as_deref() else {
@@ -382,7 +387,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                         );
                         return Ok(ExitCode::FAILURE);
                     };
-                    run_parquet_export(&repository_path, &path, depth, output_directory)?
+                    run_parquet_export(&repository_path, &path, depth, output_directory, quiet)?
                 }
                 ExportFormat::Sqlite => {
                     let Some(output_path) = output.as_deref() else {
@@ -392,16 +397,32 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                         );
                         return Ok(ExitCode::FAILURE);
                     };
-                    run_sqlite_export(&repository_path, &path, depth, output_path)?
+                    run_sqlite_export(&repository_path, &path, depth, output_path, quiet)?
                 }
             };
-            if let Some(node_count) = written {
+            if let Some((node_count, elapsed)) = written {
+                let rate = if elapsed.is_zero() {
+                    0.0
+                } else {
+                    // A node count is a display figure; the precision
+                    // loss of the cast is irrelevant at the reported
+                    // scale.
+                    #[allow(clippy::cast_precision_loss)]
+                    let rate = node_count as f64 / elapsed.as_secs_f64();
+                    rate
+                };
                 match &output {
                     Some(destination) => eprintln!(
-                        "froe: exported {node_count} nodes to {}",
-                        destination.display()
+                        "froe: exported {node_count} nodes to {} in {:.1}s ({:.0} nodes/s)",
+                        destination.display(),
+                        elapsed.as_secs_f64(),
+                        rate
                     ),
-                    None => eprintln!("froe: exported {node_count} nodes"),
+                    None => eprintln!(
+                        "froe: exported {node_count} nodes in {:.1}s ({:.0} nodes/s)",
+                        elapsed.as_secs_f64(),
+                        rate
+                    ),
                 }
             } else {
                 eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
@@ -498,29 +519,33 @@ fn run(command: Command) -> froe::Result<ExitCode> {
 }
 
 /// Streams a JSON lines export to `output`, or to standard output when
-/// `output` is `None`. Returns the node count, or `None` when the path
-/// does not exist; a freshly created output file never lingers after
-/// either failure shape.
+/// `output` is `None`. Returns the node count and elapsed time, or `None`
+/// when the path does not exist; a freshly created output file never
+/// lingers after either failure shape.
 fn run_json_lines_export(
     repository_path: &Path,
     path: &str,
     depth: Option<usize>,
     output: Option<&Path>,
-) -> froe::Result<Option<u64>> {
+    quiet: bool,
+) -> froe::Result<Option<(u64, std::time::Duration)>> {
     let repository = Repository::open(repository_path)?;
     if let Some(output_path) = output {
         let file = froe_export::create_export_output(repository_path, output_path)?;
-        let mut sink =
-            froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(1 << 20, file));
+        let mut sink = progress::ProgressSink::new(
+            froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(1 << 20, file)),
+            quiet,
+        );
         match froe_export::export_subtree(&repository, path, depth, &mut sink) {
             Ok(written) => {
+                let elapsed = sink.elapsed();
                 if written.is_none() {
                     // Nothing was exported: the freshly created, empty
                     // output file must not linger either.
                     drop(sink);
                     let _ = std::fs::remove_file(output_path);
                 }
-                Ok(written)
+                Ok(written.map(|count| (count, elapsed)))
             }
             Err(error) => {
                 // The file was freshly created above; a partial export
@@ -532,23 +557,29 @@ fn run_json_lines_export(
         }
     } else {
         let standard_output = std::io::stdout();
-        let mut sink = froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(
-            1 << 20,
-            standard_output.lock(),
-        ));
+        let mut sink = progress::ProgressSink::new(
+            froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(
+                1 << 20,
+                standard_output.lock(),
+            )),
+            quiet,
+        );
         froe_export::export_subtree(&repository, path, depth, &mut sink)
+            .map(|written| written.map(|count| (count, sink.elapsed())))
     }
 }
 
 /// Exports the Parquet tables into `output_directory` (created if
-/// absent). Returns the node count, or `None` when the path does not
-/// exist; freshly created files never linger after either failure shape.
+/// absent). Returns the node count and elapsed time, or `None` when the
+/// path does not exist; freshly created files never linger after either
+/// failure shape.
 fn run_parquet_export(
     repository_path: &Path,
     path: &str,
     depth: Option<usize>,
     output_directory: &Path,
-) -> froe::Result<Option<u64>> {
+    quiet: bool,
+) -> froe::Result<Option<(u64, std::time::Duration)>> {
     let repository = Repository::open(repository_path)?;
     froe_export::create_export_directory(repository_path, output_directory)?;
     let nodes_path = output_directory.join("nodes.parquet");
@@ -569,7 +600,7 @@ fn run_parquet_export(
             return Err(error);
         }
     };
-    let mut sink = match froe_export::ParquetSink::new(
+    let parquet_sink = match froe_export::ParquetSink::new(
         std::io::BufWriter::with_capacity(1 << 20, nodes_file),
         std::io::BufWriter::with_capacity(1 << 20, properties_file),
         &froe_export::ParquetExportOptions::default(),
@@ -580,15 +611,17 @@ fn run_parquet_export(
             return Err(error);
         }
     };
+    let mut sink = progress::ProgressSink::new(parquet_sink, quiet);
     match froe_export::export_subtree(&repository, path, depth, &mut sink) {
         Ok(written) => {
+            let elapsed = sink.elapsed();
             if written.is_none() {
                 // Nothing was exported: the freshly created files must
                 // not linger.
                 drop(sink);
                 remove_outputs();
             }
-            Ok(written)
+            Ok(written.map(|count| (count, elapsed)))
         }
         Err(error) => {
             // The files were freshly created above; a partial export
@@ -601,22 +634,27 @@ fn run_parquet_export(
 }
 
 /// Exports the `SQLite` database into the single file `output_path`.
-/// Returns the node count, or `None` when the path does not exist; a
-/// freshly created file never lingers after either failure shape — the
-/// sink's drop implementation owns that cleanup.
+/// Returns the node count and elapsed time, or `None` when the path does
+/// not exist; a freshly created file never lingers after either failure
+/// shape — the sink's drop implementation owns that cleanup.
 fn run_sqlite_export(
     repository_path: &Path,
     path: &str,
     depth: Option<usize>,
     output_path: &Path,
-) -> froe::Result<Option<u64>> {
+    quiet: bool,
+) -> froe::Result<Option<(u64, std::time::Duration)>> {
     let repository = Repository::open(repository_path)?;
-    let mut sink = froe_export::SqliteSink::create(
-        repository_path,
-        output_path,
-        froe_export::SqliteExportOptions::default(),
-    )?;
+    let mut sink = progress::ProgressSink::new(
+        froe_export::SqliteSink::create(
+            repository_path,
+            output_path,
+            froe_export::SqliteExportOptions::default(),
+        )?,
+        quiet,
+    );
     froe_export::export_subtree(&repository, path, depth, &mut sink)
+        .map(|written| written.map(|count| (count, sink.elapsed())))
 }
 
 /// Dispatches a checkpoint subcommand. Returns whether it succeeded.
@@ -673,6 +711,7 @@ mod tests {
             depth,
             format,
             output,
+            quiet,
         } = parsed.command
         else {
             panic!("extract must dispatch to export");
@@ -682,6 +721,24 @@ mod tests {
         assert_eq!(depth, Some(2));
         assert_eq!(format, ExportFormat::JsonLines);
         assert_eq!(output, Some(std::path::PathBuf::from("out.jsonl")));
+        assert!(!quiet);
+    }
+
+    #[test]
+    fn export_parses_the_quiet_flag() {
+        let parsed = CommandLine::try_parse_from([
+            "froe",
+            "export",
+            "/store",
+            "--quiet",
+            "--output",
+            "out.jsonl",
+        ])
+        .expect("the quiet flag must parse");
+        let Command::Export { quiet, .. } = parsed.command else {
+            panic!("export must dispatch");
+        };
+        assert!(quiet);
     }
 
     #[test]

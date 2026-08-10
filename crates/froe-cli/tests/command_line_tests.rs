@@ -202,3 +202,63 @@ fn the_sqlite_format_leaves_an_existing_file_untouched() {
         "the existing file must be untouched, not opened and modified"
     );
 }
+
+#[test]
+fn the_export_reports_progress_and_a_summary_on_stderr() {
+    let directory = TestDirectory::new("export-progress");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+
+    let export = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["export", store.to_str().expect("path")])
+        .output()
+        .expect("run export");
+    assert!(
+        export.status.success(),
+        "export must succeed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    assert!(
+        stderr.contains("exported 2 nodes"),
+        "the summary must report the node count: {stderr}"
+    );
+    assert!(
+        stderr.contains("nodes/s"),
+        "the summary must report the rate: {stderr}"
+    );
+}
+
+#[test]
+fn the_quiet_flag_silences_progress_but_keeps_the_summary() {
+    let directory = TestDirectory::new("export-quiet");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+
+    let export = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "export",
+            store.to_str().expect("path"),
+            "--quiet",
+            "--output",
+            directory.path.join("content.jsonl").to_str().expect("path"),
+        ])
+        .output()
+        .expect("run export");
+    assert!(
+        export.status.success(),
+        "export --quiet must succeed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    assert!(
+        !stderr.contains("nodes ("),
+        "quiet must silence the progress reports: {stderr}"
+    );
+    assert!(
+        stderr.contains("exported 2 nodes"),
+        "the summary must still be printed: {stderr}"
+    );
+}
