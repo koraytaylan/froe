@@ -618,7 +618,7 @@ fn run_json_lines_export(
 /// existing, usable export is refreshed in place — decoding only what
 /// changed since it was taken — and anything else (a first export, an
 /// unusable base, `--full`) falls to a from-scratch export that
-/// atomically replaces whatever the directory holds.
+/// replaces the previous tables, one atomic swap per file.
 fn run_parquet_export(
     repository_path: &Path,
     path: &str,
@@ -629,8 +629,19 @@ fn run_parquet_export(
 ) -> froe::Result<ExportRun> {
     let repository = Repository::open(repository_path)?;
     froe_export::create_export_directory(repository_path, output_directory)?;
-    if !full {
-        let mut reporter = progress::Reporter::new(quiet, "re-exported");
+    if full {
+        let FullExport::Completed(run) =
+            run_full_parquet_export(&repository, path, depth, output_directory, true, quiet)?
+        else {
+            unreachable!("a forced export never defers to a refresh");
+        };
+        return Ok(run);
+    }
+    let mut reporter = progress::Reporter::new(quiet, "re-exported");
+    // A rival writer can turn the directory back into a valid export
+    // between the refresh attempt and the fallback's lock; a few
+    // rounds settle it either way.
+    for _attempt in 0..4 {
         let refresh = froe_export::refresh_parquet_export(
             &repository,
             path,
@@ -641,6 +652,11 @@ fn run_parquet_export(
         )?;
         reporter.finish_line();
         match refresh {
+            froe_export::ParquetRefresh::Missing => {
+                // The full export's own missing-path verdict, reached
+                // through the refresh — the existing export is intact.
+                return Ok(ExportRun::Missing);
+            }
             froe_export::ParquetRefresh::Current { revision } => {
                 eprintln!(
                     "froe: the export in {} is already current ({revision})",
@@ -687,10 +703,58 @@ fn run_parquet_export(
                 if leftovers {
                     eprintln!("froe: {reason}; exporting from scratch");
                 }
+                match run_full_parquet_export(
+                    &repository,
+                    path,
+                    depth,
+                    output_directory,
+                    false,
+                    quiet,
+                )? {
+                    FullExport::Completed(run) => return Ok(run),
+                    // A valid export appeared under the lock; the next
+                    // round refreshes it.
+                    FullExport::RefreshInstead => {}
+                }
             }
         }
     }
-    run_full_parquet_export(&repository, path, depth, output_directory, full, quiet)
+    Err(froe::Error::InvalidFormat {
+        details: format!(
+            "the export at {} keeps changing underneath; re-run",
+            output_directory.display()
+        ),
+    })
+}
+
+/// Authorizes an automatic (unforced) replacement under the held
+/// export lock, against the files as they are now: `false` defers to a
+/// refresh round, a guarded directory is the hard refusal — decided
+/// under the lock, not inherited from the earlier refresh attempt.
+fn authorize_replacement(
+    repository: &Repository,
+    output_directory: &Path,
+    path: &str,
+    depth: Option<usize>,
+) -> froe::Result<bool> {
+    match froe_export::assess_export(repository, output_directory, path, depth) {
+        froe_export::ExportAssessment::Reusable => Ok(false),
+        froe_export::ExportAssessment::Replaceable(_) => Ok(true),
+        froe_export::ExportAssessment::Guarded(reason) => Err(froe::Error::InvalidFormat {
+            details: format!("{reason}; refusing to replace it — pass --full to rebuild anyway"),
+        }),
+    }
+}
+
+/// The outcome of a full Parquet export.
+enum FullExport {
+    /// The export ran; the usual run outcome.
+    Completed(ExportRun),
+    /// Under the replacement lock, the directory turned out to hold a
+    /// valid, refreshable export again — a rival writer published one
+    /// between the refresh attempt and this fallback — so the caller
+    /// defers to a refresh round instead of replacing it.
+    RefreshInstead,
 }
 
 /// Exports the Parquet tables from scratch into `output_directory`.
@@ -704,6 +768,8 @@ fn run_parquet_export(
 /// Unless `forced`, the replacement is authorized afresh under the
 /// lock — a verdict the earlier refresh attempt reached before its own
 /// lock was released cannot be trusted by the time this lock is held.
+/// Finding a valid, refreshable export there defers to a refresh round
+/// rather than bulldozing it with a staler full export.
 fn run_full_parquet_export(
     repository: &Repository,
     path: &str,
@@ -711,22 +777,10 @@ fn run_full_parquet_export(
     output_directory: &Path,
     forced: bool,
     quiet: bool,
-) -> froe::Result<ExportRun> {
+) -> froe::Result<FullExport> {
     let _lock = froe_export::lock_export_directory(output_directory)?;
-    if !forced {
-        match froe_export::assess_export_replacement(output_directory, path, depth) {
-            froe_export::ExportReplacement::Authorized => {}
-            froe_export::ExportReplacement::NeedsForce { reason } => {
-                // The same hard refusal the refresh attempt gives — but
-                // decided against the files as they are now, under the
-                // replacement lock.
-                return Err(froe::Error::InvalidFormat {
-                    details: format!(
-                        "{reason}; refusing to replace it — pass --full to rebuild anyway"
-                    ),
-                });
-            }
-        }
+    if !forced && !authorize_replacement(repository, output_directory, path, depth)? {
+        return Ok(FullExport::RefreshInstead);
     }
     for file_name in [
         froe_export::NODES_FILE_NAME,
@@ -788,7 +842,7 @@ fn run_full_parquet_export(
             drop(sink);
             let Some(nodes) = written else {
                 remove_temporaries();
-                return Ok(ExportRun::Missing);
+                return Ok(FullExport::Completed(ExportRun::Missing));
             };
             let renamed = froe_export::replace_export_output(
                 &nodes_temporary,
@@ -801,7 +855,10 @@ fn run_full_parquet_export(
                 )
             });
             match renamed {
-                Ok(()) => Ok(ExportRun::Exported { nodes, elapsed }),
+                Ok(()) => Ok(FullExport::Completed(ExportRun::Exported {
+                    nodes,
+                    elapsed,
+                })),
                 Err(error) => {
                     remove_temporaries();
                     Err(error)

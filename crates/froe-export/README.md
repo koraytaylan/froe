@@ -20,9 +20,9 @@ is a new sink, not a new traversal. Three sinks ship today:
   DuckDB, DataFusion, Polars, or anything else that reads Parquet. The
   tables carry a revision stamp in their footers, so
   `refresh_parquet_export` brings an existing export up to date by
-  decoding only what changed since it was taken — each file replaced
-  atomically and durably in place, the pair's stamps always agreeing
-  after a completed run.
+  decoding only what changed since it was taken — each file forced to
+  disk and swapped in atomically (plus a directory sync on Unix), the
+  pair's stamps always agreeing after a completed run.
 * `SqliteSink` (behind the `sqlite` feature) — a single `.db` file:
   `nodes` and `properties` tables that intern every string once in a
   shared dictionary (the manual equivalent of Parquet's dictionary

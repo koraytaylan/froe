@@ -29,9 +29,9 @@
 //! blessed way to open an output file: it refuses to overwrite existing
 //! files and refuses to write inside the repository directory, where a
 //! stray file could be mistaken for a damaged archive at the next open.
-//! The Parquet refresh replaces its two table files instead — atomically
-//! via [`replace_export_output`] — after validating them as its own
-//! earlier output.
+//! The Parquet refresh replaces its two table files instead — one
+//! atomic, durable swap per file via [`replace_export_output`] — after
+//! validating them as its own earlier output.
 //!
 //! # Example
 //!
@@ -66,8 +66,8 @@ pub use crate::parquet::{
 };
 #[cfg(feature = "parquet")]
 pub use crate::refresh::{
-    ExportReplacement, NODES_FILE_NAME, PROPERTIES_FILE_NAME, ParquetRefresh,
-    assess_export_replacement, refresh_parquet_export,
+    ExportAssessment, NODES_FILE_NAME, PROPERTIES_FILE_NAME, ParquetRefresh, assess_export,
+    refresh_parquet_export,
 };
 #[cfg(feature = "sqlite")]
 pub use crate::sqlite::{SqliteExportOptions, SqliteSink};

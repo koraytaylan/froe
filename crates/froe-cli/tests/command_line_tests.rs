@@ -427,7 +427,7 @@ fn the_full_flag_rebuilds_the_export() {
 }
 
 #[test]
-fn a_compacted_store_forces_a_fresh_export() {
+fn a_compacted_store_requires_full_to_rebuild() {
     let directory = TestDirectory::new("parquet-compacted");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
@@ -445,14 +445,89 @@ fn a_compacted_store_forces_a_fresh_export() {
         String::from_utf8_lossy(&compact.stderr)
     );
 
-    let rerun = parquet_export(&store, &output, &[]);
+    // Compaction rewrites the journal to one line, so the stamped
+    // revision is unprovable: indistinguishable from another
+    // repository's export. Rebuilding takes the explicit flag.
+    let before = std::fs::read(output.join("nodes.parquet")).expect("read");
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "export",
+            store.to_str().expect("path"),
+            "--format",
+            "parquet",
+            "--output",
+            output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run export");
     assert!(
-        rerun.contains("exporting from scratch"),
-        "compaction makes the stamped revision unresolvable: {rerun}"
+        !refused.status.success(),
+        "an unprovable base is refused: {}",
+        String::from_utf8_lossy(&refused.stderr)
     );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        rerun.contains("exported 2 nodes"),
-        "the fresh export completes: {rerun}"
+        stderr.contains("does not resolve") && stderr.contains("--full"),
+        "the refusal names the reason and the flag: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(output.join("nodes.parquet")).expect("read"),
+        before,
+        "the export survives the refusal"
+    );
+
+    let rebuilt = parquet_export(&store, &output, &["--full"]);
+    assert!(
+        rebuilt.contains("exported 2 nodes"),
+        "the explicit rebuild completes: {rebuilt}"
+    );
+    // And after it, refreshes work against the new head again.
+    let current = parquet_export(&store, &output, &[]);
+    assert!(current.contains("already current"), "refreshed: {current}");
+}
+
+#[test]
+fn an_export_of_another_repository_requires_full() {
+    let directory = TestDirectory::new("parquet-cross-repo");
+    let store_a = directory.path.join("store-a");
+    let store_b = directory.path.join("store-b");
+    std::fs::create_dir_all(&store_a).expect("create store a");
+    std::fs::create_dir_all(&store_b).expect("create store b");
+    populate(&store_a);
+    populate(&store_b);
+    let output = directory.path.join("export");
+
+    // A complete, valid, same-scope export — of store B.
+    parquet_export(&store_b, &output, &[]);
+    let before = std::fs::read(output.join("nodes.parquet")).expect("read");
+
+    // Exporting store A over it without --full refuses.
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "export",
+            store_a.to_str().expect("path"),
+            "--format",
+            "parquet",
+            "--output",
+            output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run export");
+    assert!(
+        !refused.status.success(),
+        "another repository's export must be refused: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        std::fs::read(output.join("nodes.parquet")).expect("read"),
+        before,
+        "the foreign repository's export survives"
+    );
+
+    let rebuilt = parquet_export(&store_a, &output, &["--full"]);
+    assert!(
+        rebuilt.contains("exported 2 nodes"),
+        "the explicit rebuild completes: {rebuilt}"
     );
 }
 

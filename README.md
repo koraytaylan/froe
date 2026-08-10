@@ -94,29 +94,36 @@ the same directory. The two files are swapped one after the other — a
 completed run always leaves their stamps agreeing, but a crash or a
 query mid-swap can observe a mixed pair. The next froe run detects the
 disagreement and rebuilds; a query-side sanity check (diagnostic, not
-a snapshot guarantee) compares every stamp key:
+a snapshot guarantee) can demand every stamp key, present and agreeing
+in both files:
 
 ```console
 $ duckdb -c "
-  WITH stamps AS (
+  WITH required(key) AS (
+    VALUES ('froe.format'), ('froe.revision'), ('froe.root_path'), ('froe.depth_limit')
+  ), stamps AS (
     SELECT 'nodes' AS file, CAST(key AS VARCHAR) AS key, CAST(value AS VARCHAR) AS value
     FROM parquet_kv_metadata('./export/nodes.parquet')
     UNION ALL
     SELECT 'properties', CAST(key AS VARCHAR), CAST(value AS VARCHAR)
     FROM parquet_kv_metadata('./export/properties.parquet')
   ), per_key AS (
-    SELECT key, count(DISTINCT value) AS values FROM stamps
-    WHERE key LIKE 'froe.%' GROUP BY key
+    SELECT required.key,
+           count(stamps.value) AS entries,
+           count(DISTINCT stamps.file) AS files,
+           count(DISTINCT stamps.value) AS values
+    FROM required LEFT JOIN stamps ON stamps.key = required.key
+    GROUP BY required.key
   )
-  SELECT count(*) = 4 AND max(values) = 1 AS consistent_pair FROM per_key;"
+  SELECT bool_and(entries = 2 AND files = 2 AND values = 1) AS consistent_pair FROM per_key;"
 ```
 
-A stale base (a revision compacted away, an interrupted earlier
-refresh) rebuilds from scratch automatically; files froe did not
-write, or an export of a different root path or depth, are never
-replaced uninvited — rebuilding those takes an explicit `--full`. The
-`json-lines` and `sqlite` formats keep the strict never-overwrite
-contract instead.
+A base whose stamped revision no longer resolves (the store was
+compacted since, or the export belongs to a different repository —
+the two are indistinguishable) is rebuilt only with an explicit
+`--full`; files froe did not write, or an export of a different root
+path or depth, are likewise never replaced uninvited. The `json-lines`
+and `sqlite` formats keep the strict never-overwrite contract instead.
 
 `froe --help` lists every command.
 

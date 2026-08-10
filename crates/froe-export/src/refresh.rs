@@ -42,8 +42,8 @@
 //!    reader between the two renames can observe new nodes with old
 //!    properties — so the stamps exist in both files: a later froe run
 //!    detects the disagreement and rebuilds, and query-side tooling
-//!    can compare the two footers' `froe.revision` for a consistent
-//!    pair before trusting a result.
+//!    can compare every `froe.*` stamp key across both footers for a
+//!    consistent pair before trusting a result.
 //!
 //! The result is exactly the row set a full export of the pinned
 //! revision would produce; a refresh never leaves stale rows behind.
@@ -71,7 +71,6 @@ use crate::output_file::{
 };
 use crate::parquet::{
     ExportProvenance, NodeRow, ParquetExportOptions, ParquetSink, PropertyRow, provenance_of,
-    read_export_provenance,
 };
 
 /// The nodes table's file name within the export directory.
@@ -108,15 +107,19 @@ pub enum ParquetRefresh {
     NotReusable {
         /// Why the files are unusable, phrased for the operator.
         reason: String,
-        /// Whether a full export may replace the files without being
-        /// explicitly asked: they are absent, or they validated as this
-        /// tool's own export of the requested subtree (stale, partial,
-        /// or corrupt refresh residue). Foreign files and exports of a
-        /// different scope stay untouched until the caller passes the
-        /// explicit rebuild flag — replacing them uninvited could
-        /// destroy data froe does not own.
+        /// Whether a full export may replace the files uninvited: they
+        /// are absent, or they validated as this tool's own export of
+        /// the requested subtree (stale, partial, or corrupt refresh
+        /// residue). Foreign files and exports of a different scope
+        /// stay untouched until the caller passes the explicit rebuild
+        /// flag — replacing them uninvited could destroy data froe
+        /// does not own.
         replaceable: bool,
     },
+    /// The exported path does not exist at the head revision — the
+    /// same verdict a full export reports for a missing path, with the
+    /// existing export left untouched.
+    Missing,
 }
 
 /// Refreshes the Parquet export in `output_directory` to the
@@ -142,15 +145,16 @@ pub fn refresh_parquet_export(
 ) -> froe::Result<ParquetRefresh> {
     create_export_directory(repository.directory(), output_directory)?;
     let _lock = lock_export_directory(output_directory)?;
-    let provenance = match validate(output_directory, root_path, depth) {
-        Ok(provenance) => provenance,
-        Err(rejection) => {
-            return Ok(ParquetRefresh::NotReusable {
-                reason: rejection.reason,
-                replaceable: rejection.replaceable,
-            });
-        }
-    };
+    let ValidatedBase { provenance, base } =
+        match validate(repository, output_directory, root_path, depth) {
+            Ok(base) => base,
+            Err(rejection) => {
+                return Ok(ParquetRefresh::NotReusable {
+                    reason: rejection.reason,
+                    replaceable: rejection.replaceable,
+                });
+            }
+        };
     let revision = repository.head_record_identifier();
     let revision_text = revision.to_string();
     if provenance.revision() == revision_text {
@@ -166,6 +170,9 @@ pub fn refresh_parquet_export(
     ) {
         Ok(differences) => differences,
         Err(error) => {
+            // Validation resolved the stamped revision moments ago, so
+            // this is a segment vanishing mid-refresh — a compaction
+            // racing us. The base is unusable but undeniably ours.
             return Ok(ParquetRefresh::NotReusable {
                 reason: format!(
                     "the stamped revision {} no longer resolves ({error}); \
@@ -176,10 +183,9 @@ pub fn refresh_parquet_export(
             });
         }
     };
-    // A removed export root is not refreshable to an empty dataset: the
-    // full export's contract for a missing path is a failure, and the
-    // refresh follows it — the caller's full-export attempt reports the
-    // missing path and leaves the existing tables untouched.
+    // A removed export root is the full export's missing-path verdict:
+    // definitive — no retry can change it — and the existing tables
+    // stay untouched.
     let root_removed = differences.iter().any(|difference| {
         matches!(
             difference,
@@ -187,13 +193,7 @@ pub fn refresh_parquet_export(
         )
     });
     if root_removed {
-        return Ok(ParquetRefresh::NotReusable {
-            reason: format!(
-                "the exported path {} no longer exists at the head revision",
-                provenance.root_path()
-            ),
-            replaceable: true,
-        });
+        return Ok(ParquetRefresh::Missing);
     }
     let ranges = dirty_ranges(&differences, provenance.root_path(), depth);
     if ranges.is_empty() {
@@ -207,6 +207,7 @@ pub fn refresh_parquet_export(
     apply_ranges(
         repository,
         &provenance,
+        &base,
         revision,
         &revision_text,
         &ranges,
@@ -217,8 +218,9 @@ pub fn refresh_parquet_export(
     )
 }
 
-/// The back half of a refresh: delta export, base revalidation, merge,
-/// and the atomic swap, under the caller's export lock.
+/// The back half of a refresh: delta export, merge, and the atomic
+/// swap, under the caller's export lock. The validated base readers
+/// stay open from inspection through the merge.
 #[allow(
     clippy::too_many_arguments,
     reason = "the phases thread their source, ranges, scope, and destination"
@@ -226,6 +228,7 @@ pub fn refresh_parquet_export(
 fn apply_ranges(
     repository: &Repository,
     provenance: &ExportProvenance,
+    base: &[::parquet::file::reader::SerializedFileReader<std::fs::File>; 2],
     revision: RecordIdentifier,
     revision_text: &str,
     ranges: &[DirtyRange],
@@ -262,19 +265,15 @@ fn apply_ranges(
         options,
         on_node,
     )?;
-    // The lock rules out another froe writer, but nothing stops outside
-    // software from having replaced the base files mid-refresh; the
-    // merge validates the stamps on the very readers it consumes, so a
-    // swapped base can never be merged and stamped under the new head.
+    let [base_nodes, base_properties] = base;
     let new_provenance =
         ExportProvenance::new(revision_text.to_owned(), provenance.root_path(), depth);
     match merge_tables(
         repository,
-        provenance,
-        &output_directory.join(NODES_FILE_NAME),
+        base_nodes,
         &delta_nodes,
         &merged_nodes,
-        &output_directory.join(PROPERTIES_FILE_NAME),
+        base_properties,
         &delta_properties,
         &merged_properties,
         ranges,
@@ -315,50 +314,78 @@ struct Rejection {
 
 /// One table file's ownership state.
 enum TableFile {
-    /// No file at the path.
+    /// No directory entry at the path at all.
     Missing,
-    /// A readable, stamped froe export file.
-    Stamped(ExportProvenance),
-    /// Present but unreadable as Parquet or without a stamp — not
-    /// demonstrably froe's, so never replaceable uninvited.
+    /// A readable, stamped froe export file. The reader is retained
+    /// from inspection on, so the bytes a refresh validates are the
+    /// bytes it merges — a pathname swap can never substitute them.
+    Stamped {
+        /// The file's stamped provenance.
+        provenance: ExportProvenance,
+        /// The open reader the merge consumes.
+        reader: ::parquet::file::reader::SerializedFileReader<std::fs::File>,
+    },
+    /// Present but not a demonstrably froe-owned regular Parquet file:
+    /// unreadable, unstamped, a symlink (dangling symlinks fail
+    /// `File::open` with `NotFound` and would otherwise masquerade as
+    /// [`TableFile::Missing`]), or another non-regular entry such as a
+    /// FIFO — which must never reach a blocking `File::open`.
     Foreign(String),
 }
 
-/// Inspects one table file.
+/// Inspects one table file, retaining the reader of a stamped file.
 fn inspect_table(path: &Path) -> TableFile {
-    match read_export_provenance(path) {
-        Ok(Some(provenance)) => TableFile::Stamped(provenance),
-        Ok(None) => TableFile::Foreign(format!(
-            "{} is a Parquet file, but not a froe export — it carries no export stamp",
+    use ::parquet::file::reader::SerializedFileReader;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return TableFile::Missing;
+        }
+        Err(error) => {
+            return TableFile::Foreign(format!("{} cannot be inspected: {error}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return TableFile::Foreign(format!("{} is not a regular file", path.display()));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return TableFile::Foreign(format!("{} cannot be read: {error}", path.display()));
+        }
+    };
+    match SerializedFileReader::new(file) {
+        Ok(reader) => match provenance_of(&reader) {
+            Some(provenance) => TableFile::Stamped { provenance, reader },
+            None => TableFile::Foreign(format!(
+                "{} is a Parquet file, but not a froe export — it carries no export stamp",
+                path.display()
+            )),
+        },
+        Err(error) => TableFile::Foreign(format!(
+            "{} is not readable as a Parquet export: {error}",
             path.display()
         )),
-        Err(error) => {
-            let missing = matches!(
-                &error,
-                froe::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::NotFound
-            );
-            if missing {
-                TableFile::Missing
-            } else {
-                TableFile::Foreign(format!(
-                    "{} is not readable as a Parquet export: {error}",
-                    path.display()
-                ))
-            }
-        }
     }
 }
 
 /// The classification of an export directory against a requested
 /// export, deciding both refreshability and replacement authorization.
 enum Classification {
-    /// Both files are present, stamped, in scope, and agreeing.
-    Reusable(ExportProvenance),
+    /// Both files are present, stamped, in scope, and agreeing; the
+    /// open readers ride along to the merge.
+    Reusable {
+        /// The agreed provenance.
+        provenance: ExportProvenance,
+        /// The nodes and properties readers, open since inspection.
+        base: [::parquet::file::reader::SerializedFileReader<std::fs::File>; 2],
+    },
     /// Nothing present, or only froe's own in-scope output (possibly
     /// interrupted mid-refresh): a full export may replace it uninvited.
     Replaceable(String),
-    /// Foreign or out-of-scope files are present: replacing them takes
-    /// the explicit rebuild flag.
+    /// Foreign, other-repository, or out-of-scope files are present:
+    /// replacing them takes the explicit rebuild flag.
     Guarded(String),
 }
 
@@ -390,15 +417,42 @@ fn scope_mismatch(
     None
 }
 
+/// The ownership check a `TarMK` store supports. The store has no
+/// repository UUID, and compaction rewrites the journal to one line, so
+/// history cannot prove identity: a stamped revision is this
+/// repository's own exactly when its segment still resolves. A foreign
+/// repository's segments never collide (random UUIDs); a compacted-away
+/// revision conservatively fails the check, so replacing such an export
+/// takes the explicit rebuild flag.
+fn resolves_here(repository: &Repository, provenance: &ExportProvenance) -> bool {
+    froe::journal::parse_record_identifier_text(provenance.revision())
+        .is_some_and(|identifier| repository.contains_segment(identifier.segment))
+}
+
+/// The unresolvable-stamp rejection reason.
+fn unresolvable_reason(provenance: &ExportProvenance) -> String {
+    format!(
+        "the stamped revision {} does not resolve against this repository; the store was \
+         likely compacted since the export, or the export belongs to a different repository",
+        provenance.revision()
+    )
+}
+
 /// Classifies the export directory. The authorization rule, in one
 /// place: automatic replacement is safe only when both files are
-/// absent, or when every present file is demonstrably froe-owned and
-/// matches the requested scope — a foreign file anywhere, or a stamped
-/// file of another scope anywhere, guards the directory. Two stamps
-/// may disagree only in their revision for the pair to count as
-/// interrupted-refresh residue; any other disagreement is out of scope
-/// by construction and never reaches the residue branch.
-fn classify(output_directory: &Path, root_path: &str, depth: Option<usize>) -> Classification {
+/// absent, or when every present file is demonstrably froe-owned —
+/// stamped, in scope, and resolving against this repository — with a
+/// foreign, other-repository, or out-of-scope file anywhere guarding
+/// the directory. Two stamps may disagree only in their revision for
+/// the pair to count as interrupted-refresh residue; any other
+/// disagreement is out of scope by construction and never reaches the
+/// residue branch.
+fn classify(
+    repository: &Repository,
+    output_directory: &Path,
+    root_path: &str,
+    depth: Option<usize>,
+) -> Classification {
     let nodes_path = output_directory.join(NODES_FILE_NAME);
     let properties_path = output_directory.join(PROPERTIES_FILE_NAME);
     let nodes = inspect_table(&nodes_path);
@@ -413,21 +467,42 @@ fn classify(output_directory: &Path, root_path: &str, depth: Option<usize>) -> C
             "there is no export at {} yet",
             output_directory.display()
         )),
-        (TableFile::Stamped(provenance), TableFile::Missing)
-        | (TableFile::Missing, TableFile::Stamped(provenance)) => {
+        (TableFile::Stamped { provenance, .. }, TableFile::Missing)
+        | (TableFile::Missing, TableFile::Stamped { provenance, .. }) => {
             if let Some(reason) = scope_mismatch(&provenance, root_path, depth) {
                 return Classification::Guarded(reason);
             }
+            if !resolves_here(repository, &provenance) {
+                return Classification::Guarded(unresolvable_reason(&provenance));
+            }
             Classification::Replaceable("one of the export's two files is missing".to_owned())
         }
-        (TableFile::Stamped(first), TableFile::Stamped(second)) => {
+        (
+            TableFile::Stamped {
+                provenance: first,
+                reader: first_reader,
+            },
+            TableFile::Stamped {
+                provenance: second,
+                reader: second_reader,
+            },
+        ) => {
             for provenance in [&first, &second] {
                 if let Some(reason) = scope_mismatch(provenance, root_path, depth) {
                     return Classification::Guarded(reason);
                 }
             }
+            if !resolves_here(repository, &first) {
+                return Classification::Guarded(unresolvable_reason(&first));
+            }
+            if !resolves_here(repository, &second) {
+                return Classification::Guarded(unresolvable_reason(&second));
+            }
             if first == second {
-                Classification::Reusable(first)
+                Classification::Reusable {
+                    provenance: first,
+                    base: [first_reader, second_reader],
+                }
             } else {
                 Classification::Replaceable(
                     "the export's two files carry different revisions; an earlier refresh \
@@ -442,47 +517,50 @@ fn classify(output_directory: &Path, root_path: &str, depth: Option<usize>) -> C
     }
 }
 
-/// Whether a full export may replace the directory's contents without
-/// being explicitly asked. Callers replacing files should hold the
-/// export directory lock ([`lock_export_directory`]) across the
-/// assessment and the replacement, so the verdict cannot go stale.
+/// The assessment of an export directory's contents before a full
+/// export replaces them; see [`assess_export`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportAssessment {
+    /// A valid, own, in-scope export stands there — refresh it rather
+    /// than replace it.
+    Reusable,
+    /// Nothing stands there, or only froe's own in-scope residue —
+    /// replacement is safe; the string says why it is not Reusable.
+    Replaceable(String),
+    /// Foreign, other-repository, or out-of-scope files stand there —
+    /// replacement needs the explicit rebuild flag.
+    Guarded(String),
+}
+
+/// Assesses the export directory's contents ahead of a full export.
+/// Callers replacing files should hold the export directory lock
+/// ([`lock_export_directory`]) across the assessment and the
+/// replacement, so the verdict cannot go stale.
 #[must_use]
-pub fn assess_export_replacement(
+pub fn assess_export(
+    repository: &Repository,
     output_directory: &Path,
     root_path: &str,
     depth: Option<usize>,
-) -> ExportReplacement {
-    match classify(output_directory, root_path, depth) {
-        Classification::Reusable(_) | Classification::Replaceable(_) => {
-            ExportReplacement::Authorized
-        }
-        Classification::Guarded(reason) => ExportReplacement::NeedsForce { reason },
+) -> ExportAssessment {
+    match classify(repository, output_directory, root_path, depth) {
+        Classification::Reusable { .. } => ExportAssessment::Reusable,
+        Classification::Replaceable(reason) => ExportAssessment::Replaceable(reason),
+        Classification::Guarded(reason) => ExportAssessment::Guarded(reason),
     }
-}
-
-/// Whether a full export may replace the directory's contents
-/// uninvited; see [`assess_export_replacement`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExportReplacement {
-    /// The files are absent or verifiably froe's own in-scope output.
-    Authorized,
-    /// Foreign or different-scope files are present.
-    NeedsForce {
-        /// The operator-facing reason.
-        reason: String,
-    },
 }
 
 /// Validates an existing export as a refresh base. Every failure is a
 /// [`Rejection`], not an error — nothing about a reusable-or-not
 /// verdict is exceptional.
 fn validate(
+    repository: &Repository,
     output_directory: &Path,
     root_path: &str,
     depth: Option<usize>,
-) -> Result<ExportProvenance, Rejection> {
-    match classify(output_directory, root_path, depth) {
-        Classification::Reusable(provenance) => Ok(provenance),
+) -> Result<ValidatedBase, Rejection> {
+    match classify(repository, output_directory, root_path, depth) {
+        Classification::Reusable { provenance, base } => Ok(ValidatedBase { provenance, base }),
         Classification::Replaceable(reason) => Err(Rejection {
             reason,
             replaceable: true,
@@ -492,6 +570,15 @@ fn validate(
             replaceable: false,
         }),
     }
+}
+
+/// A refresh base that passed validation: the agreed provenance and the
+/// two table readers, held open from inspection through the merge.
+struct ValidatedBase {
+    /// The agreed provenance of the two files.
+    provenance: ExportProvenance,
+    /// The nodes and properties readers the merge consumes.
+    base: [::parquet::file::reader::SerializedFileReader<std::fs::File>; 2],
 }
 
 /// One dirty path range: the old rows it replaces and the replacement
@@ -757,22 +844,21 @@ enum MergeVerdict {
 }
 
 /// Merges the old tables with the delta tables into fresh files at the
-/// merged paths, stamped with `provenance`. The old tables' own stamps
-/// are read back off the very readers the merge consumes and must equal
-/// `expected_base` — an open handle keeps its bytes even if the
-/// pathname is replaced, so a base swapped mid-refresh is caught here,
-/// never silently merged.
+/// merged paths, stamped with `provenance`. The old tables arrive as
+/// the readers validation opened and the refresh held ever since — an
+/// open handle keeps its bytes even if its pathname is replaced, so a
+/// base swapped by a writer outside the lock can never be merged and
+/// stamped under the new head.
 #[allow(
     clippy::too_many_arguments,
     reason = "two tables times three paths, plus ranges, provenance, and options"
 )]
 fn merge_tables(
     repository: &Repository,
-    expected_base: &ExportProvenance,
-    old_nodes: &Path,
+    old_nodes_reader: &::parquet::file::reader::SerializedFileReader<std::fs::File>,
     delta_nodes: &Path,
     merged_nodes: &Path,
-    old_properties: &Path,
+    old_properties_reader: &::parquet::file::reader::SerializedFileReader<std::fs::File>,
     delta_properties: &Path,
     merged_properties: &Path,
     ranges: &[DirtyRange],
@@ -781,37 +867,6 @@ fn merge_tables(
 ) -> froe::Result<MergeVerdict> {
     use ::parquet::file::reader::SerializedFileReader;
 
-    // The old files opened cleanly during validation, but a reader
-    // failing here — or mid-stream, below — only ever means the base is
-    // unusable, never that the refresh must die: report Unusable and
-    // let the caller rebuild. The delta files are this run's own
-    // output; their failures stay hard errors.
-    let open_old = |path: &Path| -> Result<SerializedFileReader<std::fs::File>, MergeVerdict> {
-        let reader = std::fs::File::open(path)
-            .and_then(|file| SerializedFileReader::new(file).map_err(std::io::Error::other));
-        reader.map_err(|error| {
-            MergeVerdict::Unusable(format!(
-                "{} is not readable as a Parquet export: {error}",
-                path.display()
-            ))
-        })
-    };
-    let old_nodes_reader = match open_old(old_nodes) {
-        Ok(reader) => reader,
-        Err(verdict) => return Ok(verdict),
-    };
-    let old_properties_reader = match open_old(old_properties) {
-        Ok(reader) => reader,
-        Err(verdict) => return Ok(verdict),
-    };
-    for reader in [&old_nodes_reader, &old_properties_reader] {
-        if provenance_of(reader).as_ref() != Some(expected_base) {
-            return Err(froe::Error::InvalidFormat {
-                details: "the export changed underneath the refresh; re-run to start over"
-                    .to_owned(),
-            });
-        }
-    }
     let open_delta = |path: &Path| -> froe::Result<SerializedFileReader<std::fs::File>> {
         SerializedFileReader::new(std::fs::File::open(path)?).map_err(parquet_read_error)
     };
@@ -834,7 +889,7 @@ fn merge_tables(
     )?;
     let index = RangeIndex::new(ranges);
     merge_row_streams(
-        NodeRows::new(&old_nodes_reader, &failure, true)?,
+        NodeRows::new(old_nodes_reader, &failure, true)?,
         NodeRows::new(&delta_nodes_reader, &failure, false)?,
         ranges,
         &index,
@@ -849,7 +904,7 @@ fn merge_tables(
         },
     )?;
     merge_row_streams(
-        PropertyRows::new(&old_properties_reader, &failure, true)?,
+        PropertyRows::new(old_properties_reader, &failure, true)?,
         PropertyRows::new(&delta_properties_reader, &failure, false)?,
         ranges,
         &index,
@@ -1130,7 +1185,7 @@ mod tests {
         DirtyRange, MergeRow, ParquetRefresh, RangeIndex, Replacement, dirty_ranges,
         merge_row_streams, path_in_range, path_under, refresh_parquet_export,
     };
-    use crate::export::{ExportSink, export_subtree};
+    use crate::export::export_subtree;
     use crate::parquet::{
         ExportProvenance, NodeRow, ParquetExportOptions, ParquetSink, PropertyRow,
         read_export_provenance,
@@ -1536,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_export_root_is_not_reusable() {
+    fn a_removed_export_root_reports_missing() {
         let directory = TestDirectory::new("root-removed");
         populate_first(&directory.store());
         full_export(
@@ -1549,17 +1604,10 @@ mod tests {
 
         revise(&directory.store(), |writer| writer.leaf(&[]));
         let outcome = refresh(&directory.store(), "/content", None, &directory.export());
-        let ParquetRefresh::NotReusable {
-            reason,
-            replaceable,
-        } = outcome
-        else {
-            panic!("a vanished export root follows the missing-path contract: {outcome:?}");
-        };
-        assert!(reason.contains("no longer exists"), "the reason: {reason}");
-        assert!(
-            replaceable,
-            "the caller's full export reports the missing path"
+        assert_eq!(
+            outcome,
+            ParquetRefresh::Missing,
+            "a vanished export root follows the missing-path contract"
         );
         assert_eq!(
             node_rows(&directory.export()).len(),
@@ -1651,19 +1699,15 @@ mod tests {
             &directory.export(),
             None,
         );
-        // Rewrite the properties table alone with a different stamp, the
-        // residue an interrupted refresh would leave.
+        // The residue an interrupted refresh leaves: one file stamped
+        // with the next real revision, one with the previous — both
+        // this repository's own.
+        populate_second(&directory.store());
         let other = directory.path.join("other");
-        full_export(
-            &directory.store(),
-            "/content",
-            None,
-            &other,
-            Some("00000000-0000-0000-0000-000000000000.00000001".to_owned()),
-        );
+        full_export(&directory.store(), "/content", None, &other, None);
         std::fs::copy(
-            other.join("properties.parquet"),
-            directory.export().join("properties.parquet"),
+            other.join("nodes.parquet"),
+            directory.export().join("nodes.parquet"),
         )
         .expect("copy");
 
@@ -1683,11 +1727,13 @@ mod tests {
     }
 
     #[test]
-    fn a_compacted_away_revision_is_not_reusable() {
+    fn an_unresolvable_stamped_revision_is_guarded() {
         let directory = TestDirectory::new("stale-revision");
         populate_first(&directory.store());
         // A well-formed revision naming a segment the store never held
-        // stands in for a compacted-away one: the diff cannot resolve it.
+        // stands in for both a compacted-away revision and a foreign
+        // repository's: unresolvable is unresolvable, and replacing the
+        // files takes the explicit flag.
         full_export(
             &directory.store(),
             "/content",
@@ -1701,15 +1747,12 @@ mod tests {
             replaceable,
         } = outcome
         else {
-            panic!("an unresolvable base revision is no refresh base: {outcome:?}");
+            panic!("an unresolvable stamp is no refresh base: {outcome:?}");
         };
+        assert!(reason.contains("does not resolve"), "the reason: {reason}");
         assert!(
-            reason.contains("no longer resolves"),
-            "the reason: {reason}"
-        );
-        assert!(
-            replaceable,
-            "a stale but froe-owned export rebuilds uninvited"
+            !replaceable,
+            "compaction cannot be told from a foreign repository; --full decides"
         );
     }
 
@@ -1847,63 +1890,77 @@ mod tests {
     }
 
     #[test]
-    fn the_merge_refuses_a_base_that_changed_underneath() {
-        let directory = TestDirectory::new("merge-swap");
+    fn a_same_stamp_swap_mid_refresh_is_never_merged() {
+        let directory = TestDirectory::new("swap-mid-refresh");
         populate_first(&directory.store());
-        let revision = full_export(
+        let first_revision = full_export(
             &directory.store(),
             "/content",
             None,
             &directory.export(),
             None,
         );
-        let provenance = ExportProvenance::new(revision.clone(), "/content", None);
 
-        // Empty but valid delta files, and paths for the merge output.
-        let delta_nodes = directory.path.join("delta-nodes.parquet");
-        let delta_properties = directory.path.join("delta-properties.parquet");
-        let mut delta_sink = ParquetSink::new(
-            std::fs::File::create(&delta_nodes).expect("delta nodes"),
-            std::fs::File::create(&delta_properties).expect("delta properties"),
-            &ParquetExportOptions::default(),
-        )
-        .expect("delta sink");
-        ExportSink::finish(&mut delta_sink).expect("finish delta");
-        let merged_nodes = directory.path.join("merged-nodes.parquet");
-        let merged_properties = directory.path.join("merged-properties.parquet");
-
-        let repository = Repository::open(&directory.store()).expect("open");
-        let merge = |expected: &ExportProvenance| {
-            super::merge_tables(
-                &repository,
-                expected,
-                &directory.export().join("nodes.parquet"),
-                &delta_nodes,
-                &merged_nodes,
-                &directory.export().join("properties.parquet"),
-                &delta_properties,
-                &merged_properties,
-                &[],
-                &ExportProvenance::new("new-revision".to_owned(), "/content", None),
-                &ParquetExportOptions::default(),
-            )
-        };
-        // The matching base merges.
-        assert!(
-            matches!(merge(&provenance), Ok(super::MergeVerdict::Done)),
-            "the validated base merges"
-        );
-        // A base whose stamps no longer match is refused — the check
-        // runs on the merge's own readers, off the open files.
-        let swapped = ExportProvenance::new(
-            "00000000-0000-0000-0000-000000000000.00000001".to_owned(),
+        // The rogue pair: a different repository's export carrying the
+        // same stamp — footer equality is not content identity.
+        let rogue = TestDirectory::new("swap-rogue");
+        revise(&rogue.store(), |writer| {
+            let evil = writer.leaf(&[]);
+            let content = writer.child("evil", evil, &[]);
+            writer.child("content", content, &[])
+        });
+        full_export(
+            &rogue.store(),
             "/content",
             None,
+            &rogue.export(),
+            Some(first_revision),
         );
-        let refused = merge(&swapped);
+
+        populate_second(&directory.store());
+
+        // Rename the rogue pair over the base from the delta-export
+        // progress callback: after validation, before the merge.
+        let mut swapped = false;
+        let mut on_node = |_: u64| {
+            if !swapped {
+                swapped = true;
+                for name in ["nodes.parquet", "properties.parquet"] {
+                    std::fs::rename(rogue.export().join(name), directory.export().join(name))
+                        .expect("swap");
+                }
+            }
+        };
+        let repository = Repository::open(&directory.store()).expect("open");
+        let outcome = refresh_parquet_export(
+            &repository,
+            "/content",
+            None,
+            &directory.export(),
+            &ParquetExportOptions::default(),
+            &mut on_node,
+        )
+        .expect("refresh");
+        assert!(swapped, "the swap really happened mid-refresh: {outcome:?}");
+
+        // The merge consumed the readers validation opened — the honest
+        // base — so the result is exactly a full export of the new head.
+        let reference = directory.path.join("reference");
+        full_export(&directory.store(), "/content", None, &reference, None);
+        assert_eq!(
+            node_rows(&directory.export()),
+            node_rows(&reference),
+            "the swapped-in rogue rows never entered the merge"
+        );
+        assert_eq!(
+            property_rows(&directory.export()),
+            property_rows(&reference)
+        );
         assert!(
-            matches!(&refused, Err(froe::Error::InvalidFormat { details }) if details.contains("changed underneath")),
-            "the swapped base is refused: {refused:?}"
+            node_rows(&directory.export())
+                .iter()
+                .all(|row| !row.path.contains("evil")),
+            "no rogue row survives under the new stamp"
         );
     }
 
@@ -1948,6 +2005,75 @@ mod tests {
         };
         assert!(reason.contains("not readable"), "the reason: {reason}");
         assert!(replaceable, "a corrupt froe-owned base rebuilds uninvited");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlinks_are_foreign_never_missing() {
+        let directory = TestDirectory::new("dangling-symlinks");
+        populate_first(&directory.store());
+        std::fs::create_dir_all(directory.export()).expect("create export directory");
+        for name in ["nodes.parquet", "properties.parquet"] {
+            std::os::unix::fs::symlink(
+                directory.path.join("no-such-target"),
+                directory.export().join(name),
+            )
+            .expect("symlink");
+        }
+        let outcome = refresh(&directory.store(), "/content", None, &directory.export());
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
+            panic!("a dangling symlink is not an absent file: {outcome:?}");
+        };
+        assert!(
+            reason.contains("not a regular file"),
+            "the reason: {reason}"
+        );
+        assert!(
+            !replaceable,
+            "foreign filesystem objects are never replaced uninvited"
+        );
+        let repository = Repository::open(&directory.store()).expect("open");
+        assert!(
+            matches!(
+                super::assess_export(&repository, &directory.export(), "/content", None),
+                super::ExportAssessment::Guarded(_)
+            ),
+            "the assessment agrees"
+        );
+    }
+
+    #[test]
+    fn an_export_from_another_repository_is_guarded() {
+        let directory = TestDirectory::new("cross-repository");
+        // A complete, valid, in-scope export — of a *different* store.
+        let foreign = TestDirectory::new("cross-repository-foreign");
+        populate_first(&foreign.store());
+        full_export(
+            &foreign.store(),
+            "/content",
+            None,
+            &directory.export(),
+            None,
+        );
+
+        populate_first(&directory.store());
+        let outcome = refresh(&directory.store(), "/content", None, &directory.export());
+        let ParquetRefresh::NotReusable {
+            reason,
+            replaceable,
+        } = outcome
+        else {
+            panic!("another repository's export is no refresh base: {outcome:?}");
+        };
+        assert!(reason.contains("does not resolve"), "the reason: {reason}");
+        assert!(
+            !replaceable,
+            "a foreign repository's export is indistinguishable from a compacted base"
+        );
     }
 
     #[test]

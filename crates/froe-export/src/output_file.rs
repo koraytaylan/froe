@@ -199,30 +199,33 @@ pub fn lock_export_directory(directory: &Path) -> froe::Result<ExportDirectoryLo
 /// target is never unlinked to make room, so a failed replacement
 /// always leaves it intact.
 ///
-/// The temporary's bytes are forced to disk before the rename and the
-/// directory entry after, so the replacement survives a power loss. On
-/// Unix an existing target's permission bits carry over to the
-/// replacement (ownership and ACLs cannot, portably); the permission
-/// transfer runs after the sync, since a target mode without owner-read
-/// would otherwise make the temporary unreadable before it is synced.
+/// Durability ordering on Unix: the temporary is opened while it still
+/// has its owner-readable creation mode (a target mode without
+/// owner-read must not break the sync), the target's permission bits
+/// are applied through that descriptor, one `sync_all` then forces
+/// bytes *and* the new mode to disk, and the parent directory is
+/// synced after the rename. Ownership and ACLs cannot carry over
+/// portably; off Unix the file sync is what exists.
 pub fn replace_export_output(temporary: &Path, target: &Path) -> froe::Result<()> {
-    std::fs::File::open(temporary)?.sync_all()?;
-    preserve_permissions(temporary, target)?;
+    let file = std::fs::File::open(temporary)?;
+    preserve_permissions(&file, target)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(temporary, target).map_err(froe::Error::InputOutput)?;
     sync_parent_directory(target)
 }
 
 /// Carries an existing target's permission bits over to its replacement
-/// on Unix; a missing target keeps the temporary's fresh mode.
+/// on Unix, through the open descriptor, so the following sync covers
+/// the mode change; a missing target keeps the temporary's fresh mode.
 #[cfg(unix)]
-fn preserve_permissions(temporary: &Path, target: &Path) -> froe::Result<()> {
+fn preserve_permissions(temporary: &std::fs::File, target: &Path) -> froe::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(target) {
         Ok(metadata) => {
-            std::fs::set_permissions(
-                temporary,
-                std::fs::Permissions::from_mode(metadata.permissions().mode()),
-            )?;
+            temporary.set_permissions(std::fs::Permissions::from_mode(
+                metadata.permissions().mode(),
+            ))?;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -232,7 +235,7 @@ fn preserve_permissions(temporary: &Path, target: &Path) -> froe::Result<()> {
 
 /// No permission model to translate on other platforms.
 #[cfg(not(unix))]
-fn preserve_permissions(_temporary: &Path, _target: &Path) -> froe::Result<()> {
+fn preserve_permissions(_temporary: &std::fs::File, _target: &Path) -> froe::Result<()> {
     Ok(())
 }
 
