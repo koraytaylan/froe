@@ -262,3 +262,206 @@ fn the_quiet_flag_silences_progress_but_keeps_the_summary() {
         "the summary must still be printed: {stderr}"
     );
 }
+
+/// Commits a second revision: `/content` gains a `version` property and
+/// an `added` child.
+fn revise(directory: &std::path::Path) {
+    let store = WritableRepository::open(directory).expect("open");
+    let generation = store.writing_generation().expect("generation");
+    let mut writer = store.record_writer(generation);
+    let added = writer
+        .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+        .expect("added");
+    let version_value = writer.write_string("2").expect("version value");
+    let content = writer
+        .write_node(
+            Some("nt:unstructured"),
+            &[],
+            &froe::writer::record_writer::ChildNodesToWrite::One {
+                name: "added".to_owned(),
+                node: added,
+            },
+            &[froe::writer::record_writer::PropertyToWrite {
+                name: "version".to_owned(),
+                property_type: froe::content::PropertyType::Long,
+                values: froe::writer::record_writer::PropertyValuesToWrite::Single(version_value),
+            }],
+        )
+        .expect("content");
+    let root = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "content".to_owned(),
+                node: content,
+            },
+            &[],
+        )
+        .expect("root");
+    let head = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "root".to_owned(),
+                node: root,
+            },
+            &[],
+        )
+        .expect("super root");
+    writer.finish().expect("finish");
+    let previous = store.head();
+    assert!(store.set_head(previous, head));
+    store.close().expect("close");
+}
+
+/// Runs `froe export --format parquet` and returns the captured stderr.
+fn parquet_export(store: &std::path::Path, output: &std::path::Path, extra: &[&str]) -> String {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_froe"));
+    command.args([
+        "export",
+        store.to_str().expect("path"),
+        "--format",
+        "parquet",
+        "--output",
+        output.to_str().expect("path"),
+    ]);
+    command.args(extra);
+    let run = command.output().expect("run export");
+    assert!(
+        run.status.success(),
+        "the parquet export must succeed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    String::from_utf8_lossy(&run.stderr).into_owned()
+}
+
+#[test]
+fn the_parquet_export_refreshes_in_place() {
+    let directory = TestDirectory::new("parquet-refresh");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    let output = directory.path.join("export");
+
+    let first = parquet_export(&store, &output, &[]);
+    assert!(
+        first.contains("exported 2 nodes"),
+        "the first export: {first}"
+    );
+
+    // An unchanged store: the export reports itself current and is not
+    // rewritten.
+    let before = std::fs::read(output.join("nodes.parquet")).expect("read");
+    let second = parquet_export(&store, &output, &[]);
+    assert!(
+        second.contains("already current"),
+        "the second export: {second}"
+    );
+    assert_eq!(
+        std::fs::read(output.join("nodes.parquet")).expect("read"),
+        before,
+        "a current export is not rewritten"
+    );
+
+    // A moved head: only the change is decoded.
+    revise(&store);
+    let third = parquet_export(&store, &output, &[]);
+    assert!(
+        third.contains("refreshed the export") && third.contains("2 changed ranges"),
+        "the third export refreshes: {third}"
+    );
+    let revision = froe::store::Repository::open(&store)
+        .expect("open")
+        .head_record_identifier()
+        .to_string();
+    for name in ["nodes.parquet", "properties.parquet"] {
+        let provenance = froe_export::read_export_provenance(&output.join(name))
+            .expect("read")
+            .expect("stamped");
+        assert_eq!(
+            provenance.revision(),
+            revision,
+            "{name} carries the new head's stamp"
+        );
+    }
+    // The temporary files of the refresh never linger.
+    let leftovers: Vec<_> = std::fs::read_dir(&output)
+        .expect("read dir")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        2,
+        "only the two tables remain: {leftovers:?}"
+    );
+}
+
+#[test]
+fn the_full_flag_rebuilds_the_export() {
+    let directory = TestDirectory::new("parquet-full");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    let output = directory.path.join("export");
+
+    parquet_export(&store, &output, &[]);
+    let rebuilt = parquet_export(&store, &output, &["--full"]);
+    assert!(
+        rebuilt.contains("exported 2 nodes"),
+        "--full runs a full export even when the existing one is current: {rebuilt}"
+    );
+    assert!(!rebuilt.contains("already current"), "{rebuilt}");
+}
+
+#[test]
+fn a_compacted_store_forces_a_fresh_export() {
+    let directory = TestDirectory::new("parquet-compacted");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    let output = directory.path.join("export");
+    parquet_export(&store, &output, &[]);
+
+    let compact = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--yes"])
+        .output()
+        .expect("run compact");
+    assert!(
+        compact.status.success(),
+        "compact must succeed: {}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+
+    let rerun = parquet_export(&store, &output, &[]);
+    assert!(
+        rerun.contains("exporting from scratch"),
+        "compaction makes the stamped revision unresolvable: {rerun}"
+    );
+    assert!(
+        rerun.contains("exported 2 nodes"),
+        "the fresh export completes: {rerun}"
+    );
+}
+
+#[test]
+fn a_foreign_parquet_file_is_replaced_with_a_note() {
+    let directory = TestDirectory::new("parquet-foreign");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    let output = directory.path.join("export");
+    std::fs::create_dir_all(&output).expect("create output directory");
+    std::fs::write(output.join("nodes.parquet"), b"not a parquet file").expect("seed");
+
+    let run = parquet_export(&store, &output, &[]);
+    assert!(
+        run.contains("exporting from scratch"),
+        "the foreign file is reported before replacement: {run}"
+    );
+    assert!(
+        run.contains("exported 2 nodes"),
+        "the export completes: {run}"
+    );
+}

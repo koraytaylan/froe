@@ -16,7 +16,9 @@
 //! * `ParquetSink` (behind the `parquet` feature) — two flat,
 //!   zstd-compressed tables built for analytical SQL: one row per node
 //!   and one row per property value. See the [`parquet`]
-//!   module.
+//!   module. [`refresh_parquet_export`] brings an existing Parquet
+//!   export up to date by decoding only what changed since it was
+//!   taken; see the [`refresh`] module.
 //! * `SqliteSink` (behind the `sqlite` feature) — a single `.db` file
 //!   with interned strings, a clustered properties table, and a view
 //!   layer presenting flat, directly queryable rows. See the [`sqlite`]
@@ -27,6 +29,9 @@
 //! blessed way to open an output file: it refuses to overwrite existing
 //! files and refuses to write inside the repository directory, where a
 //! stray file could be mistaken for a damaged archive at the next open.
+//! The Parquet refresh replaces its two table files instead — atomically
+//! via [`replace_export_output`] — after validating them as its own
+//! earlier output.
 //!
 //! # Example
 //!
@@ -50,13 +55,24 @@ pub mod json_lines;
 pub mod output_file;
 #[cfg(feature = "parquet")]
 pub mod parquet;
+#[cfg(feature = "parquet")]
+pub mod refresh;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
 #[cfg(feature = "parquet")]
-pub use crate::parquet::{ParquetExportOptions, ParquetSink};
+pub use crate::parquet::{
+    ExportProvenance, ParquetExportOptions, ParquetSink, read_export_provenance,
+};
+#[cfg(feature = "parquet")]
+pub use crate::refresh::{
+    NODES_FILE_NAME, PROPERTIES_FILE_NAME, ParquetRefresh, refresh_parquet_export,
+};
 #[cfg(feature = "sqlite")]
 pub use crate::sqlite::{SqliteExportOptions, SqliteSink};
-pub use export::{ExportSink, ExportedNode, export_subtree};
+pub use export::{ExportSink, ExportedNode, export_node, export_subtree};
 pub use json_lines::JsonLinesSink;
-pub use output_file::{create_export_directory, create_export_output};
+pub use output_file::{
+    create_export_directory, create_export_output, replace_export_output, sweep_temporary_outputs,
+    temporary_output_name,
+};

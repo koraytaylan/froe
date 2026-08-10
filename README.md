@@ -83,6 +83,16 @@ $ duckdb -c "
   GROUP BY primary_type ORDER BY nodes DESC LIMIT 10;"
 ```
 
+Re-running a Parquet export into the same directory does not start
+over: the tables carry the head revision they were built from, so froe
+diffs that revision against the current head and decodes only the
+changed subtrees, rewriting the two files atomically in place — a kept
+export stays queryable at Parquet speed for the price of the delta.
+Anything the existing files cannot support (a first run, a different
+root path or depth, a revision compacted away since) falls back to a
+full export automatically; `--full` forces one. The `json-lines` and
+`sqlite` formats keep the strict never-overwrite contract instead.
+
 `froe --help` lists every command.
 
 As a library:

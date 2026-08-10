@@ -19,6 +19,14 @@
 //! Parquet's per-row-group statistics prune subtree predicates
 //! (`WHERE path LIKE '/content/dam/%'`) without reading the skipped
 //! groups. Columns are zstd-compressed and dictionary-encoded.
+//!
+//! Every export stamps both file footers with an [`ExportProvenance`]:
+//! the head revision the rows reflect, the exported root path, and the
+//! depth limit. The stamp is what makes an existing export *refreshable*
+//! — see the `refresh` module — and it is written identically into both
+//! files, so a crash between the two renames of a refresh leaves
+//! disagreeing footers that the next refresh simply treats as
+//! "not reusable".
 
 use std::io::Write;
 use std::sync::Arc;
@@ -27,6 +35,7 @@ use ::parquet::basic::{Compression, ZstdLevel};
 use ::parquet::data_type::{
     BoolType, ByteArray, ByteArrayType, DataType, DoubleType, Int32Type, Int64Type,
 };
+use ::parquet::file::metadata::KeyValue;
 use ::parquet::file::properties::WriterProperties;
 use ::parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use ::parquet::schema::parser::parse_message_type;
@@ -34,6 +43,124 @@ use froe::content::value::BinaryValue;
 use froe::content::{PropertyValue, PropertyValues};
 
 use crate::export::{ExportSink, ExportedNode};
+
+/// The footer metadata key carrying the export format version.
+const FORMAT_KEY: &str = "froe.format";
+
+/// The only format version written so far.
+const FORMAT_VERSION: &str = "1";
+
+/// The footer metadata key carrying the head revision the export
+/// reflects, in record identifier text form.
+const REVISION_KEY: &str = "froe.revision";
+
+/// The footer metadata key carrying the exported root path, normalized
+/// to a leading-slash, trailing-slash-free form.
+const ROOT_PATH_KEY: &str = "froe.root_path";
+
+/// The footer metadata key carrying the depth limit: a decimal number,
+/// or `"none"` for an unlimited export.
+const DEPTH_LIMIT_KEY: &str = "froe.depth_limit";
+
+/// What an existing export claims to reflect: the provenance a Parquet
+/// export stamps into both file footers. A refresh validates the stamp
+/// against the requested export before trusting the files as a base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportProvenance {
+    revision: String,
+    root_path: String,
+    depth_limit: Option<usize>,
+}
+
+impl ExportProvenance {
+    /// Creates the provenance of an export at `revision` (a record
+    /// identifier in text form) of `root_path` with `depth_limit`.
+    /// The root path is normalized, so differently spelled requests of
+    /// the same subtree (`"content"`, `"/content/"`) stamp identically.
+    #[must_use]
+    pub fn new(revision: String, root_path: &str, depth_limit: Option<usize>) -> Self {
+        let segments: Vec<&str> = root_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let root_path = if segments.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{}", segments.join("/"))
+        };
+        Self {
+            revision,
+            root_path,
+            depth_limit,
+        }
+    }
+
+    /// The head revision the export reflects.
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// The exported root path, normalized.
+    #[must_use]
+    pub fn root_path(&self) -> &str {
+        &self.root_path
+    }
+
+    /// The export's depth limit, when limited.
+    #[must_use]
+    pub fn depth_limit(&self) -> Option<usize> {
+        self.depth_limit
+    }
+
+    /// The footer key-value pairs stamping an export.
+    fn to_metadata(&self) -> Vec<KeyValue> {
+        let depth_limit = self
+            .depth_limit
+            .map_or_else(|| "none".to_owned(), |limit| limit.to_string());
+        vec![
+            KeyValue::new(FORMAT_KEY.to_owned(), FORMAT_VERSION.to_owned()),
+            KeyValue::new(REVISION_KEY.to_owned(), self.revision.clone()),
+            KeyValue::new(ROOT_PATH_KEY.to_owned(), self.root_path.clone()),
+            KeyValue::new(DEPTH_LIMIT_KEY.to_owned(), depth_limit),
+        ]
+    }
+
+    /// Reads the provenance from one file's footer key-value pairs, or
+    /// `None` when any key is missing or malformed — the file is then
+    /// not a froe Parquet export a refresh can build on.
+    fn from_metadata(metadata: &[KeyValue]) -> Option<Self> {
+        let get = |key: &str| {
+            metadata
+                .iter()
+                .find(|pair| pair.key == key)
+                .and_then(|pair| pair.value.as_deref())
+        };
+        if get(FORMAT_KEY)? != FORMAT_VERSION {
+            return None;
+        }
+        let depth_limit = match get(DEPTH_LIMIT_KEY)? {
+            "none" => None,
+            text => Some(text.parse().ok()?),
+        };
+        Some(Self {
+            revision: get(REVISION_KEY)?.to_owned(),
+            root_path: get(ROOT_PATH_KEY)?.to_owned(),
+            depth_limit,
+        })
+    }
+}
+
+/// Reads the provenance stamped into one Parquet export file's footer,
+/// or `Ok(None)` when the file carries none.
+pub fn read_export_provenance(path: &std::path::Path) -> froe::Result<Option<ExportProvenance>> {
+    use ::parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let file = std::fs::File::open(path)?;
+    let reader = SerializedFileReader::new(file).map_err(parquet_error)?;
+    let metadata = reader.metadata().file_metadata().key_value_metadata();
+    Ok(metadata.and_then(|pairs| ExportProvenance::from_metadata(pairs)))
+}
 
 /// The nodes table: one row per node.
 const NODES_SCHEMA: &str = "
@@ -208,15 +335,38 @@ pub struct ParquetSink<W: Write + Send> {
 
 impl<W: Write + Send> ParquetSink<W> {
     /// Creates a sink writing the nodes table to `nodes_output` and the
-    /// properties table to `properties_output`.
+    /// properties table to `properties_output`. The files carry no
+    /// provenance; exports a refresh should build on use
+    /// [`ParquetSink::new_with_provenance`].
     pub fn new(
         nodes_output: W,
         properties_output: W,
         options: &ParquetExportOptions,
     ) -> froe::Result<Self> {
+        Self::build(nodes_output, properties_output, options, None)
+    }
+
+    /// Creates a sink like [`ParquetSink::new`], additionally stamping
+    /// both file footers with `provenance`.
+    pub fn new_with_provenance(
+        nodes_output: W,
+        properties_output: W,
+        options: &ParquetExportOptions,
+        provenance: &ExportProvenance,
+    ) -> froe::Result<Self> {
+        Self::build(nodes_output, properties_output, options, Some(provenance))
+    }
+
+    fn build(
+        nodes_output: W,
+        properties_output: W,
+        options: &ParquetExportOptions,
+        provenance: Option<&ExportProvenance>,
+    ) -> froe::Result<Self> {
         let writer_properties = Arc::new(
             WriterProperties::builder()
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .set_key_value_metadata(provenance.map(ExportProvenance::to_metadata))
                 .build(),
         );
         let nodes_schema = parse_message_type(NODES_SCHEMA).map_err(parquet_error)?;
@@ -240,22 +390,57 @@ impl<W: Write + Send> ParquetSink<W> {
         })
     }
 
-    /// Appends one row to the properties buffer. `position` is the value's
-    /// index within a multi-valued property, `None` for the marker row of
-    /// an empty one; `value` is `None` for non-textual types.
+    /// Appends one row to the nodes buffer, flushing a row group when
+    /// the row limit is reached. The export root passes `parent_path`
+    /// `None`.
+    pub(crate) fn append_node_row(
+        &mut self,
+        path: &str,
+        parent_path: Option<&str>,
+        name: &str,
+        depth: i32,
+        primary_type: Option<&str>,
+    ) -> froe::Result<()> {
+        self.nodes
+            .paths
+            .push(ByteArray::from(path.as_bytes().to_vec()));
+        self.nodes
+            .parent_paths
+            .append(parent_path.map(|parent| ByteArray::from(parent.as_bytes().to_vec())));
+        self.nodes
+            .names
+            .push(ByteArray::from(name.as_bytes().to_vec()));
+        self.nodes.depths.push(depth);
+        self.nodes
+            .primary_types
+            .append(primary_type.map(|name| ByteArray::from(name.as_bytes().to_vec())));
+        if self.nodes.row_count() >= self.row_group_row_limit {
+            self.flush_nodes()?;
+        }
+        Ok(())
+    }
+
+    /// Appends one row to the properties buffer: the value in its
+    /// physical shape — at most one of the value columns is `Some`,
+    /// matching the table's one-column-per-shape layout.
     #[allow(
         clippy::too_many_arguments,
         reason = "one argument per table column; a parameter struct would restate the schema"
     )]
-    fn append_property_row(
+    pub(crate) fn append_property_columns(
         &mut self,
         path: &str,
         name: &str,
-        property_type: &'static str,
+        property_type: &str,
         multiple: bool,
         position: Option<i32>,
-        value: Option<&PropertyValue>,
-    ) {
+        text: Option<&str>,
+        long_value: Option<i64>,
+        double_value: Option<f64>,
+        boolean_value: Option<bool>,
+        binary_length: Option<i64>,
+        binary_reference: Option<&str>,
+    ) -> froe::Result<()> {
         let buffer = &mut self.properties;
         buffer.paths.push(ByteArray::from(path.as_bytes().to_vec()));
         buffer.names.push(ByteArray::from(name.as_bytes().to_vec()));
@@ -264,7 +449,35 @@ impl<W: Write + Send> ParquetSink<W> {
             .push(ByteArray::from(property_type.as_bytes().to_vec()));
         buffer.multiples.push(multiple);
         buffer.positions.append(position);
+        buffer
+            .values
+            .append(text.map(|text| ByteArray::from(text.as_bytes().to_vec())));
+        buffer.long_values.append(long_value);
+        buffer.double_values.append(double_value);
+        buffer.boolean_values.append(boolean_value);
+        buffer.binary_lengths.append(binary_length);
+        buffer.binary_references.append(
+            binary_reference.map(|reference| ByteArray::from(reference.as_bytes().to_vec())),
+        );
+        if self.properties.row_count() >= self.row_group_row_limit {
+            self.flush_properties()?;
+        }
+        Ok(())
+    }
 
+    /// Appends one property *value* as a row, decomposing the value into
+    /// its physical column. `position` is the value's index within a
+    /// multi-valued property, `None` for the marker row of an empty one;
+    /// `value` is `None` for that same marker row.
+    pub(crate) fn append_property_row(
+        &mut self,
+        path: &str,
+        name: &str,
+        property_type: &str,
+        multiple: bool,
+        position: Option<i32>,
+        value: Option<&PropertyValue>,
+    ) -> froe::Result<()> {
         let mut text = None;
         let mut long_value = None;
         let mut double_value = None;
@@ -282,7 +495,7 @@ impl<W: Write + Send> ParquetSink<W> {
                 | PropertyValue::WeakReference(content)
                 | PropertyValue::Uri(content)
                 | PropertyValue::Decimal(content),
-            ) => text = Some(ByteArray::from(content.as_bytes().to_vec())),
+            ) => text = Some(content.as_str()),
             Some(PropertyValue::Long(number)) => long_value = Some(*number),
             // Parquet doubles carry NaN and the infinities natively; no
             // textual fallback is needed.
@@ -292,15 +505,22 @@ impl<W: Write + Send> ParquetSink<W> {
                 binary_length = Some(*length as i64);
             }
             Some(PropertyValue::Binary(BinaryValue::External { blob_identifier })) => {
-                binary_reference = Some(ByteArray::from(blob_identifier.as_bytes().to_vec()));
+                binary_reference = Some(blob_identifier.as_str());
             }
         }
-        buffer.values.append(text);
-        buffer.long_values.append(long_value);
-        buffer.double_values.append(double_value);
-        buffer.boolean_values.append(boolean_value);
-        buffer.binary_lengths.append(binary_length);
-        buffer.binary_references.append(binary_reference);
+        self.append_property_columns(
+            path,
+            name,
+            property_type,
+            multiple,
+            position,
+            text,
+            long_value,
+            double_value,
+            boolean_value,
+            binary_length,
+            binary_reference,
+        )
     }
 
     /// Writes the buffered nodes rows as one row group.
@@ -404,19 +624,13 @@ impl<W: Write + Send> ExportSink for ParquetSink<W> {
                 _ => None,
             }
         });
-        self.nodes
-            .paths
-            .push(ByteArray::from(node.path.as_bytes().to_vec()));
-        self.nodes
-            .parent_paths
-            .append(parent_path.map(|parent| ByteArray::from(parent.as_bytes().to_vec())));
-        self.nodes
-            .names
-            .push(ByteArray::from(name.as_bytes().to_vec()));
-        self.nodes.depths.push(node.depth as i32);
-        self.nodes
-            .primary_types
-            .append(primary_type.map(|name| ByteArray::from(name.as_bytes().to_vec())));
+        self.append_node_row(
+            node.path,
+            parent_path,
+            name,
+            node.depth as i32,
+            primary_type,
+        )?;
 
         for property in node.properties {
             let property_type = property.property_type.jcr_name();
@@ -429,7 +643,7 @@ impl<W: Write + Send> ExportSink for ParquetSink<W> {
                         false,
                         Some(0),
                         Some(value),
-                    );
+                    )?;
                 }
                 PropertyValues::Multiple(values) if values.is_empty() => {
                     // The marker row: without it, an empty multi-valued
@@ -441,7 +655,7 @@ impl<W: Write + Send> ExportSink for ParquetSink<W> {
                         true,
                         None,
                         None,
-                    );
+                    )?;
                 }
                 PropertyValues::Multiple(values) => {
                     for (position, value) in values.iter().enumerate() {
@@ -452,17 +666,10 @@ impl<W: Write + Send> ExportSink for ParquetSink<W> {
                             true,
                             Some(position as i32),
                             Some(value),
-                        );
+                        )?;
                     }
                 }
             }
-        }
-
-        if self.nodes.row_count() >= self.row_group_row_limit {
-            self.flush_nodes()?;
-        }
-        if self.properties.row_count() >= self.row_group_row_limit {
-            self.flush_properties()?;
         }
         Ok(())
     }
@@ -472,6 +679,13 @@ impl<W: Write + Send> ExportSink for ParquetSink<W> {
         self.flush_properties()?;
         self.nodes_writer.finish().map_err(parquet_error)?;
         self.properties_writer.finish().map_err(parquet_error)?;
+        // The Parquet writers flushed their own buffers on finish, but
+        // an outer buffering writer may still hold bytes; flush it here,
+        // where an error propagates — a buffer flushed on drop would
+        // swallow a failed final write, and a refresh renames these
+        // files over a good export.
+        self.nodes_writer.inner_mut().flush()?;
+        self.properties_writer.inner_mut().flush()?;
         Ok(())
     }
 }
@@ -501,6 +715,158 @@ fn append_column<W: Write + Send, T: DataType>(
 /// Wraps a Parquet library error as an output error.
 fn parquet_error(error: ::parquet::errors::ParquetError) -> froe::Error {
     froe::Error::InputOutput(std::io::Error::other(error))
+}
+
+/// One row of the nodes table, decoded back from a Parquet file. The
+/// merge half of a refresh replays these into a [`ParquetSink`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NodeRow {
+    pub(crate) path: String,
+    pub(crate) parent_path: Option<String>,
+    pub(crate) name: String,
+    pub(crate) depth: i32,
+    pub(crate) primary_type: Option<String>,
+}
+
+impl NodeRow {
+    /// Decodes one record-API row. `None` means the file does not carry
+    /// the export's columns — it is not a froe Parquet export.
+    pub(crate) fn decode(row: &::parquet::record::Row) -> Option<Self> {
+        Some(Self {
+            path: required_string(row, "path")?,
+            parent_path: optional_string(row, "parent_path")?.into_option(),
+            name: required_string(row, "name")?,
+            depth: required_int(row, "depth")?,
+            primary_type: optional_string(row, "primary_type")?.into_option(),
+        })
+    }
+}
+
+/// One row of the properties table, decoded back from a Parquet file.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PropertyRow {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) property_type: String,
+    pub(crate) multiple: bool,
+    pub(crate) position: Option<i32>,
+    pub(crate) value: Option<String>,
+    pub(crate) long_value: Option<i64>,
+    pub(crate) double_value: Option<f64>,
+    pub(crate) boolean_value: Option<bool>,
+    pub(crate) binary_length: Option<i64>,
+    pub(crate) binary_reference: Option<String>,
+}
+
+impl PropertyRow {
+    /// Decodes one record-API row. `None` means the file does not carry
+    /// the export's columns — it is not a froe Parquet export.
+    pub(crate) fn decode(row: &::parquet::record::Row) -> Option<Self> {
+        Some(Self {
+            path: required_string(row, "path")?,
+            name: required_string(row, "name")?,
+            property_type: required_string(row, "property_type")?,
+            multiple: required_bool(row, "multiple")?,
+            position: optional_int(row, "position")?.into_option(),
+            value: optional_string(row, "value")?.into_option(),
+            long_value: optional_long(row, "long_value")?.into_option(),
+            double_value: optional_double(row, "double_value")?.into_option(),
+            boolean_value: optional_bool(row, "boolean_value")?.into_option(),
+            binary_length: optional_long(row, "binary_length")?.into_option(),
+            binary_reference: optional_string(row, "binary_reference")?.into_option(),
+        })
+    }
+}
+
+/// An optional column's content: distinguishably *null* or a value —
+/// the two states an `Option<Option<T>>` would smear together.
+enum Column<T> {
+    Null,
+    Value(T),
+}
+
+impl<T> Column<T> {
+    /// The column as an optional value.
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Null => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+}
+
+/// One named column of a record-API row.
+fn column<'row>(
+    row: &'row ::parquet::record::Row,
+    name: &str,
+) -> Option<&'row ::parquet::record::Field> {
+    row.get_column_iter()
+        .find(|(column, _)| column.as_str() == name)
+        .map(|(_, field)| field)
+}
+
+/// Extractors per physical column shape. Each returns `None` on a
+/// missing column or an unexpected field variant — both mean the file
+/// was not written by this export.
+fn required_string(row: &::parquet::record::Row, name: &str) -> Option<String> {
+    match column(row, name)? {
+        ::parquet::record::Field::Str(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn optional_string(row: &::parquet::record::Row, name: &str) -> Option<Column<String>> {
+    Some(match column(row, name)? {
+        ::parquet::record::Field::Str(text) => Column::Value(text.clone()),
+        ::parquet::record::Field::Null => Column::Null,
+        _ => return None,
+    })
+}
+
+fn required_int(row: &::parquet::record::Row, name: &str) -> Option<i32> {
+    match column(row, name)? {
+        ::parquet::record::Field::Int(number) => Some(*number),
+        _ => None,
+    }
+}
+
+fn optional_int(row: &::parquet::record::Row, name: &str) -> Option<Column<i32>> {
+    Some(match column(row, name)? {
+        ::parquet::record::Field::Int(number) => Column::Value(*number),
+        ::parquet::record::Field::Null => Column::Null,
+        _ => return None,
+    })
+}
+
+fn optional_long(row: &::parquet::record::Row, name: &str) -> Option<Column<i64>> {
+    Some(match column(row, name)? {
+        ::parquet::record::Field::Long(number) => Column::Value(*number),
+        ::parquet::record::Field::Null => Column::Null,
+        _ => return None,
+    })
+}
+
+fn optional_double(row: &::parquet::record::Row, name: &str) -> Option<Column<f64>> {
+    Some(match column(row, name)? {
+        ::parquet::record::Field::Double(number) => Column::Value(*number),
+        ::parquet::record::Field::Null => Column::Null,
+        _ => return None,
+    })
+}
+
+fn required_bool(row: &::parquet::record::Row, name: &str) -> Option<bool> {
+    match column(row, name)? {
+        ::parquet::record::Field::Bool(truth) => Some(*truth),
+        _ => None,
+    }
+}
+
+fn optional_bool(row: &::parquet::record::Row, name: &str) -> Option<Column<bool>> {
+    Some(match column(row, name)? {
+        ::parquet::record::Field::Bool(truth) => Column::Value(*truth),
+        ::parquet::record::Field::Null => Column::Null,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -866,5 +1232,110 @@ mod tests {
                 .expect("parent")
                 .join(properties_name(&directory.path)),
         );
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use ::parquet::file::metadata::KeyValue;
+
+    use super::{
+        DEPTH_LIMIT_KEY, ExportProvenance, FORMAT_KEY, ParquetExportOptions, ParquetSink,
+        REVISION_KEY, ROOT_PATH_KEY, read_export_provenance,
+    };
+    use crate::export::ExportSink;
+
+    #[test]
+    fn the_root_path_normalizes() {
+        let provenance = ExportProvenance::new("rev".to_owned(), "content/", None);
+        assert_eq!(provenance.root_path(), "/content");
+        assert_eq!(
+            ExportProvenance::new("rev".to_owned(), "/", None).root_path(),
+            "/"
+        );
+        assert_eq!(
+            ExportProvenance::new("rev".to_owned(), "//a//b", None).root_path(),
+            "/a/b"
+        );
+    }
+
+    #[test]
+    fn the_metadata_round_trips() {
+        let provenance = ExportProvenance::new("abc.00000001".to_owned(), "/content", Some(3));
+        assert_eq!(
+            ExportProvenance::from_metadata(&provenance.to_metadata()),
+            Some(provenance)
+        );
+        let unlimited = ExportProvenance::new("abc.00000001".to_owned(), "/", None);
+        assert_eq!(
+            ExportProvenance::from_metadata(&unlimited.to_metadata()),
+            Some(unlimited)
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_decodes_to_none() {
+        let provenance = ExportProvenance::new("rev".to_owned(), "/content", None);
+        let complete = provenance.to_metadata();
+        // Every key is load-bearing.
+        for dropped in [FORMAT_KEY, REVISION_KEY, ROOT_PATH_KEY, DEPTH_LIMIT_KEY] {
+            let partial: Vec<KeyValue> = complete
+                .iter()
+                .filter(|pair| pair.key != dropped)
+                .cloned()
+                .collect();
+            assert_eq!(
+                ExportProvenance::from_metadata(&partial),
+                None,
+                "without {dropped} there is no provenance"
+            );
+        }
+        let mut wrong_version = complete.clone();
+        wrong_version[0] = KeyValue::new(FORMAT_KEY.to_owned(), "0".to_owned());
+        assert_eq!(ExportProvenance::from_metadata(&wrong_version), None);
+        let mut wrong_depth = complete;
+        wrong_depth[3] = KeyValue::new(DEPTH_LIMIT_KEY.to_owned(), "deep".to_owned());
+        assert_eq!(ExportProvenance::from_metadata(&wrong_depth), None);
+    }
+
+    #[test]
+    fn a_written_file_carries_the_stamp() {
+        let directory =
+            std::env::temp_dir().join(format!("froe-parquet-provenance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create");
+        let nodes_path = directory.join("nodes.parquet");
+        let properties_path = directory.join("properties.parquet");
+        let provenance = ExportProvenance::new("abc.00000001".to_owned(), "/content", Some(2));
+        let mut sink = ParquetSink::new_with_provenance(
+            std::fs::File::create(&nodes_path).expect("nodes"),
+            std::fs::File::create(&properties_path).expect("properties"),
+            &ParquetExportOptions::default(),
+            &provenance,
+        )
+        .expect("sink");
+        sink.finish().expect("finish");
+
+        for path in [&nodes_path, &properties_path] {
+            assert_eq!(
+                read_export_provenance(path).expect("read"),
+                Some(provenance.clone()),
+                "{} carries the stamp",
+                path.display()
+            );
+        }
+        // An unstamped sink writes no provenance.
+        let plain_nodes = directory.join("plain-nodes.parquet");
+        let plain_properties = directory.join("plain-properties.parquet");
+        let mut plain = ParquetSink::new(
+            std::fs::File::create(&plain_nodes).expect("nodes"),
+            std::fs::File::create(&plain_properties).expect("properties"),
+            &ParquetExportOptions::default(),
+        )
+        .expect("sink");
+        plain.finish().expect("finish");
+        assert_eq!(read_export_provenance(&plain_nodes).expect("read"), None);
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

@@ -6,7 +6,7 @@
 //! ([`ExportedNode`]), so the driver allocates nothing per node beyond
 //! the property decode itself.
 
-use froe::content::node::PropertyState;
+use froe::content::node::{NodeState, PropertyState};
 use froe::content::traversal::DepthFirstTraversal;
 use froe::store::Repository;
 
@@ -47,6 +47,19 @@ pub fn export_subtree(
     let Some(root) = repository.node_at_path(path)? else {
         return Ok(None);
     };
+    export_node(root, path, depth, sink).map(Some)
+}
+
+/// Streams the subtree rooted at `root` into `sink`, addressing nodes by
+/// `path` exactly as [`export_subtree`] does. Taking the node directly —
+/// rather than resolving it from the repository head — lets a caller pin
+/// the export to a specific revision of the store.
+pub fn export_node(
+    root: NodeState<'_>,
+    path: &str,
+    depth: Option<usize>,
+    sink: &mut dyn ExportSink,
+) -> froe::Result<u64> {
     let mut traversal = DepthFirstTraversal::new(root, path, depth);
     let mut written = 0u64;
     while let Some(visited) = traversal.next_node()? {
@@ -59,5 +72,5 @@ pub fn export_subtree(
         written += 1;
     }
     sink.finish()?;
-    Ok(Some(written))
+    Ok(written)
 }

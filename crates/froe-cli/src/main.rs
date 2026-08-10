@@ -120,13 +120,18 @@ enum Command {
         /// The output format.
         #[arg(long, value_enum, default_value = "json-lines")]
         format: ExportFormat,
-        /// Where the export goes; never an existing file — the export
-        /// never overwrites. For json-lines a file (standard output when
-        /// omitted); for parquet the directory receiving nodes.parquet
-        /// and properties.parquet (created if absent, required); for
-        /// sqlite the database file (required).
+        /// Where the export goes. For json-lines a file (standard output
+        /// when omitted); for parquet the directory holding
+        /// nodes.parquet and properties.parquet — an existing export
+        /// there is refreshed in place, decoding only what changed; for
+        /// sqlite the database file (required). The json-lines and
+        /// sqlite formats never overwrite an existing file.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Rebuild a Parquet export from scratch instead of refreshing
+        /// the existing one in place.
+        #[arg(long)]
+        full: bool,
         /// Suppress the progress reports on standard error.
         #[arg(long)]
         quiet: bool,
@@ -373,9 +378,10 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             depth,
             format,
             output,
+            full,
             quiet,
         } => {
-            let written = match format {
+            let run = match format {
                 ExportFormat::JsonLines => {
                     run_json_lines_export(&repository_path, &path, depth, output.as_deref(), quiet)?
                 }
@@ -387,7 +393,14 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                         );
                         return Ok(ExitCode::FAILURE);
                     };
-                    run_parquet_export(&repository_path, &path, depth, output_directory, quiet)?
+                    run_parquet_export(
+                        &repository_path,
+                        &path,
+                        depth,
+                        output_directory,
+                        full,
+                        quiet,
+                    )?
                 }
                 ExportFormat::Sqlite => {
                     let Some(output_path) = output.as_deref() else {
@@ -400,33 +413,38 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                     run_sqlite_export(&repository_path, &path, depth, output_path, quiet)?
                 }
             };
-            if let Some((node_count, elapsed)) = written {
-                let rate = if elapsed.is_zero() {
-                    0.0
-                } else {
-                    // A node count is a display figure; the precision
-                    // loss of the cast is irrelevant at the reported
-                    // scale.
-                    #[allow(clippy::cast_precision_loss)]
-                    let rate = node_count as f64 / elapsed.as_secs_f64();
-                    rate
-                };
-                match &output {
-                    Some(destination) => eprintln!(
-                        "froe: exported {node_count} nodes to {} in {:.1}s ({:.0} nodes/s)",
-                        destination.display(),
-                        elapsed.as_secs_f64(),
+            match run {
+                ExportRun::Exported { nodes, elapsed } => {
+                    let rate = if elapsed.is_zero() {
+                        0.0
+                    } else {
+                        // A node count is a display figure; the precision
+                        // loss of the cast is irrelevant at the reported
+                        // scale.
+                        #[allow(clippy::cast_precision_loss)]
+                        let rate = nodes as f64 / elapsed.as_secs_f64();
                         rate
-                    ),
-                    None => eprintln!(
-                        "froe: exported {node_count} nodes in {:.1}s ({:.0} nodes/s)",
-                        elapsed.as_secs_f64(),
-                        rate
-                    ),
+                    };
+                    match &output {
+                        Some(destination) => eprintln!(
+                            "froe: exported {nodes} nodes to {} in {:.1}s ({:.0} nodes/s)",
+                            destination.display(),
+                            elapsed.as_secs_f64(),
+                            rate
+                        ),
+                        None => eprintln!(
+                            "froe: exported {nodes} nodes in {:.1}s ({:.0} nodes/s)",
+                            elapsed.as_secs_f64(),
+                            rate
+                        ),
+                    }
                 }
-            } else {
-                eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
-                return Ok(ExitCode::FAILURE);
+                // A refresh reports itself.
+                ExportRun::Reported => {}
+                ExportRun::Missing => {
+                    eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
+                    return Ok(ExitCode::FAILURE);
+                }
             }
         }
         Command::Check {
@@ -518,17 +536,31 @@ fn run(command: Command) -> froe::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// What an export run did, for the summary the caller prints.
+enum ExportRun {
+    /// Rows streamed out; the caller prints the node-count summary.
+    Exported {
+        /// How many nodes were written.
+        nodes: u64,
+        /// How long the export took.
+        elapsed: std::time::Duration,
+    },
+    /// The run reported itself (a Parquet refresh).
+    Reported,
+    /// The path does not exist.
+    Missing,
+}
+
 /// Streams a JSON lines export to `output`, or to standard output when
-/// `output` is `None`. Returns the node count and elapsed time, or `None`
-/// when the path does not exist; a freshly created output file never
-/// lingers after either failure shape.
+/// `output` is `None`; a freshly created output file never lingers
+/// after either failure shape.
 fn run_json_lines_export(
     repository_path: &Path,
     path: &str,
     depth: Option<usize>,
     output: Option<&Path>,
     quiet: bool,
-) -> froe::Result<Option<(u64, std::time::Duration)>> {
+) -> froe::Result<ExportRun> {
     let repository = Repository::open(repository_path)?;
     if let Some(output_path) = output {
         let file = froe_export::create_export_output(repository_path, output_path)?;
@@ -545,7 +577,10 @@ fn run_json_lines_export(
                     drop(sink);
                     let _ = std::fs::remove_file(output_path);
                 }
-                Ok(written.map(|count| (count, elapsed)))
+                Ok(match written {
+                    Some(nodes) => ExportRun::Exported { nodes, elapsed },
+                    None => ExportRun::Missing,
+                })
             }
             Err(error) => {
                 // The file was freshly created above; a partial export
@@ -564,86 +599,187 @@ fn run_json_lines_export(
             )),
             quiet,
         );
-        froe_export::export_subtree(&repository, path, depth, &mut sink)
-            .map(|written| written.map(|count| (count, sink.elapsed())))
+        let written = froe_export::export_subtree(&repository, path, depth, &mut sink)?;
+        Ok(match written {
+            Some(nodes) => ExportRun::Exported {
+                nodes,
+                elapsed: sink.elapsed(),
+            },
+            None => ExportRun::Missing,
+        })
     }
 }
 
-/// Exports the Parquet tables into `output_directory` (created if
-/// absent). Returns the node count and elapsed time, or `None` when the
-/// path does not exist; freshly created files never linger after either
-/// failure shape.
+/// Brings the Parquet export in `output_directory` up to date: an
+/// existing, usable export is refreshed in place — decoding only what
+/// changed since it was taken — and anything else (a first export, an
+/// unusable base, `--full`) falls to a from-scratch export that
+/// atomically replaces whatever the directory holds.
 fn run_parquet_export(
     repository_path: &Path,
     path: &str,
     depth: Option<usize>,
     output_directory: &Path,
+    full: bool,
     quiet: bool,
-) -> froe::Result<Option<(u64, std::time::Duration)>> {
+) -> froe::Result<ExportRun> {
     let repository = Repository::open(repository_path)?;
     froe_export::create_export_directory(repository_path, output_directory)?;
-    let nodes_path = output_directory.join("nodes.parquet");
-    let properties_path = output_directory.join("properties.parquet");
-    let remove_outputs = || {
-        let _ = std::fs::remove_file(&nodes_path);
-        let _ = std::fs::remove_file(&properties_path);
+    if !full {
+        let mut reporter = progress::Reporter::new(quiet, "re-exported");
+        let refresh = froe_export::refresh_parquet_export(
+            &repository,
+            path,
+            depth,
+            output_directory,
+            &froe_export::ParquetExportOptions::default(),
+            &mut |nodes| reporter.report(nodes),
+        )?;
+        reporter.finish_line();
+        match refresh {
+            froe_export::ParquetRefresh::Current { revision } => {
+                eprintln!(
+                    "froe: the export in {} is already current ({revision})",
+                    output_directory.display()
+                );
+                return Ok(ExportRun::Reported);
+            }
+            froe_export::ParquetRefresh::Refreshed {
+                revision,
+                ranges,
+                nodes,
+            } => {
+                eprintln!(
+                    "froe: refreshed the export in {} to {revision}: \
+                     {ranges} changed ranges, {nodes} nodes re-exported in {:.1}s",
+                    output_directory.display(),
+                    reporter.elapsed().as_secs_f64()
+                );
+                return Ok(ExportRun::Reported);
+            }
+            froe_export::ParquetRefresh::NotReusable { reason } => {
+                // A first export is the quiet case; anything present
+                // but unusable deserves the reason before it is
+                // replaced.
+                let leftovers = [
+                    froe_export::NODES_FILE_NAME,
+                    froe_export::PROPERTIES_FILE_NAME,
+                ]
+                .iter()
+                .any(|name| output_directory.join(name).exists());
+                if leftovers {
+                    eprintln!("froe: {reason}; exporting from scratch");
+                }
+            }
+        }
+    }
+    run_full_parquet_export(&repository, path, depth, output_directory, quiet)
+}
+
+/// Exports the Parquet tables from scratch into `output_directory`.
+/// The new files are written under temporary names and atomically
+/// moved over any existing export only once complete, so a failed
+/// export never disturbs a good one — and the temporary files never
+/// linger after either failure shape.
+fn run_full_parquet_export(
+    repository: &Repository,
+    path: &str,
+    depth: Option<usize>,
+    output_directory: &Path,
+    quiet: bool,
+) -> froe::Result<ExportRun> {
+    for file_name in [
+        froe_export::NODES_FILE_NAME,
+        froe_export::PROPERTIES_FILE_NAME,
+    ] {
+        froe_export::sweep_temporary_outputs(output_directory, file_name)?;
+    }
+    let nodes_temporary = output_directory.join(froe_export::temporary_output_name(
+        froe_export::NODES_FILE_NAME,
+    ));
+    let properties_temporary = output_directory.join(froe_export::temporary_output_name(
+        froe_export::PROPERTIES_FILE_NAME,
+    ));
+    let remove_temporaries = || {
+        let _ = std::fs::remove_file(&nodes_temporary);
+        let _ = std::fs::remove_file(&properties_temporary);
     };
 
-    let nodes_file = froe_export::create_export_output(repository_path, &nodes_path)?;
-    let properties_file = match froe_export::create_export_output(repository_path, &properties_path)
-    {
-        Ok(file) => file,
-        Err(error) => {
-            // Only the nodes file is fresh; the properties path
-            // holds someone else's data and must stay.
-            let _ = std::fs::remove_file(&nodes_path);
-            return Err(error);
-        }
-    };
-    let parquet_sink = match froe_export::ParquetSink::new(
+    let nodes_file =
+        match froe_export::create_export_output(repository.directory(), &nodes_temporary) {
+            Ok(file) => file,
+            Err(error) => {
+                remove_temporaries();
+                return Err(error);
+            }
+        };
+    let properties_file =
+        match froe_export::create_export_output(repository.directory(), &properties_temporary) {
+            Ok(file) => file,
+            Err(error) => {
+                remove_temporaries();
+                return Err(error);
+            }
+        };
+    let provenance = froe_export::ExportProvenance::new(
+        repository.head_record_identifier().to_string(),
+        path,
+        depth,
+    );
+    let parquet_sink = match froe_export::ParquetSink::new_with_provenance(
         std::io::BufWriter::with_capacity(1 << 20, nodes_file),
         std::io::BufWriter::with_capacity(1 << 20, properties_file),
         &froe_export::ParquetExportOptions::default(),
+        &provenance,
     ) {
         Ok(sink) => sink,
         Err(error) => {
-            remove_outputs();
+            remove_temporaries();
             return Err(error);
         }
     };
     let mut sink = progress::ProgressSink::new(parquet_sink, quiet);
-    match froe_export::export_subtree(&repository, path, depth, &mut sink) {
+    match froe_export::export_subtree(repository, path, depth, &mut sink) {
         Ok(written) => {
             let elapsed = sink.elapsed();
-            if written.is_none() {
-                // Nothing was exported: the freshly created files must
-                // not linger.
-                drop(sink);
-                remove_outputs();
-            }
-            Ok(written.map(|count| (count, elapsed)))
+            // Close the files before the rename: the sink's finish has
+            // flushed them, and an open handle would block the move on
+            // Windows.
+            drop(sink);
+            let Some(nodes) = written else {
+                remove_temporaries();
+                return Ok(ExportRun::Missing);
+            };
+            froe_export::replace_export_output(
+                &nodes_temporary,
+                &output_directory.join(froe_export::NODES_FILE_NAME),
+            )?;
+            froe_export::replace_export_output(
+                &properties_temporary,
+                &output_directory.join(froe_export::PROPERTIES_FILE_NAME),
+            )?;
+            Ok(ExportRun::Exported { nodes, elapsed })
         }
         Err(error) => {
-            // The files were freshly created above; a partial export
-            // must not linger as if complete.
+            // The temporary files hold a partial export; the existing
+            // export, if any, stays untouched.
             drop(sink);
-            remove_outputs();
+            remove_temporaries();
             Err(error)
         }
     }
 }
 
 /// Exports the `SQLite` database into the single file `output_path`.
-/// Returns the node count and elapsed time, or `None` when the path does
-/// not exist; a freshly created file never lingers after either failure
-/// shape — the sink's drop implementation owns that cleanup.
+/// A freshly created file never lingers after either failure shape —
+/// the sink's drop implementation owns that cleanup.
 fn run_sqlite_export(
     repository_path: &Path,
     path: &str,
     depth: Option<usize>,
     output_path: &Path,
     quiet: bool,
-) -> froe::Result<Option<(u64, std::time::Duration)>> {
+) -> froe::Result<ExportRun> {
     let repository = Repository::open(repository_path)?;
     let mut sink = progress::ProgressSink::new(
         froe_export::SqliteSink::create(
@@ -653,8 +789,14 @@ fn run_sqlite_export(
         )?,
         quiet,
     );
-    froe_export::export_subtree(&repository, path, depth, &mut sink)
-        .map(|written| written.map(|count| (count, sink.elapsed())))
+    let written = froe_export::export_subtree(&repository, path, depth, &mut sink)?;
+    Ok(match written {
+        Some(nodes) => ExportRun::Exported {
+            nodes,
+            elapsed: sink.elapsed(),
+        },
+        None => ExportRun::Missing,
+    })
 }
 
 /// Dispatches a checkpoint subcommand. Returns whether it succeeded.
@@ -711,6 +853,7 @@ mod tests {
             depth,
             format,
             output,
+            full,
             quiet,
         } = parsed.command
         else {
@@ -721,6 +864,7 @@ mod tests {
         assert_eq!(depth, Some(2));
         assert_eq!(format, ExportFormat::JsonLines);
         assert_eq!(output, Some(std::path::PathBuf::from("out.jsonl")));
+        assert!(!full);
         assert!(!quiet);
     }
 

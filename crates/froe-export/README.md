@@ -17,7 +17,11 @@ is a new sink, not a new traversal. Three sinks ship today:
   exploded with a `position`, typed value columns). Rows arrive in
   depth-first path order, so row-group statistics prune subtree
   predicates like `WHERE path LIKE '/content/dam/%'`. Query them with
-  DuckDB, DataFusion, Polars, or anything else that reads Parquet.
+  DuckDB, DataFusion, Polars, or anything else that reads Parquet. The
+  tables carry a revision stamp in their footers, so
+  `refresh_parquet_export` brings an existing export up to date by
+  decoding only what changed since it was taken — replacing the files
+  atomically, in place.
 * `SqliteSink` (behind the `sqlite` feature) — a single `.db` file:
   `nodes` and `properties` tables that intern every string once in a
   shared dictionary (the manual equivalent of Parquet's dictionary
