@@ -64,6 +64,10 @@ pub struct TarArchiveWriter {
     graph_edges: BTreeMap<(u64, u64), BTreeSet<(u64, u64)>>,
     /// Binary references: generation triple to segment to references.
     binary_references: BinaryReferencesByGeneration,
+    /// Whether the first segment write must fail if `path` already exists.
+    /// Cleanup uses this for next-generation archives: an occupied path is
+    /// recovery evidence and must never be truncated in place.
+    create_new: bool,
     closed: bool,
 }
 
@@ -72,6 +76,65 @@ impl TarArchiveWriter {
     /// created until the first segment is written.
     #[must_use]
     pub fn new(directory: &Path, file_name: &str) -> Self {
+        Self::with_create_new(directory, file_name, false)
+    }
+
+    /// Creates a writer which refuses to overwrite an existing path.
+    ///
+    /// The file is still created lazily on the first segment write. This is
+    /// the publication mode for cleanup and other copy-on-write maintenance:
+    /// a pre-existing next-generation file may be the only useful residue of
+    /// an interrupted operation, so opening it with `truncate(true)` would be
+    /// destructive before the replacement has been proved safe.
+    #[must_use]
+    pub fn new_exclusive(directory: &Path, file_name: &str) -> Self {
+        Self::with_create_new(directory, file_name, true)
+    }
+
+    /// Creates an exclusive writer whose physical staging path differs from
+    /// the logical archive name embedded in its trailer entry names.
+    ///
+    /// Cleanup uses this to validate a complete non-active file before it is
+    /// atomically published under `logical_file_name`. `physical_file_name`
+    /// must not itself match the active `data*.tar` naming pattern.
+    #[must_use]
+    pub(crate) fn new_exclusive_staged(
+        directory: &Path,
+        physical_file_name: &str,
+        logical_file_name: &str,
+    ) -> Self {
+        Self {
+            path: directory.join(physical_file_name),
+            file_name: logical_file_name.to_owned(),
+            file: None,
+            length: 0,
+            index_entries: Vec::new(),
+            index_lookup: HashMap::new(),
+            graph_edges: BTreeMap::new(),
+            binary_references: BTreeMap::new(),
+            create_new: true,
+            closed: false,
+        }
+    }
+
+    /// The physical path receiving archive bytes.
+    ///
+    /// This can differ from the logical trailer basename for a cleanup
+    /// staging writer.
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The descriptor created by the first segment write, when any.
+    ///
+    /// Archive cleanup clones this descriptor immediately so an unwinding
+    /// write/close error can remove only the exact staging inode it created.
+    pub(crate) fn created_file(&self) -> Option<&File> {
+        self.file.as_ref()
+    }
+
+    fn with_create_new(directory: &Path, file_name: &str, create_new: bool) -> Self {
         Self {
             path: directory.join(file_name),
             file_name: file_name.to_owned(),
@@ -81,6 +144,7 @@ impl TarArchiveWriter {
             index_lookup: HashMap::new(),
             graph_edges: BTreeMap::new(),
             binary_references: BTreeMap::new(),
+            create_new,
             closed: false,
         }
     }
@@ -162,14 +226,20 @@ impl TarArchiveWriter {
             });
         }
         if self.file.is_none() {
-            self.file = Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .read(true)
-                    .write(true)
-                    .open(&self.path)?,
-            );
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true);
+            if self.create_new {
+                options.create_new(true);
+            } else {
+                options.create(true).truncate(true);
+            }
+            self.file = Some(options.open(&self.path)?);
+            #[cfg(test)]
+            if self.path.file_name() != Some(std::ffi::OsStr::new(&self.file_name)) {
+                crate::writer::cleanup_fault_injection::fail_if_armed(
+                    "sweep.staging-write-after-create",
+                )?;
+            }
         }
 
         let entry_name = format!("{identifier}.{:08x}", crc32(content));
@@ -257,6 +327,12 @@ impl TarArchiveWriter {
     /// written at all.
     pub fn close(mut self) -> Result<bool> {
         self.closed = true;
+        #[cfg(test)]
+        if self.path.file_name() != Some(std::ffi::OsStr::new(&self.file_name)) {
+            crate::writer::cleanup_fault_injection::fail_if_armed(
+                "sweep.staging-close-before-trailers",
+            )?;
+        }
         let Some(mut file) = self.file.take() else {
             return Ok(false);
         };
@@ -539,6 +615,29 @@ mod tests {
         let writer = TarArchiveWriter::new(&directory.path, "data00000a.tar");
         assert!(!writer.close().expect("close"), "no file was written");
         assert!(!directory.path.join("data00000a.tar").exists());
+    }
+
+    #[test]
+    fn exclusive_writers_never_truncate_an_existing_archive() {
+        let directory = TestDirectory::new("exclusive");
+        std::fs::create_dir_all(&directory.path).expect("create directory");
+        let path = directory.path.join("data00000b.tar");
+        std::fs::write(&path, b"recovery evidence").expect("seed existing file");
+
+        let generation = test_generation();
+        let identifier = crate::writer::identifier_generator::new_bulk_segment_identifier();
+        let mut writer = TarArchiveWriter::new_exclusive(&directory.path, "data00000b.tar");
+        assert!(
+            writer
+                .write_segment(identifier, b"replacement", generation, &[], &[])
+                .is_err(),
+            "exclusive creation must reject an occupied path"
+        );
+        assert_eq!(
+            std::fs::read(path).expect("read existing file"),
+            b"recovery evidence",
+            "the refused open must leave every byte untouched"
+        );
     }
 
     #[test]

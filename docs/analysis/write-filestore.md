@@ -72,10 +72,11 @@ on OverlappingFileLockException:                           # same-JVM double ope
 Semantics the Rust port must match:
 
 * **Blocking** acquire (`FileChannel.lock()`, not `tryLock()`): if another process holds
-  the OS advisory lock, open blocks indefinitely. On Linux this is a POSIX/OFD advisory
-  write lock over the entire file (Rust: `flock`-style is *not* identical; use
-  `fcntl(F_OFD_SETLKW)` or equivalent whole-file exclusive lock — AEM/Oak uses
-  `FileChannel.lock()` which maps to `fcntl` OFD locks on OpenJDK/Linux).
+  the OS advisory lock, open blocks indefinitely. On Linux this is a classic POSIX
+  `fcntl` write lock over the entire file (Rust: `flock`-style is *not* identical;
+  use `fcntl(F_SETLKW)` or an equivalent whole-file exclusive lock). Classic locks
+  are process-associated and are not inherited across `fork`, matching OpenJDK's
+  native `FileChannel.lock()` implementation.
 * The lock file's **content is never written**; only its existence and the advisory
   lock matter. Never delete `repo.lock`.
 * Unlock (at close): `lock.release(); lockFile.close();` — file stays on disk.

@@ -9,19 +9,20 @@
 //!
 //! The reading API ([`Repository`], [`store`], [`content`], [`tooling`]) is
 //! read-only by design: it never takes the repository lock and never
-//! modifies any file, so it is safe to point at a live repository. Like
-//! Oak itself the reader memory-maps archives, relying on the store's
-//! file protocol (existing archive bytes are never modified in place); a
-//! process mutating archives outside that protocol would disturb froe
-//! and a running Oak instance alike. The
-//! writing API ([`writer`]) — commits, checkpoints, compaction, backup,
-//! restore, journal recovery — takes the exclusive repository lock first,
-//! so it can never race a running instance, and produces stores byte-for-byte
-//! compatible with what Oak itself writes (one documented rendering
-//! residue: extreme-subnormal doubles; see
-//! [`content::property::double_to_text`]). Only run the writing API against
-//! a *stopped* repository; it requires a Unix operating system entropy
-//! source and refuses to open on Windows.
+//! modifies any file, so it is safe to point at a live repository. Like Oak,
+//! the reader memory-maps archives and relies on the store's
+//! never-modify-in-place file protocol; an external process that truncates or
+//! rewrites an archive would disturb both froe and a running Oak instance.
+//!
+//! The mutating writing API ([`writer`]) covers commits, checkpoints, applying
+//! `cleanup`, compaction, backup, restore, and journal recovery. It takes the
+//! exclusive repository lock first, so it cannot race a cooperating running
+//! instance, and produces stores byte-for-byte compatible with Oak (apart from
+//! the documented extreme-subnormal rendering residue; see
+//! [`content::property::double_to_text`]). Planning `cleanup` is the read-only
+//! exception and never takes the lock. Run mutations only against a *stopped*
+//! repository. The writer requires a Unix operating-system entropy source and
+//! therefore refuses to open on Windows.
 //!
 //! **The writing API is beta**: it is verified against byte-exact
 //! specifications extracted from the Oak sources and an extensive test
@@ -84,6 +85,8 @@ pub use journal::JournalEntry;
 pub use segment::{RecordIdentifier, RecordType, SegmentIdentifier, SegmentKind};
 pub use store::Repository;
 pub use writer::{
-    CompactionKind, CompactionOutcome, RecoveryOutcome, WritableRepository, backup, compact,
-    recover_journal, restore,
+    CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupOutcome, CleanupPlan,
+    CleanupTask, CompactionKind, CompactionOutcome, JournalLineRemoval, JournalRemovalReason,
+    PreparedCleanup, RecoveryBackupPolicy, RecoveryOutcome, StaleArchiveReason, WritableRepository,
+    backup, cleanup, compact, plan_cleanup, recover_journal, restore,
 };

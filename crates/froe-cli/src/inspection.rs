@@ -164,7 +164,7 @@ pub(crate) fn print_checkpoints(repository: &Repository) -> froe::Result<()> {
             read_long("timestamp")?.map_or_else(|| "unknown".to_owned(), format_timestamp);
         println!(
             "{}  created {created}  expires {expires}",
-            crate::output::sanitize_terminal_text(&name)
+            crate::output::quote_terminal_text(&name)
         );
     }
     Ok(())

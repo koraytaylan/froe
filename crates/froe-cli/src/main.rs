@@ -5,10 +5,10 @@
 //! is never taken, so they are safe against a live repository (archives
 //! are memory-mapped under the store's never-modify-in-place file
 //! protocol, the same reliance a running Oak instance has). The
-//! maintenance commands — `compact`, `backup`, `restore`,
-//! `recover-journal`, and `checkpoint` — take the exclusive repository
-//! lock and modify the store, so they must only be run against a *stopped*
-//! repository, and each asks for confirmation first.
+//! mutating maintenance commands — `compact`, `cleanup` apply, `backup`,
+//! `restore`, `recover-journal`, and checkpoint mutation — take the exclusive
+//! repository lock, so they must only be run against a *stopped* repository
+//! and ask for confirmation first. `cleanup --dry-run` is strictly read-only.
 
 mod content_display;
 mod inspection;
@@ -35,8 +35,10 @@ use crate::mutation::CheckpointRemoval;
                   export commands are read-only and safe against a live repository (archives \
                   are memory-mapped under the store's never-modify-in-place file protocol, the \
                   same reliance a running Oak instance has); the compact, backup, restore, \
-                  recover-journal, and checkpoint commands modify the store and must be run \
-                  against a stopped repository."
+                  cleanup, recover-journal, and checkpoint commands modify the store and must be run \
+                  against a stopped repository. If repo.lock is absent, every mutating command \
+                  requires same-directory hard-link and durable directory-fsync support to publish \
+                  that lock safely."
 )]
 struct CommandLine {
     #[command(subcommand)]
@@ -192,6 +194,13 @@ enum Command {
         limit: usize,
     },
     /// Compact the repository offline (modifies the store).
+    ///
+    /// Reclamation may publish validated successor TARs with absent-only,
+    /// same-directory hard links. A filesystem without hard-link or durable
+    /// directory-fsync support can fail safely after the new compacted head is
+    /// committed, leaving old source archives for a later retry. When repo.lock
+    /// is absent, publication independently requires same-directory hard-link
+    /// and durable directory-fsync support.
     Compact {
         /// The segment store directory.
         repository: PathBuf,
@@ -202,7 +211,46 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Conservatively reclaim orphaned storage and stale repository metadata.
+    ///
+    /// Dry-run is strictly read-only and does not create or acquire repo.lock.
+    /// Applying cleanup is beta, Unix-only offline maintenance: stop Oak/AEM,
+    /// run as the operating-system owner of journal.log (normally the service
+    /// account, not sudo), and keep a recoverable copy of important stores.
+    /// The repository argument is resolved once to its canonical absolute
+    /// target before planning or locking, and that target is shown in the plan.
+    /// Recovery backups are retained unless an explicit age/count policy is
+    /// supplied. Applying also requires same-directory hard-link and durable
+    /// directory-fsync support when repo.lock is absent. See docs/cleanup.md
+    /// for the full safety contract.
+    Cleanup {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Cleanup category to run (repeatable). Supplying any --task
+        /// replaces the defaults: journal, segments, stale-archives,
+        /// expired-checkpoints, and stale-temporaries.
+        #[arg(long = "task", value_enum)]
+        tasks: Vec<CleanupTaskArgument>,
+        /// Analyze and print the plan without taking repo.lock or writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Proceed without prompts (locked replan and verification still run).
+        #[arg(long)]
+        yes: bool,
+        /// Remove backups at least this old; with --backup-keep-latest this
+        /// enables recovery-backups in addition to the selected task set.
+        #[arg(long, requires = "backup_keep_latest")]
+        backup_min_age_days: Option<u64>,
+        /// Retain at least this many newest backups per target (all mtime ties
+        /// at the boundary are kept); with --backup-min-age-days this enables
+        /// recovery-backups.
+        #[arg(long, requires = "backup_min_age_days")]
+        backup_keep_latest: Option<usize>,
+    },
     /// Copy a repository's head into a target store (modifies the target).
+    ///
+    /// If repo.lock is absent in a locked store, safe lock publication requires
+    /// same-directory hard-link and durable directory-fsync support.
     Backup {
         /// The source segment store directory.
         source: PathBuf,
@@ -213,6 +261,9 @@ enum Command {
         yes: bool,
     },
     /// Restore a backup into an existing store (modifies the target).
+    ///
+    /// If repo.lock is absent in a locked store, safe lock publication requires
+    /// same-directory hard-link and durable directory-fsync support.
     Restore {
         /// The backup segment store directory.
         backup: PathBuf,
@@ -223,6 +274,9 @@ enum Command {
         yes: bool,
     },
     /// Rebuild journal.log from the segments (modifies the store).
+    ///
+    /// If repo.lock is absent, safe lock publication requires same-directory
+    /// hard-link and durable directory-fsync support.
     RecoverJournal {
         /// The segment store directory.
         repository: PathBuf,
@@ -262,6 +316,9 @@ enum CheckpointAction {
         repository: PathBuf,
     },
     /// Create a checkpoint.
+    ///
+    /// If repo.lock is absent, safe lock publication requires same-directory
+    /// hard-link and durable directory-fsync support.
     Create {
         /// The segment store directory.
         repository: PathBuf,
@@ -273,6 +330,9 @@ enum CheckpointAction {
         yes: bool,
     },
     /// Remove one checkpoint by name.
+    ///
+    /// If repo.lock is absent, safe lock publication requires same-directory
+    /// hard-link and durable directory-fsync support.
     Remove {
         /// The segment store directory.
         repository: PathBuf,
@@ -283,6 +343,9 @@ enum CheckpointAction {
         yes: bool,
     },
     /// Remove every checkpoint.
+    ///
+    /// If repo.lock is absent, safe lock publication requires same-directory
+    /// hard-link and durable directory-fsync support.
     RemoveAll {
         /// The segment store directory.
         repository: PathBuf,
@@ -291,6 +354,9 @@ enum CheckpointAction {
         yes: bool,
     },
     /// Remove checkpoints not referenced by the asynchronous indexer.
+    ///
+    /// If repo.lock is absent, safe lock publication requires same-directory
+    /// hard-link and durable directory-fsync support.
     RemoveUnreferenced {
         /// The segment store directory.
         repository: PathBuf,
@@ -298,6 +364,31 @@ enum CheckpointAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum CleanupTaskArgument {
+    Journal,
+    Segments,
+    StaleArchives,
+    ExpiredCheckpoints,
+    StaleTemporaries,
+    UnreferencedCheckpoints,
+    RecoveryBackups,
+}
+
+impl From<CleanupTaskArgument> for froe::CleanupTask {
+    fn from(task: CleanupTaskArgument) -> Self {
+        match task {
+            CleanupTaskArgument::Journal => Self::Journal,
+            CleanupTaskArgument::Segments => Self::Segments,
+            CleanupTaskArgument::StaleArchives => Self::StaleArchives,
+            CleanupTaskArgument::ExpiredCheckpoints => Self::ExpiredCheckpoints,
+            CleanupTaskArgument::StaleTemporaries => Self::StaleTemporaries,
+            CleanupTaskArgument::UnreferencedCheckpoints => Self::UnreferencedCheckpoints,
+            CleanupTaskArgument::RecoveryBackups => Self::RecoveryBackups,
+        }
+    }
 }
 
 /// Parses a `NAME=VALUE` search predicate.
@@ -318,11 +409,27 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let command_line = CommandLine::parse();
+    let command_line = match CommandLine::try_parse() {
+        Ok(command_line) => command_line,
+        Err(error) => {
+            let exit_code =
+                u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from);
+            let diagnostic = output::sanitize_terminal_diagnostic(&error.to_string());
+            if error.use_stderr() {
+                eprint!("{diagnostic}");
+            } else {
+                print!("{diagnostic}");
+            }
+            return exit_code;
+        }
+    };
     match run(command_line.command) {
         Ok(exit_code) => exit_code,
         Err(error) => {
-            eprintln!("froe: {error}");
+            eprintln!(
+                "froe: {}",
+                output::sanitize_terminal_text(&error.to_string())
+            );
             ExitCode::FAILURE
         }
     }
@@ -505,6 +612,50 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             yes,
         } => {
             if !mutation::run_compact(&repository, tail, yes)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Cleanup {
+            repository,
+            tasks,
+            dry_run,
+            yes,
+            backup_min_age_days,
+            backup_keep_latest,
+        } => {
+            let recovery_backups_selected = tasks.contains(&CleanupTaskArgument::RecoveryBackups);
+            if recovery_backups_selected
+                && (backup_min_age_days.is_none() || backup_keep_latest.is_none())
+            {
+                eprintln!(
+                    "froe: --task recovery-backups requires --backup-min-age-days and --backup-keep-latest"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            let mut options = froe::CleanupOptions::default();
+            if !tasks.is_empty() {
+                options = options.with_tasks(tasks.into_iter().map(Into::into));
+            }
+            match (backup_min_age_days, backup_keep_latest) {
+                (Some(days), Some(keep_latest)) => {
+                    let Some(seconds) = days.checked_mul(24 * 60 * 60) else {
+                        eprintln!("froe: --backup-min-age-days is too large");
+                        return Ok(ExitCode::FAILURE);
+                    };
+                    options = options.with_recovery_backup_policy(froe::RecoveryBackupPolicy::new(
+                        std::time::Duration::from_secs(seconds),
+                        keep_latest,
+                    ));
+                }
+                (None, None) => {}
+                _ => {
+                    eprintln!(
+                        "froe: --backup-min-age-days and --backup-keep-latest must be supplied together"
+                    );
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            if !mutation::run_cleanup(&repository, options, dry_run, yes)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -936,7 +1087,7 @@ fn run_checkpoint(action: CheckpointAction) -> froe::Result<bool> {
 mod tests {
     use clap::Parser;
 
-    use super::{Command, CommandLine, ExportFormat};
+    use super::{CleanupTaskArgument, Command, CommandLine, ExportFormat};
 
     #[test]
     fn extract_parses_as_the_hidden_export_alias() {
@@ -1002,5 +1153,133 @@ mod tests {
             !help.contains("extract"),
             "the compatibility alias must stay undocumented"
         );
+    }
+
+    #[test]
+    fn cleanup_parses_repeatable_tasks_and_backup_policy() {
+        let parsed = CommandLine::try_parse_from([
+            "froe",
+            "cleanup",
+            "/store",
+            "--task",
+            "journal",
+            "--task",
+            "recovery-backups",
+            "--backup-min-age-days",
+            "30",
+            "--backup-keep-latest",
+            "3",
+            "--dry-run",
+        ])
+        .expect("cleanup arguments parse");
+        let Command::Cleanup {
+            repository,
+            tasks,
+            dry_run,
+            yes,
+            backup_min_age_days,
+            backup_keep_latest,
+        } = parsed.command
+        else {
+            panic!("cleanup must dispatch");
+        };
+        assert_eq!(repository, std::path::PathBuf::from("/store"));
+        assert_eq!(
+            tasks,
+            [
+                CleanupTaskArgument::Journal,
+                CleanupTaskArgument::RecoveryBackups
+            ]
+        );
+        assert!(dry_run);
+        assert!(!yes);
+        assert_eq!(backup_min_age_days, Some(30));
+        assert_eq!(backup_keep_latest, Some(3));
+    }
+
+    #[test]
+    fn cleanup_help_states_the_offline_safety_preconditions() {
+        let mut command = <CommandLine as clap::CommandFactory>::command();
+        let cleanup = command
+            .find_subcommand_mut("cleanup")
+            .expect("cleanup subcommand");
+        let mut help = Vec::new();
+        cleanup.write_long_help(&mut help).expect("render help");
+        let help = String::from_utf8(help).expect("valid UTF-8");
+        for required in [
+            "Unix-only offline maintenance",
+            "stop Oak/AEM",
+            "owner of journal.log",
+            "Recovery backups are retained",
+            "strictly read-only",
+            "canonical absolute",
+            "enables recovery-backups",
+        ] {
+            assert!(
+                help.contains(required),
+                "cleanup help omitted {required:?}: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_help_states_archive_publication_requirements() {
+        let mut command = <CommandLine as clap::CommandFactory>::command();
+        let compact = command
+            .find_subcommand_mut("compact")
+            .expect("compact subcommand");
+        let mut help = Vec::new();
+        compact.write_long_help(&mut help).expect("render help");
+        let help = String::from_utf8(help).expect("valid UTF-8");
+        for required in [
+            "same-directory hard links",
+            "directory-fsync",
+            "fail safely",
+        ] {
+            assert!(
+                help.contains(required),
+                "compact help omitted {required:?}: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mutating_command_help_states_absent_lock_requirements() {
+        fn long_help(path: &[&str]) -> String {
+            let mut command = <CommandLine as clap::CommandFactory>::command();
+            let mut selected = &mut command;
+            for component in path {
+                selected = selected
+                    .find_subcommand_mut(component)
+                    .unwrap_or_else(|| panic!("missing subcommand path {path:?}"));
+            }
+            let mut help = Vec::new();
+            selected.write_long_help(&mut help).expect("render help");
+            String::from_utf8(help).expect("valid UTF-8")
+        }
+
+        for path in [
+            &["compact"][..],
+            &["cleanup"],
+            &["backup"],
+            &["restore"],
+            &["recover-journal"],
+            &["checkpoint", "create"],
+            &["checkpoint", "remove"],
+            &["checkpoint", "remove-all"],
+            &["checkpoint", "remove-unreferenced"],
+        ] {
+            let help = long_help(path);
+            for required in [
+                "repo.lock is absent",
+                "same-directory hard-link",
+                "directory-fsync",
+            ] {
+                assert!(
+                    help.contains(required),
+                    "help for {path:?} omitted {required:?}: {help}"
+                );
+            }
+        }
     }
 }

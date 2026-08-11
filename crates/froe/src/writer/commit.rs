@@ -14,7 +14,7 @@
 //! *shares* the current content root's record — an immutable snapshot at
 //! zero cost. Releasing a checkpoint is plain child removal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::content::provider::SegmentProvider;
 use crate::content::template::ChildNodeArity;
@@ -321,19 +321,64 @@ pub fn create_checkpoint(
 
 /// Releases (removes) a checkpoint by name. Returns whether it existed.
 pub fn release_checkpoint(store: &WritableRepository, name: &str) -> Result<bool> {
+    Ok(remove_checkpoints_with_head_move_error(
+        store,
+        &[name.to_owned()],
+        "the head moved while releasing the checkpoint",
+    )? != 0)
+}
+
+/// Removes the named checkpoints in one atomic head update and returns
+/// how many existed.
+///
+/// Duplicate names count once and names absent from the captured head are
+/// ignored. When none of the supplied names exist, this is a true no-op:
+/// no records are written, the head is not advanced, and the journal is
+/// not flushed. Otherwise all removals share one rewritten checkpoint
+/// container, one compare-and-set of the head, and one flush.
+pub fn remove_checkpoints(store: &WritableRepository, names: &[String]) -> Result<u64> {
+    remove_checkpoints_with_head_move_error(
+        store,
+        names,
+        "the head moved while removing checkpoints",
+    )
+}
+
+fn remove_checkpoints_with_head_move_error(
+    store: &WritableRepository,
+    names: &[String],
+    head_move_error: &str,
+) -> Result<u64> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+
+    let requested: BTreeSet<&str> = names.iter().map(String::as_str).collect();
     let head = store.head();
-    let head_node = store.head_node();
+    // Bind all reads to the head used by the compare-and-set. This keeps
+    // the planned edits internally consistent even if another caller
+    // advances the in-memory head before our CAS (the CAS will then fail).
+    let head_node = crate::content::node::NodeState::new(store, head);
     let Some(container) = head_node.child_node("checkpoints")? else {
-        return Ok(false);
+        return Ok(0);
     };
-    if container.child_node(name)?.is_none() {
-        return Ok(false);
+
+    let mut existing_names = Vec::with_capacity(requested.len());
+    for name in requested {
+        if container.child_node(name)?.is_some() {
+            existing_names.push(name.to_owned());
+        }
+    }
+    if existing_names.is_empty() {
+        return Ok(0);
     }
 
     let generation = store.writing_generation()?;
     let mut writer = store.record_writer(generation);
     let mut edits = ChildEdits::new();
-    edits.insert(name.to_owned(), None);
+    for name in &existing_names {
+        edits.insert(name.clone(), None);
+    }
     let new_container = rewrite_node_with_child_edits(
         store,
         &mut writer,
@@ -348,11 +393,11 @@ pub fn release_checkpoint(store: &WritableRepository, name: &str) -> Result<bool
 
     if !store.set_head(head, new_head) {
         return Err(Error::InvalidFormat {
-            details: "the head moved while releasing the checkpoint".to_owned(),
+            details: head_move_error.to_owned(),
         });
     }
     store.flush()?;
-    Ok(true)
+    Ok(existing_names.len() as u64)
 }
 
 /// Removes every checkpoint. Returns how many were removed.
@@ -361,13 +406,7 @@ pub fn remove_all_checkpoints(store: &WritableRepository) -> Result<u64> {
         .into_iter()
         .map(|checkpoint| checkpoint.name)
         .collect();
-    let mut removed = 0u64;
-    for name in names {
-        if release_checkpoint(store, &name)? {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    remove_checkpoints(store, &names)
 }
 
 /// Removes every checkpoint not referenced from the asynchronous indexer
@@ -405,13 +444,7 @@ pub fn remove_unreferenced_checkpoints(store: &WritableRepository) -> Result<u64
         .map(|checkpoint| checkpoint.name)
         .filter(|name| !referenced.contains(name))
         .collect();
-    let mut removed = 0u64;
-    for name in names {
-        if release_checkpoint(store, &name)? {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    remove_checkpoints(store, &names)
 }
 
 /// Replaces the content root (`/root` of the super-root) with an already
@@ -462,7 +495,10 @@ fn random_checkpoint_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_checkpoint, list_checkpoints, release_checkpoint, remove_all_checkpoints};
+    use super::{
+        create_checkpoint, list_checkpoints, release_checkpoint, remove_all_checkpoints,
+        remove_checkpoints, remove_unreferenced_checkpoints, replace_content_root,
+    };
     use crate::store::Repository;
     use crate::writer::store_writer::WritableRepository;
 
@@ -483,6 +519,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn journal_line_count(directory: &TestDirectory) -> usize {
+        std::fs::read_to_string(directory.path.join("journal.log"))
+            .expect("read journal")
+            .lines()
+            .count()
     }
 
     #[test]
@@ -579,8 +622,174 @@ mod tests {
         let store = WritableRepository::open(&directory.path).expect("bootstrap");
         create_checkpoint(&store, 1_000_000, &[]).expect("first");
         create_checkpoint(&store, 1_000_000, &[]).expect("second");
+        let lines_before = journal_line_count(&directory);
         assert_eq!(remove_all_checkpoints(&store).expect("remove"), 2);
+        assert_eq!(
+            journal_line_count(&directory),
+            lines_before + 1,
+            "all checkpoint removals share one persisted head"
+        );
         assert!(list_checkpoints(&store).expect("list").is_empty());
         store.close().expect("close");
+    }
+
+    #[test]
+    fn a_checkpoint_set_is_removed_with_one_head_and_noop_sets_write_nothing() {
+        let directory = TestDirectory::new("remove-set");
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        let first = create_checkpoint(&store, 1_000_000, &[]).expect("first");
+        let retained = create_checkpoint(&store, 1_000_000, &[]).expect("retained");
+        let third = create_checkpoint(&store, 1_000_000, &[]).expect("third");
+
+        let head_before = store.head();
+        let lines_before = journal_line_count(&directory);
+        let requested = vec![first.clone(), "missing".to_owned(), third.clone(), first];
+        assert_eq!(remove_checkpoints(&store, &requested).expect("remove"), 2);
+        assert_ne!(
+            store.head(),
+            head_before,
+            "a non-empty removal advances head"
+        );
+        assert_eq!(
+            journal_line_count(&directory),
+            lines_before + 1,
+            "duplicates and multiple names still produce one journal revision"
+        );
+        assert_eq!(
+            list_checkpoints(&store)
+                .expect("list")
+                .into_iter()
+                .map(|checkpoint| checkpoint.name)
+                .collect::<Vec<_>>(),
+            vec![retained.clone()]
+        );
+
+        let head_after = store.head();
+        let lines_after = journal_line_count(&directory);
+        assert_eq!(
+            remove_checkpoints(&store, &["missing".to_owned()]).expect("missing no-op"),
+            0
+        );
+        assert_eq!(remove_checkpoints(&store, &[]).expect("empty no-op"), 0);
+        assert_eq!(store.head(), head_after, "no-op removals preserve head");
+        assert_eq!(
+            journal_line_count(&directory),
+            lines_after,
+            "no-op removals do not append journal revisions"
+        );
+        store.close().expect("close");
+
+        let repository = Repository::open(&directory.path).expect("reopen read-only");
+        assert_eq!(
+            repository
+                .checkpoints()
+                .expect("persisted checkpoints")
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec![retained],
+            "the finalized archive retains exactly the unremoved checkpoint"
+        );
+    }
+
+    #[test]
+    fn unreferenced_checkpoint_removal_is_batched() {
+        let directory = TestDirectory::new("remove-unreferenced");
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        create_checkpoint(&store, 1_000_000, &[]).expect("first");
+        create_checkpoint(&store, 1_000_000, &[]).expect("second");
+        create_checkpoint(&store, 1_000_000, &[]).expect("third");
+        let lines_before = journal_line_count(&directory);
+
+        // With no /:async state, the established API regards every
+        // checkpoint as unreferenced; the removals must still be atomic.
+        assert_eq!(
+            remove_unreferenced_checkpoints(&store).expect("remove unreferenced"),
+            3
+        );
+        assert_eq!(
+            journal_line_count(&directory),
+            lines_before + 1,
+            "the unreferenced set shares one persisted head"
+        );
+        assert!(list_checkpoints(&store).expect("list").is_empty());
+        store.close().expect("close");
+
+        let repository = Repository::open(&directory.path).expect("reopen read-only");
+        assert!(
+            repository
+                .checkpoints()
+                .expect("persisted checkpoints")
+                .is_empty(),
+            "the finalized archive persists the batched removal"
+        );
+    }
+
+    #[test]
+    fn unreferenced_checkpoint_removal_preserves_async_references() {
+        let directory = TestDirectory::new("remove-unreferenced-referenced");
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        let retained = create_checkpoint(&store, 1_000_000, &[]).expect("retained");
+        create_checkpoint(&store, 1_000_000, &[]).expect("unreferenced one");
+        create_checkpoint(&store, 1_000_000, &[]).expect("unreferenced two");
+
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let checkpoint_value = writer.write_string(&retained).expect("checkpoint value");
+        let async_state = writer
+            .write_node(
+                None,
+                &[],
+                &crate::writer::record_writer::ChildNodesToWrite::Zero,
+                &[crate::writer::record_writer::PropertyToWrite {
+                    name: "async".to_owned(),
+                    property_type: crate::content::property::PropertyType::String,
+                    values: crate::writer::record_writer::PropertyValuesToWrite::Single(
+                        checkpoint_value,
+                    ),
+                }],
+            )
+            .expect("async state");
+        let content_root = writer
+            .write_node(
+                None,
+                &[],
+                &crate::writer::record_writer::ChildNodesToWrite::One {
+                    name: ":async".to_owned(),
+                    node: async_state,
+                },
+                &[],
+            )
+            .expect("content root");
+        writer.finish().expect("finish content root");
+        replace_content_root(&store, content_root).expect("install content root");
+
+        let lines_before = journal_line_count(&directory);
+        assert_eq!(
+            remove_unreferenced_checkpoints(&store).expect("remove unreferenced"),
+            2
+        );
+        assert_eq!(journal_line_count(&directory), lines_before + 1);
+        assert_eq!(
+            list_checkpoints(&store)
+                .expect("list")
+                .into_iter()
+                .map(|checkpoint| checkpoint.name)
+                .collect::<Vec<_>>(),
+            vec![retained.clone()]
+        );
+        store.close().expect("close");
+
+        let repository = Repository::open(&directory.path).expect("reopen read-only");
+        assert_eq!(
+            repository
+                .checkpoints()
+                .expect("persisted checkpoints")
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec![retained],
+            "the finalized archive preserves the referenced checkpoint"
+        );
     }
 }

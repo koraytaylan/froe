@@ -233,6 +233,12 @@ pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<C
         },
     };
 
+    // Refuse damaged base payloads or incomplete graph/BRF trailers before
+    // allocating the compacted copy. Reclamation certifies them again at its
+    // mutation boundary, but doing the first pass here prevents every retry
+    // against a pre-existing defect from durably appending another full copy.
+    store.preflight_reclaim_sources()?;
+
     let mut writer = store.record_writer_with_identifier(target_generation, "c");
     let (new_head, compacted_nodes) = deep_copy_tree(store, &mut writer, head)?;
     writer.finish()?;
@@ -363,6 +369,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn corrupt_graph_checksum(path: &std::path::Path) {
+        let mut bytes = std::fs::read(path).expect("read archive");
+        let mut offset = 0usize;
+        while offset + 512 <= bytes.len() {
+            let header = &bytes[offset..offset + 512];
+            if header.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let name_end = header[..100]
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(100);
+            let name = std::str::from_utf8(&header[..name_end]).expect("UTF-8 TAR entry name");
+            let size_text = std::str::from_utf8(&header[124..136])
+                .expect("ASCII TAR size")
+                .trim_matches(['\0', ' ']);
+            let size = usize::from_str_radix(size_text, 8).expect("octal TAR size");
+            if std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gph"))
+            {
+                let payload_end = offset + 512 + size;
+                assert!(size >= 16, "graph payload includes its footer");
+                bytes[payload_end - 16] ^= 0x01;
+                std::fs::write(path, bytes).expect("corrupt graph checksum");
+                return;
+            }
+            offset += 512 + size.div_ceil(512) * 512;
+        }
+        panic!("graph trailer not found in {}", path.display());
     }
 
     /// Builds a store with a `/content` node carrying properties and two
@@ -836,6 +874,62 @@ mod tests {
         let store = WritableRepository::open(&directory.path).expect("open");
         assert_eq!(list_checkpoints(&store).expect("list").len(), 1);
         store.close().expect("close");
+    }
+
+    #[test]
+    fn compaction_certifies_base_archives_before_writing_a_retry_copy() {
+        let directory = TestDirectory::new("preflight-base-certificate");
+        build_populated_store(&directory);
+        let repository = Repository::open(&directory.path).expect("open healthy repository");
+        let archive_name = repository.archives()[0].file_name().to_owned();
+        drop(repository);
+        corrupt_graph_checksum(&directory.path.join(&archive_name));
+
+        let journal_before =
+            std::fs::read(directory.path.join("journal.log")).expect("read journal before");
+        let archives_before =
+            crate::store::list_archive_file_names(&directory.path).expect("list archives before");
+        let bytes_before: Vec<_> = archives_before
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    std::fs::read(directory.path.join(name)).expect("read archive before"),
+                )
+            })
+            .collect();
+
+        for attempt in 1..=2 {
+            let mut store = WritableRepository::open(&directory.path)
+                .expect("ordinary read path tolerates an invalid optional graph");
+            let error = compact(&mut store, CompactionKind::Full)
+                .expect_err("strict reclaim source preflight must refuse the graph");
+            assert!(error.to_string().contains("segment graph"), "{error}");
+            drop(store);
+            assert_eq!(
+                crate::store::list_archive_file_names(&directory.path)
+                    .expect("list archives after refused attempt"),
+                archives_before,
+                "refused retry {attempt} must not allocate another compacted TAR"
+            );
+        }
+
+        assert_eq!(
+            crate::store::list_archive_file_names(&directory.path).expect("list archives after"),
+            archives_before,
+            "preflight refusal must not allocate a compacted TAR"
+        );
+        for (name, expected) in bytes_before {
+            assert_eq!(
+                std::fs::read(directory.path.join(name)).expect("read archive after"),
+                expected
+            );
+        }
+        assert_eq!(
+            std::fs::read(directory.path.join("journal.log")).expect("read journal after"),
+            journal_before,
+            "preflight refusal must not publish another head"
+        );
     }
 
     /// Every data segment's referenced segments must resolve — the sweep

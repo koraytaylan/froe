@@ -11,9 +11,13 @@
 //! source; the writable store refuses to open on Windows.
 
 pub mod backup;
+pub mod cleanup;
+#[cfg(test)]
+mod cleanup_fault_injection;
 pub mod commit;
 pub mod compaction;
 pub mod identifier_generator;
+pub(crate) mod journal_maintenance;
 pub mod record_writer;
 pub mod repository_lock;
 pub mod segment_builder;
@@ -21,9 +25,15 @@ pub mod store_writer;
 pub mod tar_writer;
 
 pub use backup::{RecoveryOutcome, backup, recover_journal, restore};
+pub use cleanup::{
+    CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupOutcome, CleanupPlan,
+    CleanupTask, JournalLineRemoval, JournalRemovalReason, PreparedCleanup, RecoveryBackupPolicy,
+    StaleArchiveReason, cleanup, plan_cleanup,
+};
 pub use commit::{
     CheckpointDescription, create_checkpoint, list_checkpoints, release_checkpoint,
-    remove_all_checkpoints, remove_unreferenced_checkpoints, replace_content_root,
+    remove_all_checkpoints, remove_checkpoints, remove_unreferenced_checkpoints,
+    replace_content_root,
 };
 pub use compaction::{CompactionKind, CompactionOutcome, compact};
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};

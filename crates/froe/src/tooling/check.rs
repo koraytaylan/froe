@@ -10,7 +10,7 @@
 //! succeeds when *any* path found a good revision (Java's default,
 //! fail-fast off).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
@@ -302,7 +302,14 @@ fn check_one_path(
             }
         }
     }
-    match verify_subtree(provider, node.record_identifier(), check_binaries) {
+    match verify_subtree(
+        provider,
+        node.record_identifier(),
+        SubtreeChecks {
+            binaries: check_binaries,
+            stable_identifiers: false,
+        },
+    ) {
         Ok(()) => Ok(()),
         Err(corrupt) => {
             if !path_to_check.corrupt_paths.contains(&corrupt.path) {
@@ -419,23 +426,107 @@ struct CorruptLocation {
     reason: String,
 }
 
+/// Verifies one complete node subtree, including every stable-identifier
+/// record and inline binary.
+///
+/// `root` is the exact node record to check; the provider may be a full
+/// repository or any other segment source. External binaries are verified
+/// only as references because their content is outside the segment store.
+/// A corrupt root or descendant is reported as [`Error::InvalidFormat`]
+/// whose details include its path relative to `root` (`/` denotes `root`
+/// itself).
+/// This deliberately classifies every traversal failure as invalid repository
+/// data so path context is retained; the original error text is preserved in
+/// the details even when the underlying failure was I/O or a missing segment.
+pub fn verify_node_tree(provider: &dyn SegmentProvider, root: RecordIdentifier) -> Result<()> {
+    NodeTreeVerifier::new(provider).verify(root)
+}
+
+/// A provider-bound verifier which reuses certificates for fully verified
+/// immutable node subtrees across multiple roots.
+///
+/// Segment providers expose immutable record bytes, so a node that completed
+/// every shallow, stable-identifier, inline-binary, and descendant check can
+/// be safely reused while this verifier remains bound to the same provider.
+/// Failed and cyclic subtrees are never cached. Cached subtree height is also
+/// retained: a reuse that could cross the traversal depth limit falls back to
+/// a real walk, preserving both the limit and the original path diagnostic.
+pub struct NodeTreeVerifier<'provider> {
+    provider: &'provider dyn SegmentProvider,
+    verified_subtree_heights: HashMap<RecordIdentifier, usize>,
+}
+
+impl<'provider> NodeTreeVerifier<'provider> {
+    /// Binds a reusable verifier to one immutable segment provider.
+    #[must_use]
+    pub fn new(provider: &'provider dyn SegmentProvider) -> Self {
+        Self {
+            provider,
+            verified_subtree_heights: HashMap::new(),
+        }
+    }
+
+    /// Verifies `root`, reusing only subtrees which a previous call completed
+    /// successfully against this same provider.
+    pub fn verify(&mut self, root: RecordIdentifier) -> Result<()> {
+        verify_subtree_with_cache(
+            self.provider,
+            root,
+            SubtreeChecks {
+                binaries: true,
+                stable_identifiers: true,
+            },
+            &mut self.verified_subtree_heights,
+        )
+        .map(|_| ())
+        .map_err(|corrupt| node_tree_error(&corrupt))
+    }
+}
+
+fn node_tree_error(corrupt: &CorruptLocation) -> Error {
+    Error::InvalidFormat {
+        details: format!(
+            "node tree verification failed at {}: {}",
+            display_relative(&corrupt.path),
+            corrupt.reason
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SubtreeChecks {
+    binaries: bool,
+    stable_identifiers: bool,
+}
+
 /// Traverses a subtree, resolving every node, property, and — when asked
-/// — binary content. Returns the first corrupt location, which the
-/// caller remembers and re-probes at older revisions.
+/// — binary content and stable identifier. Returns the first corrupt
+/// location, which the caller remembers and re-probes at older revisions.
 fn verify_subtree(
     provider: &dyn SegmentProvider,
     root: RecordIdentifier,
-    check_binaries: bool,
+    checks: SubtreeChecks,
 ) -> std::result::Result<(), CorruptLocation> {
+    verify_subtree_with_cache(provider, root, checks, &mut HashMap::new()).map(|_| ())
+}
+
+/// Returns the verified subtree height. A record enters `verified` only
+/// after every descendant completed successfully.
+fn verify_subtree_with_cache(
+    provider: &dyn SegmentProvider,
+    root: RecordIdentifier,
+    checks: SubtreeChecks,
+    verified: &mut HashMap<RecordIdentifier, usize>,
+) -> std::result::Result<usize, CorruptLocation> {
     fn walk(
         provider: &dyn SegmentProvider,
         record: RecordIdentifier,
-        check_binaries: bool,
-        visited: &mut HashSet<RecordIdentifier>,
+        checks: SubtreeChecks,
+        verified: &mut HashMap<RecordIdentifier, usize>,
         ancestors: &mut HashSet<RecordIdentifier>,
         depth: usize,
         path: &mut String,
-    ) -> std::result::Result<(), CorruptLocation> {
+    ) -> std::result::Result<usize, CorruptLocation> {
         let corrupt_here = |reason: String| CorruptLocation {
             path: path.clone(),
             reason,
@@ -457,49 +548,63 @@ fn verify_subtree(
                 "node record {record} is contained in its own subtree"
             )));
         }
-        if !visited.insert(record) {
-            return Ok(());
+        if let Some(&subtree_height) = verified.get(&record)
+            && depth
+                .checked_add(subtree_height)
+                .is_some_and(|deepest| deepest <= MAXIMUM_CHECK_DEPTH)
+        {
+            return Ok(subtree_height);
         }
         ancestors.insert(record);
         // Not `map_err(corrupt_here)`: different clippy versions disagree
         // about the borrow there, and an explicit struct keeps both quiet.
-        if let Err(reason) = check_node_shallow(provider, record, check_binaries) {
+        if let Err(reason) = check_node_shallow(provider, record, checks.binaries) {
             return Err(CorruptLocation {
                 path: path.clone(),
                 reason,
             });
         }
         let node = NodeState::new(provider, record);
+        if checks.stable_identifiers
+            && let Err(error) = node.stable_identifier_bytes()
+        {
+            return Err(CorruptLocation {
+                path: path.clone(),
+                reason: error.to_string(),
+            });
+        }
         let children = node
             .child_node_entries()
             .map_err(|error| corrupt_here(error.to_string()))?;
+        let mut subtree_height = 0usize;
         for (name, child) in children {
             let parent_length = path.len();
             path.push('/');
             path.push_str(&name);
-            walk(
+            let child_height = walk(
                 provider,
                 child.record_identifier(),
-                check_binaries,
-                visited,
+                checks,
+                verified,
                 ancestors,
                 depth + 1,
                 path,
             )?;
             path.truncate(parent_length);
+            subtree_height = subtree_height.max(child_height + 1);
         }
         ancestors.remove(&record);
-        Ok(())
+        verified.insert(record, subtree_height);
+        Ok(subtree_height)
     }
 
-    let mut visited = HashSet::new();
     let mut ancestors = HashSet::new();
     let mut path = String::new();
     walk(
         provider,
         root,
-        check_binaries,
-        &mut visited,
+        checks,
+        verified,
         &mut ancestors,
         0,
         &mut path,
@@ -526,8 +631,21 @@ fn materialize_binary(
 
 #[cfg(test)]
 mod tests {
-    use super::check_consistency;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::{NodeTreeVerifier, check_consistency, verify_node_tree};
+    use crate::content::provider::SegmentProvider;
+    use crate::content::provider::tests::MemorySegmentProvider;
+    use crate::content::template::{Template, read_template};
+    use crate::content::value::read_string;
+    use crate::error::{Error, Result};
+    use crate::segment::identifier::SegmentIdentifier;
+    use crate::segment::record::RecordIdentifier;
+    use crate::segment::view::SegmentView;
     use crate::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
+    use crate::writer::segment_builder::SegmentBufferBuilder;
     use crate::writer::store_writer::WritableRepository;
 
     struct TestDirectory {
@@ -546,6 +664,86 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A provider that makes selected, otherwise-valid segments disappear.
+    /// Its string/template readers deliberately route back through `self`,
+    /// so their record accesses cannot bypass the hiding behavior by
+    /// delegating directly to the wrapped repository.
+    struct HidingProvider<'store> {
+        store: &'store WritableRepository,
+        exact: Option<SegmentIdentifier>,
+        bulk: bool,
+    }
+
+    impl SegmentProvider for HidingProvider<'_> {
+        fn segment(&self, identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+            if self.exact == Some(identifier) || self.bulk && identifier.is_bulk_segment() {
+                return Err(Error::SegmentNotFound {
+                    segment_identifier: identifier,
+                });
+            }
+            self.store.segment(identifier)
+        }
+
+        fn string(&self, identifier: RecordIdentifier) -> Result<Arc<str>> {
+            read_string(self, identifier).map(Arc::from)
+        }
+
+        fn template(&self, identifier: RecordIdentifier) -> Result<Arc<Template>> {
+            read_template(self, identifier).map(Arc::new)
+        }
+    }
+
+    /// Counts every segment resolution and can make one segment unavailable.
+    /// String/template reads route through `self`, so all record access is
+    /// observable by the counter.
+    struct CountingProvider<'provider> {
+        inner: &'provider dyn SegmentProvider,
+        hidden: Option<SegmentIdentifier>,
+        reads: RefCell<HashMap<SegmentIdentifier, usize>>,
+    }
+
+    impl<'provider> CountingProvider<'provider> {
+        fn new(inner: &'provider dyn SegmentProvider) -> Self {
+            Self {
+                inner,
+                hidden: None,
+                reads: RefCell::new(HashMap::new()),
+            }
+        }
+
+        fn hiding(inner: &'provider dyn SegmentProvider, hidden: SegmentIdentifier) -> Self {
+            Self {
+                inner,
+                hidden: Some(hidden),
+                reads: RefCell::new(HashMap::new()),
+            }
+        }
+
+        fn reads_of(&self, segment: SegmentIdentifier) -> usize {
+            self.reads.borrow().get(&segment).copied().unwrap_or(0)
+        }
+    }
+
+    impl SegmentProvider for CountingProvider<'_> {
+        fn segment(&self, identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+            *self.reads.borrow_mut().entry(identifier).or_default() += 1;
+            if self.hidden == Some(identifier) {
+                return Err(Error::SegmentNotFound {
+                    segment_identifier: identifier,
+                });
+            }
+            self.inner.segment(identifier)
+        }
+
+        fn string(&self, identifier: RecordIdentifier) -> Result<Arc<str>> {
+            read_string(self, identifier).map(Arc::from)
+        }
+
+        fn template(&self, identifier: RecordIdentifier) -> Result<Arc<Template>> {
+            read_template(self, identifier).map(Arc::new)
         }
     }
 
@@ -676,5 +874,340 @@ mod tests {
             report.overall_revision.is_some(),
             "every path verified, so an overall revision exists"
         );
+    }
+
+    #[test]
+    fn node_tree_verifier_reports_the_corrupt_descendant_path() {
+        let directory = TestDirectory::new("verify-corrupt-path");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+
+        // Finish the child first so it occupies a different segment from
+        // the parent. The wrapped provider can then make only that child
+        // unavailable while leaving the parent perfectly readable.
+        let mut child_writer = store.record_writer(generation);
+        let child = child_writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("child");
+        child_writer.finish().expect("finish child");
+        let mut root_writer = store.record_writer(generation);
+        let root = root_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "broken".to_owned(),
+                    node: child,
+                },
+                &[],
+            )
+            .expect("root");
+        root_writer.finish().expect("finish root");
+
+        verify_node_tree(&store, root).expect("the complete tree verifies");
+        let provider = HidingProvider {
+            store: &store,
+            exact: Some(child.segment),
+            bulk: false,
+        };
+        let error = verify_node_tree(&provider, root).expect_err("hidden child must fail");
+        let Error::InvalidFormat { details } = error else {
+            panic!("verification must return a structured format error");
+        };
+        assert!(
+            details.contains("at /broken:"),
+            "the error identifies the corrupt relative path: {details}"
+        );
+        assert!(
+            details.contains(&child.segment.to_string()),
+            "the underlying failure remains useful: {details}"
+        );
+
+        let provider = HidingProvider {
+            store: &store,
+            exact: Some(root.segment),
+            bulk: false,
+        };
+        let error = verify_node_tree(&provider, root).expect_err("hidden root must fail");
+        let Error::InvalidFormat { details } = error else {
+            panic!("verification must return a structured format error");
+        };
+        assert!(
+            details.contains("at /:"),
+            "root corruption uses the documented root path: {details}"
+        );
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn reusable_node_tree_verifier_reuses_fully_verified_shared_descendants() {
+        let directory = TestDirectory::new("verify-shared-cache");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+
+        let mut child_writer = store.record_writer(generation);
+        let shared = child_writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("shared child");
+        child_writer.finish().expect("finish shared child");
+
+        let mut first_writer = store.record_writer(generation);
+        let first_root = first_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "shared".to_owned(),
+                    node: shared,
+                },
+                &[],
+            )
+            .expect("first root");
+        first_writer.finish().expect("finish first root");
+
+        let mut second_writer = store.record_writer(generation);
+        let second_root = second_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "shared".to_owned(),
+                    node: shared,
+                },
+                &[],
+            )
+            .expect("second root");
+        second_writer.finish().expect("finish second root");
+
+        let provider = CountingProvider::new(&store);
+        let mut verifier = NodeTreeVerifier::new(&provider);
+        verifier.verify(first_root).expect("first tree verifies");
+        let shared_reads = provider.reads_of(shared.segment);
+        assert!(shared_reads > 0, "the first root traverses the shared node");
+        assert!(
+            verifier.verified_subtree_heights.contains_key(&shared),
+            "only a completed shared subtree receives a certificate"
+        );
+
+        verifier.verify(second_root).expect("second tree verifies");
+        assert_eq!(
+            provider.reads_of(shared.segment),
+            shared_reads,
+            "the second root reuses the provider-bound subtree certificate"
+        );
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn reusable_node_tree_verifier_never_caches_a_failed_subtree() {
+        let directory = TestDirectory::new("verify-failed-not-cached");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+
+        let mut child_writer = store.record_writer(generation);
+        let child = child_writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("child");
+        child_writer.finish().expect("finish child");
+        let mut root_writer = store.record_writer(generation);
+        let root = root_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "broken".to_owned(),
+                    node: child,
+                },
+                &[],
+            )
+            .expect("root");
+        root_writer.finish().expect("finish root");
+
+        let provider = CountingProvider::hiding(&store, child.segment);
+        let mut verifier = NodeTreeVerifier::new(&provider);
+        let first = verifier.verify(root).expect_err("hidden child fails");
+        let first_reads = provider.reads_of(child.segment);
+        assert!(first_reads > 0);
+        assert!(
+            verifier.verified_subtree_heights.is_empty(),
+            "neither the corrupt child nor its incomplete ancestor is cached"
+        );
+        let second = verifier
+            .verify(root)
+            .expect_err("the same hidden child must be re-read and fail again");
+        assert!(provider.reads_of(child.segment) > first_reads);
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(verifier.verified_subtree_heights.is_empty());
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn reusable_node_tree_verifier_never_caches_a_cyclic_subtree() {
+        let directory = TestDirectory::new("verify-cycle-not-cached");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let original_child = writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("original child");
+        let root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "loop".to_owned(),
+                    node: original_child,
+                },
+                &[],
+            )
+            .expect("root");
+        writer.finish().expect("finish segment");
+
+        let view = store.segment(root.segment).expect("root segment");
+        let root_position = view
+            .record_position(root.record_number)
+            .expect("root position");
+        let mut cyclic_bytes = view.bytes.to_vec();
+        let child_slot: &mut [u8; 6] = (&mut cyclic_bytes[root_position + 12..root_position + 18])
+            .try_into()
+            .expect("one child identifier slot");
+        SegmentBufferBuilder::write_record_identifier_bytes(0, root.record_number, child_slot);
+        let mut memory = MemorySegmentProvider::default();
+        memory.insert(root.segment, cyclic_bytes);
+
+        let provider = CountingProvider::new(&memory);
+        let mut verifier = NodeTreeVerifier::new(&provider);
+        let first = verifier.verify(root).expect_err("self-cycle fails");
+        let first_reads = provider.reads_of(root.segment);
+        let Error::InvalidFormat { details } = &first else {
+            panic!("cycle verification returns a format error");
+        };
+        assert!(details.contains("at /loop:"));
+        assert!(details.contains("contained in its own subtree"));
+        assert!(verifier.verified_subtree_heights.is_empty());
+
+        let second = verifier.verify(root).expect_err("cycle is never cached");
+        assert!(provider.reads_of(root.segment) > first_reads);
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(verifier.verified_subtree_heights.is_empty());
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn node_tree_verifier_materializes_long_inline_binary_blocks() {
+        let directory = TestDirectory::new("verify-inline-binary");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let content: Vec<u8> = (0..300 * 1024).map(|index| (index % 251) as u8).collect();
+        let mut writer = store.record_writer(generation);
+        let binary = writer.write_binary_content(&content).expect("binary");
+        let payload = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[PropertyToWrite {
+                    name: "data".to_owned(),
+                    property_type: crate::content::property::PropertyType::Binary,
+                    values: PropertyValuesToWrite::Single(binary),
+                }],
+            )
+            .expect("payload");
+        let root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "payload".to_owned(),
+                    node: payload,
+                },
+                &[],
+            )
+            .expect("root");
+        writer.finish().expect("finish");
+
+        verify_node_tree(&store, root).expect("complete binary verifies");
+        let provider = HidingProvider {
+            store: &store,
+            exact: None,
+            bulk: true,
+        };
+        let error = verify_node_tree(&provider, root).expect_err("missing block must fail");
+        let Error::InvalidFormat { details } = error else {
+            panic!("verification must return a structured format error");
+        };
+        assert!(
+            details.contains("at /payload:"),
+            "binary corruption is attributed to its containing node: {details}"
+        );
+        assert!(
+            details.contains("not found in any archive"),
+            "the missing block reason is retained: {details}"
+        );
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn node_tree_verifier_resolves_preserved_stable_identifiers() {
+        let directory = TestDirectory::new("verify-stable-identifier");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+
+        let mut child_writer = store.record_writer(generation);
+        let child = child_writer
+            .write_node_with_stable_identifier(
+                None,
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[],
+                Some([0x5a; 20]),
+            )
+            .expect("child");
+        child_writer.finish().expect("finish child");
+        let mut root_writer = store.record_writer(generation);
+        let root = root_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "stable".to_owned(),
+                    node: child,
+                },
+                &[],
+            )
+            .expect("root");
+        root_writer.finish().expect("finish root");
+        verify_node_tree(&store, root).expect("valid stable identifier verifies");
+
+        // Keep both node-shaped segments intact except for the child's slot
+        // zero. Point that slot at a nonexistent record in its own segment:
+        // templates, properties, and children still decode, so only a
+        // verifier that resolves stable identifiers detects this corruption.
+        let child_view = store.segment(child.segment).expect("child segment");
+        let mut child_bytes = child_view.bytes.to_vec();
+        let child_position = child_view
+            .record_position(child.record_number)
+            .expect("child position");
+        child_bytes[child_position..child_position + 2].copy_from_slice(&0u16.to_be_bytes());
+        child_bytes[child_position + 2..child_position + 6]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+        let root_view = store.segment(root.segment).expect("root segment");
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(child.segment, child_bytes);
+        provider.insert(root.segment, root_view.bytes.to_vec());
+
+        let error = verify_node_tree(&provider, root).expect_err("invalid stable id must fail");
+        let Error::InvalidFormat { details } = error else {
+            panic!("verification must return a structured format error");
+        };
+        assert!(
+            details.contains("at /stable:"),
+            "stable-id corruption is attributed to its node: {details}"
+        );
+        assert!(
+            details.contains("record 4294967295 does not exist"),
+            "the stable-id failure reason is retained: {details}"
+        );
+        store.close().expect("close");
     }
 }

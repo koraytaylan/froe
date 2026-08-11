@@ -19,8 +19,8 @@ instance and without the JVM's startup and garbage collection overhead:
 * **Writing** takes the exclusive repository lock and produces stores
   byte-for-byte compatible with what Oak writes, so a subsequent AEM start
   consumes the result cleanly. Compact offline, back up and restore,
-  recover a lost journal, and manage checkpoints — against a *stopped*
-  repository.
+  safely clean orphaned storage and stale metadata, recover a lost journal,
+  and manage checkpoints — against a *stopped* repository.
 
 The writing path reproduces every invariant Oak depends on — locking,
 durability ordering, generation arithmetic, archive and trailer layout —
@@ -58,11 +58,37 @@ $ target/release/froe export /path/to/segmentstore --path /content --output cont
 $ target/release/froe export /path/to/segmentstore --path /content --format parquet --output ./export
 $ target/release/froe check /path/to/segmentstore
 
-# Maintenance — stopped repository only (each asks for confirmation):
+# Maintenance — stopped repository only (mutating forms ask for confirmation):
+$ target/release/froe cleanup /path/to/segmentstore --dry-run
+$ target/release/froe cleanup /path/to/segmentstore
 $ target/release/froe compact /path/to/segmentstore
 $ target/release/froe backup /path/to/segmentstore /path/to/backup
 $ target/release/froe recover-journal /path/to/segmentstore
 ```
+
+`froe cleanup` first prints a strictly read-only plan. When that plan contains
+mutations, it then acquires the repository lock and rebuilds the plan before
+applying it; an empty plan returns without taking the lock. If the locked plan
+changed, it is printed and confirmed again. The conservative defaults preserve
+every readable journal revision while pruning dangling or unreadable journal
+entries, reclaiming eligible segments, removing expired checkpoints, and
+cleaning only proven stale files. See the [cleanup guide](docs/cleanup.md) for
+task selection, retention rules, resource expectations, and failure behavior.
+When a planned checkpoint removal or segment-archive rewrite needs to write
+version-two state, the plan also shows the one-way `store.version=1` to `2`
+manifest upgrade before apply.
+
+Every mutating command takes `repo.lock`. If that file is absent, froe first
+creates and fsyncs a mode-`0600` staging inode, then publishes it with an
+absent-only, same-directory hard link. Consequently, all mutating commands
+require same-directory hard-link and durable directory-fsync support when
+`repo.lock` has not already been created; unsupported filesystems fail without
+falling back to an unsafe lock-creation sequence.
+
+Archive rewrites performed by either `froe cleanup` or the cleanup phase of
+`froe compact` publish validated successors with absent-only, same-directory
+hard links. A filesystem that does not support those links cannot perform such
+a rewrite; the operation fails with the original archive still active.
 
 Every command takes the segment store directory (the one containing
 `journal.log` and the `data*.tar` archives). `froe export` is the fast
@@ -159,6 +185,9 @@ fn main() -> froe::Result<()> {
 * [`docs/storage-format.md`](docs/storage-format.md)
   — the on-disk format as implemented by this workspace: tar archive layout,
   segment headers, and every record encoding.
+* [`docs/cleanup.md`](docs/cleanup.md)
+  — the safety model, default and opt-in tasks, retention rules, and examples
+  for offline repository cleanup.
 
 ## Relationship to Apache Jackrabbit Oak
 

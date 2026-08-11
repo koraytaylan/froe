@@ -61,11 +61,19 @@ impl TarArchiveReader {
     /// Opens an archive file, trying the index first and falling back to
     /// the recovery scan.
     pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        Self::open_file(path, &file)
+    }
+
+    /// Opens an archive from an already-held file descriptor while retaining
+    /// `path` as its logical name. Maintenance publication uses this to bind a
+    /// validation certificate to the exact inode it will later publish rather
+    /// than reopening a replaceable pathname between validation steps.
+    pub(crate) fn open_file(path: &Path, file: &File) -> Result<Self> {
         let file_name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let file = File::open(path)?;
         let length = file.metadata()?.len();
         if length == 0 {
             return Err(Error::InvalidFormat {
@@ -87,7 +95,7 @@ impl TarArchiveReader {
         // fault this mapping exactly as it would fault a running Oak
         // instance; froe accepts that shared residual risk rather than
         // give up zero-copy segment access.
-        let bytes = unsafe { memmap2::Mmap::map(&file)? };
+        let bytes = unsafe { memmap2::Mmap::map(file)? };
 
         let content = if let Ok(index) = parse_segment_index(&bytes) {
             ArchiveContent::Indexed(index)
@@ -194,6 +202,132 @@ impl TarArchiveReader {
         self.index()?.find_entry(segment_identifier)
     }
 
+    /// Validates the tar entry named by one index row, including the UUID,
+    /// declared size, and payload CRC encoded in its entry name.
+    ///
+    /// The normal indexed read path intentionally trusts the index and jumps
+    /// directly to payload bytes. Destructive maintenance needs the stronger
+    /// certificate: a valid trailer index must not authorize deletion of an
+    /// alternate archive when its referenced payload entry is stale or
+    /// corrupt.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the index/header/name/size/payload certificate is safest as one linear validation sequence"
+    )]
+    pub(crate) fn validate_indexed_segment_entry(
+        &self,
+        segment_identifier: SegmentIdentifier,
+    ) -> crate::error::Result<()> {
+        let entry = self.index_entry(segment_identifier).ok_or_else(|| {
+            crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} has no index entry for segment {segment_identifier}",
+                    self.file_name
+                ),
+            }
+        })?;
+        let payload_start = entry.position as usize;
+        let header_start = payload_start.checked_sub(512).ok_or_else(|| {
+            crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} indexes segment {segment_identifier} before a complete tar header",
+                    self.file_name
+                ),
+            }
+        })?;
+        let header_end = header_start.checked_add(512).ok_or_else(|| {
+            crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} overflows the tar-header range for segment {segment_identifier}",
+                    self.file_name
+                ),
+            }
+        })?;
+        let header_block = self.bytes.get(header_start..header_end).ok_or_else(|| {
+            crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} truncates the tar header for segment {segment_identifier}",
+                    self.file_name
+                ),
+            }
+        })?;
+        let header = TarEntryHeader::parse(header_block).ok_or_else(|| {
+            crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} has no tar entry header for indexed segment {segment_identifier}",
+                    self.file_name
+                ),
+            }
+        })?;
+        let (header_identifier, expected_crc) = parse_segment_entry_name(&header.name)
+            .and_then(|(identifier, checksum)| checksum.map(|checksum| (identifier, checksum)))
+            .ok_or_else(|| crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} has malformed or checksum-free tar entry name {:?} for indexed segment {segment_identifier}",
+                    self.file_name, header.name
+                ),
+            })?;
+        if header_identifier != segment_identifier {
+            return Err(crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} index names segment {segment_identifier}, but its tar entry names {header_identifier}",
+                    self.file_name
+                ),
+            });
+        }
+        let canonical_name = format!("{segment_identifier}.{expected_crc:08x}");
+        if header.name != canonical_name {
+            return Err(crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} tar entry name {:?} is not the canonical indexed-segment name {canonical_name:?}",
+                    self.file_name, header.name
+                ),
+            });
+        }
+        if header.size != i64::from(entry.size) {
+            return Err(crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} index size {} disagrees with tar entry size {} for segment {segment_identifier}",
+                    self.file_name, entry.size, header.size
+                ),
+            });
+        }
+        if !tar_header_checksum_is_valid(header_block) {
+            return Err(crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} has an invalid tar-header checksum for segment {segment_identifier}",
+                    self.file_name
+                ),
+            });
+        }
+        let payload_end = payload_start
+            .checked_add(entry.size as usize)
+            .ok_or_else(|| crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} overflows the payload range for segment {segment_identifier}",
+                    self.file_name
+                ),
+            })?;
+        let payload = self.bytes.get(payload_start..payload_end).ok_or_else(|| {
+            crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} truncates the payload for segment {segment_identifier}",
+                    self.file_name
+                ),
+            }
+        })?;
+        let actual_crc = crc32(payload);
+        if actual_crc != expected_crc {
+            return Err(crate::error::Error::InvalidFormat {
+                details: format!(
+                    "archive {} payload CRC {actual_crc:08x} disagrees with tar entry CRC {expected_crc:08x} for segment {segment_identifier}",
+                    self.file_name
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Parses the archive's segment graph, when present and valid.
     #[must_use]
     pub fn segment_graph(&self) -> Option<SegmentGraph> {
@@ -214,6 +348,34 @@ impl TarArchiveReader {
             .checked_sub(1024 + index_entry_disk_size(index) + graph_disk_size)?;
         parse_binary_references(&self.bytes, anchor)
     }
+}
+
+fn tar_header_checksum_is_valid(block: &[u8]) -> bool {
+    let Some(block) = block.get(..512) else {
+        return false;
+    };
+    let Ok(field) = std::str::from_utf8(&block[148..156]) else {
+        return false;
+    };
+    let digits = field.trim_matches(['\0', ' ']);
+    if digits.is_empty() || !digits.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+        return false;
+    }
+    let Ok(stored) = u32::from_str_radix(digits, 8) else {
+        return false;
+    };
+    let calculated: u32 = block
+        .iter()
+        .enumerate()
+        .map(|(index, &byte)| {
+            if (148..156).contains(&index) {
+                u32::from(b' ')
+            } else {
+                u32::from(byte)
+            }
+        })
+        .sum();
+    stored == calculated
 }
 
 /// The name of a segment entry inside an archive:
@@ -353,9 +515,13 @@ fn recover_segment_entries(bytes: &[u8], archive_file_name: &str) -> RecoveredSe
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Seek, SeekFrom, Write};
+
     use super::{TarArchiveReader, parse_segment_entry_name, recover_segment_entries};
     use crate::checksum::crc32;
     use crate::segment::identifier::SegmentIdentifier;
+    use crate::writer::segment_builder::GarbageCollectionGeneration;
+    use crate::writer::tar_writer::TarArchiveWriter;
 
     fn tar_entry(name: &str, data: &[u8]) -> Vec<u8> {
         let mut block = vec![0u8; 512];
@@ -549,6 +715,109 @@ mod tests {
             reader.segment_data(identifier).expect("segment data"),
             &data[..]
         );
+
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn indexed_entry_validation_checks_the_name_size_and_payload_crc() {
+        let directory = std::env::temp_dir().join(format!(
+            "froe-indexed-entry-validation-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create test directory");
+        let path = directory.join("data00000a.tar");
+        let identifier = SegmentIdentifier::new(7, 0xA000_0000_0000_0007);
+        let payload = vec![0x77; 64];
+        let mut writer = TarArchiveWriter::new(&directory, "data00000a.tar");
+        writer
+            .write_segment(
+                identifier,
+                &payload,
+                GarbageCollectionGeneration {
+                    generation: 1,
+                    full_generation: 1,
+                    is_compacted: false,
+                },
+                &[],
+                &[],
+            )
+            .expect("write segment");
+        writer.close().expect("close archive");
+        let pristine = std::fs::read(&path).expect("read pristine archive");
+
+        let reader = TarArchiveReader::open(&path).expect("open pristine archive");
+        reader
+            .validate_indexed_segment_entry(identifier)
+            .expect("writer produced a fully certified indexed entry");
+        let position = reader
+            .index_entry(identifier)
+            .expect("index entry")
+            .position;
+        drop(reader);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open archive for corruption");
+        file.seek(SeekFrom::Start(u64::from(position)))
+            .expect("seek payload");
+        file.write_all(&[0x76]).expect("corrupt payload");
+        file.sync_all().expect("sync corruption");
+        drop(file);
+        let reader = TarArchiveReader::open(&path).expect("index remains structurally valid");
+        assert!(
+            reader
+                .validate_indexed_segment_entry(identifier)
+                .expect_err("payload CRC mismatch must fail")
+                .to_string()
+                .contains("payload CRC")
+        );
+        drop(reader);
+
+        let header_start = usize::try_from(position).expect("position fits") - 512;
+        let mut wrong_name = pristine.clone();
+        wrong_name[header_start] = b'f';
+        std::fs::write(&path, wrong_name).expect("write wrong entry name");
+        let reader = TarArchiveReader::open(&path).expect("index still parses");
+        assert!(
+            reader
+                .validate_indexed_segment_entry(identifier)
+                .expect_err("header/index identifier mismatch must fail")
+                .to_string()
+                .contains("index names")
+        );
+        drop(reader);
+
+        std::fs::write(&path, &pristine).expect("restore archive");
+        let header_size_field = header_start + 124;
+        let mut wrong_size = pristine.clone();
+        wrong_size[header_size_field..header_size_field + 12].copy_from_slice(b"00000000000\0");
+        std::fs::write(&path, wrong_size).expect("write wrong header size");
+        let reader = TarArchiveReader::open(&path).expect("index still parses");
+        assert!(
+            reader
+                .validate_indexed_segment_entry(identifier)
+                .expect_err("header/index size mismatch must fail")
+                .to_string()
+                .contains("index size")
+        );
+        drop(reader);
+
+        let mut wrong_header_checksum = pristine;
+        wrong_header_checksum[header_start + 100] ^= 0x01;
+        std::fs::write(&path, wrong_header_checksum).expect("write bad header checksum");
+        let reader = TarArchiveReader::open(&path).expect("index still parses");
+        assert!(
+            reader
+                .validate_indexed_segment_entry(identifier)
+                .expect_err("tar header checksum mismatch must fail")
+                .to_string()
+                .contains("tar-header checksum")
+        );
+        drop(reader);
 
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }

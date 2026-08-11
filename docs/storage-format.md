@@ -21,6 +21,7 @@ A repository is one flat directory:
 | `manifest` | Java properties file; key `store.version` is `1` (Oak 1.6) or `2` (Oak 1.8 and later). Archives without a manifest mean the legacy pre-tar format. |
 | `gc.log` | One comma-separated line per completed garbage collection cycle. |
 | `repo.lock` | Zero-byte advisory lock target. Writers lock it; readers never touch it. |
+| `.repo.lock.creating.*` | Non-active lock-creation staging name. It can remain after an interrupted creator, is never selected as the canonical lock, and may be removed manually while no writer is starting. |
 
 ### Journal lines
 
@@ -245,9 +246,21 @@ subsequent Oak (or AEM) start depends on:
 * **Locking.** A write session takes an exclusive lock on `repo.lock`
   before anything else — a POSIX `fcntl` record lock, the same lock space
   Oak's `FileChannel.lock()` uses, so it genuinely excludes a running
-  instance. The lock file is never written or deleted.
-* **Manifest.** The manifest is rewritten with `store.version=2` on every
-  write open; a directory with archives but no manifest is rejected.
+  instance. An existing lock is opened once without following a final
+  symlink. On Unix, an absent lock is created under a same-directory
+  `.repo.lock.creating.*` name, changed to mode `0600`, fsynced, verified as a
+  regular file owned by the effective user, and published with an absent-only
+  hard link. The already-open inode is then locked, the staging link is
+  removed, and the directory is fsynced. A competing creator retries the
+  winner; filesystems without same-directory hard-link support fail instead of
+  falling back to a directly created canonical path. The canonical lock file
+  is never written or deleted.
+* **Manifest.** An ordinary writable-store open rewrites the manifest with
+  `store.version=2`; a directory with archives but no manifest is rejected.
+  Read-only cleanup planning never changes it. Cleanup apply atomically makes
+  the one-way version-one-to-version-two upgrade only when a selected
+  checkpoint removal or segment-archive rewrite will write version-two state,
+  and exposes that upgrade as a separate plan action.
 * **Durability ordering.** Segment bytes are appended and fsynced before
   the journal line referencing them is appended and fdatasynced, and a
   journal line is written only when the head actually moved. A crash
@@ -273,8 +286,10 @@ subsequent Oak (or AEM) start depends on:
 * **Compaction.** Offline compaction deep-copies the reachable tree
   (content root and every checkpoint) into a fresh generation, reclaims
   the old generations with Oak's reclaim predicate, and rewrites the
-  journal to a single line. Checkpoints and their shared root snapshots
-  survive.
+  journal to a single line. Post-compaction archive rewrites publish validated
+  successors with same-directory hard links, so `compact` requires that
+  filesystem capability whenever reclamation rewrites an archive. Checkpoints
+  and their shared root snapshots survive.
 * **Never in place.** Existing archives with an index are immutable;
   every rewrite goes to a new file, and `journal.log` and `gc.log` are
   append-only (compaction's journal rewrite writes a fresh file and
