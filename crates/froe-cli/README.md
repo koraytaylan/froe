@@ -43,7 +43,7 @@ over the format's 256 KiB limit is refused before rendering. It also safely
 escapes segment-info terminal controls and names unknown record types. The
 second walks the current head from the super-root (so live JCR content appears
 below `/root/`), attributes node, template, stored-property, and binary
-bulk-block records to each named active archive, and prints its segment graph.
+block records to each named active archive, and prints its segment graph.
 Archive arguments are canonical `data*.tar`
 file names in the repository, not arbitrary paths. A missing archive is
 reported and skipped, as is a superseded archive that is no longer active;
@@ -51,14 +51,20 @@ the graph always prints one row per segment, including empty data and bulk
 rows. A valid stored graph is trusted; an absent or corrupt optional graph is
 reconstructed from the archive's data-segment reference tables without
 discarding independently derived path attribution.
-Exceptionally large non-binary property displays are summarized rather than
-materialized; normal STRING/STRINGS displays use Oak's fixed default of 60
-Java characters (with an empty STRINGS value left unquoted, like Oak), while
-binary bulk-block attribution still examines every block. Reports retain at
-most 250,000 attribution rows and 64 MiB of path/name/value text; exceeding a
-limit fails with the attempted and configured sizes instead of risking an
-unbounded allocation. External binaries report that their size is unavailable
-when no blob store is configured.
+STRING/STRINGS displays use Oak's first-value-only preview of 60 Java UTF-16
+code units and full UTF-16 length (with an empty STRINGS value left unquoted).
+Other scalar and array values render in full; a report that cannot retain the
+full value fails with a typed budget error instead of printing an invented
+omission summary. Scalar external binaries render Oak's `{-1 bytes}` without
+resolving a long external identifier, and binary arrays retain their count.
+By default each archive report is limited to 250,000 attribution rows, 64 MiB
+of path/name/value text, 100,000,000 logical work units, 250,000 children
+materialized from any one node, and 16 MiB of stored child/template-name bytes
+per node, plus 250,000 pending child visits, 250,000 graph rows, and 1,000,000
+graph edges. A refusal reports the configured and attempted bound. Each archive
+argument currently performs its own bounded head traversal;
+the command does not batch several archive names into one globally budgeted
+walk.
 Both commands remain strictly read-only and never create or acquire
 `repo.lock`.
 

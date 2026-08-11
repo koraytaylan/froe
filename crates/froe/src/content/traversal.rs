@@ -53,6 +53,14 @@ enum WorkItem<'provider> {
     RestorePathLength(usize),
 }
 
+#[derive(Clone, Copy)]
+struct SchedulingLimits {
+    children: u64,
+    child_name_bytes: u64,
+    work: u64,
+    pending_nodes: u64,
+}
+
 /// One visited node, valid until the traversal advances.
 pub struct VisitedNode<'traversal, 'provider> {
     /// The node's content path.
@@ -61,6 +69,12 @@ pub struct VisitedNode<'traversal, 'provider> {
     pub node: NodeState<'provider>,
     /// How many levels below the traversal root the node sits.
     pub depth: usize,
+    /// Children scheduled for later visits while producing this node.
+    pub scheduled_children: u64,
+    /// Stored bytes of child names materialized while scheduling them.
+    pub scheduled_child_name_bytes: u64,
+    /// Map records visited while counting and enumerating scheduled children.
+    pub scheduled_child_map_records: u64,
 }
 
 /// A depth-first walk over a subtree, in document order.
@@ -69,6 +83,7 @@ pub struct DepthFirstTraversal<'provider> {
     path_buffer: String,
     descent_limit: Option<usize>,
     visited_nodes: u64,
+    pending_nodes: u64,
 }
 
 impl<'provider> DepthFirstTraversal<'provider> {
@@ -91,6 +106,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
             path_buffer,
             descent_limit,
             visited_nodes: 0,
+            pending_nodes: 1,
         }
     }
 
@@ -98,6 +114,34 @@ impl<'provider> DepthFirstTraversal<'provider> {
     /// the subtree is exhausted. The returned [`VisitedNode`] borrows the
     /// traversal's path buffer, so it lives until the next call.
     pub fn next_node(&mut self) -> Result<Option<VisitedNode<'_, 'provider>>> {
+        self.next_node_internal(None)
+    }
+
+    /// Advances with independent per-node child-count and stored-name-byte
+    /// caps, plus a combined scheduling-work cap checked before expansion.
+    pub(crate) fn next_node_with_scheduling_limits(
+        &mut self,
+        maximum_scheduled_children: u64,
+        maximum_scheduled_child_name_bytes: u64,
+        maximum_scheduling_work: u64,
+        maximum_pending_nodes: u64,
+    ) -> Result<Option<VisitedNode<'_, 'provider>>> {
+        self.next_node_internal(Some(SchedulingLimits {
+            children: maximum_scheduled_children,
+            child_name_bytes: maximum_scheduled_child_name_bytes,
+            work: maximum_scheduling_work,
+            pending_nodes: maximum_pending_nodes,
+        }))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the traversal step keeps path restoration and bounded child scheduling in one state transition"
+    )]
+    fn next_node_internal(
+        &mut self,
+        limits: Option<SchedulingLimits>,
+    ) -> Result<Option<VisitedNode<'_, 'provider>>> {
         loop {
             let Some(item) = self.stack.pop() else {
                 return Ok(None);
@@ -107,7 +151,10 @@ impl<'provider> DepthFirstTraversal<'provider> {
                     self.path_buffer.truncate(length);
                     continue;
                 }
-                WorkItem::Visit { node, name, depth } => (node, name, depth),
+                WorkItem::Visit { node, name, depth } => {
+                    self.pending_nodes = self.pending_nodes.saturating_sub(1);
+                    (node, name, depth)
+                }
             };
             if depth >= MAXIMUM_TRAVERSAL_DEPTH {
                 return Err(Error::InvalidFormat {
@@ -138,23 +185,119 @@ impl<'provider> DepthFirstTraversal<'provider> {
                 Some(limit) => depth < limit,
                 None => true,
             };
-            if descend {
-                // Push children in reverse so they pop in storage order.
-                for (child_name, child) in node.child_node_entries()?.into_iter().rev() {
-                    self.stack.push(WorkItem::Visit {
-                        node: child,
-                        name: child_name,
-                        depth: depth + 1,
-                    });
-                }
-            }
+            let (scheduled_children, scheduled_child_name_bytes, scheduled_child_map_records) =
+                if descend {
+                    let (child_entries, child_count, child_name_bytes, child_map_records) =
+                        if let Some(limits) = limits {
+                            let (child_count, count_map_records) = node
+                                .child_node_count_with_maximum_work(limits.work)
+                                .map_err(|error| match error {
+                                    Error::MapTraversalWorkBudgetExceeded {
+                                        attempted_work_units,
+                                        ..
+                                    } => Error::TraversalSchedulingWorkBudgetExceeded {
+                                        maximum_scheduling_work: limits.work,
+                                        attempted_scheduling_work: attempted_work_units,
+                                    },
+                                    other => other,
+                                })?;
+                            if child_count > limits.children {
+                                return Err(Error::TraversalSchedulingBudgetExceeded {
+                                    maximum_scheduled_children: limits.children,
+                                    attempted_scheduled_children: child_count,
+                                });
+                            }
+                            let reserved_work = child_count.saturating_add(count_map_records);
+                            if reserved_work > limits.work {
+                                return Err(Error::TraversalSchedulingWorkBudgetExceeded {
+                                    maximum_scheduling_work: limits.work,
+                                    attempted_scheduling_work: reserved_work,
+                                });
+                            }
+                            let remaining_work = limits.work - reserved_work;
+                            let maximum_name_bytes = limits.child_name_bytes.min(remaining_work);
+                            let (entries, name_bytes, enumeration_map_records) = node
+                                .child_node_entries_with_limits(
+                                    child_count,
+                                    maximum_name_bytes,
+                                    remaining_work,
+                                )
+                                .map_err(|error| match error {
+                                    Error::StringMaterializationBudgetExceeded {
+                                        maximum_stored_bytes,
+                                        attempted_stored_bytes,
+                                        ..
+                                    } => Error::TraversalChildNameBudgetExceeded {
+                                        maximum_stored_child_name_bytes: maximum_stored_bytes,
+                                        attempted_stored_child_name_bytes: attempted_stored_bytes,
+                                        scheduled_children: child_count,
+                                    },
+                                    Error::MapTraversalWorkBudgetExceeded {
+                                        attempted_work_units,
+                                        ..
+                                    } => Error::TraversalSchedulingWorkBudgetExceeded {
+                                        maximum_scheduling_work: limits.work,
+                                        attempted_scheduling_work: reserved_work
+                                            .saturating_add(attempted_work_units),
+                                    },
+                                    Error::MapEntryBudgetExceeded {
+                                        attempted_entries, ..
+                                    } => Error::TraversalSchedulingBudgetExceeded {
+                                        maximum_scheduled_children: limits.children,
+                                        attempted_scheduled_children: attempted_entries,
+                                    },
+                                    other => other,
+                                })?;
+                            (
+                                entries,
+                                child_count,
+                                name_bytes,
+                                count_map_records.saturating_add(enumeration_map_records),
+                            )
+                        } else {
+                            let entries = node.child_node_entries()?;
+                            let child_count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+                            (entries, child_count, 0, 0)
+                        };
+
+                    let attempted_pending_nodes = self
+                        .pending_nodes
+                        .saturating_add(u64::try_from(child_entries.len()).unwrap_or(u64::MAX));
+                    if let Some(limits) = limits
+                        && attempted_pending_nodes > limits.pending_nodes
+                    {
+                        return Err(Error::TraversalPendingBudgetExceeded {
+                            maximum_pending_nodes: limits.pending_nodes,
+                            attempted_pending_nodes,
+                        });
+                    }
+                    self.pending_nodes = attempted_pending_nodes;
+                    // Push children in reverse so they pop in storage order.
+                    for (child_name, child) in child_entries.into_iter().rev() {
+                        self.stack.push(WorkItem::Visit {
+                            node: child,
+                            name: child_name,
+                            depth: depth + 1,
+                        });
+                    }
+                    (child_count, child_name_bytes, child_map_records)
+                } else {
+                    (0, 0, 0)
+                };
 
             let path = if self.path_buffer.is_empty() {
                 "/"
             } else {
                 self.path_buffer.as_str()
             };
-            return Ok(Some(VisitedNode { path, node, depth }));
+            return Ok(Some(VisitedNode {
+                path,
+                node,
+                depth,
+                scheduled_children,
+                scheduled_child_name_bytes,
+                scheduled_child_map_records,
+            }));
         }
     }
 }
@@ -162,7 +305,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
 #[cfg(test)]
 mod tests {
     use super::DepthFirstTraversal;
-    use crate::content::provider::tests::MemorySegmentProvider;
+    use crate::content::provider::tests::{CountingSegmentProvider, MemorySegmentProvider};
     use crate::content::template::tests::{TemplateArity, template_record};
     use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
     use crate::segment::record::RecordIdentifier;
@@ -362,5 +505,48 @@ mod tests {
             error.to_string().contains("cycle"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn ordinary_traversal_uses_the_provider_template_surface() {
+        let identifier_bytes = |record_number: u32| {
+            let mut bytes = [0u8; 6];
+            bytes[2..6].copy_from_slice(&record_number.to_be_bytes());
+            bytes
+        };
+        let segment = data_segment_identifier(2);
+        let mut child_name = vec![5u8];
+        child_name.extend_from_slice(b"child");
+        let mut root = Vec::new();
+        root.extend_from_slice(&identifier_bytes(30));
+        root.extend_from_slice(&identifier_bytes(21));
+        root.extend_from_slice(&identifier_bytes(31));
+        let mut child = Vec::new();
+        child.extend_from_slice(&identifier_bytes(31));
+        child.extend_from_slice(&identifier_bytes(22));
+        let records = vec![
+            (1, 4, child_name),
+            (
+                21,
+                6,
+                template_record(None, &[], &TemplateArity::One(1), None, &[]),
+            ),
+            (
+                22,
+                6,
+                template_record(None, &[], &TemplateArity::Zero, None, &[]),
+            ),
+            (30, 7, root),
+            (31, 7, child),
+        ];
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(segment, synthetic_data_segment(&[], &records));
+        let provider = CountingSegmentProvider::new(&inner);
+        let node =
+            crate::content::node::NodeState::new(&provider, RecordIdentifier::new(segment, 30));
+        let mut traversal = DepthFirstTraversal::new(node, "/", None);
+
+        assert!(traversal.next_node().expect("advance").is_some());
+        assert_eq!(provider.template_reads(), 1);
     }
 }

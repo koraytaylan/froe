@@ -18,7 +18,10 @@ pub use archive_debug::{
     ArchiveDebugError, ArchiveDebugGraph, ArchiveDebugOptions, ArchiveDebugReport,
     ArchiveDebugResult, ArchiveDebugState, ArchiveDebugWork, ArchiveGraphOrigin,
     ArchiveGraphReferences, ArchiveGraphRow, ArchivePathReference, ArchivePropertyDisplay,
-    DEFAULT_MAXIMUM_ARCHIVE_PATH_REFERENCES, DEFAULT_MAXIMUM_ARCHIVE_REFERENCE_TEXT_BYTES,
+    DEFAULT_MAXIMUM_ARCHIVE_GRAPH_EDGES, DEFAULT_MAXIMUM_ARCHIVE_GRAPH_ROWS,
+    DEFAULT_MAXIMUM_ARCHIVE_NAME_BYTES_PER_NODE, DEFAULT_MAXIMUM_ARCHIVE_PATH_REFERENCES,
+    DEFAULT_MAXIMUM_ARCHIVE_PENDING_NODES, DEFAULT_MAXIMUM_ARCHIVE_REFERENCE_TEXT_BYTES,
+    DEFAULT_MAXIMUM_ARCHIVE_SCHEDULED_CHILDREN_PER_NODE, DEFAULT_MAXIMUM_ARCHIVE_WORK_UNITS,
     debug_archive, debug_archive_with_options,
 };
 pub use check::{

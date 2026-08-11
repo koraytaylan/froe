@@ -84,7 +84,8 @@ enum Command {
     Debug {
         /// The segment store directory.
         repository: PathBuf,
-        /// Canonical active archive file names, for example data00000a.tar.
+        /// Canonical archive names, for example data00000a.tar; missing or
+        /// inactive archives are reported and skipped.
         #[arg(required = true)]
         archives: Vec<String>,
     },

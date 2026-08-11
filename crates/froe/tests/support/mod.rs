@@ -85,6 +85,11 @@ pub fn string_record(text: &str) -> Vec<u8> {
 pub const TYPE_MAP_LEAF: u8 = 0;
 pub const TYPE_MAP_BRANCH: u8 = 1;
 pub const TYPE_LIST_BUCKET: u8 = 2;
+#[allow(
+    dead_code,
+    reason = "only the diagnostics integration binary independently encodes counted lists"
+)]
+pub const TYPE_LIST: u8 = 3;
 pub const TYPE_VALUE: u8 = 4;
 pub const TYPE_TEMPLATE: u8 = 6;
 pub const TYPE_NODE: u8 = 7;
@@ -240,6 +245,7 @@ fn leaf_map_record(level: u32, entries: &[MapEntryFixture]) -> Vec<u8> {
 pub struct ArchiveBuilder {
     segments: Vec<(SegmentUuid, Vec<u8>)>,
     include_index: bool,
+    graph: Vec<(SegmentUuid, Vec<SegmentUuid>)>,
 }
 
 impl ArchiveBuilder {
@@ -247,6 +253,7 @@ impl ArchiveBuilder {
         Self {
             segments: Vec::new(),
             include_index: true,
+            graph: Vec::new(),
         }
     }
 
@@ -259,6 +266,17 @@ impl ArchiveBuilder {
 
     pub fn add_segment(&mut self, uuid: SegmentUuid, bytes: Vec<u8>) {
         self.segments.push((uuid, bytes));
+    }
+
+    /// Supplies graph rows encoded independently into the `.gph` trailer.
+    /// Row and target order, including duplicate source rows, is preserved.
+    #[allow(
+        dead_code,
+        reason = "only the diagnostics integration binary needs a nonempty graph fixture"
+    )]
+    pub fn with_graph(mut self, graph: Vec<(SegmentUuid, Vec<SegmentUuid>)>) -> Self {
+        self.graph = graph;
+        self
     }
 
     /// Serializes the archive: segment entries, then (unless disabled)
@@ -295,11 +313,25 @@ impl ArchiveBuilder {
             ));
             archive.extend_from_slice(&references_payload);
 
-            // Empty graph: same shape with the graph magic.
-            let mut graph_payload = vec![0u8; 512 - 16];
-            graph_payload.extend_from_slice(&crc32(&[]).to_be_bytes());
-            graph_payload.extend_from_slice(&0u32.to_be_bytes());
-            graph_payload.extend_from_slice(&16u32.to_be_bytes());
+            // Graph rows use their on-disk source/count/targets structure,
+            // independently of the production parser and TAR writer.
+            let mut graph_data = Vec::new();
+            for ((source_most, source_least), targets) in &self.graph {
+                graph_data.extend_from_slice(&source_most.to_be_bytes());
+                graph_data.extend_from_slice(&source_least.to_be_bytes());
+                graph_data.extend_from_slice(&(targets.len() as u32).to_be_bytes());
+                for (target_most, target_least) in targets {
+                    graph_data.extend_from_slice(&target_most.to_be_bytes());
+                    graph_data.extend_from_slice(&target_least.to_be_bytes());
+                }
+            }
+            let graph_size = graph_data.len() + 16;
+            let graph_padded_size = graph_size.div_ceil(512) * 512;
+            let mut graph_payload = vec![0u8; graph_padded_size - graph_size];
+            graph_payload.extend_from_slice(&graph_data);
+            graph_payload.extend_from_slice(&crc32(&graph_data).to_be_bytes());
+            graph_payload.extend_from_slice(&(self.graph.len() as u32).to_be_bytes());
+            graph_payload.extend_from_slice(&(graph_size as u32).to_be_bytes());
             graph_payload.extend_from_slice(&0x0A30_470Au32.to_be_bytes());
             archive.extend(tar_entry_header(
                 &format!("{archive_file_name}.gph"),

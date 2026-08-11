@@ -1,15 +1,14 @@
 //! Rendering for the read-only diagnostic commands: check, diff,
 //! history, search, segment dumps, and archive attribution.
 
-use std::fmt::Write as _;
+use std::io;
 use std::path::Path;
 
 use froe::content::node::PropertyValues;
 use froe::segment::identifier::SegmentIdentifier;
 use froe::store::Repository;
 use froe::tooling::archive_debug::{
-    ArchiveDebugState, ArchiveGraphReferences, ArchivePathReference, ArchivePropertyDisplay,
-    debug_archive,
+    ArchiveDebugState, ArchiveGraphReferences, ArchivePathReference, debug_archive,
 };
 use froe::tooling::diff::{NodeDifference, PropertyChange};
 use froe::tooling::search::SearchQuery;
@@ -50,6 +49,13 @@ pub(crate) fn print_archive_debug(
                 continue;
             }
             ArchiveDebugState::Active => {}
+            _ => {
+                println!(
+                    "archive has an unsupported state, skipping {}",
+                    report.archive_file_name
+                );
+                continue;
+            }
         }
 
         println!(
@@ -76,18 +82,20 @@ pub(crate) fn print_archive_debug(
                 for row in &graph.rows {
                     match &row.references {
                         ArchiveGraphReferences::Available(targets) => {
-                            let targets = targets
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            println!("{}=[{targets}]", row.segment_identifier);
+                            let stdout = io::stdout();
+                            let mut output = stdout.lock();
+                            write_available_graph_row(
+                                &mut output,
+                                row.segment_identifier,
+                                targets,
+                            )?;
                         }
                         ArchiveGraphReferences::Unavailable { details } => println!(
                             "{}=unavailable ({})",
                             row.segment_identifier,
                             sanitize_terminal_text(details)
                         ),
+                        _ => println!("{}=unavailable", row.segment_identifier),
                     }
                 }
             }
@@ -95,6 +103,21 @@ pub(crate) fn print_archive_debug(
         }
     }
     Ok(())
+}
+
+fn write_available_graph_row(
+    output: &mut dyn io::Write,
+    source: SegmentIdentifier,
+    targets: &[SegmentIdentifier],
+) -> io::Result<()> {
+    write!(output, "{source}=[")?;
+    for (position, target) in targets.iter().enumerate() {
+        if position > 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{target}")?;
+    }
+    writeln!(output, "]")
 }
 
 fn print_archive_reference(reference: &ArchivePathReference) {
@@ -122,11 +145,7 @@ fn print_archive_reference(reference: &ArchivePathReference) {
             display,
             ..
         } => {
-            let display = match display {
-                ArchivePropertyDisplay::String(value) => java_string_display(value, 60),
-                ArchivePropertyDisplay::EmptyStrings => String::new(),
-                ArchivePropertyDisplay::Other(value) => sanitize_terminal_text(value),
-            };
+            let display = sanitize_terminal_text(&display.oak_rendered_value());
             println!(
                 "  {}{} = {display} [SegmentPropertyState<{}>@{record_identifier}]",
                 sanitize_terminal_text(path),
@@ -134,6 +153,7 @@ fn print_archive_reference(reference: &ArchivePathReference) {
                 oak_property_type_name(*property_type, *is_multiple),
             );
         }
+        _ => println!("  unsupported archive reference"),
     }
 }
 
@@ -146,31 +166,6 @@ fn oak_property_type_name(property_type: froe::PropertyType, is_multiple: bool) 
     } else {
         format!("{singular}S")
     }
-}
-
-/// Oak's default `max.char.display` is 60 Java `char`s. Commons Lang's
-/// `escapeJava` then escapes controls and non-ASCII UTF-16 code units.
-fn java_string_display(value: &str, maximum_characters: usize) -> String {
-    let character_count = value.encode_utf16().count();
-    let mut display = String::from("\"");
-    for unit in value.encode_utf16().take(maximum_characters) {
-        match unit {
-            0x08 => display.push_str("\\b"),
-            0x09 => display.push_str("\\t"),
-            0x0a => display.push_str("\\n"),
-            0x0c => display.push_str("\\f"),
-            0x0d => display.push_str("\\r"),
-            0x22 => display.push_str("\\\""),
-            0x5c => display.push_str("\\\\"),
-            0x20..=0x7e => display.push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
-            _ => write!(display, "\\u{unit:04X}").expect("writing to a String cannot fail"),
-        }
-    }
-    if character_count > maximum_characters {
-        write!(display, "... ({character_count} chars)").expect("writing to a String cannot fail");
-    }
-    display.push('"');
-    display
 }
 
 /// `froe check`: each path's latest good revision, Oak-style. Succeeds
@@ -370,16 +365,32 @@ pub(crate) fn print_search(
 
 #[cfg(test)]
 mod archive_rendering_tests {
-    use super::{java_string_display, oak_property_type_name};
+    use super::{oak_property_type_name, write_available_graph_row};
+    use froe::segment::identifier::SegmentIdentifier;
+    use froe::tooling::ArchivePropertyDisplay;
 
     #[test]
     fn string_display_uses_java_escaping_and_utf16_truncation() {
+        let escaped_units: Vec<u16> = "quote \" slash \\ line\n caf\u{e9}"
+            .encode_utf16()
+            .collect();
         assert_eq!(
-            java_string_display("quote \" slash \\ line\n caf\u{e9}", 60),
+            ArchivePropertyDisplay::String {
+                preview_utf16: escaped_units.clone(),
+                utf16_length: escaped_units.len() as u64,
+            }
+            .oak_rendered_value(),
             "\"quote \\\" slash \\\\ line\\n caf\\u00E9\""
         );
         assert_eq!(
-            java_string_display(&format!("{}\u{1f600}", "x".repeat(59)), 60),
+            ArchivePropertyDisplay::String {
+                preview_utf16: format!("{}\u{1f600}", "x".repeat(59))
+                    .encode_utf16()
+                    .take(60)
+                    .collect::<Vec<_>>(),
+                utf16_length: 61,
+            }
+            .oak_rendered_value(),
             format!("\"{}\\uD83D... (61 chars)\"", "x".repeat(59)),
             "the sixty-character boundary follows Java UTF-16 units"
         );
@@ -398,6 +409,34 @@ mod archive_rendering_tests {
         assert_eq!(
             oak_property_type_name(froe::PropertyType::Binary, true),
             "BINARIES"
+        );
+    }
+
+    #[test]
+    fn high_degree_graph_rows_stream_without_collecting_target_strings() {
+        struct CountingWriter(usize);
+        impl std::io::Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let identifier = SegmentIdentifier::new(1, 0xa000_0000_0000_0001);
+        let targets = vec![identifier; 10_000];
+        let mut output = CountingWriter(0);
+        write_available_graph_row(&mut output, identifier, &targets).expect("render row");
+        assert_eq!(
+            output.0,
+            identifier.to_string().len()
+                + "=[".len()
+                + targets.len() * identifier.to_string().len()
+                + (targets.len() - 1) * ", ".len()
+                + "]\n".len()
         );
     }
 }

@@ -116,7 +116,10 @@ Missing journal or exception ⇒ empty list (exception also stack-traced to stde
   `DECIMAL` and plural forms `STRINGS`, `BINARIES`, `LONGS`, … for arrays.
 - **`AbstractPropertyState.toString(PropertyState)`** (oak-store-spi): `BINARIES` ⇒
   `name + " = [" + count + " binaries]"`; `BINARY` ⇒ `name + " = {" + size + " bytes}"`;
-  else `name + " = " + value` (array values render as Java list `[a, b]`).
+  else `name + " = " + value` (array values render as Java list `[a, b]`). Its
+  `getBinarySize` catches an unavailable binary's exception and returns `-1`, so a scalar
+  external binary without a blob store renders exactly `{-1 bytes}` rather than failing the
+  diagnostic or resolving its identifier merely to classify it.
 - **`AbstractNodeState.toString(NodeState)`** (oak-store-spi, line ~200): non-existent ⇒
   `"{N/A}"`; else `{ prop1, prop2, child1 : {...}, ... }` — properties first, then child
   entries capped at `CHILDREN_CAP` = sysprop `oak.children.cap`, default 100 (then
@@ -533,12 +536,18 @@ Per tar name `t` (as given on the command line, must end `.tar`):
   - property whose value record lives in the tar:
     - STRING type: `{path}{name} = {display} [SegmentPropertyState<{TYPE}>@{recordId}]`,
       where `display` = first value only, truncated to sysprop `max.char.display`
-      (default 60) chars with `... ({len} chars)` suffix, Java-escaped
-      (`StringEscapeUtils.escapeJava`), double-quoted;
+      (default 60) Java UTF-16 code units using `String.length()` and `substring`, with
+      `... ({len} chars)` carrying the full UTF-16 length, then Java-escaped
+      (`StringEscapeUtils.escapeJava`) and double-quoted. A substring can therefore end
+      between a supplementary character's two surrogate code units;
     - other types: `{path}{propertyToString} [SegmentPropertyState<{TYPE}>@{recordId}]`
       (property via `AbstractPropertyState.toString`, §0.4);
   - BINARY properties additionally match when any of the blob's bulk segment ids
-    (`SegmentBlob.getBulkSegmentIds`) is in the tar (same non-string line format);
+    (`SegmentBlob.getBulkSegmentIds`) is in the tar (same non-string line format).
+    `getBulkSegmentIds` inserts every long-value block record's segment id into a
+    `HashSet` without requiring the segment kind to be bulk. The set is built eagerly,
+    so every block-list entry is resolved even after an earlier segment would match;
+    `DebugTars` then excludes the property record's own segment id before matching the tar;
   - node record in the tar: `{path} [SegmentNodeState@{recordId}]`;
   - template record in the tar: `{path}[Template@{recordId}]` (**no space** before `[` —
     quirk, line 231).
@@ -547,6 +556,10 @@ Per tar name `t` (as given on the command line, must end `.tar`):
 - Then a blank line, `Tar graph:`, and per index-map entry `"{uuid}={setOfUuids}"`
   (`java.util.UUID` toString and `Set` toString `[a, b]`; `HashMap` iteration order). A
   failure reading the graph prints `Error getting tar graph:` + stack trace to stderr.
+  Stored graph parsing gives each row's targets set semantics and inserts rows with
+  `Map.put(source, targets)`, so a duplicate source row replaces the preceding row
+  (last row wins). `TarFiles.getGraph` emits an empty set for an indexed segment with
+  no stored source row.
 
 ### 5.2 DebugSegments (`tool/DebugSegments.java`)
 

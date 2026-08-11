@@ -71,9 +71,9 @@ after which a normal AEM start consumes the result cleanly.
 | Segment-info record (`{"wid","sno","t"}`) | `SegmentBufferWriter.newSegment` | written as record 0 by `RecordWriter` | **Implemented** |
 | Deduplication caches | `WriterCacheManager`, `PriorityCache` | source-record cache during compaction; content preservation by identity during commit | **Implemented** (correctness; a global write-side dedup cache is **Planned** as a size optimization) |
 | Segment, string, and template caches | `SegmentCache`, `StringCache`, `TemplateCache` | bounded caches on `Repository` | **Implemented** |
-| Streaming reads of large binaries | `SegmentStream` | `content::read_binary_stream`, `BinaryStream` (`Read` plus typed `read_chunk`) | **Implemented** (lazy 4 KiB block traversal with constant stream state; `read_binary_content` remains as an explicitly materializing compatibility helper) |
+| Streaming reads of large binaries | `SegmentStream` | `content::read_binary_stream`, `BinaryStream` (`Read` plus typed `read_chunk`) | **Implemented** (lazy 4 KiB block traversal with constant stream state; the opener reports a long external value by record without resolving its identifier; `read_binary_content` remains an explicitly materializing compatibility helper with the legacy identifier-bearing error) |
 | Record space usage analysis | `RecordUsageAnalyser` | `froe segment` prints per-type record counts | **Implemented** (summary form) |
-| Segment hex dump | `SegmentDump` | `tooling::dump_segment`, `tooling::dump_segment_bytes`, `froe segment --hex` | **Implemented** (Oak headers, hexadecimal record numbers, and Commons IO byte layout; structurally corrupt segments retain a raw dump and terminal-safe parse diagnostic, while over-size input is rejected before parsing/render allocation) |
+| Segment hex dump | `SegmentDump` | `tooling::dump_segment`, `tooling::dump_segment_bytes`, `froe segment --hex` | **Implemented** (Oak headers, hexadecimal record numbers, and Commons IO byte layout; structurally corrupt segments retain a raw dump and terminal-safe parse diagnostic, while over-size input is rejected before parsing/render allocation; the Windows CRLF path is cross-target compile-checked, but its assertions have not run on a native Windows runner) |
 
 ### 1.4 Journal and metadata files
 
@@ -83,7 +83,7 @@ after which a normal AEM start consumes the result cleanly.
 | Journal append and rewrite | `TarRevisions.doFlush`, `Compact` rewrite | `WritableRepository::flush`, compaction and byte-preserving cleanup journal rewrites | **Implemented** |
 | Record identifier string forms | `RecordId.fromString`/`toString10` | `journal::parse_record_identifier_text` | **Implemented** |
 | `gc.log` writing | `GCJournal.persist` | successful offline compaction appends and syncs Oak's seven-field line | **Implemented** (reduced form: no Oak-style no-op suppression; standalone cleanup does not write it) |
-| `gc.log` parsing | `GCJournal.read`, `readAll` | `gc_journal::{read_gc_journal, read_all_gc_journal}` | **Implemented** (six/seven-field layouts, Java split/numeric fallbacks, line-ending and unreadable-file behavior) |
+| `gc.log` parsing | `GCJournal.read`, `readAll` | `gc_journal::{read_gc_journal, read_all_gc_journal, read_gc_journal_with_options, read_all_gc_journal_with_options}` | **Implemented** (six/seven-field layouts, Java split/numeric fallbacks, line-ending and unreadable-file behavior; streaming readers default to 64 MiB/file, 1 MiB/line, and 250,000 entries, with typed configurable-limit errors; Oak-style wrappers treat limit failures as an empty optional journal) |
 
 ## 2. Garbage collection and compaction
 
@@ -115,7 +115,7 @@ after which a normal AEM start consumes the result cleanly.
 | `debug PATH` (store statistics) | `tool/DebugStore` | `froe summary`, `froe archives`, `froe segments` | **Implemented** (reachability analysis **Planned**) |
 | `debug PATH uuid:record/path` | `tool/DebugSegments` | `froe segment`, `froe node` | **Implemented** |
 | `explore` (GUI) | `oak-run` + `file/proc/Proc` | `froe tree`, `froe node` | **Implemented** (terminal form) |
-| `debug PATH file.tar` | `tool/DebugTars` | `tooling::debug_archive`, `tooling::debug_archive_with_options`, `froe debug PATH file.tar…` | **Implemented** (bounded node/template/property/binary attribution; Oak-style total graph rows for every segment; missing/corrupt graphs reconstructed archive-locally) |
+| `debug PATH file.tar` | `tool/DebugTars` | `tooling::debug_archive`, `tooling::debug_archive_with_options`, `froe debug PATH file.tar…` | **Implemented** (bounded total work/result text/per-node expansion; Oak UTF-16 STRING preview and full other values; external binary `{-1 bytes}`; all-kind long-value block segment attribution; stored graph set/last-row semantics and archive-local reconstruction) |
 | `iotrace` | `tool/iotrace` | — | **Not applicable** (measures the Java store's IO behavior) |
 | `segment-copy` (remote persistences) | `oak-segment-azure` tooling | — | **Planned** alongside remote persistence support |
 
@@ -132,7 +132,7 @@ introduction above):
 | `froe archives REPOSITORY` | Per-archive size, segment count, index version or recovery state. |
 | `froe segments REPOSITORY` | Every segment with kind, size, and generation data. |
 | `froe segment REPOSITORY UUID [--hex]` | One segment's summary, or an Oak-compatible `SegmentDump` header, record table, and raw-byte dump that remains available after structural parse failure. |
-| `froe debug REPOSITORY dataNNNNNa.tar…` | Bounded current-head super-root attribution plus one graph row per active-archive segment, reconstructing a missing/corrupt stored graph from segment bytes. |
+| `froe debug REPOSITORY dataNNNNNa.tar…` | Current-head super-root attribution plus one graph row per active-archive segment, with default 250,000 attribution-row, 64-MiB text, 100,000,000-work-unit, 250,000-child-per-node, 16-MiB stored-name-per-node, 250,000-pending-node, 250,000-graph-row, and 1,000,000-graph-edge bounds; each archive argument performs a separate bounded traversal. |
 | `froe node REPOSITORY PATH` | One node: record identifiers, typed properties, children. |
 | `froe tree REPOSITORY [PATH] [--depth N]` | Indented content tree with primary types. |
 | `froe checkpoints REPOSITORY` | Checkpoint names with creation and expiry times. |
@@ -208,7 +208,8 @@ fn main() -> froe::Result<()> {
 The crate exposes each layer independently: `tar_archive` (archives,
 indexes, graphs, binary reference catalogs), `segment` (segment parsing,
 addressing, and building), `content` (records to node states), `journal`,
-`store` (the read-only repository), `writer` (the write path), and
-`tooling` (check, diff, history, search). Custom backends implement the
-`SegmentProvider` and `SegmentSink` traits and reuse the whole content and
-writer layers unchanged.
+`gc_journal`, `store` (the read-only repository), `writer` (the write path),
+and `tooling` (check, diff, history, search, `tooling::segment_dump` /
+`dump_segment`, archive debug).
+Custom backends implement the `SegmentProvider` and `SegmentSink` traits and
+reuse the whole content and writer layers unchanged.

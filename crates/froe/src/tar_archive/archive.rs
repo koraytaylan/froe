@@ -30,7 +30,9 @@ use crate::error::{Error, Result};
 use crate::segment::identifier::SegmentIdentifier;
 use crate::tar_archive::binary_references::{BinaryReferences, parse_binary_references};
 use crate::tar_archive::entry_header::TarEntryHeader;
-use crate::tar_archive::graph::{SegmentGraph, parse_segment_graph};
+use crate::tar_archive::graph::{
+    BoundedSegmentGraph, SegmentGraph, parse_segment_graph, parse_segment_graph_with_limits,
+};
 use crate::tar_archive::index::{
     SegmentIndex, SegmentIndexEntry, index_entry_disk_size, parse_segment_index,
 };
@@ -332,6 +334,25 @@ impl TarArchiveReader {
     #[must_use]
     pub fn segment_graph(&self) -> Option<SegmentGraph> {
         parse_segment_graph(&self.bytes, self.index()?)
+    }
+
+    /// Parses the optional graph while bounding checksum and allocation work.
+    pub(crate) fn segment_graph_with_limits(
+        &self,
+        maximum_work_units: u64,
+        maximum_rows: usize,
+        maximum_edges: usize,
+    ) -> BoundedSegmentGraph {
+        let Some(index) = self.index() else {
+            return BoundedSegmentGraph::Unavailable { work_units: 0 };
+        };
+        parse_segment_graph_with_limits(
+            &self.bytes,
+            index,
+            maximum_work_units,
+            maximum_rows,
+            maximum_edges,
+        )
     }
 
     /// Parses the archive's binary references catalog, when present and

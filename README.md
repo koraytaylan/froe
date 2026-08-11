@@ -68,6 +68,16 @@ $ target/release/froe backup /path/to/segmentstore /path/to/backup
 $ target/release/froe recover-journal /path/to/segmentstore
 ```
 
+Archive debug output follows Oak's UTF-16 STRING preview and full rendering for
+other values; unavailable scalar external binaries appear as `{-1 bytes}`.
+Each named archive is a separate read-only traversal, bounded by default to
+250,000 retained attribution rows, 64 MiB of retained path/name/value text,
+100,000,000 logical work units, 250,000 materialized children per node, and
+16 MiB of stored child/template-name bytes per node, with at most 250,000
+pending child visits, 250,000 graph rows, and 1,000,000 graph edges.
+Crossing a bound is a typed refusal rather than partial successful output;
+multiple archive arguments are not yet batched under one global work budget.
+
 `froe cleanup` first prints a strictly read-only plan. When that plan contains
 mutations, it then acquires the repository lock and rebuilds the plan before
 applying it; an empty plan returns without taking the lock. If the locked plan

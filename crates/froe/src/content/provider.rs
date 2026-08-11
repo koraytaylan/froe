@@ -37,6 +37,7 @@ pub trait SegmentProvider {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -82,6 +83,48 @@ pub(crate) mod tests {
 
         fn template(&self, record_identifier: RecordIdentifier) -> Result<Arc<Template>> {
             read_template(self, record_identifier).map(Arc::new)
+        }
+    }
+
+    /// Observes whether ordinary readers use the provider's cache-aware
+    /// string/template surface instead of bypassing it for raw parsing.
+    pub(crate) struct CountingSegmentProvider<'provider> {
+        inner: &'provider MemorySegmentProvider,
+        string_reads: Cell<usize>,
+        template_reads: Cell<usize>,
+    }
+
+    impl<'provider> CountingSegmentProvider<'provider> {
+        pub(crate) fn new(inner: &'provider MemorySegmentProvider) -> Self {
+            Self {
+                inner,
+                string_reads: Cell::new(0),
+                template_reads: Cell::new(0),
+            }
+        }
+
+        pub(crate) fn string_reads(&self) -> usize {
+            self.string_reads.get()
+        }
+
+        pub(crate) fn template_reads(&self) -> usize {
+            self.template_reads.get()
+        }
+    }
+
+    impl SegmentProvider for CountingSegmentProvider<'_> {
+        fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+            self.inner.segment(segment_identifier)
+        }
+
+        fn string(&self, record_identifier: RecordIdentifier) -> Result<Arc<str>> {
+            self.string_reads.set(self.string_reads.get() + 1);
+            self.inner.string(record_identifier)
+        }
+
+        fn template(&self, record_identifier: RecordIdentifier) -> Result<Arc<Template>> {
+            self.template_reads.set(self.template_reads.get() + 1);
+            self.inner.template(record_identifier)
         }
     }
 }

@@ -17,10 +17,13 @@
 use std::sync::Arc;
 
 use crate::content::list::{read_counted_list, uncounted_list_entries, uncounted_list_entry};
-use crate::content::map::{map_entries, map_entry, map_size};
+use crate::content::map::{
+    map_entries, map_entries_with_limits, map_entry, map_size, map_size_with_maximum_work,
+};
 use crate::content::property::{PropertyType, PropertyValue, read_property_value};
 use crate::content::provider::SegmentProvider;
 use crate::content::template::{ChildNodeArity, Template};
+use crate::content::value::read_string_with_stored_byte_budget;
 use crate::error::{Error, Result};
 use crate::segment::record::RecordIdentifier;
 
@@ -52,6 +55,8 @@ pub struct NodeState<'provider> {
     record_identifier: RecordIdentifier,
 }
 
+type ChildNodeEntry<'provider> = (String, NodeState<'provider>);
+
 impl<'provider> NodeState<'provider> {
     /// Creates a node state for the node record at `record_identifier`.
     #[must_use]
@@ -73,10 +78,7 @@ impl<'provider> NodeState<'provider> {
 
     /// The node's template.
     pub fn template(&self) -> Result<Arc<Template>> {
-        let view = self.provider.segment(self.record_identifier.segment)?;
-        let template_identifier =
-            view.read_record_identifier(self.record_identifier.record_number, 0, 1)?;
-        self.provider.template(template_identifier)
+        self.provider.template(self.template_identifier()?)
     }
 
     /// The node's stable identifier: `<segment UUID>:<record number>`.
@@ -135,10 +137,29 @@ impl<'provider> NodeState<'provider> {
         match self.template()?.child_arity {
             ChildNodeArity::Zero => Ok(0),
             ChildNodeArity::One { .. } => Ok(1),
-            ChildNodeArity::Many => {
-                let map_identifier = self.child_map_identifier()?;
-                map_size(self.provider, map_identifier)
-            }
+            ChildNodeArity::Many => map_size(self.provider, self.child_map_identifier()?),
+        }
+    }
+
+    /// Reads the child count without materializing template names, bounding
+    /// map records followed through a many-child diff chain.
+    pub(crate) fn child_node_count_with_maximum_work(
+        &self,
+        maximum_work_units: u64,
+    ) -> Result<(u64, u64)> {
+        let template_identifier = self.template_identifier()?;
+        let view = self.provider.segment(template_identifier.segment)?;
+        let head = view.read_u32(template_identifier.record_number, 0)?;
+        if head & (1 << 28) != 0 {
+            map_size_with_maximum_work(
+                self.provider,
+                self.child_map_identifier()?,
+                maximum_work_units,
+            )
+        } else if head & (1 << 29) != 0 {
+            Ok((0, 0))
+        } else {
+            Ok((1, 0))
         }
     }
 
@@ -181,6 +202,62 @@ impl<'provider> NodeState<'provider> {
                     .collect())
             }
         }
+    }
+
+    /// Reads child entries after bounding concrete entries, cumulative stored
+    /// child-name bytes, and map enumeration work.
+    pub(crate) fn child_node_entries_with_limits(
+        &self,
+        maximum_entries: u64,
+        maximum_stored_name_bytes: u64,
+        maximum_work_units: u64,
+    ) -> Result<(Vec<ChildNodeEntry<'provider>>, u64, u64)> {
+        let template_identifier = self.template_identifier()?;
+        let view = self.provider.segment(template_identifier.segment)?;
+        let head = view.read_u32(template_identifier.record_number, 0)?;
+        if head & (1 << 28) != 0 {
+            let map_identifier = self.child_map_identifier()?;
+            let (entries, stored_name_bytes, visited_map_records) = map_entries_with_limits(
+                self.provider,
+                map_identifier,
+                maximum_entries,
+                maximum_stored_name_bytes,
+                maximum_work_units,
+            )?;
+            return Ok((
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.name, NodeState::new(self.provider, entry.value)))
+                    .collect(),
+                stored_name_bytes,
+                visited_map_records,
+            ));
+        }
+        if head & (1 << 29) != 0 {
+            return Ok((Vec::new(), 0, 0));
+        }
+
+        let has_primary_type = head & (1 << 31) != 0;
+        let has_mixin_types = head & (1 << 30) != 0;
+        let mixin_count = (head >> 18) & 0x3ff;
+        let cursor = 4usize
+            + usize::from(has_primary_type) * 6
+            + usize::from(has_mixin_types) * mixin_count as usize * 6;
+        let child_name_identifier =
+            view.read_record_identifier(template_identifier.record_number, cursor, 0)?;
+        let mut stored_name_bytes = 0;
+        let child_name = read_string_with_stored_byte_budget(
+            self.provider,
+            child_name_identifier,
+            maximum_stored_name_bytes,
+            &mut stored_name_bytes,
+        )?;
+        let child_identifier = self.child_map_identifier()?;
+        Ok((
+            vec![(child_name, NodeState::new(self.provider, child_identifier))],
+            stored_name_bytes,
+            0,
+        ))
     }
 
     /// All properties, in template order, with `jcr:primaryType` and
@@ -313,6 +390,11 @@ impl<'provider> NodeState<'provider> {
     fn child_map_identifier(&self) -> Result<RecordIdentifier> {
         let view = self.provider.segment(self.record_identifier.segment)?;
         view.read_record_identifier(self.record_identifier.record_number, 0, 2)
+    }
+
+    fn template_identifier(&self) -> Result<RecordIdentifier> {
+        let view = self.provider.segment(self.record_identifier.segment)?;
+        view.read_record_identifier(self.record_identifier.record_number, 0, 1)
     }
 
     /// The record identifier of the property value list: slot 2 without

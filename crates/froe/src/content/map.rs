@@ -18,6 +18,7 @@
 //! hash's top bits. Both quirks are load-bearing and reproduced here.
 
 use crate::content::provider::SegmentProvider;
+use crate::content::value::read_string_with_stored_byte_budget;
 use crate::error::{Error, Result};
 use crate::hashing::map_entry_hash;
 use crate::segment::record::RecordIdentifier;
@@ -75,6 +76,32 @@ pub fn map_size(provider: &dyn SegmentProvider, map_identifier: RecordIdentifier
             continue;
         }
         return Ok(u64::from(head & SIZE_MASK));
+    }
+    Err(walk_too_long(map_identifier))
+}
+
+/// Reads a map's declared size while bounding record visits through a corrupt
+/// diff chain. Returns the size and records inspected.
+pub(crate) fn map_size_with_maximum_work(
+    provider: &dyn SegmentProvider,
+    map_identifier: RecordIdentifier,
+    maximum_work_units: u64,
+) -> Result<(u64, u64)> {
+    let mut current = map_identifier;
+    for visited_map_records in 1..=u64::from(MAXIMUM_WALK_LENGTH) {
+        if visited_map_records > maximum_work_units {
+            return Err(Error::MapTraversalWorkBudgetExceeded {
+                maximum_work_units,
+                attempted_work_units: visited_map_records,
+            });
+        }
+        let view = provider.segment(current.segment)?;
+        let head = view.read_u32(current.record_number, 0)?;
+        if head == DIFF_HEAD {
+            current = view.read_record_identifier(current.record_number, 8, 2)?;
+            continue;
+        }
+        return Ok((u64::from(head & SIZE_MASK), visited_map_records));
     }
     Err(walk_too_long(map_identifier))
 }
@@ -191,6 +218,36 @@ pub fn map_entries(
     provider: &dyn SegmentProvider,
     map_identifier: RecordIdentifier,
 ) -> Result<Vec<MapEntry>> {
+    map_entries_internal(provider, map_identifier, None).map(|(entries, _, _)| entries)
+}
+
+/// Reads all map entries while bounding concrete entries, cumulative stored
+/// key bytes, and map-record/key-byte work before allocation or materialization.
+pub(crate) fn map_entries_with_limits(
+    provider: &dyn SegmentProvider,
+    map_identifier: RecordIdentifier,
+    maximum_entries: u64,
+    maximum_stored_name_bytes: u64,
+    maximum_work_units: u64,
+) -> Result<(Vec<MapEntry>, u64, u64)> {
+    map_entries_internal(
+        provider,
+        map_identifier,
+        Some(MapEnumerationBudget {
+            maximum_entries,
+            maximum_stored_name_bytes,
+            maximum_work_units,
+            stored_name_bytes: 0,
+            visited_map_records: 0,
+        }),
+    )
+}
+
+fn map_entries_internal(
+    provider: &dyn SegmentProvider,
+    map_identifier: RecordIdentifier,
+    mut budget: Option<MapEnumerationBudget>,
+) -> Result<(Vec<MapEntry>, u64, u64)> {
     let mut overlays: Vec<(RecordIdentifier, RecordIdentifier)> = Vec::new();
     let mut current = map_identifier;
 
@@ -201,6 +258,7 @@ pub fn map_entries(
             return Err(walk_too_long(map_identifier));
         }
         walk_length += 1;
+        charge_map_record(&mut budget)?;
         let view = provider.segment(current.segment)?;
         let head = view.read_u32(current.record_number, 0)?;
         if head != DIFF_HEAD {
@@ -220,7 +278,7 @@ pub fn map_entries(
 
     let mut entries = Vec::new();
     let mut visited = std::collections::HashSet::new();
-    collect_map_entries(provider, base, &mut entries, 0, &mut visited)?;
+    collect_map_entries(provider, base, &mut entries, 0, &mut visited, &mut budget)?;
     if !overlays.is_empty() {
         for entry in &mut entries {
             if let Some((_, value)) = overlays
@@ -231,13 +289,64 @@ pub fn map_entries(
             }
         }
     }
-    Ok(entries
-        .into_iter()
-        .map(|entry| MapEntry {
-            name: entry.name,
-            value: entry.value,
-        })
-        .collect())
+    let stored_name_bytes = budget.as_ref().map_or(0, |budget| budget.stored_name_bytes);
+    let visited_map_records = budget
+        .as_ref()
+        .map_or(0, |budget| budget.visited_map_records);
+    Ok((
+        entries
+            .into_iter()
+            .map(|entry| MapEntry {
+                name: entry.name,
+                value: entry.value,
+            })
+            .collect(),
+        stored_name_bytes,
+        visited_map_records,
+    ))
+}
+
+struct MapEnumerationBudget {
+    maximum_entries: u64,
+    maximum_stored_name_bytes: u64,
+    maximum_work_units: u64,
+    stored_name_bytes: u64,
+    visited_map_records: u64,
+}
+
+fn charge_map_record(budget: &mut Option<MapEnumerationBudget>) -> Result<()> {
+    let Some(budget) = budget else {
+        return Ok(());
+    };
+    let attempted_map_records = budget.visited_map_records.saturating_add(1);
+    let attempted_work_units = attempted_map_records.saturating_add(budget.stored_name_bytes);
+    if attempted_work_units > budget.maximum_work_units {
+        return Err(Error::MapTraversalWorkBudgetExceeded {
+            maximum_work_units: budget.maximum_work_units,
+            attempted_work_units,
+        });
+    }
+    budget.visited_map_records = attempted_map_records;
+    Ok(())
+}
+
+fn read_map_name(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+    budget: &mut Option<MapEnumerationBudget>,
+) -> Result<String> {
+    let Some(budget) = budget else {
+        return Ok(provider.string(identifier)?.as_ref().to_owned());
+    };
+    let maximum_from_work = budget
+        .maximum_work_units
+        .saturating_sub(budget.visited_map_records);
+    read_string_with_stored_byte_budget(
+        provider,
+        identifier,
+        budget.maximum_stored_name_bytes.min(maximum_from_work),
+        &mut budget.stored_name_bytes,
+    )
 }
 
 /// A map entry augmented with its key record identifier, needed to apply
@@ -254,6 +363,7 @@ fn collect_map_entries(
     entries: &mut Vec<CollectedEntry>,
     depth: u32,
     visited: &mut std::collections::HashSet<RecordIdentifier>,
+    budget: &mut Option<MapEnumerationBudget>,
 ) -> Result<()> {
     // Valid tries are at most seven levels deep (plus stray diffs); a much
     // larger depth means the records form a cycle.
@@ -269,13 +379,14 @@ fn collect_map_entries(
     if !visited.insert(map_identifier) {
         return Err(walk_too_long(map_identifier));
     }
+    charge_map_record(budget)?;
     let view = provider.segment(map_identifier.segment)?;
     let head = view.read_u32(map_identifier.record_number, 0)?;
     if head == DIFF_HEAD {
         // A nested diff below a branch never occurs in well-formed data,
         // but the Java reader recurses, so we do too.
         let base = view.read_record_identifier(map_identifier.record_number, 8, 2)?;
-        return collect_map_entries(provider, base, entries, depth + 1, visited);
+        return collect_map_entries(provider, base, entries, depth + 1, visited, budget);
     }
     let size = head & SIZE_MASK;
     let level = head >> LEVEL_SHIFT;
@@ -288,13 +399,24 @@ fn collect_map_entries(
         for bucket_position in 0..bucket_count {
             let bucket =
                 view.read_record_identifier(map_identifier.record_number, 8, bucket_position)?;
-            collect_map_entries(provider, bucket, entries, depth + 1, visited)?;
+            collect_map_entries(provider, bucket, entries, depth + 1, visited, budget)?;
         }
         return Ok(());
     }
     let size = size as usize;
     let identifiers_base = 4 + size * 4;
     for position in 0..size {
+        if let Some(budget) = budget {
+            let attempted_entries = u64::try_from(entries.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            if attempted_entries > budget.maximum_entries {
+                return Err(Error::MapEntryBudgetExceeded {
+                    maximum_entries: budget.maximum_entries,
+                    attempted_entries,
+                });
+            }
+        }
         let key_identifier = view.read_record_identifier(
             map_identifier.record_number,
             identifiers_base,
@@ -306,7 +428,7 @@ fn collect_map_entries(
             position * 2 + 1,
         )?;
         entries.push(CollectedEntry {
-            name: provider.string(key_identifier)?.as_ref().to_owned(),
+            name: read_map_name(provider, key_identifier, budget)?,
             key_identifier,
             value,
         });
@@ -326,7 +448,7 @@ pub fn is_branch_head(head: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{map_entries, map_entry, map_size};
-    use crate::content::provider::tests::MemorySegmentProvider;
+    use crate::content::provider::tests::{CountingSegmentProvider, MemorySegmentProvider};
     use crate::hashing::map_entry_hash;
     use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
     use crate::segment::record::RecordIdentifier;
@@ -416,6 +538,30 @@ mod tests {
         assert_eq!(entries.len(), 3);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains(&"alpha") && names.contains(&"beta") && names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn ordinary_map_enumeration_uses_the_provider_string_surface() {
+        let segment = data_segment_identifier(2);
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("child")),
+                    (4, 4, small_string_record("value")),
+                    (10, 0, leaf_record(0, &[("child", 1, 4)])),
+                ],
+            ),
+        );
+        let provider = CountingSegmentProvider::new(&inner);
+
+        assert_eq!(
+            map_entries(&provider, RecordIdentifier::new(segment, 10)).expect("entries")[0].name,
+            "child"
+        );
+        assert_eq!(provider.string_reads(), 1);
     }
 
     #[test]

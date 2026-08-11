@@ -36,16 +36,19 @@ crate for the command-line interface.
 
 Large inline binaries can be consumed without materializing their full
 contents through `content::read_binary_stream`, whose returned
-`BinaryStream` implements `std::io::Read`. The read-only `gc_journal` module
+`BinaryStream` implements `std::io::Read`. The bounded opener does not follow a
+long external blob-identifier record merely to report that local content is
+unavailable; the legacy materializing helper retains its identifier-bearing
+error. The read-only `gc_journal` module
 parses both legacy six-field and current seven-field `gc.log` histories even
 when the repository itself cannot resolve a head.
 
 Low-level diagnostics expose `tooling::dump_segment_bytes`, which preserves a
 raw hex dump even when segment parsing fails, and
-`tooling::debug_archive_with_options`, which applies explicit count/text
-budgets to retained path attribution. Archive graphs are totalized to one row
-per segment and reconstructed archive-locally when the stored graph is missing
-or corrupt.
+`tooling::debug_archive_with_options`, which applies explicit retained-row,
+retained-text, total-work, per-node child/name, pending-traversal, and graph
+row/edge budgets. Archive graphs are totalized to one row per segment and
+reconstructed archive-locally when the stored graph is missing or corrupt.
 
 [`store`]: https://docs.rs/froe/latest/froe/store/
 [`content`]: https://docs.rs/froe/latest/froe/content/

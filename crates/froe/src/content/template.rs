@@ -13,6 +13,7 @@
 use crate::content::list::uncounted_list_entries;
 use crate::content::property::PropertyType;
 use crate::content::provider::SegmentProvider;
+use crate::content::value::read_string_with_stored_byte_budget;
 use crate::error::{Error, Result};
 use crate::segment::record::RecordIdentifier;
 
@@ -78,6 +79,29 @@ pub fn read_template(
     provider: &dyn SegmentProvider,
     identifier: RecordIdentifier,
 ) -> Result<Template> {
+    read_template_internal(provider, identifier, None).map(|(template, _)| template)
+}
+
+/// Reads a template after bounding its property-slot vector and the
+/// cumulative stored bytes of every name it materializes.
+pub(crate) fn read_template_with_limits(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+    maximum_properties: u64,
+    maximum_stored_name_bytes: u64,
+) -> Result<(Template, u64)> {
+    read_template_internal(
+        provider,
+        identifier,
+        Some((maximum_properties, maximum_stored_name_bytes)),
+    )
+}
+
+fn read_template_internal(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+    limits: Option<(u64, u64)>,
+) -> Result<(Template, u64)> {
     let view = provider.segment(identifier.segment)?;
     let record_number = identifier.record_number;
     let head = view.read_u32(record_number, 0)?;
@@ -87,6 +111,15 @@ pub fn read_template(
     let many_child_nodes = head & (1 << 28) != 0;
     let mixin_count = ((head >> 18) & 0x3FF) as usize;
     let property_count = (head & 0x3FFFF) as usize;
+    if let Some((maximum_properties, _)) = limits
+        && property_count as u64 > maximum_properties
+    {
+        return Err(Error::TemplatePropertyBudgetExceeded {
+            maximum_properties,
+            attempted_properties: property_count as u64,
+        });
+    }
+    let mut stored_name_bytes = 0;
 
     let mut cursor = 4usize;
     let read_identifier = |cursor: &mut usize| -> Result<RecordIdentifier> {
@@ -97,7 +130,12 @@ pub fn read_template(
 
     let primary_type = if has_primary_type {
         let name_identifier = read_identifier(&mut cursor)?;
-        Some(provider.string(name_identifier)?.as_ref().to_owned())
+        Some(read_template_name(
+            provider,
+            name_identifier,
+            limits,
+            &mut stored_name_bytes,
+        )?)
     } else {
         None
     };
@@ -106,7 +144,12 @@ pub fn read_template(
     if has_mixin_types {
         for _ in 0..mixin_count {
             let name_identifier = read_identifier(&mut cursor)?;
-            mixin_types.push(provider.string(name_identifier)?.as_ref().to_owned());
+            mixin_types.push(read_template_name(
+                provider,
+                name_identifier,
+                limits,
+                &mut stored_name_bytes,
+            )?);
         }
     }
 
@@ -119,7 +162,12 @@ pub fn read_template(
     } else {
         let name_identifier = read_identifier(&mut cursor)?;
         ChildNodeArity::One {
-            child_name: provider.string(name_identifier)?.as_ref().to_owned(),
+            child_name: read_template_name(
+                provider,
+                name_identifier,
+                limits,
+                &mut stored_name_bytes,
+            )?,
         }
     };
 
@@ -138,26 +186,51 @@ pub fn read_template(
                     ),
                 })?;
             properties.push(PropertyTemplate {
-                name: provider.string(name_identifier)?.as_ref().to_owned(),
+                name: read_template_name(
+                    provider,
+                    name_identifier,
+                    limits,
+                    &mut stored_name_bytes,
+                )?,
                 property_type,
                 is_multiple: type_byte < 0,
             });
         }
     }
 
-    Ok(Template {
-        primary_type,
-        mixin_types,
-        child_arity,
-        properties,
-    })
+    Ok((
+        Template {
+            primary_type,
+            mixin_types,
+            child_arity,
+            properties,
+        },
+        stored_name_bytes,
+    ))
+}
+
+fn read_template_name(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+    limits: Option<(u64, u64)>,
+    stored_name_bytes: &mut u64,
+) -> Result<String> {
+    match limits {
+        Some((_, maximum_stored_name_bytes)) => read_string_with_stored_byte_budget(
+            provider,
+            identifier,
+            maximum_stored_name_bytes,
+            stored_name_bytes,
+        ),
+        None => Ok(provider.string(identifier)?.as_ref().to_owned()),
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{ChildNodeArity, read_template};
     use crate::content::property::PropertyType;
-    use crate::content::provider::tests::MemorySegmentProvider;
+    use crate::content::provider::tests::{CountingSegmentProvider, MemorySegmentProvider};
     use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
     use crate::segment::record::RecordIdentifier;
 
@@ -314,6 +387,37 @@ pub(crate) mod tests {
             }
         );
         assert!(template.properties.is_empty());
+    }
+
+    #[test]
+    fn ordinary_template_parsing_uses_the_provider_string_surface() {
+        let segment = data_segment_identifier(2);
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("child")),
+                    (
+                        20,
+                        6,
+                        template_record(None, &[], &TemplateArity::One(1), None, &[]),
+                    ),
+                ],
+            ),
+        );
+        let provider = CountingSegmentProvider::new(&inner);
+
+        let template =
+            read_template(&provider, RecordIdentifier::new(segment, 20)).expect("template");
+        assert_eq!(
+            template.child_arity,
+            ChildNodeArity::One {
+                child_name: "child".to_owned()
+            }
+        );
+        assert_eq!(provider.string_reads(), 1);
     }
 
     #[test]

@@ -267,6 +267,60 @@ pub fn read_value_length(
     }
 }
 
+/// Returns the stored UTF-8 byte length of a string record without reading
+/// or materializing its content.
+pub(crate) fn read_string_stored_length(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+) -> Result<u64> {
+    let view = provider.segment(identifier.segment)?;
+    let head = view.read_u8(identifier.record_number, 0)?;
+    if head & 0x80 == 0 {
+        return Ok(u64::from(head));
+    }
+    if head & 0x40 == 0 {
+        return Ok(
+            u64::from(view.read_u16(identifier.record_number, 0)? & 0x3fff) + SMALL_VALUE_LIMIT,
+        );
+    }
+    if head & 0xe0 != 0xc0 {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "record {identifier} starts with binary marker {head:#04x} and is not a string"
+            ),
+        });
+    }
+    let stored = view.read_u64(identifier.record_number, 0)?;
+    let length = (stored & 0x3fff_ffff_ffff_ffff) + MEDIUM_VALUE_LIMIT;
+    if length >= i32::MAX as u64 {
+        return Err(Error::InvalidFormat {
+            details: format!("string of {length} bytes in record {identifier} is too long"),
+        });
+    }
+    Ok(length)
+}
+
+/// Reads one string only after reserving its declared bytes from a cumulative
+/// caller-owned materialization budget.
+pub(crate) fn read_string_with_stored_byte_budget(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+    maximum_stored_bytes: u64,
+    consumed_stored_bytes: &mut u64,
+) -> Result<String> {
+    let length = read_string_stored_length(provider, identifier)?;
+    let attempted_stored_bytes = consumed_stored_bytes.saturating_add(length);
+    if attempted_stored_bytes > maximum_stored_bytes {
+        return Err(Error::StringMaterializationBudgetExceeded {
+            maximum_stored_bytes,
+            attempted_stored_bytes,
+            value_identifier: identifier,
+        });
+    }
+    *consumed_stored_bytes = attempted_stored_bytes;
+    read_string(provider, identifier)
+}
+
 /// Reads a string value record and decodes it as UTF-8.
 ///
 /// Invalid UTF-8 sequences become replacement characters, matching the
@@ -378,8 +432,12 @@ pub fn read_binary_value(
 /// The returned stream borrows `provider` and implements [`io::Read`]. Its
 /// own memory use is constant regardless of the binary's declared length;
 /// caller-provided read buffers determine the amount copied at a time.
-/// Requesting an external binary fails with
-/// [`Error::ExternalBinaryContentUnavailable`].
+/// Requesting a short-identifier external binary fails with
+/// [`Error::ExternalBinaryContentUnavailable`]. A long-identifier external
+/// binary fails with [`Error::ExternalBinaryContentUnavailableByRecord`]
+/// without following or materializing its identifier string record. This
+/// keeps opening a stream bounded even when that string record is hostile or
+/// unavailable.
 pub fn read_binary_stream<Provider: SegmentProvider + ?Sized>(
     provider: &Provider,
     identifier: RecordIdentifier,
@@ -432,8 +490,10 @@ pub fn read_binary_stream<Provider: SegmentProvider + ?Sized>(
         return Err(Error::ExternalBinaryContentUnavailable { blob_identifier });
     } else if head & 0x08 == 0 {
         let string_identifier = view.read_record_identifier(identifier.record_number, 1, 0)?;
-        let blob_identifier = provider.string(string_identifier)?.to_string();
-        return Err(Error::ExternalBinaryContentUnavailable { blob_identifier });
+        return Err(Error::ExternalBinaryContentUnavailableByRecord {
+            value_identifier: identifier,
+            blob_identifier_record: string_identifier,
+        });
     } else {
         return Err(Error::InvalidFormat {
             details: format!("unexpected value record marker {head:#04x} in record {identifier}"),
@@ -455,11 +515,29 @@ pub fn read_binary_stream<Provider: SegmentProvider + ?Sized>(
 ///
 /// This compatibility helper materializes the complete value. Prefer
 /// [`read_binary_stream`] when binary size is not already known to be small.
+/// Unlike that bounded stream opener, this legacy helper resolves a long
+/// external identifier so existing callers retain the original error payload.
 pub fn read_binary_content(
     provider: &dyn SegmentProvider,
     identifier: RecordIdentifier,
 ) -> Result<Vec<u8>> {
-    let mut stream = read_binary_stream(provider, identifier)?;
+    let mut stream = match read_binary_stream(provider, identifier) {
+        Ok(stream) => stream,
+        Err(Error::ExternalBinaryContentUnavailableByRecord { .. }) => {
+            let BinaryValue::External { blob_identifier } =
+                read_binary_value(provider, identifier)?
+            else {
+                return Err(Error::InvalidFormat {
+                    details: format!(
+                        "binary value {identifier} changed classification while resolving its \
+                         external identifier"
+                    ),
+                });
+            };
+            return Err(Error::ExternalBinaryContentUnavailable { blob_identifier });
+        }
+        Err(error) => return Err(error),
+    };
     let mut content = Vec::with_capacity(
         usize::try_from(stream.len())
             .unwrap_or(usize::MAX)
@@ -479,7 +557,9 @@ pub fn read_binary_content(
 /// content in memory — for consistency gates, which must survive
 /// multi-gigabyte binaries that could never be materialized whole (Oak's
 /// checker streams them in 8 KiB chunks for the same reason). External
-/// binaries have no local content and verify trivially.
+/// binaries have no local content; long external identifiers are still
+/// streamed and structurally validated so consistency checks retain their
+/// historical coverage without materializing a hostile identifier.
 pub fn verify_binary_content(
     provider: &dyn SegmentProvider,
     identifier: RecordIdentifier,
@@ -487,6 +567,10 @@ pub fn verify_binary_content(
     let mut stream = match read_binary_stream(provider, identifier) {
         Ok(stream) => stream,
         Err(Error::ExternalBinaryContentUnavailable { .. }) => return Ok(()),
+        Err(Error::ExternalBinaryContentUnavailableByRecord {
+            blob_identifier_record,
+            ..
+        }) => return verify_string_content(provider, blob_identifier_record),
         Err(error) => return Err(error),
     };
     let mut buffer = [0u8; 8192];
@@ -495,6 +579,39 @@ pub fn verify_binary_content(
             return Ok(());
         }
     }
+}
+
+fn verify_string_content(
+    provider: &dyn SegmentProvider,
+    identifier: RecordIdentifier,
+) -> Result<()> {
+    let length = read_string_stored_length(provider, identifier)?;
+    let view = provider.segment(identifier.segment)?;
+    let head = view.read_u8(identifier.record_number, 0)?;
+    if head & 0x80 == 0 {
+        view.read_bytes(identifier.record_number, 1, length as usize)?;
+        return Ok(());
+    }
+    if head & 0x40 == 0 {
+        view.read_bytes(identifier.record_number, 2, length as usize)?;
+        return Ok(());
+    }
+
+    let list_identifier = view.read_record_identifier(identifier.record_number, 8, 0)?;
+    let block_count = length.div_ceil(BLOCK_SIZE);
+    let mut remaining = length;
+    for block_index in 0..block_count {
+        let block_identifier =
+            uncounted_list_entry(provider, list_identifier, block_count, block_index)?;
+        let block_length = remaining.min(BLOCK_SIZE) as usize;
+        provider.segment(block_identifier.segment)?.read_bytes(
+            block_identifier.record_number,
+            0,
+            block_length,
+        )?;
+        remaining -= block_length as u64;
+    }
+    Ok(())
 }
 
 /// Compares two inline binaries by content without materializing either,
@@ -805,18 +922,117 @@ mod tests {
             }
             other => panic!("expected external binary error, got {other:?}"),
         }
-        for record_number in [0u32, 2] {
-            match read_binary_stream(&provider, RecordIdentifier::new(segment, record_number)) {
-                Err(Error::ExternalBinaryContentUnavailable {
-                    blob_identifier: reported,
-                }) => assert_eq!(reported, blob_identifier),
-                _ => panic!("expected external binary stream error"),
+        match read_binary_content(&provider, RecordIdentifier::new(segment, 2)) {
+            Err(Error::ExternalBinaryContentUnavailable {
+                blob_identifier: reported,
+            }) => assert_eq!(reported, blob_identifier),
+            other => panic!("expected legacy long-external error, got {other:?}"),
+        }
+        match read_binary_stream(&provider, RecordIdentifier::new(segment, 0)) {
+            Err(Error::ExternalBinaryContentUnavailable {
+                blob_identifier: reported,
+            }) => assert_eq!(reported, blob_identifier),
+            _ => panic!("expected short external binary stream error"),
+        }
+        match read_binary_stream(&provider, RecordIdentifier::new(segment, 2)) {
+            Err(Error::ExternalBinaryContentUnavailableByRecord {
+                value_identifier,
+                blob_identifier_record,
+            }) => {
+                assert_eq!(value_identifier, RecordIdentifier::new(segment, 2));
+                assert_eq!(blob_identifier_record, RecordIdentifier::new(segment, 1));
             }
+            _ => panic!("expected bounded long external binary stream error"),
+        }
+        for record_number in [0u32, 2] {
             verify_binary_content(&provider, RecordIdentifier::new(segment, record_number))
                 .expect("external binaries have no local content to verify");
         }
         assert!(matches!(
             verify_binary_content(&provider, RecordIdentifier::new(segment, 3)),
+            Err(Error::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn long_external_stream_does_not_follow_the_identifier_record() {
+        let value_segment = data_segment_identifier(11);
+        let identifier_segment = data_segment_identifier(12);
+        let mut long_external = vec![0xF0u8];
+        long_external.extend_from_slice(&referenced_record_identifier(1, 7));
+
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(
+            value_segment,
+            synthetic_data_segment(&[identifier_segment], &[(3, 8, long_external)]),
+        );
+        inner.insert(
+            identifier_segment,
+            synthetic_data_segment(
+                &[],
+                &[(7, 4, small_string_record("identifier-must-not-be-read"))],
+            ),
+        );
+        let provider = CountingProvider::new(&inner);
+        let value_identifier = RecordIdentifier::new(value_segment, 3);
+
+        match read_binary_stream(&provider, value_identifier) {
+            Err(Error::ExternalBinaryContentUnavailableByRecord {
+                value_identifier: reported_value,
+                blob_identifier_record,
+            }) => {
+                assert_eq!(reported_value, value_identifier);
+                assert_eq!(
+                    blob_identifier_record,
+                    RecordIdentifier::new(identifier_segment, 7)
+                );
+            }
+            _ => panic!("expected bounded long-external error"),
+        }
+        assert_eq!(
+            provider.segment_reads(),
+            1,
+            "opening the stream reads only the value record's segment"
+        );
+        provider.reset_segment_reads();
+        verify_binary_content(&provider, value_identifier)
+            .expect("consistency verification validates the identifier record");
+        assert!(
+            provider.segment_reads() > 1,
+            "verification follows the identifier while the stream opener stays bounded"
+        );
+    }
+
+    #[test]
+    fn long_external_verification_reports_missing_or_non_string_identifiers() {
+        let value_segment = data_segment_identifier(13);
+        let identifier_segment = data_segment_identifier(14);
+        let mut long_external = vec![0xF0u8];
+        long_external.extend_from_slice(&referenced_record_identifier(1, 7));
+        let value_identifier = RecordIdentifier::new(value_segment, 3);
+
+        let mut missing = MemorySegmentProvider::default();
+        missing.insert(
+            value_segment,
+            synthetic_data_segment(&[identifier_segment], &[(3, 8, long_external.clone())]),
+        );
+        assert!(matches!(
+            verify_binary_content(&missing, value_identifier),
+            Err(Error::SegmentNotFound { segment_identifier })
+                if segment_identifier == identifier_segment
+        ));
+
+        let mut nested = MemorySegmentProvider::default();
+        nested.insert(
+            value_segment,
+            synthetic_data_segment(&[identifier_segment], &[(3, 8, long_external)]),
+        );
+        nested.insert(
+            identifier_segment,
+            synthetic_data_segment(&[], &[(7, 8, vec![0xe0, 0])]),
+        );
+        assert!(matches!(
+            verify_binary_content(&nested, value_identifier),
             Err(Error::InvalidFormat { .. })
         ));
     }
