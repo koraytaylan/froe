@@ -3296,6 +3296,22 @@ mod tests {
         })
     }
 
+    /// The canonical repository directory of a test fixture.
+    ///
+    /// Planning resolves the directory once through
+    /// [`canonical_repository_directory`] and reports every path relative to
+    /// that target, so an expectation built from the raw fixture path is not
+    /// comparable on a platform whose temporary directory is reached through a
+    /// symlink — macOS resolves `/var` to `/private/var`. Join the managed file
+    /// name onto this rather than canonicalizing the file itself: a managed
+    /// path under test may be a symlink, and following it would assert the
+    /// wrong name.
+    fn canonical_fixture_directory(directory: &std::path::Path) -> std::path::PathBuf {
+        directory
+            .canonicalize()
+            .expect("canonicalize the fixture directory")
+    }
+
     fn file_bytes(directory: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(directory).expect("read directory") {
@@ -4279,7 +4295,7 @@ mod tests {
             details,
             format!(
                 "{} is not an existing segment-tar repository (manifest and journal.log are required)",
-                directory.path.display()
+                canonical_fixture_directory(&directory.path).display()
             )
         );
         assert!(file_bytes(&directory.path).is_empty());
@@ -4306,7 +4322,9 @@ mod tests {
             details,
             format!(
                 "managed repository path {} is not a regular file",
-                staging.display()
+                canonical_fixture_directory(&directory.path)
+                    .join("journal.log.compacting")
+                    .display()
             )
         );
         assert_eq!(file_bytes(&directory.path), before);
@@ -4443,9 +4461,11 @@ mod tests {
         let outcome = cleanup(&directory.path, options).expect("apply");
 
         assert_eq!(outcome.removed_journal_lines, 1);
+        let expected_backup =
+            canonical_fixture_directory(&directory.path).join("journal.log.bak.000");
         assert_eq!(
             outcome.journal_backup_path(),
-            Some(directory.path.join("journal.log.bak.000").as_path())
+            Some(expected_backup.as_path())
         );
         assert!(outcome.is_complete());
         assert!(directory.path.join("journal.log.bak.000").is_file());
@@ -5131,7 +5151,9 @@ mod tests {
             error.to_string(),
             format!(
                 "invalid segment-tar data: managed repository path {} is not a regular file",
-                backup.display()
+                canonical_fixture_directory(&directory.path)
+                    .join("data00000a.tar.2.ro.bak")
+                    .display()
             )
         );
     }
