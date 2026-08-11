@@ -779,8 +779,14 @@ impl WritableRepository {
                 actually_unavailable.extend(outcome.newly_unavailable);
             }
             #[cfg(test)]
-            if !rewrite_phase {
-                probe_archive_sweep_phase_boundary()?;
+            if !rewrite_phase
+                && planned_base_sweeps
+                    .values()
+                    .any(|planned| matches!(planned, PlannedArchiveSweep::Rewrite { .. }))
+            {
+                probe_archive_sweep_phase_boundary(
+                    "postcomp-sweep.removals-complete-before-rewrites",
+                )?;
             }
         }
         drop(fallback_provider);
@@ -1584,6 +1590,7 @@ pub(crate) struct StandaloneSegmentCleanupOutcome {
 pub(crate) struct DeferredFileDeletion {
     pub(crate) file_name: String,
     pub(crate) error: String,
+    pub(crate) target_was_already_absent: bool,
 }
 
 /// The observed physical result of one archive sweep attempt.
@@ -1791,7 +1798,7 @@ fn apply_standalone_segment_cleanup_from_archives(
         }
         #[cfg(test)]
         if !rewrite_phase {
-            probe_archive_sweep_phase_boundary()?;
+            probe_archive_sweep_phase_boundary("sweep.removals-complete-before-rewrites")?;
         }
     }
     drop(fallback_provider);
@@ -1822,6 +1829,7 @@ fn apply_standalone_segment_cleanup_from_archives(
                         outcome.deletion_failures.push(DeferredFileDeletion {
                             file_name: file_name.clone(),
                             error: "file reappeared after the archive unlink succeeded".to_owned(),
+                            target_was_already_absent: false,
                         });
                     }
                 } else {
@@ -1858,6 +1866,7 @@ fn apply_standalone_segment_cleanup_from_archives(
                     outcome.deletion_failures.push(DeferredFileDeletion {
                         file_name: file_name.clone(),
                         error: "source archive remained after replacement publication".to_owned(),
+                        target_was_already_absent: false,
                     });
                 }
             }
@@ -2778,8 +2787,14 @@ fn sweep_one_archive<'archives>(
             )?;
             require_held_file_identity(source_file, *source_identity, "certified removal source")?;
             require_path_file_identity(&path, *source_identity, "certified removal source")?;
-            // Deletion failures are consistency-safe: the old archive remains
-            // authoritative and a later cleanup can retry.
+            #[cfg(test)]
+            crate::writer::cleanup_fault_injection::remove_path_if_armed(
+                "sweep.remove-before-source-unlink-not-found",
+                &path,
+            )?;
+            // Deletion failures are consistency-safe: ordinarily the old
+            // archive remains authoritative for retry; `NotFound` records
+            // that another actor already achieved this exact unlink.
             return Ok(match std::fs::remove_file(&path) {
                 Ok(()) => ArchiveSweepOutcome {
                     disposition: ArchiveSweepDisposition::Removed,
@@ -2791,6 +2806,7 @@ fn sweep_one_archive<'archives>(
                     deletion_failures: vec![DeferredFileDeletion {
                         file_name: reader.file_name().to_owned(),
                         error: error.to_string(),
+                        target_was_already_absent: error.kind() == std::io::ErrorKind::NotFound,
                     }],
                     newly_unavailable: std::collections::HashSet::new(),
                 },
@@ -2825,6 +2841,12 @@ fn sweep_one_archive<'archives>(
     );
     let current_rewrite_targets = planned_unavailable;
 
+    // These two proofs deliberately have different graph scopes. The active
+    // source certificate above reconstructs its complete, unfiltered graph
+    // from payloads before mutation. A replacement `.gph` describes the
+    // post-sweep physical set, so it may omit edges to targets whose active
+    // copies were removed earlier or are removed by this rewrite; staged and
+    // published validation below compare it with that exact filtered view.
     let trailers = FilteredTrailers::from_archive(
         reader,
         reclaimable,
@@ -3054,6 +3076,7 @@ fn sweep_one_archive<'archives>(
         deletion_failures.push(DeferredFileDeletion {
             file_name: staging_name,
             error: error.to_string(),
+            target_was_already_absent: error.kind() == std::io::ErrorKind::NotFound,
         });
     }
     #[cfg(test)]
@@ -3093,6 +3116,7 @@ fn sweep_one_archive<'archives>(
         deletion_failures.push(DeferredFileDeletion {
             file_name: reader.file_name().to_owned(),
             error: error.to_string(),
+            target_was_already_absent: error.kind() == std::io::ErrorKind::NotFound,
         });
     }
     #[cfg(test)]
@@ -3107,10 +3131,9 @@ fn sweep_one_archive<'archives>(
 }
 
 #[cfg(test)]
-fn probe_archive_sweep_phase_boundary() -> Result<()> {
-    const CUTPOINT: &str = "sweep.removals-complete-before-rewrites";
-    crate::writer::cleanup_fault_injection::fail_if_armed(CUTPOINT)?;
-    crate::writer::cleanup_fault_injection::crash_if_armed(CUTPOINT);
+fn probe_archive_sweep_phase_boundary(cutpoint: &str) -> Result<()> {
+    crate::writer::cleanup_fault_injection::fail_if_armed(cutpoint)?;
+    crate::writer::cleanup_fault_injection::crash_if_armed(cutpoint);
     Ok(())
 }
 
@@ -3872,19 +3895,23 @@ mod tests {
     use std::io::Write as _;
     use std::sync::Arc;
 
+    #[cfg(unix)]
+    use super::certify_active_archive;
     use super::{
         PlannedArchiveSweep, ReclaimPolicy, WritableRepository, analyze_standalone_segment_cleanup,
-        archive_segments_provider, certify_active_archive, is_reclaimable, mark_one_archive,
-        next_cleanup_archive_number, oak_sweep_defers, oak_sweep_threshold, plan_archive_sweep,
-        read_blob_identifiers, seed_references_from_archive, stored_segment_generation,
-        sweep_one_archive, validate_swept_archive,
+        archive_segments_provider, is_reclaimable, mark_one_archive, next_cleanup_archive_number,
+        oak_sweep_defers, oak_sweep_threshold, plan_archive_sweep, read_blob_identifiers,
+        seed_references_from_archive, stored_segment_generation, sweep_one_archive,
+        validate_swept_archive,
     };
     use crate::content::provider::SegmentProvider;
     use crate::segment::identifier::SegmentIdentifier;
+    #[cfg(unix)]
     use crate::segment::parsed_segment::ParsedSegment;
     use crate::segment::record::{RecordIdentifier, RecordType};
     use crate::store::Repository;
     use crate::tar_archive::archive::TarArchiveReader;
+    #[cfg(unix)]
     use crate::tar_archive::file_name::ArchiveFileName;
     use crate::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
     use crate::writer::repository_lock::RepositoryLock;

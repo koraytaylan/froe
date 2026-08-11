@@ -43,6 +43,33 @@ struct CapturedOutput {
     stderr: Vec<u8>,
 }
 
+const CLEANUP_PROMPT_END: &[u8] = b"Continue? [y/N] ";
+
+/// Drains stderr completely while framing each prompt with only the bytes
+/// received since the preceding prompt. The returned transcript remains
+/// cumulative so failures can report the child's complete stderr.
+fn drain_cleanup_stderr<R: std::io::Read>(
+    mut stderr: R,
+    prompt_tx: &std::sync::mpsc::Sender<Vec<u8>>,
+) -> Vec<u8> {
+    let mut captured = Vec::new();
+    let mut prompt_start = 0;
+    loop {
+        let mut byte = [0_u8; 1];
+        match stderr.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                captured.push(byte[0]);
+                if captured.ends_with(CLEANUP_PROMPT_END) {
+                    let _ = prompt_tx.send(captured[prompt_start..].to_vec());
+                    prompt_start = captured.len();
+                }
+            }
+        }
+    }
+    captured
+}
+
 impl InteractiveCleanup {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -68,23 +95,8 @@ impl InteractiveCleanup {
             captured
         });
         let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
-        let stderr_reader = std::thread::spawn(move || {
-            const PROMPT_END: &[u8] = b"Continue? [y/N] ";
-            let mut captured = Vec::new();
-            loop {
-                let mut byte = [0_u8; 1];
-                match stderr.read(&mut byte) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        captured.push(byte[0]);
-                        if captured.ends_with(PROMPT_END) {
-                            let _ = prompt_tx.send(captured.clone());
-                        }
-                    }
-                }
-            }
-            captured
-        });
+        let stderr_reader =
+            std::thread::spawn(move || drain_cleanup_stderr(&mut stderr, &prompt_tx));
         Self {
             child,
             stdin: Some(stdin),
@@ -107,7 +119,7 @@ impl InteractiveCleanup {
         for text in expected {
             if !prompt.contains(text) {
                 self.fail(&format!(
-                    "{description} did not contain {text:?}; prompt so far:\n{prompt}"
+                    "{description} did not contain {text:?}; stderr since the previous prompt:\n{prompt}"
                 ));
             }
         }
@@ -194,6 +206,29 @@ impl Drop for InteractiveCleanup {
             let _ = self.join_readers();
         }
     }
+}
+
+#[test]
+fn interactive_cleanup_prompt_frames_do_not_reuse_earlier_stderr() {
+    let first = b"first-prompt-only\nContinue? [y/N] ";
+    let second = b"second-prompt-only\nContinue? [y/N] ";
+    let mut stderr = first.to_vec();
+    stderr.extend_from_slice(second);
+    stderr.extend_from_slice(b"after-prompts\n");
+    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
+
+    let captured = drain_cleanup_stderr(std::io::Cursor::new(&stderr), &prompt_tx);
+    drop(prompt_tx);
+    let prompts: Vec<_> = prompt_rx.into_iter().collect();
+
+    assert_eq!(captured, stderr, "the complete diagnostic is retained");
+    assert_eq!(prompts, [first.as_slice(), second.as_slice()]);
+    assert!(
+        !prompts[1]
+            .windows(b"first-prompt-only".len())
+            .any(|window| window == b"first-prompt-only"),
+        "the second prompt frame must not reuse first-prompt stderr"
+    );
 }
 
 /// Writes a store whose content tree is `/content`.

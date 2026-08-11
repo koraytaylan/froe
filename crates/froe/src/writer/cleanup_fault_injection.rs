@@ -8,11 +8,15 @@ use std::ffi::OsStr;
 const CHILD_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_CHILD";
 const CUTPOINT_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_CUTPOINT";
 const MODE_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_MODE";
+#[cfg(unix)]
 const CRASH_EXIT_CODE: i32 = 86;
+#[cfg(unix)]
 const VERIFIED_EXIT_CODE: i32 = 87;
+#[cfg(unix)]
 const CRASH_MODE: &str = "crash";
 const ERROR_MODE: &str = "error";
 const SUBSTITUTE_MODE: &str = "substitute";
+const ABSENCE_MODE: &str = "absence";
 
 fn is_armed(cutpoint: &str, mode: &str) -> bool {
     std::env::var_os(CHILD_ENVIRONMENT).as_deref() == Some(OsStr::new("1"))
@@ -36,6 +40,8 @@ pub(super) fn crash_if_armed(cutpoint: &str) {
         // without Rust unwinding or guard cleanup.
         unsafe { libc::_exit(CRASH_EXIT_CODE) }
     }
+    #[cfg(not(unix))]
+    let _ = cutpoint;
 }
 
 /// Returns a deterministic synthetic I/O error from an explicitly armed test
@@ -71,6 +77,18 @@ pub(super) fn substitute_path_if_armed(
     Ok(())
 }
 
+/// Removes an armed pathname immediately before production retries the same
+/// unlink, modelling an external actor winning that exact deletion race.
+pub(super) fn remove_path_if_armed(
+    cutpoint: &str,
+    path: &std::path::Path,
+) -> crate::error::Result<()> {
+    if is_armed(cutpoint, ABSENCE_MODE) {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 /// Omits the final retained item from an explicitly armed in-memory
 /// post-mutation analysis. This changes no repository byte; it makes the
 /// production retained-root verification call load-bearing in tests.
@@ -98,8 +116,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        CHILD_ENVIRONMENT, CRASH_EXIT_CODE, CRASH_MODE, CUTPOINT_ENVIRONMENT, ERROR_MODE,
-        MODE_ENVIRONMENT, SUBSTITUTE_MODE, VERIFIED_EXIT_CODE,
+        ABSENCE_MODE, CHILD_ENVIRONMENT, CRASH_EXIT_CODE, CRASH_MODE, CUTPOINT_ENVIRONMENT,
+        ERROR_MODE, MODE_ENVIRONMENT, SUBSTITUTE_MODE, VERIFIED_EXIT_CODE,
     };
     use crate::segment::identifier::SegmentIdentifier;
     use crate::segment::record::RecordIdentifier;
@@ -121,6 +139,7 @@ mod tests {
 
     const CHECKPOINT_SCENARIO: &str = "checkpoint";
     const SWEEP_SCENARIO: &str = "sweep";
+    const POSTCOMPACTION_SWEEP_SCENARIO: &str = "postcomp-sweep";
     const JOURNAL_SCENARIO: &str = "journal";
     const MANIFEST_SCENARIO: &str = "manifest";
     const REMOVAL_SCENARIO: &str = "removal";
@@ -268,6 +287,17 @@ mod tests {
         );
     }
 
+    fn run_absence_child(directory: &Path, scenario: &str, cutpoint: &str) {
+        let output = cleanup_child_output(directory, scenario, cutpoint, ABSENCE_MODE);
+        assert_eq!(
+            output.status.code(),
+            Some(VERIFIED_EXIT_CODE),
+            "child did not observe the already-absent unlink at {cutpoint}; stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn scenario_options(scenario: &str) -> CleanupOptions {
         let task = match scenario {
             CHECKPOINT_SCENARIO | MANIFEST_SCENARIO => CleanupTask::UnreferencedCheckpoints,
@@ -285,6 +315,10 @@ mod tests {
 
     /// Child entrypoint. A normal `cargo test` invocation leaves the marker
     /// unset, so this registered test is a no-op outside its parent harness.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all isolated fault modes share one exact libtest child entrypoint"
+    )]
     #[test]
     fn cleanup_fault_child() {
         if std::env::var_os(CHILD_ENVIRONMENT).as_deref() != Some(OsStr::new("1")) {
@@ -299,6 +333,36 @@ mod tests {
         let cutpoint =
             std::env::var(CUTPOINT_ENVIRONMENT).expect("fault child cutpoint must be supplied");
         let mode = std::env::var(MODE_ENVIRONMENT).expect("fault child mode must be supplied");
+        if scenario == POSTCOMPACTION_SWEEP_SCENARIO {
+            let mut store = WritableRepository::open(&directory)
+                .expect("open post-compaction boundary fixture");
+            let reference = store
+                .writing_generation()
+                .expect("read post-compaction reference generation");
+            let outcome = store.reclaim_old_generations(reference, true);
+            match mode.as_str() {
+                ERROR_MODE => {
+                    let error = outcome
+                        .expect_err("post-compaction reclaim completed without injected error");
+                    assert!(
+                        error.to_string().contains(&cutpoint),
+                        "post-compaction reclaim failed before {cutpoint}: {error}"
+                    );
+                }
+                CRASH_MODE => match outcome {
+                    Ok(()) => {
+                        panic!("post-compaction reclaim completed without reaching {cutpoint}")
+                    }
+                    Err(error) => {
+                        panic!("post-compaction reclaim failed before {cutpoint}: {error}")
+                    }
+                },
+                other => panic!("unsupported post-compaction fault mode {other}"),
+            }
+            // SAFETY: `_exit` has no memory-safety preconditions and this is
+            // an isolated child whose error path was checked above.
+            unsafe { libc::_exit(VERIFIED_EXIT_CODE) }
+        }
         let outcome = cleanup(&directory, scenario_options(&scenario));
         match mode.as_str() {
             ERROR_MODE => {
@@ -322,6 +386,24 @@ mod tests {
                 } else {
                     let error =
                         outcome.expect_err("cleanup accepted injected post-mutation inconsistency");
+                    if cutpoint == "checkpoint.tar-durable-before-journal" {
+                        assert!(
+                            error.to_string().contains("finalized session archive"),
+                            "unexpected checkpoint TAR identity refusal: {error}"
+                        );
+                    }
+                    if cutpoint == "sweep.staging-validated-before-publish" {
+                        assert!(
+                            error.to_string().contains("validated archive staging file"),
+                            "unexpected staging identity refusal: {error}"
+                        );
+                    }
+                    if cutpoint == "sweep.remove-before-source-identity" {
+                        assert!(
+                            error.to_string().contains("certified removal source"),
+                            "unexpected archive-source identity refusal: {error}"
+                        );
+                    }
                     if cutpoint == "cleanup.before-final-retained-root-verification" {
                         assert!(
                             error
@@ -357,6 +439,23 @@ mod tests {
                         );
                     }
                 }
+            }
+            ABSENCE_MODE => {
+                let outcome = outcome.expect("cleanup lost the already-absent segment outcome");
+                let failures: Vec<_> = outcome
+                    .deletion_failures()
+                    .iter()
+                    .filter(|failure| failure.target_was_already_absent())
+                    .collect();
+                assert_eq!(
+                    failures.len(),
+                    1,
+                    "the segment unlink race must have one typed already-absent result: {outcome:?}"
+                );
+                assert!(
+                    Path::new(failures[0].file_name()).extension() == Some(OsStr::new("tar")),
+                    "the typed absence must come from the archive segment pass"
+                );
             }
             CRASH_MODE => match outcome {
                 Ok(_) => panic!("cleanup completed without reaching the armed crash cutpoint"),
@@ -774,6 +873,54 @@ mod tests {
         );
     }
 
+    fn assert_postcomp_removal_then_rewrite_prefix(
+        directory: &Path,
+        snapshot: &RepositorySnapshot,
+        removal_source: &str,
+        rewrite_source: &str,
+        rewrite_bytes: &[u8],
+        replacement: &str,
+    ) {
+        // Post-compaction reclamation is allowed to retire older journal
+        // roots before the journal itself is compacted. Its healthy-prefix
+        // oracle is therefore the still-durable current head, not byte-for-
+        // byte preservation of every historical root.
+        let repository = Repository::open(directory)
+            .expect("fresh read-only reopen after post-compaction boundary fault");
+        assert_eq!(repository.head_record_identifier(), snapshot.head);
+        repository
+            .content_root()
+            .expect("the durable current head remains traversable");
+        let readable_roots = readable_journal_roots(&repository);
+        assert!(
+            readable_roots.contains(&snapshot.head),
+            "the durable current head must remain among the readable journal roots"
+        );
+        drop(repository);
+        drop(RepositoryLock::acquire(directory).expect("child releases repository lock"));
+
+        assert_eq!(
+            std::fs::read(directory.join("journal.log"))
+                .expect("read journal after post-compaction boundary fault"),
+            snapshot.journal_bytes,
+            "post-compaction archive sweeping cannot rewrite the journal"
+        );
+        assert!(
+            !directory.join(removal_source).exists(),
+            "the post-compaction boundary follows the whole-removal phase"
+        );
+        assert_eq!(
+            std::fs::read(directory.join(rewrite_source))
+                .expect("post-compaction rewrite source remains at the boundary"),
+            rewrite_bytes,
+            "the post-compaction rewrite phase must not have begun"
+        );
+        assert!(
+            !directory.join(replacement).exists(),
+            "no post-compaction replacement may publish before its rewrite phase"
+        );
+    }
+
     #[test]
     fn removal_to_rewrite_error_and_process_crash_leave_a_healthy_prefix() {
         const CUTPOINT: &str = "sweep.removals-complete-before-rewrites";
@@ -802,6 +949,51 @@ mod tests {
                 &replacement,
             );
         }
+    }
+
+    #[test]
+    fn postcomp_removal_to_rewrite_error_and_process_crash_leave_a_healthy_prefix() {
+        const CUTPOINT: &str = "postcomp-sweep.removals-complete-before-rewrites";
+        for crash in [false, true] {
+            let name = if crash {
+                "postcomp-removal-rewrite-boundary-crash"
+            } else {
+                "postcomp-removal-rewrite-boundary-error"
+            };
+            let directory = TestDirectory::repository(name);
+            let (snapshot, removal_source, rewrite_source, rewrite_bytes, replacement) =
+                create_removal_then_rewrite_fixture(&directory);
+
+            if crash {
+                run_crash_child(&directory.path, POSTCOMPACTION_SWEEP_SCENARIO, CUTPOINT);
+            } else {
+                run_error_child(&directory.path, POSTCOMPACTION_SWEEP_SCENARIO, CUTPOINT);
+            }
+
+            assert_postcomp_removal_then_rewrite_prefix(
+                &directory.path,
+                &snapshot,
+                &removal_source,
+                &rewrite_source,
+                &rewrite_bytes,
+                &replacement,
+            );
+        }
+    }
+
+    #[test]
+    fn segment_unlink_enoent_is_reported_with_a_typed_already_absent_disposition() {
+        const CUTPOINT: &str = "sweep.remove-before-source-unlink-not-found";
+        let directory = TestDirectory::repository("segment-unlink-already-absent");
+        let (snapshot, source, _) = create_whole_archive_sweep_fixture(&directory);
+
+        run_absence_child(&directory.path, SWEEP_SCENARIO, CUTPOINT);
+
+        assert_exact_snapshot_reopens(&directory.path, &snapshot);
+        assert!(
+            !directory.path.join(source).exists(),
+            "the simulated competing unlink must leave the planned orphan absent"
+        );
     }
 
     #[test]

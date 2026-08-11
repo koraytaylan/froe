@@ -19,6 +19,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(unix)]
+// `PermissionsExt::mode` is always `u32`, while libc's `mode_t` (and thus
+// `libc::S_ISGID`) is `u16` on Apple targets.
+const SETGID_MODE: u32 = 0o2000;
+
 use crate::content::node::PropertyValues;
 use crate::content::property::PropertyValue;
 use crate::content::provider::SegmentProvider;
@@ -280,6 +285,12 @@ impl JournalLineRemoval {
 
 const ALREADY_ABSENT_DELETION_DETAIL: &str = "file was already absent when deletion was attempted";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupDeletionFailureKind {
+    Retained,
+    AlreadyAbsent,
+}
+
 /// A planned deletion that this cleanup could not perform or confirm itself.
 ///
 /// The target usually remains for a later retry. It can instead have already
@@ -290,13 +301,23 @@ const ALREADY_ABSENT_DELETION_DETAIL: &str = "file was already absent when delet
 pub struct CleanupDeletionFailure {
     file_name: String,
     error: String,
+    kind: CleanupDeletionFailureKind,
 }
 
 impl CleanupDeletionFailure {
-    fn new(file_name: String, error: impl Into<String>) -> Self {
+    fn retained(file_name: String, error: impl Into<String>) -> Self {
         Self {
             file_name,
             error: error.into(),
+            kind: CleanupDeletionFailureKind::Retained,
+        }
+    }
+
+    fn already_absent(file_name: String, error: impl Into<String>) -> Self {
+        Self {
+            file_name,
+            error: error.into(),
+            kind: CleanupDeletionFailureKind::AlreadyAbsent,
         }
     }
 
@@ -320,7 +341,7 @@ impl CleanupDeletionFailure {
     /// when cleanup reached its guarded deletion.
     #[must_use]
     pub fn target_was_already_absent(&self) -> bool {
-        self.error == ALREADY_ABSENT_DELETION_DETAIL
+        self.kind == CleanupDeletionFailureKind::AlreadyAbsent
     }
 }
 
@@ -618,6 +639,7 @@ fn validate_apply_environment(directory: &Path) -> Result<()> {
     }
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn validate_apply_identity(directory: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -634,21 +656,31 @@ fn validate_apply_identity(directory: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn validate_apply_identity_for_uid(directory: &Path, effective_uid: u32) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let journal = directory.join("journal.log");
-    let owner = std::fs::symlink_metadata(&journal)?.uid();
-    if owner != effective_uid {
+    if let Some(issue) = journal_service_user_issue(directory, effective_uid)? {
         return Err(Error::InvalidFormat {
             details: format!(
-                "cleanup must run as the repository service user: {} is owned by uid {owner}, but the effective uid is {effective_uid}; refusing before repo.lock or replacement files can be created with the wrong owner",
-                journal.display()
+                "{issue}; refusing before repo.lock or replacement files can be created with the wrong owner"
             ),
         });
     }
     Ok(())
 }
 
+#[cfg(unix)]
+fn journal_service_user_issue(directory: &Path, effective_uid: u32) -> Result<Option<String>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let journal = directory.join("journal.log");
+    let owner = std::fs::symlink_metadata(&journal)?.uid();
+    Ok((owner != effective_uid).then(|| {
+        format!(
+            "cleanup must run as the repository service user: {} is owned by uid {owner}, but the effective uid is {effective_uid}",
+            journal.display()
+        )
+    }))
+}
+
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn validate_plan_apply_identity(directory: &Path, plan: &CleanupPlan) -> Result<()> {
     #[cfg(unix)]
     {
@@ -700,6 +732,7 @@ fn current_apply_credentials() -> Result<ApplyCredentials> {
     })
 }
 
+#[cfg(unix)]
 fn planned_metadata_sources(
     directory: &Path,
     manifest_upgrade: bool,
@@ -760,17 +793,11 @@ fn planned_apply_identity_issue(
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let directory_metadata = std::fs::symlink_metadata(directory)?;
-    let directory_gid = directory_metadata.gid();
-    let possible_created_gids = if directory_metadata.permissions().mode() & libc::S_ISGID != 0 {
-        BTreeSet::from([directory_gid])
-    } else {
-        // POSIX permits either System V inheritance (the process effective
-        // gid) or BSD inheritance (the parent-directory gid). Linux normally
-        // selects with S_ISGID, but some filesystems also honor bsdgroups/grpid
-        // mount policy. A read-only preview cannot distinguish those cases,
-        // so model both outcomes rather than assuming the host default.
-        BTreeSet::from([credentials.effective_gid, directory_gid])
-    };
+    let possible_created_gids = possible_created_group_ids(
+        directory_metadata.gid(),
+        directory_metadata.permissions().mode(),
+        credentials,
+    );
 
     for name in planned_metadata_sources(
         directory,
@@ -781,33 +808,70 @@ fn planned_apply_identity_issue(
     )? {
         let path = directory.join(&name);
         let metadata = std::fs::symlink_metadata(&path)?;
-        let owner = metadata.uid();
-        if owner != credentials.effective_uid {
-            return Ok(Some(format!(
-                "cleanup cannot safely replace {} while preserving its metadata: it is owned by uid {owner}, but the effective uid is {}",
-                path.display(),
-                credentials.effective_uid
-            )));
-        }
-        let group = metadata.gid();
-        let mode = metadata.permissions().mode();
-        let might_need_to_change_group = possible_created_gids
-            .iter()
-            .any(|&created_gid| created_gid != group);
-        let must_install_setgid = mode & libc::S_ISGID != 0;
-        if credentials.effective_uid != 0
-            && !credentials.group_ids.contains(&group)
-            && (might_need_to_change_group || must_install_setgid)
-        {
-            return Ok(Some(format!(
-                "cleanup cannot safely replace {} while preserving its metadata: gid {group} is not the effective or a supplementary group of uid {}, while a new staging file may have gid {possible_created_gids:?} and the source mode is {:#06o}; group ownership and setgid-mode preservation cannot be guaranteed read-only",
-                path.display(),
-                credentials.effective_uid,
-                mode & 0o7777
-            )));
+        if let Some(issue) = metadata_source_apply_identity_issue(
+            &path,
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            &possible_created_gids,
+            credentials,
+        ) {
+            return Ok(Some(issue));
         }
     }
     Ok(None)
+}
+
+#[cfg(unix)]
+fn possible_created_group_ids(
+    directory_gid: u32,
+    directory_mode: u32,
+    credentials: &ApplyCredentials,
+) -> BTreeSet<u32> {
+    if directory_mode & SETGID_MODE != 0 {
+        BTreeSet::from([directory_gid])
+    } else {
+        // POSIX permits either System V inheritance (the process effective
+        // gid) or BSD inheritance (the parent-directory gid). Linux normally
+        // selects with S_ISGID, but some filesystems also honor bsdgroups/grpid
+        // mount policy. A read-only preview cannot distinguish those cases,
+        // so model both outcomes rather than assuming the host default.
+        BTreeSet::from([credentials.effective_gid, directory_gid])
+    }
+}
+
+#[cfg(unix)]
+fn metadata_source_apply_identity_issue(
+    path: &Path,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    possible_created_gids: &BTreeSet<u32>,
+    credentials: &ApplyCredentials,
+) -> Option<String> {
+    if owner != credentials.effective_uid {
+        return Some(format!(
+            "cleanup cannot safely replace {} while preserving its metadata: it is owned by uid {owner}, but the effective uid is {}",
+            path.display(),
+            credentials.effective_uid
+        ));
+    }
+    let might_need_to_change_group = possible_created_gids
+        .iter()
+        .any(|&created_gid| created_gid != group);
+    let must_install_setgid = mode & SETGID_MODE != 0;
+    if credentials.effective_uid != 0
+        && !credentials.group_ids.contains(&group)
+        && (might_need_to_change_group || must_install_setgid)
+    {
+        return Some(format!(
+            "cleanup cannot safely replace {} while preserving its metadata: gid {group} is not the effective or a supplementary group of uid {}, while a new staging file may have gid {possible_created_gids:?} and the source mode is {:#06o}; group ownership and setgid-mode preservation cannot be guaranteed read-only",
+            path.display(),
+            credentials.effective_uid,
+            mode & 0o7777
+        ));
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -832,23 +896,30 @@ fn preview_apply_identity_issue(
     plan: &CleanupPlan,
     credentials: &ApplyCredentials,
 ) -> Result<Option<String>> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let journal_path = directory.join("journal.log");
-    let journal_owner = std::fs::symlink_metadata(&journal_path)?.uid();
-    if journal_owner != credentials.effective_uid {
-        return Ok(Some(format!(
-            "cleanup must run as the repository service user: {} is owned by uid {journal_owner}, but the effective uid is {}",
-            journal_path.display(),
-            credentials.effective_uid
-        )));
+    if let Some(issue) = journal_service_user_issue(directory, credentials.effective_uid)? {
+        return Ok(Some(issue));
     }
     planned_apply_identity_issue(directory, plan, credentials)
 }
 
 fn append_apply_identity_preview_warning(directory: &Path, plan: &mut CleanupPlan) {
     #[cfg(unix)]
-    match current_apply_credentials()
+    append_apply_identity_preview_warning_for_credentials(
+        directory,
+        plan,
+        current_apply_credentials(),
+    );
+    #[cfg(not(unix))]
+    let _ = (directory, plan);
+}
+
+#[cfg(unix)]
+fn append_apply_identity_preview_warning_for_credentials(
+    directory: &Path,
+    plan: &mut CleanupPlan,
+    credentials: Result<ApplyCredentials>,
+) {
+    match credentials
         .and_then(|credentials| preview_apply_identity_issue(directory, plan, &credentials))
     {
         Ok(Some(issue)) => plan.warnings.push(format!(
@@ -859,8 +930,6 @@ fn append_apply_identity_preview_warning(directory: &Path, plan: &mut CleanupPla
             "apply ownership could not be proved during this read-only preview ({error}); authoritative apply will retry the check under the repository lock"
         )),
     }
-    #[cfg(not(unix))]
-    let _ = (directory, plan);
 }
 
 /// Resolves `directory` once to its canonical absolute target, then builds a
@@ -2438,7 +2507,13 @@ fn apply_prepared(prepared: PreparedCleanup) -> Result<CleanupOutcome> {
     let mut deletion_failures: Vec<_> = segment_outcome
         .deletion_failures
         .into_iter()
-        .map(|failure| CleanupDeletionFailure::new(failure.file_name, failure.error))
+        .map(|failure| {
+            if failure.target_was_already_absent {
+                CleanupDeletionFailure::already_absent(failure.file_name, failure.error)
+            } else {
+                CleanupDeletionFailure::retained(failure.file_name, failure.error)
+            }
+        })
         .collect();
     deletion_failures.append(&mut stale_not_deleted);
     deletion_failures.append(&mut temporary_not_deleted);
@@ -2621,8 +2696,10 @@ fn accept_planned_file_verification(
             record_planned_file_removal_failure(
                 PlannedFileRemovalFailureMode::Partial,
                 failures,
-                file_name.to_owned(),
-                ALREADY_ABSENT_DELETION_DETAIL,
+                CleanupDeletionFailure::already_absent(
+                    file_name.to_owned(),
+                    ALREADY_ABSENT_DELETION_DETAIL,
+                ),
             )?;
             Ok(false)
         }
@@ -2630,8 +2707,7 @@ fn accept_planned_file_verification(
             record_planned_file_removal_failure(
                 failure_mode,
                 failures,
-                file_name.to_owned(),
-                error.to_string(),
+                CleanupDeletionFailure::retained(file_name.to_owned(), error.to_string()),
             )?;
             Ok(false)
         }
@@ -2641,16 +2717,17 @@ fn accept_planned_file_verification(
 fn record_planned_file_removal_failure(
     mode: PlannedFileRemovalFailureMode,
     failures: &mut Vec<CleanupDeletionFailure>,
-    file_name: String,
-    error: impl Into<String>,
+    failure: CleanupDeletionFailure,
 ) -> Result<()> {
-    let error = error.into();
     if mode == PlannedFileRemovalFailureMode::RequireCertifiedTarget {
         return Err(Error::InvalidFormat {
-            details: format!("planned cleanup deletion of {file_name} failed: {error}"),
+            details: format!(
+                "planned cleanup deletion of {} failed: {}",
+                failure.file_name, failure.error
+            ),
         });
     }
-    failures.push(CleanupDeletionFailure::new(file_name, error));
+    failures.push(failure);
     Ok(())
 }
 
@@ -2680,7 +2757,7 @@ fn remove_planned_files_with(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn remove_planned_files_with_after_open(
     directory: &Path,
     files: impl IntoIterator<Item = PlannedFileRemoval>,
@@ -2719,8 +2796,10 @@ fn remove_planned_files_core(
                 record_planned_file_removal_failure(
                     PlannedFileRemovalFailureMode::Partial,
                     &mut failures,
-                    file.file_name,
-                    ALREADY_ABSENT_DELETION_DETAIL,
+                    CleanupDeletionFailure::already_absent(
+                        file.file_name,
+                        ALREADY_ABSENT_DELETION_DETAIL,
+                    ),
                 )?;
                 continue;
             }
@@ -2728,8 +2807,7 @@ fn remove_planned_files_core(
                 record_planned_file_removal_failure(
                     failure_mode,
                     &mut failures,
-                    file.file_name,
-                    error.to_string(),
+                    CleanupDeletionFailure::retained(file.file_name, error.to_string()),
                 )?;
                 continue;
             }
@@ -2753,8 +2831,7 @@ fn remove_planned_files_core(
             record_planned_file_removal_failure(
                 failure_mode,
                 &mut failures,
-                file.file_name,
-                error.to_string(),
+                CleanupDeletionFailure::retained(file.file_name, error.to_string()),
             )?;
             continue;
         }
@@ -2783,15 +2860,16 @@ fn remove_planned_files_core(
                 record_planned_file_removal_failure(
                     PlannedFileRemovalFailureMode::Partial,
                     &mut failures,
-                    file.file_name,
-                    ALREADY_ABSENT_DELETION_DETAIL,
+                    CleanupDeletionFailure::already_absent(
+                        file.file_name,
+                        ALREADY_ABSENT_DELETION_DETAIL,
+                    ),
                 )?;
             }
             Err(error) => record_planned_file_removal_failure(
                 PlannedFileRemovalFailureMode::Partial,
                 &mut failures,
-                file.file_name,
-                error.to_string(),
+                CleanupDeletionFailure::retained(file.file_name, error.to_string()),
             )?,
         }
     }
@@ -3122,25 +3200,31 @@ impl Drop for UncommittedFile {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    #[cfg(unix)]
+    use std::collections::BTreeSet;
+    use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::fs::{File, OpenOptions};
+    use std::fs::File;
+    #[cfg(unix)]
+    use std::fs::OpenOptions;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime};
 
     #[cfg(unix)]
     use super::{
-        ApplyCredentials, ManifestFileAccess, certify_manifest_file, planned_apply_identity_issue,
-        preview_apply_identity_issue, remove_planned_files_with_after_open,
-        validate_apply_identity_for_uid, validate_plan_apply_identity_for_credentials,
+        ApplyCredentials, ManifestFileAccess, SETGID_MODE,
+        append_apply_identity_preview_warning_for_credentials, certify_manifest_file,
+        journal_service_user_issue, metadata_source_apply_identity_issue, planned_metadata_sources,
+        possible_created_group_ids, preview_apply_identity_issue,
+        remove_planned_files_with_after_open, validate_apply_identity_for_uid,
+        validate_plan_apply_identity_for_credentials,
     };
     use super::{
         CleanupAction, CleanupOptions, CleanupTask, JOURNAL_LINE_PREVIEW_LIMIT,
         JournalRemovalReason, PlannedFileRemoval, PlannedFileRemovalFailureMode, PreparedCleanup,
         RecoveryBackupPolicy, cleanup, file_fingerprint, manifest_upgrade_bytes, plan_cleanup,
-        planned_metadata_sources, recovery_backup_target, remove_planned_files,
-        remove_planned_files_with,
+        recovery_backup_target, remove_planned_files, remove_planned_files_with,
     };
     use crate::checksum::crc32;
     use crate::content::provider::SegmentProvider as _;
@@ -3815,11 +3899,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ownership_preview_mirrors_the_unconditional_journal_service_user_gate() {
+    fn ownership_preview_emits_a_known_mismatch_and_matches_the_apply_gate() {
         use std::os::unix::fs::MetadataExt as _;
 
         let directory = TestDirectory::repository("preview-service-user-warning");
-        let plan = plan_cleanup(
+        let mut plan = plan_cleanup(
             &directory.path,
             &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
         )
@@ -3841,67 +3925,127 @@ mod tests {
         let issue = preview_apply_identity_issue(&directory.path, &plan, &credentials)
             .expect("preview identity analysis")
             .expect("foreign service user must produce a preview warning");
+        let shared_issue = journal_service_user_issue(&directory.path, other_uid)
+            .expect("shared journal ownership analysis")
+            .expect("foreign service user must fail the shared gate");
 
-        assert!(issue.contains("repository service user"), "{issue}");
-        assert!(issue.contains("journal.log"), "{issue}");
+        assert_eq!(issue, shared_issue);
+        let apply_error = validate_apply_identity_for_uid(&directory.path, other_uid)
+            .expect_err("authoritative apply rejects the same mismatch")
+            .to_string();
+        assert!(apply_error.contains(&shared_issue), "{apply_error}");
+
+        let warnings_before = plan.warnings.len();
+        append_apply_identity_preview_warning_for_credentials(
+            &directory.path,
+            &mut plan,
+            Ok(credentials),
+        );
+        assert_eq!(plan.warnings.len(), warnings_before + 1);
+        let warning = plan.warnings.last().expect("known-mismatch warning");
+        assert!(
+            warning.contains("apply ownership preflight warning"),
+            "{warning}"
+        );
+        assert!(warning.contains(&shared_issue), "{warning}");
+        assert!(warning.contains("authoritative apply"), "{warning}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_preview_emits_a_warning_when_analysis_is_unprovable() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, source_name, _, _) =
+            rewrite_certificate_fixture("preview-unprovable-warning");
+        let mut plan = plan_cleanup(
+            &directory.path,
+            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+        )
+        .expect("read-only rewrite plan");
+        let journal_metadata = std::fs::symlink_metadata(directory.path.join("journal.log"))
+            .expect("journal metadata");
+        let credentials = ApplyCredentials {
+            effective_uid: journal_metadata.uid(),
+            effective_gid: journal_metadata.gid(),
+            group_ids: BTreeSet::from([journal_metadata.gid()]),
+        };
+        std::fs::rename(
+            directory.path.join(&source_name),
+            directory
+                .path
+                .join(format!("{source_name}.removed-after-plan")),
+        )
+        .expect("make the planned metadata source unavailable");
+        assert!(
+            preview_apply_identity_issue(&directory.path, &plan, &credentials).is_err(),
+            "the fixture must exercise the analysis-error arm"
+        );
+
+        let warnings_before = plan.warnings.len();
+        append_apply_identity_preview_warning_for_credentials(
+            &directory.path,
+            &mut plan,
+            Ok(credentials),
+        );
+
+        assert_eq!(plan.warnings.len(), warnings_before + 1);
+        let warning = plan.warnings.last().expect("unprovable-analysis warning");
+        assert!(
+            warning.contains("apply ownership could not be proved"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("authoritative apply will retry"),
+            "{warning}"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn metadata_preflight_models_inherited_gid_and_setgid_mode_conservatively() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        const SYNTHETIC_NON_ROOT_UID: u32 = 42_424;
+        const ARCHIVE_GROUP: u32 = 27_182;
+        const UNRELATED_GROUP: u32 = 31_415;
 
-        let (directory, source_name, _, _) =
-            rewrite_certificate_fixture("metadata-gid-mode-preflight");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("healthy rewrite plan");
-        let source_path = directory.path.join(&source_name);
-        let source_metadata = std::fs::symlink_metadata(&source_path).expect("source metadata");
-        let archive_owner = source_metadata.uid();
-        let archive_group = source_metadata.gid();
-        let unrelated_gid = if archive_group == u32::MAX {
-            archive_group - 1
-        } else {
-            archive_group + 1
-        };
         let credentials = ApplyCredentials {
-            effective_uid: archive_owner,
-            effective_gid: unrelated_gid,
-            group_ids: BTreeSet::from([unrelated_gid]),
+            effective_uid: SYNTHETIC_NON_ROOT_UID,
+            effective_gid: UNRELATED_GROUP,
+            group_ids: BTreeSet::from([UNRELATED_GROUP]),
         };
-
-        let directory_mode = std::fs::symlink_metadata(&directory.path)
-            .expect("directory metadata")
-            .permissions()
-            .mode();
-        std::fs::set_permissions(
-            &directory.path,
-            std::fs::Permissions::from_mode(directory_mode | libc::S_ISGID),
-        )
-        .expect("make staging files inherit the source gid");
-        let source_mode = source_metadata.permissions().mode();
-        std::fs::set_permissions(
-            &source_path,
-            std::fs::Permissions::from_mode(source_mode & !libc::S_ISGID),
-        )
-        .expect("clear source setgid bit");
+        let possible_created_gids =
+            possible_created_group_ids(ARCHIVE_GROUP, SETGID_MODE | 0o750, &credentials);
+        let source_path = std::path::Path::new("data00000a.tar");
+        let source_mode = 0o640;
 
         assert_eq!(
-            planned_apply_identity_issue(&directory.path, &plan, &credentials)
-                .expect("read-only inherited-gid analysis"),
+            possible_created_gids,
+            BTreeSet::from([ARCHIVE_GROUP]),
+            "a setgid directory fixes the staging-file group"
+        );
+        assert_eq!(
+            metadata_source_apply_identity_issue(
+                source_path,
+                SYNTHETIC_NON_ROOT_UID,
+                ARCHIVE_GROUP,
+                source_mode,
+                &possible_created_gids,
+                &credentials,
+            ),
             None,
             "an already inherited source gid needs neither fchown nor group membership when no setgid bit is requested"
         );
 
-        std::fs::set_permissions(
-            &source_path,
-            std::fs::Permissions::from_mode(source_mode | libc::S_ISGID),
+        let issue = metadata_source_apply_identity_issue(
+            source_path,
+            SYNTHETIC_NON_ROOT_UID,
+            ARCHIVE_GROUP,
+            source_mode | SETGID_MODE,
+            &possible_created_gids,
+            &credentials,
         )
-        .expect("install source setgid bit");
-        let issue = planned_apply_identity_issue(&directory.path, &plan, &credentials)
-            .expect("read-only setgid analysis")
-            .expect("setgid preservation outside caller groups must refuse conservatively");
-        assert!(issue.contains(&format!("gid {archive_group}")), "{issue}");
+        .expect("setgid preservation outside caller groups must refuse conservatively");
+        assert!(issue.contains(&format!("gid {ARCHIVE_GROUP}")), "{issue}");
         assert!(issue.contains("setgid-mode"), "{issue}");
         assert!(issue.contains("cannot be guaranteed read-only"), "{issue}");
     }
@@ -3909,46 +4053,38 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn metadata_preflight_models_both_permitted_non_setgid_creation_groups() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        const SYNTHETIC_NON_ROOT_UID: u32 = 42_424;
+        const SOURCE_GROUP: u32 = 27_182;
+        const EFFECTIVE_GROUP: u32 = 31_415;
 
-        let (directory, source_name, _, _) =
-            rewrite_certificate_fixture("metadata-non-setgid-group-preflight");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("healthy rewrite plan");
-        let source_path = directory.path.join(&source_name);
-        let source_metadata = std::fs::symlink_metadata(&source_path).expect("source metadata");
-        let source_gid = source_metadata.gid();
-        let effective_gid = if source_gid == u32::MAX {
-            source_gid - 1
-        } else {
-            source_gid + 1
-        };
-        let directory_mode = std::fs::symlink_metadata(&directory.path)
-            .expect("directory metadata")
-            .permissions()
-            .mode();
-        std::fs::set_permissions(
-            &directory.path,
-            std::fs::Permissions::from_mode(directory_mode & !libc::S_ISGID),
-        )
-        .expect("clear directory setgid bit");
         let credentials = ApplyCredentials {
-            effective_uid: source_metadata.uid(),
-            effective_gid,
-            group_ids: BTreeSet::from([effective_gid]),
+            effective_uid: SYNTHETIC_NON_ROOT_UID,
+            effective_gid: EFFECTIVE_GROUP,
+            group_ids: BTreeSet::from([EFFECTIVE_GROUP]),
         };
+        let possible_gids = possible_created_group_ids(SOURCE_GROUP, 0o750, &credentials);
 
-        let issue = planned_apply_identity_issue(&directory.path, &plan, &credentials)
-            .expect("read-only non-setgid analysis")
-            .expect("a possible System V group outcome must be treated conservatively");
-        let possible_gids = BTreeSet::from([source_gid, effective_gid]);
+        let issue = metadata_source_apply_identity_issue(
+            std::path::Path::new("data00000a.tar"),
+            SYNTHETIC_NON_ROOT_UID,
+            SOURCE_GROUP,
+            0o640,
+            &possible_gids,
+            &credentials,
+        )
+        .expect("a possible System V group outcome must be treated conservatively");
 
+        assert_eq!(
+            possible_gids,
+            BTreeSet::from([SOURCE_GROUP, EFFECTIVE_GROUP])
+        );
         assert!(
             issue.contains(&format!("may have gid {possible_gids:?}")),
             "the diagnostic must record both POSIX-permitted creation groups: {issue}"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_metadata_preflight_checks_only_the_newest_possible_template() {
         let directory = TestDirectory::repository("checkpoint-template-prefix");
@@ -3964,6 +4100,7 @@ mod tests {
         assert_eq!(sources, BTreeSet::from(["data00001a.tar".to_owned()]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_metadata_preflight_includes_the_leading_removal_outcome_prefix() {
         let directory = TestDirectory::repository("checkpoint-template-removal-prefix");
@@ -4617,6 +4754,21 @@ mod tests {
             std::fs::read(&path).expect("replacement remains"),
             b"new recovery material"
         );
+    }
+
+    #[test]
+    fn deletion_absence_state_does_not_depend_on_diagnostic_text() {
+        let retained = super::CleanupDeletionFailure::retained(
+            "data00000a.tar".to_owned(),
+            super::ALREADY_ABSENT_DELETION_DETAIL,
+        );
+        let absent = super::CleanupDeletionFailure::already_absent(
+            "data00001a.tar".to_owned(),
+            "a deliberately different ENOENT diagnostic",
+        );
+
+        assert!(!retained.target_was_already_absent());
+        assert!(absent.target_was_already_absent());
     }
 
     #[test]
