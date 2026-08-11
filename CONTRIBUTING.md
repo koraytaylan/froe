@@ -92,6 +92,14 @@ implementation is complete.
   constraints the code cannot express — never what the next line does.
   Safety comments describe the exact mechanism and scope proved by the
   code, not a stronger idealized state.
+* **User-facing documentation moves with the code.** A change that adds,
+  removes, or alters a capability updates the capability inventory in
+  [`docs/oak-segment-tar-feature-map.md`](docs/oak-segment-tar-feature-map.md),
+  the affected command's guide, and any remediation text, in the same
+  commit. A guide that claims a capability is unimplemented after it
+  ships, or omits a side effect the code now has — a one-way format
+  upgrade, a file an interrupted run leaves behind — reads as correct and
+  costs a review cycle to rediscover.
 * **Idiomatic Rust, not transliterated Java.** The format semantics are
   exact; the implementation is not a line-by-line translation. Errors
   are `Result`s, not exceptions; ownership replaces defensive copying;
@@ -111,7 +119,9 @@ layers green. New functionality explains why any layer does not apply:
    boundary-value inputs.
 2. **Independent-encoder round-trips.** Integration tests build
    repositories through `crates/froe/tests/support/` — a separate
-   encoder sharing no production code with the reader or writer — so a
+   encoder that shares no production encoding or parsing code with the
+   reader or writer, its single production import being
+   `checksum::crc32`, which known-answer vectors pin independently — so a
    self-consistent bug in one cannot hide in the other. Writer changes
    additionally round-trip through the *reader*: everything written must
    be read back identically.
@@ -172,9 +182,14 @@ HEAD`. For committed work, check the complete review range with `git diff
 
 ## Workflow
 
-* Development happens on `develop`; `main` holds released states.
-* Commits follow conventional commit prefixes (`feat:`, `fix:`,
-  `docs:`, `chore:`) with bodies that explain *why*, in full sentences.
+* Development happens on `develop`, the default branch. Releases are cut
+  and tagged there, following [`docs/releasing.md`](docs/releasing.md).
+  `main` stopped tracking released states after `v0.1.0` and nothing in
+  the release workflow reads it; treat it as historical.
+* Commits follow the conventional commit prefixes
+  [`cliff.toml`](cliff.toml) groups into release notes — `feat:`, `fix:`,
+  `harden:`, `perf:`, `refactor:`, `docs:`, `test:`, `chore:` — with
+  bodies that explain *why*, in full sentences.
 * A change to format-facing code cites the specification section (or the
   Java file and method) that justifies it, in the commit body or the
   code.
