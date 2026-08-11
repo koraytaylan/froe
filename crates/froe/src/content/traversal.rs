@@ -69,12 +69,15 @@ pub struct VisitedNode<'traversal, 'provider> {
     pub node: NodeState<'provider>,
     /// How many levels below the traversal root the node sits.
     pub depth: usize,
-    /// Children scheduled for later visits while producing this node.
-    pub scheduled_children: u64,
-    /// Stored bytes of child names materialized while scheduling them.
-    pub scheduled_child_name_bytes: u64,
-    /// Map records visited while counting and enumerating scheduled children.
-    pub scheduled_child_map_records: u64,
+}
+
+/// Diagnostic-only scheduling accounting kept out of the stable public
+/// [`VisitedNode`] shape.
+pub(crate) struct BoundedVisitedNode<'traversal, 'provider> {
+    pub(crate) visited: VisitedNode<'traversal, 'provider>,
+    pub(crate) scheduled_children: u64,
+    pub(crate) scheduled_child_name_bytes: u64,
+    pub(crate) scheduled_child_map_records: u64,
 }
 
 /// A depth-first walk over a subtree, in document order.
@@ -114,7 +117,9 @@ impl<'provider> DepthFirstTraversal<'provider> {
     /// the subtree is exhausted. The returned [`VisitedNode`] borrows the
     /// traversal's path buffer, so it lives until the next call.
     pub fn next_node(&mut self) -> Result<Option<VisitedNode<'_, 'provider>>> {
-        self.next_node_internal(None)
+        Ok(self
+            .next_node_internal(None)?
+            .map(|bounded| bounded.visited))
     }
 
     /// Advances with independent per-node child-count and stored-name-byte
@@ -125,7 +130,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
         maximum_scheduled_child_name_bytes: u64,
         maximum_scheduling_work: u64,
         maximum_pending_nodes: u64,
-    ) -> Result<Option<VisitedNode<'_, 'provider>>> {
+    ) -> Result<Option<BoundedVisitedNode<'_, 'provider>>> {
         self.next_node_internal(Some(SchedulingLimits {
             children: maximum_scheduled_children,
             child_name_bytes: maximum_scheduled_child_name_bytes,
@@ -141,7 +146,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
     fn next_node_internal(
         &mut self,
         limits: Option<SchedulingLimits>,
-    ) -> Result<Option<VisitedNode<'_, 'provider>>> {
+    ) -> Result<Option<BoundedVisitedNode<'_, 'provider>>> {
         loop {
             let Some(item) = self.stack.pop() else {
                 return Ok(None);
@@ -241,13 +246,26 @@ impl<'provider> DepthFirstTraversal<'provider> {
                                             .saturating_add(attempted_work_units),
                                     },
                                     Error::MapEntryBudgetExceeded {
-                                        attempted_entries, ..
-                                    } => Error::TraversalSchedulingBudgetExceeded {
-                                        maximum_scheduled_children: limits.children,
-                                        attempted_scheduled_children: attempted_entries,
+                                        maximum_entries,
+                                        attempted_entries,
+                                    } => Error::InvalidFormat {
+                                        details: format!(
+                                            "child map declared {maximum_entries} entries but \
+                                             enumerated at least {attempted_entries}"
+                                        ),
                                     },
                                     other => other,
                                 })?;
+                            let enumerated_children =
+                                u64::try_from(entries.len()).unwrap_or(u64::MAX);
+                            if enumerated_children != child_count {
+                                return Err(Error::InvalidFormat {
+                                    details: format!(
+                                        "child map declared {child_count} entries but enumerated \
+                                         {enumerated_children}"
+                                    ),
+                                });
+                            }
                             (
                                 entries,
                                 child_count,
@@ -290,10 +308,8 @@ impl<'provider> DepthFirstTraversal<'provider> {
             } else {
                 self.path_buffer.as_str()
             };
-            return Ok(Some(VisitedNode {
-                path,
-                node,
-                depth,
+            return Ok(Some(BoundedVisitedNode {
+                visited: VisitedNode { path, node, depth },
                 scheduled_children,
                 scheduled_child_name_bytes,
                 scheduled_child_map_records,

@@ -82,6 +82,20 @@ pub struct ParsedSegment {
     record_table: Vec<RecordTableEntry>,
 }
 
+/// Validated fixed-header and table-layout metadata for a data segment.
+/// Keeping this separate lets bounded diagnostics inspect the reference
+/// count without allocating either parsed table.
+#[derive(Clone, Copy, Debug)]
+struct DataSegmentHeader {
+    version: u8,
+    generation: i32,
+    full_generation: i32,
+    is_compacted: bool,
+    segment_reference_count: usize,
+    record_count: usize,
+    record_table_start: usize,
+}
+
 impl ParsedSegment {
     /// Parses a segment buffer.
     ///
@@ -89,9 +103,8 @@ impl ParsedSegment {
     /// segments are validated: magic bytes, version 12 or 13, table sizes
     /// within bounds, and a record table sorted by record number.
     pub fn parse(identifier: SegmentIdentifier, bytes: &[u8]) -> Result<Self> {
-        let kind = identifier.kind().ok_or_else(|| Error::InvalidFormat {
-            details: format!("segment {identifier} is neither a data nor a bulk segment"),
-        })?;
+        Self::validate_maximum_size(identifier, bytes)?;
+        let kind = Self::validate_segment_kind(identifier)?;
         if kind == SegmentKind::Bulk {
             return Ok(Self {
                 identifier,
@@ -108,8 +121,77 @@ impl ParsedSegment {
         Self::parse_data_segment(identifier, bytes)
     }
 
+    fn validate_maximum_size(identifier: SegmentIdentifier, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > MAXIMUM_SEGMENT_SIZE {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "segment {identifier} has {} bytes, exceeding the {MAXIMUM_SEGMENT_SIZE}-byte format limit",
+                    bytes.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_segment_kind(identifier: SegmentIdentifier) -> Result<SegmentKind> {
+        identifier.kind().ok_or_else(|| Error::InvalidFormat {
+            details: format!("segment {identifier} is neither a data nor a bulk segment"),
+        })
+    }
+
+    /// Validates a data segment's fixed header and table layout, returning
+    /// its reference count without allocating or parsing either table.
+    pub(crate) fn validated_data_segment_reference_count(
+        identifier: SegmentIdentifier,
+        bytes: &[u8],
+    ) -> Result<usize> {
+        Self::validate_maximum_size(identifier, bytes)?;
+        if Self::validate_segment_kind(identifier)? != SegmentKind::Data {
+            return Err(Error::InvalidFormat {
+                details: format!("segment {identifier} is not a data segment"),
+            });
+        }
+        Ok(Self::validate_data_segment_header(identifier, bytes)?.segment_reference_count)
+    }
+
     /// Parses and validates a data segment's header and tables.
     fn parse_data_segment(identifier: SegmentIdentifier, bytes: &[u8]) -> Result<Self> {
+        let header = Self::validate_data_segment_header(identifier, bytes)?;
+        let mut referenced_segments = Vec::with_capacity(header.segment_reference_count);
+        for reference_index in 0..header.segment_reference_count {
+            let base = HEADER_SIZE + reference_index * SEGMENT_REFERENCE_SIZE;
+            referenced_segments.push(SegmentIdentifier::new(
+                read_u64(bytes, base),
+                read_u64(bytes, base + 8),
+            ));
+        }
+
+        let record_table = Self::parse_record_table(
+            identifier,
+            bytes,
+            header.record_table_start,
+            header.record_count,
+        )?;
+
+        Ok(Self {
+            identifier,
+            kind: SegmentKind::Data,
+            size: bytes.len(),
+            version: Some(header.version),
+            generation: header.generation,
+            full_generation: header.full_generation,
+            is_compacted: header.is_compacted,
+            referenced_segments,
+            record_table,
+        })
+    }
+
+    /// Validates the fixed header and verifies that both declared tables fit
+    /// in the stored buffer. This performs no table allocation or traversal.
+    fn validate_data_segment_header(
+        identifier: SegmentIdentifier,
+        bytes: &[u8],
+    ) -> Result<DataSegmentHeader> {
         let invalid = |details: String| Error::InvalidFormat { details };
         if bytes.len() < HEADER_SIZE {
             return Err(invalid(format!(
@@ -170,28 +252,14 @@ impl ParsedSegment {
             )));
         }
 
-        let mut referenced_segments = Vec::with_capacity(segment_reference_count);
-        for reference_index in 0..segment_reference_count {
-            let base = HEADER_SIZE + reference_index * SEGMENT_REFERENCE_SIZE;
-            referenced_segments.push(SegmentIdentifier::new(
-                read_u64(bytes, base),
-                read_u64(bytes, base + 8),
-            ));
-        }
-
-        let record_table =
-            Self::parse_record_table(identifier, bytes, record_table_start, record_count)?;
-
-        Ok(Self {
-            identifier,
-            kind: SegmentKind::Data,
-            size: bytes.len(),
-            version: Some(version),
+        Ok(DataSegmentHeader {
+            version,
             generation,
             full_generation,
             is_compacted,
-            referenced_segments,
-            record_table,
+            segment_reference_count,
+            record_count,
+            record_table_start,
         })
     }
 
@@ -433,6 +501,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn validates_data_reference_count_without_materializing_tables() {
+        let identifier = data_segment_identifier(1);
+        let referenced = [data_segment_identifier(2), bulk_segment_identifier(3)];
+        let bytes = synthetic_data_segment(&referenced, &[(0, 0xff, vec![0])]);
+        assert_eq!(
+            ParsedSegment::validated_data_segment_reference_count(identifier, &bytes)
+                .expect("valid header and table layout"),
+            2
+        );
+
+        let mut negative_record_count = bytes.clone();
+        negative_record_count[18..22].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(
+            ParsedSegment::validated_data_segment_reference_count(
+                identifier,
+                &negative_record_count
+            )
+            .is_err()
+        );
+        assert!(
+            ParsedSegment::validated_data_segment_reference_count(
+                bulk_segment_identifier(4),
+                &bytes
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn resolves_record_offsets_through_the_table() {
         let identifier = data_segment_identifier(1);
         let bytes = synthetic_data_segment(&[], &[(0, 4, vec![1, b'x']), (1, 4, vec![1, b'y'])]);
@@ -464,6 +561,21 @@ pub(crate) mod tests {
             segment.buffer_position(virtual_offset).expect("in range"),
             0
         );
+    }
+
+    #[test]
+    fn rejects_oversized_data_and_bulk_segments_before_parsing() {
+        let bytes = vec![0u8; MAXIMUM_SEGMENT_SIZE + 1];
+        for identifier in [data_segment_identifier(1), bulk_segment_identifier(2)] {
+            let error = ParsedSegment::parse(identifier, &bytes).expect_err("oversized segment");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid segment-tar data: segment {identifier} has {} bytes, exceeding the {MAXIMUM_SEGMENT_SIZE}-byte format limit",
+                    bytes.len()
+                )
+            );
+        }
     }
 
     #[test]

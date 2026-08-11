@@ -189,6 +189,7 @@ pub type GarbageCollectionJournalReadResult<Value> =
 /// Parsing is deliberately total. A malformed or absent numeric field is
 /// represented by `-1`, while an absent root uses Oak's null record-id text.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct GarbageCollectionJournalEntry {
     /// Repository size after cleanup, in bytes, or `-1` when unavailable.
     pub repository_size: i64,

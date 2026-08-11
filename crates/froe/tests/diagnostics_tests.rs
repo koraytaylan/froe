@@ -16,7 +16,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use froe::PropertyType;
-use froe::segment::identifier::SegmentIdentifier;
+use froe::segment::{MAXIMUM_SEGMENT_SIZE, identifier::SegmentIdentifier};
 use froe::store::Repository;
 use froe::tooling::{
     ArchiveDebugError, ArchiveDebugOptions, ArchiveDebugState, ArchiveGraphOrigin,
@@ -44,6 +44,7 @@ struct DiagnosticFixture {
     data_identifier: SegmentIdentifier,
     bulk_identifiers: [SegmentIdentifier; 4],
     graph_empty_identifier: Option<SegmentIdentifier>,
+    invalid_graph_identifier: Option<SegmentIdentifier>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +56,7 @@ enum GraphFixture {
     HostileChildName,
     HostileTemplateName,
     Corrupt,
+    CorruptWithInvalidHeader,
     Missing,
 }
 
@@ -230,8 +232,26 @@ fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> Dia
     } else {
         None
     };
+    let invalid_graph_uuid = data_segment_uuid(0x107);
+    let invalid_graph_identifier =
+        if matches!(graph_fixture, GraphFixture::CorruptWithInvalidHeader) {
+            let mut invalid_header = vec![0u8; 32];
+            invalid_header[0..3].copy_from_slice(b"0aK");
+            invalid_header[3] = 13;
+            invalid_header[14..18].copy_from_slice(&u32::MAX.to_be_bytes());
+            data_archive.add_segment(invalid_graph_uuid, invalid_header);
+            Some(SegmentIdentifier::new(
+                invalid_graph_uuid.0,
+                invalid_graph_uuid.1,
+            ))
+        } else {
+            None
+        };
     let mut data_archive_bytes = data_archive.build(DATA_ARCHIVE);
-    if matches!(graph_fixture, GraphFixture::Corrupt) {
+    if matches!(
+        graph_fixture,
+        GraphFixture::Corrupt | GraphFixture::CorruptWithInvalidHeader
+    ) {
         let graph_magic = 0x0A30_470Au32.to_be_bytes();
         let magic_position = data_archive_bytes
             .windows(graph_magic.len())
@@ -259,6 +279,7 @@ fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> Dia
         data_identifier: SegmentIdentifier::new(data_uuid.0, data_uuid.1),
         bulk_identifiers: bulk_uuids.map(|uuid| SegmentIdentifier::new(uuid.0, uuid.1)),
         graph_empty_identifier,
+        invalid_graph_identifier,
     }
 }
 
@@ -347,6 +368,31 @@ fn write_deep_wide_production_fixture(directory: &std::path::Path) {
                 &[],
             )
             .expect("branch");
+    }
+    writer.finish().expect("finish writer");
+    assert!(store.set_head(store.head(), chain));
+    store.close().expect("close writer");
+}
+
+fn write_deep_shared_name_production_fixture(directory: &std::path::Path) {
+    let store = WritableRepository::open(directory).expect("open writable repository");
+    let generation = store.writing_generation().expect("generation");
+    let mut writer = store.record_writer(generation);
+    let mut chain = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+        .expect("leaf");
+    for _ in 0..5 {
+        chain = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "shared-name".to_owned(),
+                    node: chain,
+                },
+                &[],
+            )
+            .expect("chain node");
     }
     writer.finish().expect("finish writer");
     assert!(store.set_head(store.head(), chain));
@@ -522,10 +568,14 @@ fn write_external_binary_fixture(test_name: &str) -> TestDirectory {
     directory
 }
 
-/// Independently encodes a corrupt branch whose declared root size is 33
-/// while its two leaves enumerate 34 concrete entries. All keys are empty,
-/// so the actual-entry limit—not the stored-name-byte limit—must stop it.
-fn write_corrupt_child_map_fixture(test_name: &str) -> TestDirectory {
+/// Independently encodes a corrupt branch whose declared root size differs
+/// from the sum of its two leaves. All keys are empty, so concrete entry
+/// accounting—not the stored-name-byte limit—must detect the mismatch.
+fn write_mismatched_child_map_fixture(
+    test_name: &str,
+    declared_size: u32,
+    leaf_sizes: [u32; 2],
+) -> TestDirectory {
     let directory = TestDirectory::new(test_name);
     let data_uuid = data_segment_uuid(0x351);
     let mut data = SegmentBuilder::new(data_uuid);
@@ -536,20 +586,58 @@ fn write_corrupt_child_map_fixture(test_name: &str) -> TestDirectory {
     let mut child = record_identifier_bytes(0, 4);
     child.extend(record_identifier_bytes(0, 3));
     data.add_record(4, TYPE_NODE, child);
-    for leaf_record_number in [5u32, 6] {
-        let mut leaf = ((1u32 << 29) | 0x11).to_be_bytes().to_vec();
-        leaf.extend(std::iter::repeat_n(0u8, 17 * 4));
-        for _ in 0..17 {
+    for (leaf_record_number, leaf_size) in [5u32, 6].into_iter().zip(leaf_sizes) {
+        let mut leaf = ((1u32 << 29) | leaf_size).to_be_bytes().to_vec();
+        leaf.extend(std::iter::repeat_n(0u8, leaf_size as usize * 4));
+        for _ in 0..leaf_size {
             leaf.extend(record_identifier_bytes(0, 1));
             leaf.extend(record_identifier_bytes(0, 4));
         }
         data.add_record(leaf_record_number, TYPE_MAP_LEAF, leaf);
     }
-    let mut branch = 33u32.to_be_bytes().to_vec();
+    let mut branch = declared_size.to_be_bytes().to_vec();
     branch.extend(0b11u32.to_be_bytes());
     branch.extend(record_identifier_bytes(0, 5));
     branch.extend(record_identifier_bytes(0, 6));
     data.add_record(7, TYPE_MAP_BRANCH, branch);
+
+    let mut head = record_identifier_bytes(0, 8);
+    head.extend(record_identifier_bytes(0, 2));
+    head.extend(record_identifier_bytes(0, 7));
+    data.add_record(8, TYPE_NODE, head);
+    let mut archive = ArchiveBuilder::new();
+    archive.add_segment(data_uuid, data.build());
+    write_repository(
+        &directory.path,
+        &[(DATA_ARCHIVE.to_owned(), archive.build(DATA_ARCHIVE))],
+        &[format!("{}:8 root 1", format_uuid(data_uuid))],
+    );
+    directory
+}
+
+/// Independently encodes a two-record diff chain whose base record is absent.
+/// The diagnostic's first scheduling preflight must refuse before attempting
+/// to resolve that third map record.
+fn write_diff_child_map_fixture(test_name: &str) -> TestDirectory {
+    let directory = TestDirectory::new(test_name);
+    let data_uuid = data_segment_uuid(0x353);
+    let mut data = SegmentBuilder::new(data_uuid);
+    data.add_record(1, TYPE_VALUE, string_record("child"));
+    data.add_record(2, TYPE_TEMPLATE, (1u32 << 28).to_be_bytes().to_vec());
+    data.add_record(3, TYPE_TEMPLATE, (1u32 << 29).to_be_bytes().to_vec());
+
+    let mut child = record_identifier_bytes(0, 4);
+    child.extend(record_identifier_bytes(0, 3));
+    data.add_record(4, TYPE_NODE, child);
+
+    for (record_number, base_record_number) in [(6, 5), (7, 6)] {
+        let mut diff = u32::MAX.to_be_bytes().to_vec();
+        diff.extend(independent_map_entry_hash("child").to_be_bytes());
+        diff.extend(record_identifier_bytes(0, 1));
+        diff.extend(record_identifier_bytes(0, 4));
+        diff.extend(record_identifier_bytes(0, base_record_number));
+        data.add_record(record_number, TYPE_MAP_LEAF, diff);
+    }
 
     let mut head = record_identifier_bytes(0, 8);
     head.extend(record_identifier_bytes(0, 2));
@@ -884,6 +972,40 @@ fn corrupt_graph_is_reconstructed_and_does_not_hide_content_attribution() {
 }
 
 #[test]
+fn reconstructed_graph_validates_headers_before_reserving_raw_edge_counts() {
+    let fixture = write_diagnostic_fixture(
+        "corrupt-debug-graph-header",
+        GraphFixture::CorruptWithInvalidHeader,
+    );
+    let repository = Repository::open(&fixture.directory.path).expect("open repository");
+    let mut options = ArchiveDebugOptions::default();
+    options.maximum_graph_edges = fixture.bulk_identifiers.len();
+    let report = debug_archive_with_options(&repository, DATA_ARCHIVE, options)
+        .expect("invalid header is an unavailable row, not a graph-budget refusal");
+
+    let graph = report.graph.expect("reconstructed graph");
+    assert_eq!(graph.origin, ArchiveGraphOrigin::Reconstructed);
+    assert_eq!(graph.rows.len(), 2);
+    assert_eq!(
+        graph.rows[0].references,
+        ArchiveGraphReferences::Available(fixture.bulk_identifiers.to_vec())
+    );
+    let invalid_identifier = fixture
+        .invalid_graph_identifier
+        .expect("fixture includes an invalid data segment");
+    let invalid_row = graph
+        .rows
+        .iter()
+        .find(|row| row.segment_identifier == invalid_identifier)
+        .expect("invalid row remains totalized");
+    assert!(matches!(
+        &invalid_row.references,
+        ArchiveGraphReferences::Unavailable { details }
+            if details.contains("declares -1 segment references")
+    ));
+}
+
+#[test]
 fn crc_valid_nonempty_stored_graph_uses_oak_set_order_and_last_source_row() {
     let fixture = write_diagnostic_fixture("stored-debug-graph", GraphFixture::ValidNonempty);
     let repository = Repository::open(&fixture.directory.path).expect("open repository");
@@ -977,21 +1099,26 @@ fn missing_graph_is_reconstructed_from_recovered_archive_bytes() {
 fn reconstructed_graph_charges_dense_segment_bytes_before_parsing() {
     let fixture = write_diagnostic_fixture("missing-debug-graph-work", GraphFixture::Missing);
     let repository = Repository::open(&fixture.directory.path).expect("open repository");
-    let complete = debug_archive(&repository, DATA_ARCHIVE)
-        .expect("complete reconstructed report")
-        .work
-        .consumed_work_units;
-    let referenced_segments = fixture.bulk_identifiers.len() as u64;
+    let data_bytes = repository
+        .archives()
+        .iter()
+        .find(|archive| archive.file_name() == DATA_ARCHIVE)
+        .and_then(|archive| archive.segment_data(fixture.data_identifier))
+        .expect("independent data segment");
+    assert_eq!(data_bytes.len(), 2_096);
+    // The independently encoded tree consumes 1,087 units before graph
+    // reconstruction; graph selection and its row cost two more. Reserving
+    // the complete 2,096-byte segment therefore attempts unit 3,185 before
+    // parsing. Removing the byte charge makes this absolute threshold pass.
     let mut options = ArchiveDebugOptions::default();
-    options.maximum_work_units = complete - referenced_segments - 1;
+    options.maximum_work_units = 3_184;
 
     assert!(matches!(
         debug_archive_with_options(&repository, DATA_ARCHIVE, options),
         Err(ArchiveDebugError::WorkBudgetExceeded {
-            maximum_work_units,
-            attempted_work_units,
-        }) if maximum_work_units == complete - referenced_segments - 1
-            && attempted_work_units == complete - referenced_segments
+            maximum_work_units: 3_184,
+            attempted_work_units: 3_185,
+        })
     ));
 }
 
@@ -1116,8 +1243,14 @@ fn duplicate_rendered_property_lines_use_oak_tree_set_semantics() {
     assert_eq!(
         report.work.retained_path_references,
         report.references.len() as u64,
-        "deduplicated rows are released from the result ledger"
+        "only unique rows enter the result ledger"
     );
+    let mut exact_unique = ArchiveDebugOptions::default();
+    exact_unique.maximum_path_references = report.references.len();
+    exact_unique.maximum_reference_text_bytes = report.work.retained_reference_text_bytes as usize;
+    let bounded = debug_archive_with_options(&repository, DATA_ARCHIVE, exact_unique)
+        .expect("duplicate candidates do not consume aggregate result budget");
+    assert_eq!(bounded.references, report.references);
 }
 
 #[test]
@@ -1246,16 +1379,57 @@ fn per_node_child_materialization_cap_is_typed_and_checked_before_expansion() {
 
 #[test]
 fn corrupt_map_cannot_enumerate_past_its_preflighted_child_limit() {
-    let directory = write_corrupt_child_map_fixture("debug-corrupt-map-count");
+    for (fixture_name, declared_size, leaf_sizes, expected_details) in [
+        (
+            "debug-corrupt-map-over-count",
+            33,
+            [17, 17],
+            "child map declared 33 entries but enumerated at least 34",
+        ),
+        (
+            "debug-corrupt-map-under-count",
+            34,
+            [17, 16],
+            "child map declared 34 entries but enumerated 33",
+        ),
+    ] {
+        let directory = write_mismatched_child_map_fixture(fixture_name, declared_size, leaf_sizes);
+        let repository = Repository::open(&directory.path).expect("open repository");
+        for child_limit in [
+            ArchiveDebugOptions::default().maximum_scheduled_children_per_node,
+            u64::MAX,
+        ] {
+            let mut options = ArchiveDebugOptions::default();
+            options.maximum_scheduled_children_per_node = child_limit;
+            let error = debug_archive_with_options(&repository, DATA_ARCHIVE, options)
+                .expect_err("the concrete entry mismatch is repository corruption");
+            assert!(
+                matches!(
+                    error,
+                    ArchiveDebugError::Repository(froe::Error::InvalidFormat { ref details })
+                        if details == expected_details
+                ),
+                "fixture {fixture_name}, child limit {child_limit}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn archive_work_budget_charges_each_child_map_diff_record_at_an_absolute_threshold() {
+    let directory = write_diff_child_map_fixture("debug-map-diff-work");
     let repository = Repository::open(&directory.path).expect("open repository");
     let mut options = ArchiveDebugOptions::default();
-    options.maximum_scheduled_children_per_node = 33;
+    options.maximum_work_units = 2;
 
+    // Unit one selects the root traversal step. Only one further unit
+    // remains: the first diff fits, but following the second diff attempts
+    // absolute unit three before any child-entry materialization.
     assert!(matches!(
         debug_archive_with_options(&repository, DATA_ARCHIVE, options),
-        Err(ArchiveDebugError::NodeChildBudgetExceeded {
-            maximum_scheduled_children_per_node: 33,
-            attempted_scheduled_children: 34,
+        Err(ArchiveDebugError::WorkBudgetExceeded {
+            maximum_work_units: 2,
+            attempted_work_units: 3,
         })
     ));
 }
@@ -1275,6 +1449,29 @@ fn deep_wide_tree_hits_total_pending_node_cap() {
         Err(ArchiveDebugError::PendingNodeBudgetExceeded {
             maximum_pending_nodes: 2,
             attempted_pending_nodes: 3,
+        })
+    ));
+}
+
+#[test]
+fn deep_shared_name_paths_charge_each_full_path_copy() {
+    let directory = TestDirectory::new("debug-deep-path-work");
+    write_deep_shared_name_production_fixture(&directory.path);
+    std::fs::remove_file(directory.path.join("repo.lock")).expect("remove bootstrap lock");
+    let repository = Repository::open(&directory.path).expect("open repository");
+    let archive_file_name = repository.archives()[0].file_name().to_owned();
+    let mut options = ArchiveDebugOptions::default();
+    options.maximum_work_units = 1_116;
+
+    // The fifth nested node's Oak path is five copies of "/shared-name"
+    // plus the trailing slash used for its rows: 5 * 12 + 1 = 61 bytes.
+    // The independently fixed threshold catches that whole copy as work;
+    // charging only the newly scheduled name would not reach 1_177.
+    assert!(matches!(
+        debug_archive_with_options(&repository, &archive_file_name, options),
+        Err(ArchiveDebugError::WorkBudgetExceeded {
+            maximum_work_units: 1_116,
+            attempted_work_units: 1_177,
         })
     ));
 }
@@ -1344,4 +1541,33 @@ fn archive_argument_is_a_file_name_not_an_escape_path() {
     let repository = Repository::open(&fixture.directory.path).expect("open repository");
     assert!(debug_archive(&repository, "../data00000a.tar").is_err());
     assert!(debug_archive(&repository, "not-an-archive.tar").is_err());
+}
+
+#[test]
+fn archive_debug_rejects_an_oversized_indexed_segment() {
+    let directory = TestDirectory::new("debug-oversized-indexed-segment");
+    let data_uuid = data_segment_uuid(0x501);
+    let mut oversized_segment = vec![0u8; MAXIMUM_SEGMENT_SIZE + 1];
+    oversized_segment[0..3].copy_from_slice(b"0aK");
+    oversized_segment[3] = 13;
+    oversized_segment[4..8].copy_from_slice(&(1u32 | 0x8000_0000).to_be_bytes());
+    oversized_segment[10..14].copy_from_slice(&1u32.to_be_bytes());
+
+    let mut archive = ArchiveBuilder::new();
+    archive.add_segment(data_uuid, oversized_segment);
+    write_repository(
+        &directory.path,
+        &[(DATA_ARCHIVE.to_owned(), archive.build(DATA_ARCHIVE))],
+        &[format!("{}:0 root 1", format_uuid(data_uuid))],
+    );
+    let repository = Repository::open(&directory.path).expect("open indexed repository");
+    assert!(repository.archives()[0].index().is_some());
+
+    let error = debug_archive(&repository, DATA_ARCHIVE).expect_err("oversized segment");
+    assert!(matches!(
+        error,
+        ArchiveDebugError::Repository(froe::Error::InvalidFormat { details })
+            if details.contains("262145 bytes")
+                && details.contains("262144-byte format limit")
+    ));
 }

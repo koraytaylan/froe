@@ -18,3 +18,17 @@ fn legacy_writer_exports_are_the_neutral_type() {
 
     assert_eq!(root_export, neutral);
 }
+
+#[test]
+fn visited_node_keeps_its_three_field_destructuring_surface() {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "moving the external public value is the compatibility surface under test"
+    )]
+    fn destructure(visited: froe::content::traversal::VisitedNode<'_, '_>) {
+        let froe::content::traversal::VisitedNode { path, node, depth } = visited;
+        let _ = (path, node, depth);
+    }
+
+    let _ = destructure;
+}

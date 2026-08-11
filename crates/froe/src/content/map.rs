@@ -447,7 +447,7 @@ pub fn is_branch_head(head: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_entries, map_entry, map_size};
+    use super::{map_entries, map_entry, map_size, map_size_with_maximum_work};
     use crate::content::provider::tests::{CountingSegmentProvider, MemorySegmentProvider};
     use crate::hashing::map_entry_hash;
     use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
@@ -562,6 +562,46 @@ mod tests {
             "child"
         );
         assert_eq!(provider.string_reads(), 1);
+    }
+
+    #[test]
+    fn bounded_map_size_charges_each_diff_record_before_following_it() {
+        let segment = data_segment_identifier(3);
+        let diff_record = |base_record_number: u32| {
+            let mut bytes = u32::MAX.to_be_bytes().to_vec();
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.extend_from_slice(&identifier_bytes(1));
+            bytes.extend_from_slice(&identifier_bytes(4));
+            bytes.extend_from_slice(&identifier_bytes(base_record_number));
+            bytes
+        };
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("child")),
+                    (4, 4, small_string_record("value")),
+                    (10, 0, leaf_record(0, &[("child", 1, 4)])),
+                    (11, 0, diff_record(10)),
+                    (12, 0, diff_record(11)),
+                ],
+            ),
+        );
+        let map = RecordIdentifier::new(segment, 12);
+
+        assert!(matches!(
+            map_size_with_maximum_work(&provider, map, 2),
+            Err(crate::Error::MapTraversalWorkBudgetExceeded {
+                maximum_work_units: 2,
+                attempted_work_units: 3,
+            })
+        ));
+        assert_eq!(
+            map_size_with_maximum_work(&provider, map, 3).expect("exact diff budget"),
+            (1, 3)
+        );
     }
 
     #[test]

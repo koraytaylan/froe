@@ -21,6 +21,8 @@
 //! path-copy work. Child counts, concrete map entries, map-record visits, and
 //! stored name lengths are checked before the corresponding expansion.
 //! Returned path references have both a count and retained-text budget; a
+//! candidate is individually preflighted and inserted into a per-node
+//! TreeSet-equivalent, so duplicate rendered lines do not accumulate. A
 //! rejected candidate can already hold work/name-bounded text but is never
 //! retained in the report.
 //!
@@ -35,7 +37,7 @@
 //! structurally invalid data segment encountered during graph reconstruction
 //! gets an explicit unavailable row so other archive rows remain useful.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use crate::content::list::{read_counted_list, uncounted_list_entry};
@@ -756,14 +758,15 @@ pub fn debug_archive_with_options(
         )?;
         work.visited_nodes += 1;
         let oak_path_bytes = visited
+            .visited
             .path
             .len()
-            .saturating_add(usize::from(visited.path != "/"));
+            .saturating_add(usize::from(visited.visited.path != "/"));
         work_budget.charge_many(oak_path_bytes)?;
-        let path = oak_node_path(visited.path);
-        let mut node_references = references_for_node(
+        let path = oak_node_path(visited.visited.path);
+        let node_references = references_for_node(
             repository,
-            visited.node,
+            visited.visited.node,
             &path,
             archive,
             &mut work,
@@ -772,21 +775,7 @@ pub fn debug_archive_with_options(
             options.maximum_name_bytes_per_node,
             visited.scheduled_child_name_bytes,
         )?;
-        let mut keyed_references = Vec::with_capacity(node_references.len());
-        for reference in node_references.drain(..) {
-            work_budget.charge_many(reference.oak_rendered_line_byte_len())?;
-            keyed_references.push((reference.oak_rendered_utf16_sort_key(), reference));
-        }
-        keyed_references.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut previous_key: Option<Vec<u16>> = None;
-        for (key, reference) in keyed_references {
-            if previous_key.as_ref() == Some(&key) {
-                result_budget.release(&reference);
-            } else {
-                previous_key = Some(key);
-                references.push(reference);
-            }
-        }
+        references.extend(node_references);
     }
     let graph = diagnostic_archive_graph(archive, &mut work_budget, options)?;
     work.consumed_work_units = work_budget.consumed;
@@ -880,19 +869,18 @@ impl ResultBudget {
         Ok(())
     }
 
-    fn release(&mut self, reference: &ArchivePathReference) {
-        self.retained_path_references -= 1;
-        self.retained_reference_text_bytes -= reference.retained_text_bytes();
-    }
-
-    fn display_budget(&self, base_text_bytes: usize) -> ArchiveDebugResult<DisplayBudget> {
+    fn candidate_display_budget(
+        &self,
+        base_text_bytes: usize,
+    ) -> ArchiveDebugResult<DisplayBudget> {
         let budget = DisplayBudget {
+            // Uniqueness is known only after the complete Oak line is
+            // rendered. Candidate construction is bounded by the configured
+            // text cap; aggregate row/text reservation happens after dedup.
             maximum_path_references: self.options.maximum_path_references,
             maximum_reference_text_bytes: self.options.maximum_reference_text_bytes,
-            attempted_path_references: self.retained_path_references.saturating_add(1),
-            base_reference_text_bytes: self
-                .retained_reference_text_bytes
-                .saturating_add(base_text_bytes),
+            attempted_path_references: 1,
+            base_reference_text_bytes: base_text_bytes,
         };
         budget.check_display_bytes(0)?;
         Ok(budget)
@@ -957,13 +945,22 @@ impl BoundedDisplay {
     }
 }
 
-fn retain_reference(
-    references: &mut Vec<ArchivePathReference>,
+fn collect_reference(
+    references: &mut BTreeMap<Vec<u16>, ArchivePathReference>,
     reference: ArchivePathReference,
+    work_budget: &mut WorkBudget,
     result_budget: &mut ResultBudget,
 ) -> ArchiveDebugResult<()> {
-    result_budget.retain(&reference)?;
-    references.push(reference);
+    // A candidate can be larger than the remaining aggregate allowance when
+    // it duplicates a retained line, but it may never exceed the configured
+    // single-candidate text bound before its rendered key is allocated.
+    result_budget.candidate_display_budget(reference.retained_text_bytes())?;
+    work_budget.charge_many(reference.oak_rendered_line_byte_len())?;
+    let key = reference.oak_rendered_utf16_sort_key();
+    if let std::collections::btree_map::Entry::Vacant(entry) = references.entry(key) {
+        result_budget.retain(&reference)?;
+        entry.insert(reference);
+    }
     Ok(())
 }
 
@@ -1010,24 +1007,23 @@ fn diagnostic_archive_graph(
                     // charge the complete segment byte slice before entering
                     // the parser rather than only its declared references.
                     work_budget.charge_many(bytes.len())?;
-                    // Version 13 stores its referenced-segment count in the
-                    // fixed header. Reserve that edge work before the parser
-                    // can allocate and populate the reference vector. A
-                    // truncated header remains an ordinary unavailable row.
-                    if let Some(count_bytes) = bytes.get(14..18) {
-                        let reference_count = u32::from_be_bytes(
-                            count_bytes
-                                .try_into()
-                                .expect("a four-byte slice converts to an array"),
-                        );
-                        graph_edges = graph_edges.saturating_add(reference_count as usize);
-                        check_graph_budget(options, segment_count, graph_edges)?;
-                        work_budget.charge_amount(u64::from(reference_count))?;
-                    }
-                    match ParsedSegment::parse(segment_identifier, bytes) {
-                        Ok(segment) => ArchiveGraphReferences::Available(
-                            sorted_unique_segment_identifiers(segment.referenced_segments),
-                        ),
+                    match ParsedSegment::validated_data_segment_reference_count(
+                        segment_identifier,
+                        bytes,
+                    ) {
+                        Ok(reference_count) => {
+                            graph_edges = graph_edges.saturating_add(reference_count);
+                            check_graph_budget(options, segment_count, graph_edges)?;
+                            work_budget.charge_many(reference_count)?;
+                            match ParsedSegment::parse(segment_identifier, bytes) {
+                                Ok(segment) => ArchiveGraphReferences::Available(
+                                    sorted_unique_segment_identifiers(segment.referenced_segments),
+                                ),
+                                Err(error) => ArchiveGraphReferences::Unavailable {
+                                    details: error.to_string(),
+                                },
+                            }
+                        }
                         Err(error) => ArchiveGraphReferences::Unavailable {
                             details: error.to_string(),
                         },
@@ -1186,31 +1182,37 @@ fn references_for_node(
         other => ArchiveDebugError::Repository(other),
     })?;
     work_budget.charge_amount(template_name_bytes)?;
-    let mut references = Vec::new();
+    // Oak uses a TreeSet of complete rendered lines per visited node. Using a
+    // map here deduplicates as each candidate arrives, so duplicate hostile
+    // template entries do not accumulate in a second pre-sort vector. Unique
+    // entries reserve the aggregate result budget before insertion.
+    let mut references = BTreeMap::new();
 
     if archive.contains_segment(node_identifier.segment) {
-        retain_reference(
+        collect_reference(
             &mut references,
             ArchivePathReference::Node {
                 path: path.to_owned(),
                 record_identifier: node_identifier,
             },
+            work_budget,
             result_budget,
         )?;
     }
     if archive.contains_segment(template_identifier.segment) {
-        retain_reference(
+        collect_reference(
             &mut references,
             ArchivePathReference::Template {
                 path: path.to_owned(),
                 record_identifier: template_identifier,
             },
+            work_budget,
             result_budget,
         )?;
     }
 
     if template.properties.is_empty() {
-        return Ok(references);
+        return Ok(references.into_values().collect());
     }
     let property_list_slot = if template.child_arity == ChildNodeArity::Zero {
         2
@@ -1245,8 +1247,8 @@ fn references_for_node(
             false
         };
         if record_is_in_archive || binary_block_segment_match {
-            let display_budget =
-                result_budget.display_budget(path.len().saturating_add(property.name.len()))?;
+            let display_budget = result_budget
+                .candidate_display_budget(path.len().saturating_add(property.name.len()))?;
             let display = property_display(
                 repository,
                 property,
@@ -1254,7 +1256,7 @@ fn references_for_node(
                 work_budget,
                 display_budget,
             )?;
-            retain_reference(
+            collect_reference(
                 &mut references,
                 ArchivePathReference::Property {
                     path: path.to_owned(),
@@ -1265,11 +1267,12 @@ fn references_for_node(
                     record_is_in_archive,
                     display,
                 },
+                work_budget,
                 result_budget,
             )?;
         }
     }
-    Ok(references)
+    Ok(references.into_values().collect())
 }
 
 fn property_display(
