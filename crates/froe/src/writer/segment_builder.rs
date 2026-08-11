@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+pub use crate::segment::generation::GarbageCollectionGeneration;
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::parsed_segment::MAXIMUM_SEGMENT_SIZE;
 use crate::segment::record::RecordType;
@@ -38,17 +39,6 @@ const MAXIMUM_SEGMENT_REFERENCES: usize = 0xFFFD;
 /// segment and allocate in a fresh one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentBufferFull;
-
-/// The garbage collection generation stamped on written segments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GarbageCollectionGeneration {
-    /// The generation, incremented by every compaction.
-    pub generation: i32,
-    /// The full generation, incremented only by full compactions.
-    pub full_generation: i32,
-    /// Whether the segment was produced by a compactor.
-    pub is_compacted: bool,
-}
 
 /// A finished segment ready to be persisted.
 pub struct BuiltSegment {

@@ -18,7 +18,9 @@
 //! external blob store, of which the segment store only knows the
 //! identifier.
 
-use crate::content::list::uncounted_list_entries;
+use std::io;
+
+use crate::content::list::{MAXIMUM_LIST_SIZE, uncounted_list_entries, uncounted_list_entry};
 use crate::content::provider::SegmentProvider;
 use crate::error::{Error, Result};
 use crate::segment::record::RecordIdentifier;
@@ -40,6 +42,7 @@ pub enum BinaryValue {
         /// The binary's length in bytes.
         length: u64,
         /// The value record; content is fetched on demand with
+        /// [`read_binary_stream`] or materialized with
         /// [`read_binary_content`].
         record_identifier: RecordIdentifier,
     },
@@ -49,6 +52,193 @@ pub enum BinaryValue {
         /// binary.
         blob_identifier: String,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BinaryStreamSource {
+    Direct {
+        record_identifier: RecordIdentifier,
+        content_offset: usize,
+    },
+    Blocks {
+        list_identifier: RecordIdentifier,
+        block_count: u64,
+    },
+}
+
+/// A bounded-memory reader over an inline binary value.
+///
+/// The stream borrows its [`SegmentProvider`] and keeps no segment view or
+/// content buffer alive between reads. Small and medium values are copied
+/// directly from their value record. For a long value, each read resolves
+/// only the list entry for the current 4 KiB block; the complete block list
+/// and binary are never materialized by the stream itself.
+///
+/// This type implements [`io::Read`]. Call [`Self::read_chunk`] instead when
+/// the caller needs `froe`'s precise [`Error`] variants: `io::Read` preserves
+/// non-I/O errors as the inner value of an [`io::Error`], where they remain
+/// available through [`io::Error::get_ref`] and downcasting. The stream is
+/// `Send` whenever its concrete provider type is `Sync`, and its lifetime
+/// prevents it from outliving that provider.
+pub struct BinaryStream<
+    'provider,
+    Provider: SegmentProvider + ?Sized = dyn SegmentProvider + 'provider,
+> {
+    provider: &'provider Provider,
+    source: BinaryStreamSource,
+    length: u64,
+    position: u64,
+    resolved_block: Option<(u64, RecordIdentifier)>,
+}
+
+impl<Provider: SegmentProvider + ?Sized> BinaryStream<'_, Provider> {
+    fn resolve_block_identifier(
+        &mut self,
+        list_identifier: RecordIdentifier,
+        block_count: u64,
+        block_index: u64,
+    ) -> Result<RecordIdentifier> {
+        if let Some((resolved_index, identifier)) = self.resolved_block
+            && resolved_index == block_index
+        {
+            return Ok(identifier);
+        }
+        let identifier =
+            uncounted_list_entry(self.provider, list_identifier, block_count, block_index)?;
+        self.resolved_block = Some((block_index, identifier));
+        Ok(identifier)
+    }
+
+    fn current_block_identifier(&mut self) -> Result<Option<RecordIdentifier>> {
+        if self.position == self.length {
+            return Ok(None);
+        }
+        match self.source {
+            BinaryStreamSource::Direct { .. } => Ok(None),
+            BinaryStreamSource::Blocks {
+                list_identifier,
+                block_count,
+            } => self
+                .resolve_block_identifier(list_identifier, block_count, self.position / BLOCK_SIZE)
+                .map(Some),
+        }
+    }
+
+    /// Returns the total binary length declared by the value record.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.length
+    }
+
+    /// Returns whether the binary is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Returns the number of bytes already read from the stream.
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Reads content into `buffer`, preserving `froe`'s typed errors.
+    ///
+    /// A long-value read stops at the current 4 KiB block boundary even when
+    /// `buffer` has more room. Repeated calls continue with the next block,
+    /// as permitted by [`io::Read`]. An empty buffer or an exhausted stream
+    /// returns zero.
+    pub fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        if buffer.is_empty() || self.position == self.length {
+            return Ok(0);
+        }
+
+        let buffer_capacity = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+        let remaining = self.length - self.position;
+        let maximum_read = remaining.min(buffer_capacity);
+
+        let read_length = match self.source {
+            BinaryStreamSource::Direct {
+                record_identifier,
+                content_offset,
+            } => {
+                let read_length =
+                    usize::try_from(maximum_read).map_err(|_| Error::InvalidFormat {
+                        details: format!(
+                            "binary read length does not fit this platform in record \
+                             {record_identifier}"
+                        ),
+                    })?;
+                let position =
+                    usize::try_from(self.position).map_err(|_| Error::InvalidFormat {
+                        details: format!(
+                            "binary position does not fit this platform in record \
+                             {record_identifier}"
+                        ),
+                    })?;
+                let offset =
+                    content_offset
+                        .checked_add(position)
+                        .ok_or_else(|| Error::InvalidFormat {
+                            details: format!(
+                                "binary content offset overflows in record {record_identifier}"
+                            ),
+                        })?;
+                let view = self.provider.segment(record_identifier.segment)?;
+                buffer[..read_length].copy_from_slice(view.read_bytes(
+                    record_identifier.record_number,
+                    offset,
+                    read_length,
+                )?);
+                read_length
+            }
+            BinaryStreamSource::Blocks {
+                list_identifier,
+                block_count,
+            } => {
+                let block_index = self.position / BLOCK_SIZE;
+                let block_offset = self.position % BLOCK_SIZE;
+                let block_remaining = BLOCK_SIZE - block_offset;
+                let read_length =
+                    usize::try_from(maximum_read.min(block_remaining)).map_err(|_| {
+                        Error::InvalidFormat {
+                            details: format!(
+                                "binary block read length does not fit this platform for list \
+                             {list_identifier}"
+                            ),
+                        }
+                    })?;
+                let block_identifier =
+                    self.resolve_block_identifier(list_identifier, block_count, block_index)?;
+                let view = self.provider.segment(block_identifier.segment)?;
+                buffer[..read_length].copy_from_slice(view.read_bytes(
+                    block_identifier.record_number,
+                    usize::try_from(block_offset).map_err(|_| Error::InvalidFormat {
+                        details: format!(
+                            "binary block offset does not fit this platform in record \
+                             {block_identifier}"
+                        ),
+                    })?,
+                    read_length,
+                )?);
+                read_length
+            }
+        };
+        let read_length_u64 = u64::try_from(read_length).map_err(|_| Error::InvalidFormat {
+            details: "binary read length does not fit the 64-bit value format".to_owned(),
+        })?;
+        self.position += read_length_u64;
+        Ok(read_length)
+    }
+}
+
+impl<Provider: SegmentProvider + ?Sized> io::Read for BinaryStream<'_, Provider> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read_chunk(buffer).map_err(|error| match error {
+            Error::InputOutput(source) => source,
+            other => io::Error::other(other),
+        })
+    }
 }
 
 /// Reads the length of a small, medium, or long value record. Fails on the
@@ -183,36 +373,105 @@ pub fn read_binary_value(
     })
 }
 
+/// Opens a bounded-memory stream over an inline binary value.
+///
+/// The returned stream borrows `provider` and implements [`io::Read`]. Its
+/// own memory use is constant regardless of the binary's declared length;
+/// caller-provided read buffers determine the amount copied at a time.
+/// Requesting an external binary fails with
+/// [`Error::ExternalBinaryContentUnavailable`].
+pub fn read_binary_stream<Provider: SegmentProvider + ?Sized>(
+    provider: &Provider,
+    identifier: RecordIdentifier,
+) -> Result<BinaryStream<'_, Provider>> {
+    let view = provider.segment(identifier.segment)?;
+    let head = view.read_u8(identifier.record_number, 0)?;
+    let (length, source) = if head & 0x80 == 0 {
+        (
+            u64::from(head),
+            BinaryStreamSource::Direct {
+                record_identifier: identifier,
+                content_offset: 1,
+            },
+        )
+    } else if head & 0x40 == 0 {
+        let stored = view.read_u16(identifier.record_number, 0)?;
+        (
+            u64::from(stored & 0x3FFF) + SMALL_VALUE_LIMIT,
+            BinaryStreamSource::Direct {
+                record_identifier: identifier,
+                content_offset: 2,
+            },
+        )
+    } else if head & 0x20 == 0 {
+        let stored = view.read_u64(identifier.record_number, 0)?;
+        let length = (stored & 0x1FFF_FFFF_FFFF_FFFF) + MEDIUM_VALUE_LIMIT;
+        let block_count = length.div_ceil(BLOCK_SIZE);
+        if block_count > MAXIMUM_LIST_SIZE {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "binary of {length} bytes in record {identifier} needs {block_count} blocks, \
+                     exceeding the list maximum of {MAXIMUM_LIST_SIZE}"
+                ),
+            });
+        }
+        let list_identifier = view.read_record_identifier(identifier.record_number, 8, 0)?;
+        (
+            length,
+            BinaryStreamSource::Blocks {
+                list_identifier,
+                block_count,
+            },
+        )
+    } else if head & 0x10 == 0 {
+        let stored = view.read_u16(identifier.record_number, 0)?;
+        let length = usize::from(stored & 0x0FFF);
+        let blob_identifier =
+            String::from_utf8_lossy(view.read_bytes(identifier.record_number, 2, length)?)
+                .into_owned();
+        return Err(Error::ExternalBinaryContentUnavailable { blob_identifier });
+    } else if head & 0x08 == 0 {
+        let string_identifier = view.read_record_identifier(identifier.record_number, 1, 0)?;
+        let blob_identifier = provider.string(string_identifier)?.to_string();
+        return Err(Error::ExternalBinaryContentUnavailable { blob_identifier });
+    } else {
+        return Err(Error::InvalidFormat {
+            details: format!("unexpected value record marker {head:#04x} in record {identifier}"),
+        });
+    };
+
+    Ok(BinaryStream {
+        provider,
+        source,
+        length,
+        position: 0,
+        resolved_block: None,
+    })
+}
+
 /// Reads the full content of an inline binary. Requesting the content of
 /// an external binary fails with
 /// [`Error::ExternalBinaryContentUnavailable`].
+///
+/// This compatibility helper materializes the complete value. Prefer
+/// [`read_binary_stream`] when binary size is not already known to be small.
 pub fn read_binary_content(
     provider: &dyn SegmentProvider,
     identifier: RecordIdentifier,
 ) -> Result<Vec<u8>> {
-    match read_binary_value(provider, identifier)? {
-        BinaryValue::External { blob_identifier } => {
-            Err(Error::ExternalBinaryContentUnavailable { blob_identifier })
+    let mut stream = read_binary_stream(provider, identifier)?;
+    let mut content = Vec::with_capacity(
+        usize::try_from(stream.len())
+            .unwrap_or(usize::MAX)
+            .min(1 << 20),
+    );
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read_length = stream.read_chunk(&mut buffer)?;
+        if read_length == 0 {
+            return Ok(content);
         }
-        BinaryValue::Inline {
-            length,
-            record_identifier,
-        } => {
-            let view = provider.segment(record_identifier.segment)?;
-            if length < SMALL_VALUE_LIMIT {
-                Ok(view
-                    .read_bytes(record_identifier.record_number, 1, length as usize)?
-                    .to_vec())
-            } else if length < MEDIUM_VALUE_LIMIT {
-                Ok(view
-                    .read_bytes(record_identifier.record_number, 2, length as usize)?
-                    .to_vec())
-            } else {
-                let list_identifier =
-                    view.read_record_identifier(record_identifier.record_number, 8, 0)?;
-                read_block_list(provider, list_identifier, length)
-            }
-        }
+        content.extend_from_slice(&buffer[..read_length]);
     }
 }
 
@@ -225,32 +484,15 @@ pub fn verify_binary_content(
     provider: &dyn SegmentProvider,
     identifier: RecordIdentifier,
 ) -> Result<()> {
-    match read_binary_value(provider, identifier)? {
-        BinaryValue::External { .. } => Ok(()),
-        BinaryValue::Inline {
-            length,
-            record_identifier,
-        } => {
-            let view = provider.segment(record_identifier.segment)?;
-            if length < SMALL_VALUE_LIMIT {
-                view.read_bytes(record_identifier.record_number, 1, length as usize)?;
-            } else if length < MEDIUM_VALUE_LIMIT {
-                view.read_bytes(record_identifier.record_number, 2, length as usize)?;
-            } else {
-                let list_identifier =
-                    view.read_record_identifier(record_identifier.record_number, 8, 0)?;
-                let block_count = length.div_ceil(BLOCK_SIZE);
-                let block_identifiers =
-                    uncounted_list_entries(provider, list_identifier, block_count)?;
-                let mut remaining = length;
-                for block_identifier in block_identifiers {
-                    let block_length = remaining.min(BLOCK_SIZE) as usize;
-                    let block_view = provider.segment(block_identifier.segment)?;
-                    block_view.read_bytes(block_identifier.record_number, 0, block_length)?;
-                    remaining -= block_length as u64;
-                }
-            }
-            Ok(())
+    let mut stream = match read_binary_stream(provider, identifier) {
+        Ok(stream) => stream,
+        Err(Error::ExternalBinaryContentUnavailable { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut buffer = [0u8; 8192];
+    loop {
+        if stream.read_chunk(&mut buffer)? == 0 {
+            return Ok(());
         }
     }
 }
@@ -263,62 +505,154 @@ pub fn inline_binary_contents_equal(
     provider: &dyn SegmentProvider,
     first: RecordIdentifier,
     second: RecordIdentifier,
-    length: u64,
+    _length: u64,
 ) -> Result<bool> {
     if first == second {
         return Ok(true);
     }
-    if length < MEDIUM_VALUE_LIMIT {
-        let offset = if length < SMALL_VALUE_LIMIT { 1 } else { 2 };
-        let first_view = provider.segment(first.segment)?;
-        let second_view = provider.segment(second.segment)?;
-        let first_bytes = first_view.read_bytes(first.record_number, offset, length as usize)?;
-        let second_bytes = second_view.read_bytes(second.record_number, offset, length as usize)?;
-        return Ok(first_bytes == second_bytes);
-    }
-    let first_list =
-        provider
-            .segment(first.segment)?
-            .read_record_identifier(first.record_number, 8, 0)?;
-    let second_list =
-        provider
-            .segment(second.segment)?
-            .read_record_identifier(second.record_number, 8, 0)?;
-    let block_count = length.div_ceil(BLOCK_SIZE);
-    let first_blocks = uncounted_list_entries(provider, first_list, block_count)?;
-    let second_blocks = uncounted_list_entries(provider, second_list, block_count)?;
-    let mut remaining = length;
-    for (first_block, second_block) in first_blocks.into_iter().zip(second_blocks) {
-        let block_length = remaining.min(BLOCK_SIZE) as usize;
-        if first_block != second_block {
-            let first_view = provider.segment(first_block.segment)?;
-            let second_view = provider.segment(second_block.segment)?;
-            let first_bytes = first_view.read_bytes(first_block.record_number, 0, block_length)?;
-            let second_bytes =
-                second_view.read_bytes(second_block.record_number, 0, block_length)?;
-            if first_bytes != second_bytes {
-                return Ok(false);
-            }
+    let mut first_stream = read_binary_stream(provider, first)?;
+    let mut second_stream = read_binary_stream(provider, second)?;
+
+    let mut first_buffer = [0u8; 8192];
+    let mut second_buffer = [0u8; 8192];
+    loop {
+        let first_block = first_stream.current_block_identifier()?;
+        let second_block = second_stream.current_block_identifier()?;
+        if first_block.is_some() && first_block == second_block {
+            // Segment records are immutable. Preserve the existing
+            // same-block fast path while resolving identifiers lazily: this
+            // avoids both reads and treats two compacted values sharing a
+            // block as equal even when that shared segment is unavailable.
+            let first_chunk = (first_stream.length - first_stream.position)
+                .min(BLOCK_SIZE - first_stream.position % BLOCK_SIZE);
+            let second_chunk = (second_stream.length - second_stream.position)
+                .min(BLOCK_SIZE - second_stream.position % BLOCK_SIZE);
+            let skipped = first_chunk.min(second_chunk);
+            first_stream.position += skipped;
+            second_stream.position += skipped;
+            continue;
         }
-        remaining -= block_length as u64;
+        let first_length = first_stream.read_chunk(&mut first_buffer)?;
+        let second_length = second_stream.read_chunk(&mut second_buffer)?;
+        if first_length != second_length
+            || first_buffer[..first_length] != second_buffer[..second_length]
+        {
+            return Ok(false);
+        }
+        if first_length == 0 {
+            return Ok(true);
+        }
     }
-    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::io::Read;
+    use std::sync::Arc;
+
     use super::{
-        BinaryValue, read_binary_content, read_binary_value, read_string, read_value_length,
+        BLOCK_SIZE, BinaryStream, BinaryValue, MEDIUM_VALUE_LIMIT, SMALL_VALUE_LIMIT,
+        inline_binary_contents_equal, read_binary_content, read_binary_stream, read_binary_value,
+        read_string, read_value_length, verify_binary_content,
     };
-    use crate::content::provider::tests::MemorySegmentProvider;
-    use crate::error::Error;
-    use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
+    use crate::content::list::uncounted_list_entry;
+    use crate::content::provider::{SegmentProvider, tests::MemorySegmentProvider};
+    use crate::content::template::{Template, read_template};
+    use crate::error::{Error, Result};
+    use crate::segment::identifier::SegmentIdentifier;
+    use crate::segment::parsed_segment::{
+        MAXIMUM_SEGMENT_SIZE,
+        tests::{bulk_segment_identifier, data_segment_identifier, synthetic_data_segment},
+    };
     use crate::segment::record::RecordIdentifier;
+    use crate::segment::view::SegmentView;
 
     fn small_string_record(text: &str) -> Vec<u8> {
         let mut bytes = vec![text.len() as u8];
         bytes.extend_from_slice(text.as_bytes());
         bytes
+    }
+
+    fn direct_binary_record(content: &[u8]) -> Vec<u8> {
+        let length = content.len() as u64;
+        let mut record = if length < SMALL_VALUE_LIMIT {
+            vec![length as u8]
+        } else {
+            assert!(length < MEDIUM_VALUE_LIMIT);
+            ((0x8000u16) | (length as u16 - SMALL_VALUE_LIMIT as u16))
+                .to_be_bytes()
+                .to_vec()
+        };
+        record.extend_from_slice(content);
+        record
+    }
+
+    fn local_record_identifier(record_number: u32) -> Vec<u8> {
+        let mut bytes = vec![0, 0];
+        bytes.extend_from_slice(&record_number.to_be_bytes());
+        bytes
+    }
+
+    fn referenced_record_identifier(reference: u16, record_number: u32) -> Vec<u8> {
+        let mut bytes = reference.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&record_number.to_be_bytes());
+        bytes
+    }
+
+    fn repeated_local_identifiers(record_number: u32, count: usize) -> Vec<u8> {
+        let identifier = local_record_identifier(record_number);
+        let mut bytes = Vec::with_capacity(identifier.len() * count);
+        for _ in 0..count {
+            bytes.extend_from_slice(&identifier);
+        }
+        bytes
+    }
+
+    fn long_binary_record(length: u64, list_record_number: u32) -> Vec<u8> {
+        assert!(length >= MEDIUM_VALUE_LIMIT);
+        let mut record = ((length - MEDIUM_VALUE_LIMIT) | (0x3 << 62))
+            .to_be_bytes()
+            .to_vec();
+        record.extend_from_slice(&local_record_identifier(list_record_number));
+        record
+    }
+
+    struct CountingProvider<'provider> {
+        inner: &'provider MemorySegmentProvider,
+        segment_reads: Cell<usize>,
+    }
+
+    impl<'provider> CountingProvider<'provider> {
+        fn new(inner: &'provider MemorySegmentProvider) -> Self {
+            Self {
+                inner,
+                segment_reads: Cell::new(0),
+            }
+        }
+
+        fn segment_reads(&self) -> usize {
+            self.segment_reads.get()
+        }
+
+        fn reset_segment_reads(&self) {
+            self.segment_reads.set(0);
+        }
+    }
+
+    impl SegmentProvider for CountingProvider<'_> {
+        fn segment(&self, identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+            self.segment_reads.set(self.segment_reads.get() + 1);
+            self.inner.segment(identifier)
+        }
+
+        fn string(&self, identifier: RecordIdentifier) -> Result<Arc<str>> {
+            read_string(self, identifier).map(Arc::from)
+        }
+
+        fn template(&self, identifier: RecordIdentifier) -> Result<Arc<Template>> {
+            read_template(self, identifier).map(Arc::new)
+        }
     }
 
     #[test]
@@ -435,6 +769,7 @@ mod tests {
         let mut long_external = vec![0xF0u8];
         long_external.extend_from_slice(&[0, 0]);
         long_external.extend_from_slice(&1u32.to_be_bytes());
+        let truncated_external = vec![0xE0, 20, b'x'];
 
         let mut provider = MemorySegmentProvider::default();
         provider.insert(
@@ -445,6 +780,7 @@ mod tests {
                     (0, 8, short_external),
                     (1, 4, small_string_record(blob_identifier)),
                     (2, 8, long_external),
+                    (3, 8, truncated_external),
                 ],
             ),
         );
@@ -469,14 +805,27 @@ mod tests {
             }
             other => panic!("expected external binary error, got {other:?}"),
         }
+        for record_number in [0u32, 2] {
+            match read_binary_stream(&provider, RecordIdentifier::new(segment, record_number)) {
+                Err(Error::ExternalBinaryContentUnavailable {
+                    blob_identifier: reported,
+                }) => assert_eq!(reported, blob_identifier),
+                _ => panic!("expected external binary stream error"),
+            }
+            verify_binary_content(&provider, RecordIdentifier::new(segment, record_number))
+                .expect("external binaries have no local content to verify");
+        }
+        assert!(matches!(
+            verify_binary_content(&provider, RecordIdentifier::new(segment, 3)),
+            Err(Error::InvalidFormat { .. })
+        ));
     }
 
     #[test]
     fn reads_inline_binaries() {
         let segment = data_segment_identifier(1);
         let content = vec![0x00u8, 0xFF, 0x7F, 0x80];
-        let mut record = vec![content.len() as u8];
-        record.extend_from_slice(&content);
+        let record = direct_binary_record(&content);
         let mut provider = MemorySegmentProvider::default();
         provider.insert(segment, synthetic_data_segment(&[], &[(0, 4, record)]));
         let identifier = RecordIdentifier::new(segment, 0);
@@ -495,6 +844,526 @@ mod tests {
     }
 
     #[test]
+    fn streams_small_and_medium_binaries_through_io_read() {
+        let segment = data_segment_identifier(1);
+        let empty = Vec::new();
+        let boundary_small: Vec<u8> = (0..127).map(|index| index as u8).collect();
+        let first_medium: Vec<u8> = (0..128).map(|index| index as u8).collect();
+        let boundary_medium: Vec<u8> = (0..16_511).map(|index| (index % 251) as u8).collect();
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (0, 4, direct_binary_record(&empty)),
+                    (1, 4, direct_binary_record(&boundary_small)),
+                    (2, 4, direct_binary_record(&first_medium)),
+                    (3, 4, direct_binary_record(&boundary_medium)),
+                ],
+            ),
+        );
+
+        for (record_number, expected) in [
+            (0, empty.as_slice()),
+            (1, boundary_small.as_slice()),
+            (2, first_medium.as_slice()),
+            (3, boundary_medium.as_slice()),
+        ] {
+            let mut stream =
+                read_binary_stream(&provider, RecordIdentifier::new(segment, record_number))
+                    .expect("stream");
+            assert_eq!(stream.len(), expected.len() as u64);
+            assert_eq!(stream.is_empty(), expected.is_empty());
+            assert_eq!(stream.position(), 0);
+
+            let mut actual = Vec::new();
+            let mut buffer = [0u8; 37];
+            loop {
+                let read_length = stream.read(&mut buffer).expect("read");
+                if read_length == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&buffer[..read_length]);
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(stream.position(), expected.len() as u64);
+            assert_eq!(
+                read_binary_content(&provider, RecordIdentifier::new(segment, record_number))
+                    .expect("compatibility helper"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn streams_long_binary_from_partial_bulk_segment_across_block_boundaries() {
+        let data_segment = data_segment_identifier(1);
+        let bulk_segment = bulk_segment_identifier(2);
+        let content: Vec<u8> = (0..20_000).map(|index| (index % 251) as u8).collect();
+        let first_virtual_offset = (MAXIMUM_SEGMENT_SIZE - content.len()) as u32;
+
+        let mut block_list = Vec::new();
+        for block_offset in (0..content.len()).step_by(BLOCK_SIZE as usize) {
+            block_list.extend_from_slice(&referenced_record_identifier(
+                1,
+                first_virtual_offset + block_offset as u32,
+            ));
+        }
+        let value_record = long_binary_record(content.len() as u64, 10);
+
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(bulk_segment, content.clone());
+        provider.insert(
+            data_segment,
+            synthetic_data_segment(
+                &[bulk_segment],
+                &[(10, 2, block_list), (11, 4, value_record)],
+            ),
+        );
+
+        let identifier = RecordIdentifier::new(data_segment, 11);
+        let mut stream = read_binary_stream(&provider, identifier).expect("stream");
+        let mut first = [0u8; 17];
+        assert_eq!(stream.read(&mut first).expect("first bytes"), first.len());
+        assert_eq!(&first, &content[..17]);
+
+        let mut through_boundary = [0u8; 5000];
+        assert_eq!(
+            stream.read(&mut through_boundary).expect("rest of block"),
+            BLOCK_SIZE as usize - first.len(),
+            "a read stops at the current block boundary"
+        );
+        assert_eq!(stream.position(), BLOCK_SIZE);
+
+        let mut actual = content[..BLOCK_SIZE as usize].to_vec();
+        stream.read_to_end(&mut actual).expect("remaining blocks");
+        assert_eq!(actual, content);
+        assert_eq!(
+            read_binary_content(&provider, identifier).expect("compatibility helper"),
+            content
+        );
+    }
+
+    #[test]
+    fn large_declared_binary_resolves_only_the_current_list_branch() {
+        let segment = data_segment_identifier(1);
+        let block_count = 256u64;
+        let length = block_count * BLOCK_SIZE;
+
+        // A 256-entry list has a top bucket (record 11), whose first child
+        // is a 255-entry bucket (record 10). All identifiers deliberately
+        // reuse one valid block; a one-byte read must still resolve only the
+        // current branch instead of materializing the 256 identifiers.
+        let mut child_bucket = Vec::new();
+        for _ in 0..255 {
+            child_bucket.extend_from_slice(&local_record_identifier(1));
+        }
+        let mut top_bucket = local_record_identifier(10);
+        top_bucket.extend_from_slice(&local_record_identifier(2));
+        let mut repeated_block = vec![0u8; BLOCK_SIZE as usize];
+        repeated_block[0] = 0xAB;
+        repeated_block[1] = 0xCD;
+        let records = [
+            (1, 5, repeated_block),
+            (2, 5, vec![0xEF; BLOCK_SIZE as usize]),
+            (10, 2, child_bucket),
+            (11, 2, top_bucket),
+            (12, 4, long_binary_record(length, 11)),
+        ];
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(segment, synthetic_data_segment(&[], &records));
+        let provider = CountingProvider::new(&inner);
+
+        let mut stream =
+            read_binary_stream(&provider, RecordIdentifier::new(segment, 12)).expect("stream");
+        assert_eq!(stream.len(), length);
+        assert_eq!(
+            provider.segment_reads(),
+            1,
+            "opening reads only the value record"
+        );
+
+        provider.reset_segment_reads();
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).expect("first byte"), 1);
+        assert_eq!(byte, [0xAB]);
+        assert_eq!(
+            provider.segment_reads(),
+            3,
+            "one top bucket, one child bucket, and the current block"
+        );
+
+        assert_eq!(stream.read(&mut byte).expect("second byte"), 1);
+        assert_eq!(byte, [0xCD]);
+        assert_eq!(
+            provider.segment_reads(),
+            4,
+            "the one-entry block cache avoids traversing the list again"
+        );
+
+        // Finish through the 255-way bucket transition without collecting
+        // the one-megabyte value. Blocks 0..=254 reuse record 1; block 255
+        // is record 2, so observing its distinct last byte proves the top
+        // bucket's pass-through child was selected.
+        let mut last_byte = None;
+        let mut buffer = [0u8; 8192];
+        loop {
+            let read_length = stream.read(&mut buffer).expect("remaining binary");
+            if read_length == 0 {
+                break;
+            }
+            last_byte = Some(buffer[read_length - 1]);
+        }
+        assert_eq!(stream.position(), length);
+        assert_eq!(last_byte, Some(0xEF));
+        let block_count = usize::try_from(block_count).expect("fixture block count fits usize");
+        assert_eq!(
+            provider.segment_reads(),
+            4 + 1 + (block_count - 2) * 3 + 2,
+            "blocks 1 through 254 resolve two buckets and one block; the pass-through final \
+             child resolves one bucket and one block"
+        );
+    }
+
+    #[test]
+    fn canonical_list_resolver_accepts_concrete_and_erased_providers_at_boundaries() {
+        let segment = data_segment_identifier(1);
+
+        // 65,026 is the first size requiring a 65,025-entry top-level
+        // bucket. Entry 65,024 takes all three levels; entry 65,025 is the
+        // one-element pass-through child of the root.
+        let mut first_three_level_root = local_record_identifier(101);
+        first_three_level_root.extend_from_slice(&local_record_identifier(2));
+
+        // The exact maximum 255^3 list exercises three full 255-way levels.
+        // Reusing child buckets is legal and keeps this boundary fixture
+        // sparse without weakening the list arithmetic under test.
+        let maximum_size = crate::content::list::MAXIMUM_LIST_SIZE;
+        let records = [
+            (1, 5, vec![0x11]),
+            (2, 5, vec![0x22]),
+            (3, 5, vec![0x33]),
+            (100, 2, first_three_level_root),
+            (101, 2, repeated_local_identifiers(102, 255)),
+            (102, 2, repeated_local_identifiers(1, 255)),
+            (200, 2, repeated_local_identifiers(201, 255)),
+            (201, 2, repeated_local_identifiers(202, 255)),
+            (202, 2, repeated_local_identifiers(3, 255)),
+        ];
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(segment, synthetic_data_segment(&[], &records));
+
+        for (list_record, size, index, expected_record) in [
+            (100, 65_026, 65_024, 1),
+            (100, 65_026, 65_025, 2),
+            (200, maximum_size, 0, 3),
+            (200, maximum_size, maximum_size - 1, 3),
+        ] {
+            let list_identifier = RecordIdentifier::new(segment, list_record);
+            let expected = RecordIdentifier::new(segment, expected_record);
+            assert_eq!(
+                uncounted_list_entry(&provider, list_identifier, size, index)
+                    .expect("concrete provider"),
+                expected
+            );
+            let erased: &dyn SegmentProvider = &provider;
+            assert_eq!(
+                uncounted_list_entry(erased, list_identifier, size, index)
+                    .expect("erased provider"),
+                expected,
+                "generic and erased traversal differ at size {size}, index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_verification_streams_a_large_list_and_reports_a_truncated_second_block() {
+        let segment = data_segment_identifier(1);
+        let block_count = 65_026u64;
+        let length = block_count * BLOCK_SIZE;
+
+        // The first 65,025 entries use three bucket levels. Entry zero is a
+        // complete block and every later entry in its leaf is the truncated
+        // final record. A streaming verifier reaches that failure after two
+        // blocks; eager list materialization would resolve all 65,026 block
+        // identifiers first.
+        let mut root = local_record_identifier(101);
+        root.extend_from_slice(&local_record_identifier(900));
+        let mut leaf = local_record_identifier(800);
+        leaf.extend_from_slice(&repeated_local_identifiers(900, 254));
+        let records = [
+            (10, 4, long_binary_record(length, 100)),
+            (100, 2, root),
+            (101, 2, repeated_local_identifiers(102, 255)),
+            (102, 2, leaf),
+            (800, 5, vec![0x11; BLOCK_SIZE as usize]),
+            (900, 5, vec![0x22; BLOCK_SIZE as usize - 4]),
+        ];
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(segment, synthetic_data_segment(&[], &records));
+        let provider = CountingProvider::new(&inner);
+
+        let error = verify_binary_content(&provider, RecordIdentifier::new(segment, 10))
+            .expect_err("truncated second block");
+        assert!(matches!(error, Error::InvalidFormat { .. }));
+        assert_eq!(
+            provider.segment_reads(),
+            9,
+            "one value head plus three list levels and one block per streamed chunk"
+        );
+    }
+
+    #[test]
+    fn binary_comparison_streams_large_lists_across_a_boundary_before_truncation() {
+        let segment = data_segment_identifier(1);
+        let block_count = 65_026u64;
+        let length = block_count * BLOCK_SIZE;
+
+        let mut first_root = local_record_identifier(101);
+        first_root.extend_from_slice(&local_record_identifier(900));
+        let mut first_leaf = local_record_identifier(800);
+        first_leaf.extend_from_slice(&repeated_local_identifiers(801, 254));
+        let mut second_root = local_record_identifier(201);
+        second_root.extend_from_slice(&local_record_identifier(900));
+        let mut second_leaf = local_record_identifier(802);
+        second_leaf.extend_from_slice(&repeated_local_identifiers(900, 254));
+        let records = [
+            (10, 4, long_binary_record(length, 100)),
+            (11, 4, long_binary_record(length, 200)),
+            (100, 2, first_root),
+            (101, 2, repeated_local_identifiers(102, 255)),
+            (102, 2, first_leaf),
+            (200, 2, second_root),
+            (201, 2, repeated_local_identifiers(202, 255)),
+            (202, 2, second_leaf),
+            (800, 5, vec![0x33; BLOCK_SIZE as usize]),
+            (801, 5, vec![0x44; BLOCK_SIZE as usize]),
+            (802, 5, vec![0x33; BLOCK_SIZE as usize]),
+            (900, 5, vec![0x44; BLOCK_SIZE as usize - 4]),
+        ];
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(segment, synthetic_data_segment(&[], &records));
+        let provider = CountingProvider::new(&inner);
+
+        let error = inline_binary_contents_equal(
+            &provider,
+            RecordIdentifier::new(segment, 10),
+            RecordIdentifier::new(segment, 11),
+            length,
+        )
+        .expect_err("second stream has a truncated second block");
+        assert!(matches!(error, Error::InvalidFormat { .. }));
+        assert_eq!(
+            provider.segment_reads(),
+            18,
+            "two value heads plus two three-level list traversals and block reads per chunk"
+        );
+    }
+
+    #[test]
+    fn binary_comparison_preserves_the_shared_block_identifier_fast_path() {
+        let segment = data_segment_identifier(1);
+        let length = MEDIUM_VALUE_LIMIT;
+        let shared_missing_blocks = repeated_local_identifiers(999, 5);
+        let records = [
+            (10, 4, long_binary_record(length, 20)),
+            (11, 4, long_binary_record(length, 21)),
+            (20, 2, shared_missing_blocks.clone()),
+            (21, 2, shared_missing_blocks),
+        ];
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(segment, synthetic_data_segment(&[], &records));
+        let provider = CountingProvider::new(&inner);
+
+        assert!(
+            inline_binary_contents_equal(
+                &provider,
+                RecordIdentifier::new(segment, 10),
+                RecordIdentifier::new(segment, 11),
+                length,
+            )
+            .expect("immutable shared block identifiers are content-equal")
+        );
+        assert_eq!(
+            provider.segment_reads(),
+            12,
+            "the two heads and two lazy list lookups per block are read, but shared blocks are not"
+        );
+    }
+
+    #[test]
+    fn stream_preserves_corrupt_and_missing_record_errors() {
+        let segment = data_segment_identifier(1);
+        let truncated_direct = direct_binary_record(&[1, 2, 3, 4]);
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(&[], &[(0, 4, truncated_direct[..3].to_vec())]),
+        );
+        let mut stream =
+            read_binary_stream(&provider, RecordIdentifier::new(segment, 0)).expect("stream");
+        let mut content = [0u8; 4];
+        let error = stream
+            .read_chunk(&mut content)
+            .expect_err("truncated value");
+        assert!(matches!(error, Error::InvalidFormat { .. }));
+        assert_eq!(stream.position(), 0, "failed reads do not advance");
+        assert!(matches!(
+            read_binary_content(&provider, RecordIdentifier::new(segment, 0)),
+            Err(Error::InvalidFormat { .. })
+        ));
+
+        let mut stream =
+            read_binary_stream(&provider, RecordIdentifier::new(segment, 0)).expect("stream");
+        let error = stream.read(&mut content).expect_err("io error");
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<Error>()),
+            Some(Error::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn stream_reports_missing_long_block_after_completed_prefix() {
+        let segment = data_segment_identifier(1);
+        let length = MEDIUM_VALUE_LIMIT;
+        let mut block_list = Vec::new();
+        for record_number in [1u32, 2, 3, 4, 99] {
+            block_list.extend_from_slice(&local_record_identifier(record_number));
+        }
+        let records = [
+            (1, 5, vec![1; BLOCK_SIZE as usize]),
+            (2, 5, vec![2; BLOCK_SIZE as usize]),
+            (3, 5, vec![3; BLOCK_SIZE as usize]),
+            (4, 5, vec![4; BLOCK_SIZE as usize]),
+            (10, 2, block_list),
+            (11, 4, long_binary_record(length, 10)),
+        ];
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(segment, synthetic_data_segment(&[], &records));
+        let mut stream =
+            read_binary_stream(&provider, RecordIdentifier::new(segment, 11)).expect("stream");
+        let mut block = [0u8; BLOCK_SIZE as usize];
+        for expected in 1..=4 {
+            assert_eq!(
+                stream.read_chunk(&mut block).expect("present block"),
+                block.len()
+            );
+            assert!(block.iter().all(|&byte| byte == expected));
+        }
+        let error = stream
+            .read_chunk(&mut block)
+            .expect_err("missing fifth block");
+        assert!(matches!(error, Error::InvalidFormat { .. }));
+        assert_eq!(stream.position(), 4 * BLOCK_SIZE);
+    }
+
+    #[test]
+    fn stream_rejects_a_truncated_block_list_bucket() {
+        let segment = data_segment_identifier(1);
+        let length = MEDIUM_VALUE_LIMIT;
+        let mut truncated_block_list = Vec::new();
+        for record_number in 1..=4u32 {
+            truncated_block_list.extend_from_slice(&local_record_identifier(record_number));
+        }
+        // Record 20 is last in physical record order, so resolving its
+        // absent fifth identifier cannot accidentally consume a following
+        // record's bytes.
+        let records = [
+            (1, 5, vec![1; BLOCK_SIZE as usize]),
+            (2, 5, vec![2; BLOCK_SIZE as usize]),
+            (3, 5, vec![3; BLOCK_SIZE as usize]),
+            (4, 5, vec![4; BLOCK_SIZE as usize]),
+            (10, 4, long_binary_record(length, 20)),
+            (20, 2, truncated_block_list),
+        ];
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(segment, synthetic_data_segment(&[], &records));
+        let mut stream =
+            read_binary_stream(&provider, RecordIdentifier::new(segment, 10)).expect("stream");
+        let mut block = [0u8; BLOCK_SIZE as usize];
+        for _ in 0..4 {
+            assert_eq!(
+                stream.read_chunk(&mut block).expect("present block"),
+                block.len()
+            );
+        }
+        match stream.read_chunk(&mut block) {
+            Err(Error::InvalidFormat { details }) => {
+                assert!(details.contains("record 20"), "unexpected error: {details}");
+            }
+            _ => panic!("expected truncated list bucket error"),
+        }
+        assert_eq!(stream.position(), 4 * BLOCK_SIZE);
+    }
+
+    #[test]
+    fn stream_preserves_missing_segment_identity() {
+        let data_segment = data_segment_identifier(1);
+        let missing_bulk_segment = bulk_segment_identifier(2);
+        let length = MEDIUM_VALUE_LIMIT;
+        let missing_block =
+            referenced_record_identifier(1, (MAXIMUM_SEGMENT_SIZE - BLOCK_SIZE as usize) as u32);
+        let mut block_list = Vec::new();
+        for _ in 0..length.div_ceil(BLOCK_SIZE) {
+            block_list.extend_from_slice(&missing_block);
+        }
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            data_segment,
+            synthetic_data_segment(
+                &[missing_bulk_segment],
+                &[(10, 2, block_list), (11, 4, long_binary_record(length, 10))],
+            ),
+        );
+
+        let mut stream =
+            read_binary_stream(&provider, RecordIdentifier::new(data_segment, 11)).expect("stream");
+        let mut byte = [0u8; 1];
+        match stream.read_chunk(&mut byte) {
+            Err(Error::SegmentNotFound { segment_identifier }) => {
+                assert_eq!(segment_identifier, missing_bulk_segment);
+            }
+            _ => panic!("expected missing bulk segment error"),
+        }
+        assert_eq!(stream.position(), 0);
+    }
+
+    #[test]
+    fn stream_rejects_truncated_heads_and_oversized_block_lists() {
+        let segment = data_segment_identifier(1);
+        let truncated = ((MEDIUM_VALUE_LIMIT - MEDIUM_VALUE_LIMIT) | (0x3 << 62))
+            .to_be_bytes()
+            .to_vec();
+        let oversized_length = (crate::content::list::MAXIMUM_LIST_SIZE + 1) * BLOCK_SIZE;
+        let oversized = long_binary_record(oversized_length, 99);
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(&[], &[(0, 4, truncated), (1, 4, oversized)]),
+        );
+
+        assert!(matches!(
+            read_binary_stream(&provider, RecordIdentifier::new(segment, 0)),
+            Err(Error::InvalidFormat { .. })
+        ));
+        match read_binary_stream(&provider, RecordIdentifier::new(segment, 1)) {
+            Err(Error::InvalidFormat { details }) => {
+                assert!(details.contains("exceeding the list maximum"));
+            }
+            _ => panic!("expected oversized list error"),
+        }
+    }
+
+    #[test]
+    fn binary_stream_is_send_when_its_provider_is_sync() {
+        fn assert_send<Type: Send>() {}
+        assert_send::<BinaryStream<'static, MemorySegmentProvider>>();
+    }
+
+    #[test]
     fn rejects_invalid_markers() {
         let segment = data_segment_identifier(1);
         let mut provider = MemorySegmentProvider::default();
@@ -504,6 +1373,7 @@ mod tests {
         );
         let identifier = RecordIdentifier::new(segment, 0);
         assert!(read_binary_value(&provider, identifier).is_err());
+        assert!(read_binary_stream(&provider, identifier).is_err());
         assert!(read_string(&provider, identifier).is_err());
         assert!(read_value_length(&provider, identifier).is_err());
     }

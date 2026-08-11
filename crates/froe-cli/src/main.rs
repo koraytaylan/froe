@@ -70,12 +70,23 @@ enum Command {
         /// The segment store directory.
         repository: PathBuf,
     },
-    /// Show one segment's header, references, and record statistics.
+    /// Show one segment's structure, or its Oak-compatible raw hex dump.
     Segment {
         /// The segment store directory.
         repository: PathBuf,
         /// The segment UUID, for example f81378fb-92b1-4b52-a5c8-e0a67152ed2c.
         identifier: String,
+        /// Print the full SegmentDump-style header, record table, and bytes.
+        #[arg(long)]
+        hex: bool,
+    },
+    /// Attribute current-head paths to records in one or more TAR archives.
+    Debug {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Canonical active archive file names, for example data00000a.tar.
+        #[arg(required = true)]
+        archives: Vec<String>,
     },
     /// Show one node: record identifiers, properties, and children.
     Node {
@@ -456,9 +467,21 @@ fn run(command: Command) -> froe::Result<ExitCode> {
         Command::Segment {
             repository,
             identifier,
+            hex,
         } => {
             let segment_identifier = identifier.to_lowercase().parse()?;
-            inspection::print_segment(&Repository::open(&repository)?, segment_identifier)?;
+            let repository = Repository::open(&repository)?;
+            if hex {
+                tooling_display::print_segment_dump(&repository, segment_identifier)?;
+            } else {
+                inspection::print_segment(&repository, segment_identifier)?;
+            }
+        }
+        Command::Debug {
+            repository,
+            archives,
+        } => {
+            tooling_display::print_archive_debug(&Repository::open(&repository)?, &archives)?;
         }
         Command::Node { repository, path } => {
             if !content_display::print_node(&Repository::open(&repository)?, &path)? {

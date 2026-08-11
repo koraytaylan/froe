@@ -23,4 +23,4 @@ pub use property::{PropertyType, PropertyValue};
 pub use provider::SegmentProvider;
 pub use template::{ChildNodeArity, PropertyTemplate, Template};
 pub use traversal::{DepthFirstTraversal, VisitedNode};
-pub use value::BinaryValue;
+pub use value::{BinaryStream, BinaryValue, read_binary_stream};

@@ -60,6 +60,7 @@
 //! * [`segment`] — segment parsing and record addressing;
 //! * [`content`] — decoding records into nodes, properties, and values;
 //! * [`journal`] — the head revision log;
+//! * [`gc_journal`] — optional garbage-collection history;
 //! * [`store`] — the assembled read-only repository.
 //!
 //! Custom backends (in-memory fixtures, remote stores) implement
@@ -68,6 +69,7 @@
 pub mod checksum;
 pub mod content;
 pub mod error;
+pub mod gc_journal;
 pub mod hashing;
 pub mod journal;
 pub mod segment;
@@ -77,12 +79,15 @@ pub mod tooling;
 pub mod writer;
 
 pub use content::{
-    BinaryValue, NodeState, PropertyState, PropertyType, PropertyValue, PropertyValues,
-    SegmentProvider, Template,
+    BinaryStream, BinaryValue, NodeState, PropertyState, PropertyType, PropertyValue,
+    PropertyValues, SegmentProvider, Template, read_binary_stream,
 };
 pub use error::{Error, Result};
+pub use gc_journal::GarbageCollectionJournalEntry;
 pub use journal::JournalEntry;
-pub use segment::{RecordIdentifier, RecordType, SegmentIdentifier, SegmentKind};
+pub use segment::{
+    GarbageCollectionGeneration, RecordIdentifier, RecordType, SegmentIdentifier, SegmentKind,
+};
 pub use store::Repository;
 pub use writer::{
     CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupOutcome, CleanupPlan,

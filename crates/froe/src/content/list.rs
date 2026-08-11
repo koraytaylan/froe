@@ -44,8 +44,8 @@ fn top_bucket_capacity(size: u64) -> u64 {
 
 /// Fetches element `index` of the uncounted list `list_identifier` whose
 /// size the caller knows from context.
-pub fn uncounted_list_entry(
-    provider: &dyn SegmentProvider,
+pub fn uncounted_list_entry<Provider: SegmentProvider + ?Sized>(
+    provider: &Provider,
     list_identifier: RecordIdentifier,
     size: u64,
     index: u64,

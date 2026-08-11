@@ -157,6 +157,22 @@ impl Repository {
             .flat_map(TarArchiveReader::segment_identifiers)
     }
 
+    /// Returns the exact stored bytes of a segment from the active archive
+    /// selection without parsing its header or record tables.
+    ///
+    /// This is the read-only escape hatch used by last-resort diagnostics:
+    /// callers can still inspect a segment whose structure is corrupt enough
+    /// that [`SegmentProvider::segment`] cannot construct a [`SegmentView`].
+    pub fn segment_bytes(&self, segment_identifier: SegmentIdentifier) -> Result<&[u8]> {
+        let archive_position = *self
+            .segment_locations
+            .get(&segment_identifier)
+            .ok_or(Error::SegmentNotFound { segment_identifier })?;
+        self.archives[archive_position]
+            .segment_data(segment_identifier)
+            .ok_or(Error::SegmentNotFound { segment_identifier })
+    }
+
     /// The node state at an arbitrary node record.
     #[must_use]
     pub fn node(&self, record_identifier: RecordIdentifier) -> NodeState<'_> {
@@ -206,13 +222,7 @@ impl Repository {
 
 impl SegmentProvider for Repository {
     fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
-        let archive_position = *self
-            .segment_locations
-            .get(&segment_identifier)
-            .ok_or(Error::SegmentNotFound { segment_identifier })?;
-        let bytes = self.archives[archive_position]
-            .segment_data(segment_identifier)
-            .ok_or(Error::SegmentNotFound { segment_identifier })?;
+        let bytes = self.segment_bytes(segment_identifier)?;
 
         if let Some(structure) = self
             .parsed_segment_cache

@@ -57,6 +57,8 @@ $ target/release/froe tree /path/to/segmentstore /content --depth 2
 $ target/release/froe export /path/to/segmentstore --path /content --output content.jsonl
 $ target/release/froe export /path/to/segmentstore --path /content --format parquet --output ./export
 $ target/release/froe check /path/to/segmentstore
+$ target/release/froe segment /path/to/segmentstore SEGMENT-UUID --hex
+$ target/release/froe debug /path/to/segmentstore data00000a.tar
 
 # Maintenance — stopped repository only (mutating forms ask for confirmation):
 $ target/release/froe cleanup /path/to/segmentstore --dry-run
