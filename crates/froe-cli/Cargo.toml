@@ -20,8 +20,8 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-froe = { version = "0.4.0", path = "../froe" }
-froe-export = { version = "0.4.0", path = "../froe-export", features = ["parquet", "sqlite"] }
+froe = { version = "0.5.0", path = "../froe" }
+froe-export = { version = "0.5.0", path = "../froe-export", features = ["parquet", "sqlite"] }
 clap = { version = "4.5", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
