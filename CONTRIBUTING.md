@@ -49,6 +49,31 @@ Java source *comments* (which are wrong in places the code is not).
   values is checked or deliberately wrapping (matching Java), never
   implicitly overflowing.
 
+## Choose the required proof before implementation
+
+These paths are cumulative, and the strictest downstream effect controls
+the classification. For example, a read-only planner or preview that can
+authorize later deletion is high-risk even though the analysis itself
+does not write.
+
+* **Documentation, local refactors, and isolated read-only behavior**
+  follow the code standards, applicable test layers, and stable host gate
+  below.
+* **Parsers and read-only format interpretation** additionally cite the
+  Oak evidence, use independent fixtures, and run the portability checks
+  relevant to the changed representation.
+* **High-risk changes** are storage serializers or other changes that
+  introduce, broaden, or reorder bytes published on disk, locking,
+  recovery, durability, destructive behavior, or reachability of
+  repository bytes. They require the safety case, fault matrix,
+  load-bearing guard tests, cross-target checks, and frozen independent
+  review in [`docs/high-risk-changes.md`](docs/high-risk-changes.md).
+
+A narrow fix that preserves an established high-risk design may link to
+its existing safety case and update only the affected invariant. Decide
+the path before coding; do not discover the proof obligations after the
+implementation is complete.
+
 ## Code standards
 
 * **No abbreviations** in file, method, or variable names:
@@ -57,14 +82,16 @@ Java source *comments* (which are wrong in places the code is not).
   CRC32, JCR, TAR, JSON, CLI) are acceptable; ad-hoc shortenings are
   not. The cargo-mandated `src/` directory is the tolerated exception.
 * **Minimal dependencies.** Everything in the tree must be strictly
-  necessary and pull its weight. Current policy: `memmap2` in the core
-  crate; `clap` and `libc` (SIGPIPE handling) in the CLI. CRC32, Java
-  string hashing, JSON encoding, and timestamp formatting are
-  hand-implemented — a new dependency needs a reason those did not.
+  necessary and pull its weight. The crate manifests are the
+  authoritative inventory; large format backends stay feature-gated.
+  CRC32, Java string hashing, JSON encoding, and timestamp formatting
+  are hand-implemented — a new dependency needs a reason those did not.
 * **Documented, concisely.** Every module starts with a doc comment
   explaining what it models and the non-obvious facts of the format it
   implements. Public items carry doc comments. Inline comments state
   constraints the code cannot express — never what the next line does.
+  Safety comments describe the exact mechanism and scope proved by the
+  code, not a stronger idealized state.
 * **Idiomatic Rust, not transliterated Java.** The format semantics are
   exact; the implementation is not a line-by-line translation. Errors
   are `Result`s, not exceptions; ownership replaces defensive copying;
@@ -75,8 +102,8 @@ Java source *comments* (which are wrong in places the code is not).
 
 ## Testing standards
 
-Tests are the port's proof of fidelity. Every change keeps all of these
-green, and new functionality arrives with all three layers:
+Tests are the port's proof of fidelity. Every change keeps all applicable
+layers green. New functionality explains why any layer does not apply:
 
 1. **Unit tests with hand-crafted bytes.** Every parser and serializer
    is exercised against fixtures written out by hand from the
@@ -93,16 +120,55 @@ green, and new functionality arrives with all three layers:
    archives reopen with valid indexes, the journal resolves, content is
    intact, and read-only invariants (no lock, no writes) hold where
    promised.
+4. **Oak/AEM interoperability for substantial writer changes.** Before a
+   new format-writing or maintenance feature is called production-ready,
+   open its output with a real compatible Oak/AEM version and exercise
+   froe against Oak-produced input. If that environment is unavailable,
+   record the gap explicitly and keep the feature labelled beta; a
+   froe-to-froe round trip is not a substitute. Record the exact Oak/AEM
+   build, producer-to-consumer direction, operation exercised, and
+   verified post-state.
 
-Run the full gate before any commit:
+### Make safety tests load-bearing
+
+High-risk tests exercise every materially distinct production phase or
+caller; a helper test alone is not evidence that the protection is wired
+into production. The authoritative guard-neutralization, fault-harness,
+environment-wiring, scale, and mutation-test requirements are in
+[`docs/high-risk-changes.md`](docs/high-risk-changes.md).
+
+## Verification and portability
+
+The executable CI matrix in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+is authoritative for automated platform coverage. Before requesting
+review, every code change runs the stable host gate:
 
 ```console
-$ cargo fmt --all -- --check
-$ cargo test --workspace
-$ cargo test --workspace --release   # overflow behavior differs by profile
-$ cargo clippy --workspace --all-targets   # zero warnings
-$ cargo doc --workspace --no-deps          # zero warnings
+$ cargo +stable fmt --all -- --check
+$ cargo +stable test --workspace --all-features --no-fail-fast
+$ cargo +stable test --workspace --all-features --release --no-fail-fast
+$ cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+$ RUSTDOCFLAGS="-D warnings" cargo +stable doc --workspace --all-features --no-deps
 ```
+
+Documentation-only changes with no generated or code-facing effect may
+run only the relevant documentation, formatting, and diff checks; record
+the omitted gates. Before final review, the relevant CI matrix must also
+be green. If no CI run is available, local MSRV host tests may support
+preliminary review, but they do not replace native macOS or Windows jobs;
+record those platform axes as unexecuted. High-risk and
+portability-sensitive changes also run the MSRV, cross-target, and
+integer-width checks in
+[`docs/high-risk-changes.md`](docs/high-risk-changes.md). Code behind
+`cfg(test)` is part of the target's compilation surface. Record whether
+each platform was executed or only cross-compiled, and list relevant
+environments not exercised.
+
+Diff checks cover only tracked paths. Before checking an uncommitted
+change, ensure `git status --short` contains no intended `??` path (stage
+new files or add them with intent-to-add), then run `git diff --check
+HEAD`. For committed work, check the complete review range with `git diff
+--check BASE..HEAD`.
 
 ## Workflow
 
@@ -112,6 +178,15 @@ $ cargo doc --workspace --no-deps          # zero warnings
 * A change to format-facing code cites the specification section (or the
   Java file and method) that justifies it, in the commit body or the
   code.
+
+### Review discipline
+
+High-risk final review uses a committed, frozen `BASE..HEAD` range and an
+independent reviewer who did not implement the patch. Later edits
+invalidate the affected review and gates. The authoritative review
+procedure, evidence requirements, fallback when an independent reviewer
+is unavailable, and follow-up-commit policy are in
+[`docs/high-risk-changes.md`](docs/high-risk-changes.md).
 
 ## License
 
