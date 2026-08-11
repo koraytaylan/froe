@@ -1,5 +1,7 @@
 # Tag-driven releases: pushing a tag `vX.Y.Z` verifies the tag matches
-# the workspace version and the tests pass, generates the changelog from
+# the workspace version and that the full ci.yml gate passes on the tagged
+# commit — on Linux and macOS, at stable and the minimum supported Rust
+# version — generates the changelog from
 # the conventional-commit history with git-cliff, builds the CLI for the
 # most compatible target of each platform (static musl on Linux, Apple
 # silicon on macOS, MSVC on Windows — where the read-only commands
@@ -24,7 +26,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  verify:
+  # Cheap and first, so a mistyped tag fails before the matrix below
+  # occupies four runners.
+  version:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -36,15 +40,41 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest_version" >&2
             exit 1
           fi
-      - run: rustup toolchain install stable --profile minimal
+
+  # Deliberately the same command set and matrix as ci.yml's gate, run
+  # against the tagged commit. A Linux-only verification could publish a
+  # release whose macOS half never ran: nothing else between the branch
+  # gate and crates.io re-checks the other platform, and the maintenance
+  # commands are Unix-specific, so macOS is a first-class target rather
+  # than an afterthought. Keep this in step with ci.yml.
+  verify:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, "1.89"]
+    runs-on: ${{ matrix.os }}
+    # Job-scoped rather than workflow-wide: the binary builds below must
+    # not compile their dependencies with warnings denied.
+    env:
+      RUSTFLAGS: --deny warnings
+      RUSTDOCFLAGS: --deny warnings
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt,clippy
+      - run: rustup default ${{ matrix.rust }}
       # Restores the dependency cache CI saves on develop for this same
       # runner/toolchain pair; tag runs can read default-branch caches.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: gate-ubuntu-latest-stable
+          shared-key: gate-${{ matrix.os }}-${{ matrix.rust }}
           save-if: false
+      - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: cargo test --workspace --release
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo doc --workspace --no-deps
 
   changelog:
     runs-on: ubuntu-latest
