@@ -822,12 +822,26 @@ fn planned_apply_identity_issue(
     Ok(None)
 }
 
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static POSSIBLE_CREATED_GROUP_IDS_INPUT: std::cell::Cell<Option<(u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn take_possible_created_group_ids_input() -> Option<(u32, u32)> {
+    POSSIBLE_CREATED_GROUP_IDS_INPUT.with(std::cell::Cell::take)
+}
+
 #[cfg(unix)]
 fn possible_created_group_ids(
     directory_gid: u32,
     directory_mode: u32,
     credentials: &ApplyCredentials,
 ) -> BTreeSet<u32> {
+    #[cfg(test)]
+    POSSIBLE_CREATED_GROUP_IDS_INPUT.with(|input| input.set(Some((directory_gid, directory_mode))));
+
     if directory_mode & SETGID_MODE != 0 {
         BTreeSet::from([directory_gid])
     } else {
@@ -3215,9 +3229,10 @@ mod tests {
     use super::{
         ApplyCredentials, ManifestFileAccess, SETGID_MODE,
         append_apply_identity_preview_warning_for_credentials, certify_manifest_file,
-        journal_service_user_issue, metadata_source_apply_identity_issue, planned_metadata_sources,
-        possible_created_group_ids, preview_apply_identity_issue,
-        remove_planned_files_with_after_open, validate_apply_identity_for_uid,
+        journal_service_user_issue, metadata_source_apply_identity_issue,
+        planned_apply_identity_issue, planned_metadata_sources, possible_created_group_ids,
+        preview_apply_identity_issue, remove_planned_files_with_after_open,
+        take_possible_created_group_ids_input, validate_apply_identity_for_uid,
         validate_plan_apply_identity_for_credentials,
     };
     use super::{
@@ -3269,6 +3284,16 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[cfg(unix)]
+    fn checked_timespec_field<T>(value: i64) -> T
+    where
+        T: TryFrom<i64>,
+    {
+        T::try_from(value).unwrap_or_else(|_| {
+            panic!("filesystem timestamp component {value} does not fit libc::timespec")
+        })
     }
 
     fn file_bytes(directory: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
@@ -3895,6 +3920,44 @@ mod tests {
         );
         assert_eq!(file_bytes(&directory.path), before);
         Repository::open(&directory.path).expect("preflight refusal leaves repository healthy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planned_identity_preflight_uses_the_real_repository_directory_gid_and_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = TestDirectory::repository("planned-identity-directory-metadata");
+        let plan = plan_cleanup(&directory.path, &CleanupOptions::new().with_tasks([]))
+            .expect("plan health-only cleanup");
+        let mut permissions = std::fs::symlink_metadata(&directory.path)
+            .expect("repository metadata before mode change")
+            .permissions();
+        permissions.set_mode(0o731);
+        std::fs::set_permissions(&directory.path, permissions)
+            .expect("install a distinctive repository mode");
+        let metadata = std::fs::symlink_metadata(&directory.path).expect("repository metadata");
+        let synthetic_gid = if metadata.gid() == u32::MAX {
+            metadata.gid() - 1
+        } else {
+            metadata.gid() + 1
+        };
+        let credentials = ApplyCredentials {
+            effective_uid: 42_424,
+            effective_gid: synthetic_gid,
+            group_ids: BTreeSet::from([synthetic_gid]),
+        };
+        let _ = take_possible_created_group_ids_input();
+
+        let issue = planned_apply_identity_issue(&directory.path, &plan, &credentials)
+            .expect("analyze planned metadata identity");
+
+        assert_eq!(issue, None, "a health-only plan has no metadata sources");
+        assert_eq!(
+            take_possible_created_group_ids_input(),
+            Some((metadata.gid(), metadata.permissions().mode())),
+            "the group model must receive the repository directory's real gid and mode"
+        );
     }
 
     #[cfg(unix)]
@@ -4956,12 +5019,12 @@ mod tests {
         let path = CString::new(staging.as_os_str().as_bytes()).expect("path without NUL");
         let times = [
             libc::timespec {
-                tv_sec: metadata.atime(),
-                tv_nsec: metadata.atime_nsec(),
+                tv_sec: checked_timespec_field(metadata.atime()),
+                tv_nsec: checked_timespec_field(metadata.atime_nsec()),
             },
             libc::timespec {
-                tv_sec: metadata.mtime(),
-                tv_nsec: metadata.mtime_nsec(),
+                tv_sec: checked_timespec_field(metadata.mtime()),
+                tv_nsec: checked_timespec_field(metadata.mtime_nsec()),
             },
         ];
         // SAFETY: the path is NUL-terminated and `times` contains two valid

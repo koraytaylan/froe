@@ -2841,12 +2841,13 @@ fn sweep_one_archive<'archives>(
     );
     let current_rewrite_targets = planned_unavailable;
 
-    // These two proofs deliberately have different graph scopes. The active
-    // source certificate above reconstructs its complete, unfiltered graph
-    // from payloads before mutation. A replacement `.gph` describes the
-    // post-sweep physical set, so it may omit edges to targets whose active
-    // copies were removed earlier or are removed by this rewrite; staged and
-    // published validation below compare it with that exact filtered view.
+    // These two proofs deliberately have different graph scopes. Production
+    // active-source certification above reconstructs the complete, unfiltered
+    // graph from payloads before mutation. A replacement `.gph` is derived
+    // subtractively: source entries not copied by this rewrite are left out,
+    // while targets are filtered against both identifiers this run previously
+    // made unavailable and identifiers belonging to those omitted entries.
+    // Staged and published validation below compare it with that exact view.
     let trailers = FilteredTrailers::from_archive(
         reader,
         reclaimable,
