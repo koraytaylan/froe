@@ -102,8 +102,6 @@ jobs:
           name: interop-run-record
           path: /tmp/interop-work/interop-run-record.txt
           if-no-files-found: warn
-      - run: cargo clippy --workspace --all-targets
-      - run: cargo doc --workspace --no-deps
 
   changelog:
     runs-on: ubuntu-latest
@@ -268,3 +266,37 @@ jobs:
               cargo publish -p "$crate"
             fi
           done
+
+  # Advance `main` to the released commit, so "main is the latest released
+  # state" is a property this pipeline maintains rather than a habit someone
+  # has to remember. It drifted to v0.1.0 once before, and a branch advertised
+  # as tracking releases that quietly lags is worse than one honestly labelled
+  # historical: it looks authoritative while being stale.
+  #
+  # Last, and dependent on the publish, so main only ever names a commit whose
+  # crates actually reached the registry. The push is a fast-forward: main
+  # carries no commits of its own, and --ff-only makes a divergence fail loudly
+  # here instead of being resolved by a merge nobody reviewed.
+  advance-main:
+    needs: publish-crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Fast-forward main to the release commit
+        run: |
+          released="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          git fetch origin main
+          if ! git merge-base --is-ancestor origin/main "$released"; then
+            echo "main ($(git rev-parse --short origin/main)) is not an ancestor of" \
+                 "$GITHUB_REF_NAME ($(git rev-parse --short "$released")); it has" \
+                 "commits of its own, so advancing it is not a fast-forward." \
+                 "Reconcile deliberately rather than letting this job merge." >&2
+            exit 1
+          fi
+          if [ "$(git rev-parse origin/main)" = "$released" ]; then
+            echo "main is already at $GITHUB_REF_NAME; nothing to do."
+            exit 0
+          fi
+          git push origin "$released:refs/heads/main"

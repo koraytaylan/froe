@@ -88,6 +88,13 @@ again rather than by inventing a new version.
 
 ## Afterwards
 
+The workflow fast-forwards `main` to the released commit once the crates are on
+the registry, so `main` always names a version whose publish actually
+succeeded. It refuses rather than merges if `main` has diverged, because a
+branch advertised as the latest release is worse than a historical one when it
+silently lags: it looks authoritative. If that job fails, reconcile `main`
+deliberately instead of re-running it.
+
 Confirm the outcome from outside the workflow that produced it:
 
 * each crate's new version is in the sparse index cargo actually reads

@@ -199,8 +199,10 @@ HEAD`. For committed work, check the complete review range with `git diff
 
 * Development happens on `develop`, the default branch. Releases are cut
   and tagged there, following [`docs/releasing.md`](docs/releasing.md).
-  `main` stopped tracking released states after `v0.1.0` and nothing in
-  the release workflow reads it; treat it as historical.
+  `main` tracks the latest released commit: the release workflow
+  fast-forwards it after the crates reach the registry, so it is a
+  pipeline-maintained pointer rather than a branch anyone commits to. Open
+  changes against `develop`.
 * Commits follow the conventional commit prefixes
   [`cliff.toml`](cliff.toml) groups into release notes — `feat:`, `fix:`,
   `harden:`, `perf:`, `refactor:`, `docs:`, `test:`, `chore:` — with
