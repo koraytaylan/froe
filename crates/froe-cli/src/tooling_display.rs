@@ -33,7 +33,7 @@ fn write_segment_dump(
     repository: &Repository,
     identifier: SegmentIdentifier,
 ) -> froe::Result<()> {
-    write_stdout_ignoring_broken_pipe(output, |output| {
+    write_diagnostic_handling_observed_broken_pipe(output, |output| {
         let dump = dump_segment(repository, identifier)?;
         output.write_all(dump.as_bytes())?;
         Ok(())
@@ -57,7 +57,7 @@ fn write_archive_debug(
     repository: &Repository,
     archive_file_names: &[String],
 ) -> froe::Result<()> {
-    write_stdout_ignoring_broken_pipe(output, |output| {
+    write_diagnostic_handling_observed_broken_pipe(output, |output| {
         render_archive_debug(output, repository, archive_file_names)
     })
 }
@@ -141,7 +141,13 @@ fn render_archive_debug(
     Ok(())
 }
 
-fn write_stdout_ignoring_broken_pipe(
+/// Converts a `BrokenPipe` returned to Rust into a quiet diagnostic exit.
+///
+/// Unix normally terminates the CLI with `SIGPIPE` before this fallback sees
+/// an error because `main` restores the conventional default disposition.
+/// Platforms that report the closed pipe to [`io::Write`] instead use this
+/// path. Other output errors remain failures.
+fn write_diagnostic_handling_observed_broken_pipe(
     output: &mut dyn io::Write,
     write_output: impl FnOnce(&mut dyn io::Write) -> froe::Result<()>,
 ) -> froe::Result<()> {
@@ -518,11 +524,14 @@ mod archive_rendering_tests {
     }
 
     #[test]
-    fn production_diagnostic_writers_treat_only_broken_pipe_as_success() {
+    fn diagnostic_writer_fallback_quiets_only_an_observed_broken_pipe() {
         let directory = TestDirectory::new("broken-pipe");
         let identifier = write_minimal_repository(&directory.path);
         let repository = froe::Repository::open(&directory.path).expect("open repository");
 
+        // This models platforms where the standard-output write returns an
+        // error. Unix's real process-level SIGPIPE contract is covered by
+        // spawned CLI integration tests instead.
         let mut broken_pipe = FailingWriter(std::io::ErrorKind::BrokenPipe);
         write_segment_dump(&mut broken_pipe, &repository, identifier)
             .expect("segment dump must stop quietly at a closed pipe");

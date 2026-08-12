@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use froe::checksum::crc32;
 
+pub(crate) mod filesystem_snapshot;
+
 /// The map-entry hash, implemented independently of the production
 /// `froe::hashing` module: `(String.hashCode(name) ^ M) * M + A` with the
 /// `MapRecord` constants and wrapping 32-bit arithmetic over UTF-16 code

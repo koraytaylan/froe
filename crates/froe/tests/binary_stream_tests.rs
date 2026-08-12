@@ -9,18 +9,17 @@
     reason = "test binaries have no external interface; pub only means module-visible"
 )]
 
-mod filesystem_snapshot;
 mod support;
 
 use std::io::Read;
 
-use filesystem_snapshot::directory_snapshot;
 use froe::content::value::read_binary_content;
 use froe::error::Error;
 use froe::read_binary_stream;
 use froe::segment::identifier::SegmentIdentifier;
 use froe::segment::record::RecordIdentifier;
 use froe::store::Repository;
+use support::filesystem_snapshot::directory_snapshot;
 use support::{
     ArchiveBuilder, SegmentBuilder, TYPE_EXTERNAL_BLOB_IDENTIFIER, TYPE_LIST_BUCKET, TYPE_VALUE,
     TestDirectory, data_segment_uuid, format_uuid, record_identifier_bytes, string_record,

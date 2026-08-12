@@ -11,10 +11,8 @@
     reason = "test binaries have no external interface; pub only means module-visible"
 )]
 
-mod filesystem_snapshot;
 mod support;
 
-use filesystem_snapshot::directory_snapshot;
 use froe::PropertyType;
 use froe::segment::{MAXIMUM_SEGMENT_SIZE, identifier::SegmentIdentifier};
 use froe::store::Repository;
@@ -27,6 +25,7 @@ use froe::writer::record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, sort_properties_for_template,
 };
 use froe::writer::store_writer::WritableRepository;
+use support::filesystem_snapshot::directory_snapshot;
 use support::{
     ArchiveBuilder, SegmentBuilder, TYPE_LIST, TYPE_LIST_BUCKET, TYPE_MAP_BRANCH, TYPE_MAP_LEAF,
     TYPE_NODE, TYPE_TEMPLATE, TYPE_VALUE, TestDirectory, data_segment_uuid, format_uuid,

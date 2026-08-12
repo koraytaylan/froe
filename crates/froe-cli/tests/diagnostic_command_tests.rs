@@ -1,13 +1,13 @@
 //! Load-bearing CLI tests for the read-only segment and archive diagnostics.
 
-mod filesystem_snapshot;
+mod support;
 
-use filesystem_snapshot::directory_snapshot;
 use froe::PropertyType;
 use froe::writer::record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, sort_properties_for_template,
 };
 use froe::writer::store_writer::WritableRepository;
+use support::filesystem_snapshot::directory_snapshot;
 
 #[cfg(windows)]
 const SEGMENT_DUMP_LINE_SEPARATOR: &str = "\r\n";
@@ -34,6 +34,33 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// Returns the write end of an OS pipe after closing its only read end.
+/// A child receiving this as standard output therefore encounters `SIGPIPE`
+/// deterministically on its first write, rather than racing a parent that
+/// closes a captured `ChildStdout` after spawning it.
+#[cfg(unix)]
+fn closed_pipe_stdout() -> std::process::Stdio {
+    use std::os::fd::FromRawFd as _;
+
+    let mut descriptors = [-1; 2];
+    // SAFETY: `descriptors` points at storage for exactly the two file
+    // descriptors required by `pipe`.
+    let result = unsafe { libc::pipe(descriptors.as_mut_ptr()) };
+    assert_eq!(
+        result,
+        0,
+        "create closed-stdout test pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: a successful `pipe` call initialized both unique descriptors,
+    // and each is transferred into exactly one owning `File`.
+    let read_end = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+    // SAFETY: as above, this is the distinct initialized write descriptor.
+    let write_end = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+    drop(read_end);
+    std::process::Stdio::from(write_end)
 }
 
 /// Encodes the checksum used in Oak segment TAR entry names without using
@@ -111,9 +138,15 @@ fn write_independent_segment_fixture(
     (directory, store_path, identifier)
 }
 
+#[cfg(unix)]
 const HOSTILE_DEBUG_TEST_NAME: &str = "hostile-debug-\u{1b}]0;repository-title\u{7}-\u{202e}";
+#[cfg(unix)]
 const ESCAPED_HOSTILE_DEBUG_TEST_NAME: &str =
     r"hostile-debug-\u{1b}]0;repository-title\u{7}-\u{202e}";
+#[cfg(windows)]
+const HOSTILE_DEBUG_TEST_NAME: &str = "hostile-debug-repository-title-\u{202e}";
+#[cfg(windows)]
+const ESCAPED_HOSTILE_DEBUG_TEST_NAME: &str = r"hostile-debug-repository-title-\u{202e}";
 const HOSTILE_DEBUG_NODE_NAME: &str = "node-\u{1b}]8;;https://example.invalid\u{7}link-\u{202e}";
 const ESCAPED_HOSTILE_DEBUG_NODE_NAME: &str =
     r"node-\u{1b}]8;;https://example.invalid\u{7}link-\u{202e}";
@@ -547,6 +580,76 @@ fn debug_command_reaches_read_only_production_path() {
         !store_path.join("repo.lock").exists(),
         "read-only commands must not create or touch the repository lock"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn segment_hex_cli_uses_conventional_sigpipe_for_a_preclosed_stdout() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let bytes = independently_encoded_info_segment("Oak");
+    let (_directory, store_path, segment_identifier) =
+        write_independent_segment_fixture("segment-closed-stdout", &bytes);
+    let before = directory_snapshot(&store_path);
+
+    let segment = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "segment",
+            store_path.to_str().expect("store path"),
+            &segment_identifier.to_string(),
+            "--hex",
+        ])
+        .stdout(closed_pipe_stdout())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run segment dump with a preclosed stdout pipe");
+    assert_eq!(
+        segment.status.signal(),
+        Some(libc::SIGPIPE),
+        "segment dump must use conventional Unix SIGPIPE termination; status {:?}, stderr {}",
+        segment.status,
+        String::from_utf8_lossy(&segment.stderr)
+    );
+    assert!(segment.stderr.is_empty());
+    assert_eq!(directory_snapshot(&store_path), before);
+    assert!(!store_path.join("repo.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn debug_cli_uses_conventional_sigpipe_for_a_preclosed_stdout() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let directory = TestDirectory::new("debug-closed-stdout");
+    let store_path = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store_path).expect("create segment store");
+    populate(&store_path);
+    std::fs::remove_file(store_path.join("repo.lock")).expect("remove bootstrap lock file");
+    let repository = froe::Repository::open(&store_path).expect("open repository");
+    let archive_file_name = repository.archives()[0].file_name().to_owned();
+    drop(repository);
+    let before = directory_snapshot(&store_path);
+
+    let debug = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "debug",
+            store_path.to_str().expect("store path"),
+            &archive_file_name,
+        ])
+        .stdout(closed_pipe_stdout())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run archive debug with a preclosed stdout pipe");
+    assert_eq!(
+        debug.status.signal(),
+        Some(libc::SIGPIPE),
+        "archive debug must use conventional Unix SIGPIPE termination; status {:?}, stderr {}",
+        debug.status,
+        String::from_utf8_lossy(&debug.stderr)
+    );
+    assert!(debug.stderr.is_empty());
+    assert_eq!(directory_snapshot(&store_path), before);
+    assert!(!store_path.join("repo.lock").exists());
 }
 
 #[test]
