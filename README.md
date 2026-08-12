@@ -48,6 +48,60 @@ shortest form than Java's; see `double_to_text`.)
 > irreplaceable data remains ordinary prudence. The read-only commands never
 > write anything.
 
+## Why froe?
+
+The reading and maintenance paths each solve a class of problem that is
+awkward or slow to address against a running Oak/AEM instance.
+
+**Repair a damaged store offline.** When `journal.log` is missing or
+corrupt, `froe recover-journal` rebuilds it from the surviving segments.
+`froe check` locates the newest consistent revision for each requested
+path — read-only, safe against a live repo, and a fast way to scope
+damage before touching anything. `froe cleanup` reclaims orphan storage,
+prunes dead journal entries, and removes stale archives left by
+interrupted compactions. `froe compact`, `backup`, and `restore` round
+out the offline maintenance set, and `froe checkpoint` manages
+checkpoints beyond what the runtime exposes. Every mutating command
+requires a *stopped* repository and a `store.version=2` store; the
+read-only commands write nothing and are safe against a live instance.
+
+**Reclaim what online GC leaves behind.** Oak's online garbage collector
+runs opportunistically and only sweeps segments — it does not prune the
+journal, remove stale archives from failed compactions, expire
+checkpoints, or clean up staging files. `froe cleanup` does all five in
+one conservative pass. It drops journal lines that point at absent or
+unreadable revisions, runs a store-wide FULL mark/sweep against the
+persisted head generation with two retained generations, reclaims
+segments whose closure is unreachable from every readable journal root,
+removes superseded archives only after reconstructing their full segment
+graph as proof, expires checkpoints past their timestamp, and deletes
+only staging files it can prove redundant. Every readable journal
+revision is retained; the safety gate fails closed rather than guessing.
+
+**Query a repository in minutes, not hours.** Auditing a running Oak/AEM
+repository — finding unused DAM assets, mapping references, inventorying
+types — usually means a full JCR traversal that takes hours on a
+moderately sized store and loads the instance while it runs. `froe export
+--format parquet` writes the whole tree as two zstd-compressed Parquet
+tables in minutes, and a re-export into the same directory only decodes
+the subtrees that changed since the stamped head revision, so a kept
+export stays current at the price of the delta. The result is analytical
+SQL in DuckDB, DataFusion, or Polars — seconds per query, no Oak process
+required:
+
+```console
+# Inventory by primary type, ranked — seconds on a Parquet export
+$ duckdb -c "
+  SELECT primary_type, count(*) AS nodes
+  FROM './export/nodes.parquet'
+  GROUP BY primary_type ORDER BY nodes DESC LIMIT 10;"
+```
+
+The same pattern extends to reference audits (which assets are pointed at
+from nowhere), property outliers, and schema drift — all as ordinary SQL
+over a snapshot you control. See the export section below for the
+stamp/consistency model and the incremental-rebuild contract.
+
 ## Platform support
 
 Rust 1.89 or newer. Linux and macOS are fully supported and CI-tested;
