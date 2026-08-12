@@ -97,6 +97,15 @@ const SLING_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long to wait for a froe command to finish.
 const FROE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The `oak-segment-tar` build this suite is verified against.
+///
+/// `apache/sling:14` is a mutable tag, so the Oak version inside the image is
+/// the only durable coordinate for what "interop-verified" means. The suite
+/// asserts it rather than trusting the tag: an image that silently starts
+/// shipping a different Oak must fail here and be re-verified deliberately,
+/// not quietly redefine the claim.
+const EXPECTED_OAK_SEGMENT_TAR_VERSION: &str = "1.90.0";
+
 // ---------------------------------------------------------------------------
 // Shared fixture
 // ---------------------------------------------------------------------------
@@ -423,6 +432,205 @@ fn content_snapshot(port: u16) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Oak's own log lines for every path by which it repairs, rewinds past, or
+/// regenerates a store it does not trust, taken from the Java rather than
+/// guessed: `file/FileStoreUtil.java:58` ("Unable to access revision {},
+/// rewinding...") and `file/tar/TarReader.java` lines 99, 128, 157, 161 and
+/// 179.
+///
+/// These matter more than any content assertion. If Oak rebuilt a TAR index
+/// from a full scan, skipped an unreadable archive, or fell back to an older
+/// journal revision, then it did not consume what froe wrote — it consumed
+/// something it reconstructed, and "Sling served the expected content"
+/// becomes evidence about Oak's recovery code instead of about froe.
+const OAK_REPAIR_MARKERS: &[&str] = &[
+    "Unable to access revision",
+    "Could not find a valid tar index",
+    "Recovering segments from tar file",
+    "Could not read tar file",
+    "Regenerating tar file",
+];
+
+/// Read the `oak-segment-tar` version out of the running container and assert
+/// it is the build this suite claims to verify against. Returns the version so
+/// the run record can name it.
+fn assert_oak_build(container: &str) -> String {
+    let listing = podman(&[
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "find / -name 'oak-segment-tar-*.jar' 2>/dev/null | head -1",
+    ]);
+    let jar = listing.trim();
+    assert!(
+        !jar.is_empty(),
+        "found no oak-segment-tar jar in {container}; this image may not be an \
+         Oak-backed Sling, so the round trip would prove nothing"
+    );
+    let version = jar
+        .rsplit_once("oak-segment-tar-")
+        .and_then(|(_, tail)| tail.strip_suffix(".jar"))
+        .unwrap_or_else(|| panic!("unexpected oak-segment-tar jar name: {jar}"))
+        .to_owned();
+    assert_eq!(
+        version, EXPECTED_OAK_SEGMENT_TAR_VERSION,
+        "{SLING_IMAGE} now ships oak-segment-tar {version}, not \
+         {EXPECTED_OAK_SEGMENT_TAR_VERSION}. The tag is mutable; re-verify \
+         deliberately and update EXPECTED_OAK_SEGMENT_TAR_VERSION rather than \
+         letting the claim drift."
+    );
+    eprintln!("  Oak build under test: oak-segment-tar {version}");
+    version
+}
+
+/// Both output streams of a container, since Sling logs to stdout and JVM
+/// diagnostics to stderr.
+fn container_logs(container: &str) -> String {
+    let output = Command::new("podman")
+        .args(["logs", container])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to read logs of {container}: {error}"));
+    let mut logs = String::from_utf8_lossy(&output.stdout).into_owned();
+    logs.push_str(&String::from_utf8_lossy(&output.stderr));
+    logs
+}
+
+/// Fail unless Oak consumed the store exactly as froe wrote it.
+fn assert_oak_consumed_store_as_written(container: &str, phase: &str) {
+    let logs = container_logs(container);
+    let repairs: Vec<&str> = OAK_REPAIR_MARKERS
+        .iter()
+        .filter(|marker| logs.contains(**marker))
+        .copied()
+        .collect();
+    assert!(
+        repairs.is_empty(),
+        "{phase}: Oak repaired the store instead of consuming it as froe wrote it \
+         ({repairs:?}). A content assertion after a repair proves nothing about \
+         froe's output.\nlogs:\n{logs}"
+    );
+}
+
+/// Every string value Sling serves for `property`, as `property=value`.
+///
+/// The `.tidy.` selector pretty-prints, so the separator is `": "` rather than
+/// `":"`; matching an exact `"key":"` byte sequence finds nothing and would
+/// leave the fingerprint silently empty.
+fn string_property_values(snapshot: &str, property: &str) -> Vec<String> {
+    let key = format!("\"{property}\"");
+    let mut values = Vec::new();
+    let mut rest = snapshot;
+    while let Some(position) = rest.find(&key) {
+        rest = &rest[position + key.len()..];
+        let Some(colon) = rest.find(':') else { break };
+        let after_colon = rest[colon + 1..].trim_start();
+        if let Some(quoted) = after_colon.strip_prefix('"')
+            && let Some(end) = quoted.find('"')
+        {
+            values.push(format!("{property}={}", &quoted[..end]));
+        }
+        rest = after_colon;
+    }
+    values
+}
+
+/// A deterministic fingerprint of the content subtree as Oak serves it: every
+/// node's primary type and every title, sorted.
+///
+/// A `contains` assertion cannot detect a deletion — the string it looks for
+/// lives on the node that survived. Comparing this fingerprint against the
+/// baseline captured from Oak's own store detects any node that disappeared,
+/// changed primary type, or lost its title.
+fn content_fingerprint(port: u16) -> Vec<String> {
+    let snapshot = content_snapshot(port);
+    assert!(
+        snapshot.contains("jcr:primaryType"),
+        "content snapshot is not a node serialization (an error page or empty \
+         body cannot be compared): {snapshot}"
+    );
+    let mut entries = Vec::new();
+    for property in ["jcr:primaryType", "jcr:title"] {
+        entries.extend(string_property_values(&snapshot, property));
+    }
+    assert!(
+        !entries.is_empty(),
+        "content fingerprint is empty, so an equality check would be vacuous"
+    );
+    entries.sort();
+    entries
+}
+
+fn content_baseline_path() -> PathBuf {
+    work_root().join("content-fingerprint-baseline.txt")
+}
+
+/// Record the fingerprint of the pristine Oak-written content, before froe
+/// has touched anything.
+fn save_content_baseline(port: u16) {
+    let fingerprint = content_fingerprint(port);
+    std::fs::write(content_baseline_path(), fingerprint.join("\n"))
+        .expect("write the content baseline");
+    eprintln!("  recorded content baseline: {} entries", fingerprint.len());
+}
+
+/// Assert the content Oak serves is exactly what it served before froe ran —
+/// no node lost, none altered, none added.
+fn assert_content_matches_baseline(port: u16, phase: &str) {
+    let recorded = std::fs::read_to_string(content_baseline_path()).expect(
+        "read the content baseline; the generate phase records it and every later \
+         phase compares against it",
+    );
+    let baseline: Vec<String> = recorded.lines().map(str::to_owned).collect();
+    let actual = content_fingerprint(port);
+    let missing: Vec<&String> = baseline.iter().filter(|e| !actual.contains(e)).collect();
+    let unexpected: Vec<&String> = actual.iter().filter(|e| !baseline.contains(e)).collect();
+    assert!(
+        missing.is_empty() && unexpected.is_empty(),
+        "{phase}: Oak no longer serves the same content as before the operation.\n\
+         missing {} entries: {missing:?}\nunexpected {} entries: {unexpected:?}",
+        missing.len(),
+        unexpected.len()
+    );
+    eprintln!(
+        "  content matches the baseline exactly ({} entries)",
+        actual.len()
+    );
+}
+
+/// The integer immediately preceding `suffix` in froe's output.
+///
+/// froe reports its cleanup counts inside one formatted line, so each count is
+/// identified by the text that follows it. Parsing the number is what makes an
+/// assertion fail on a zero count — matching the surrounding phrase cannot,
+/// because the phrase comes from an unconditional format template.
+fn parse_count(output: &str, suffix: &str) -> u64 {
+    let position = output
+        .find(suffix)
+        .unwrap_or_else(|| panic!("output contains {suffix:?}: {output}"));
+    let reversed: String = output[..position]
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let digits: String = reversed.chars().rev().collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("an integer precedes {suffix:?} in: {output}"))
+}
+
+/// The head revision froe reports, so a phase can prove which revision Oak
+/// resolved rather than assuming it was the one froe wrote.
+fn froe_head(store: &Path) -> String {
+    let summary = froe(&["summary", store.to_str().unwrap()]);
+    summary
+        .lines()
+        .find(|line| line.trim_start().starts_with("head"))
+        .unwrap_or_else(|| panic!("summary reports a head line: {summary}"))
+        .trim()
+        .to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Store manipulation helpers
 // ---------------------------------------------------------------------------
@@ -494,7 +702,89 @@ fn store_into_volume(src: &Path, volume: &str) {
 /// Make a stale archive: copy the active data*.tar to the next generation
 /// letter. This is the on-disk condition Oak leaves behind after its own
 /// compaction publishes a newer generation.
-fn make_stale_archive(store: &Path) {
+/// Confirm every condition the cleanup fixture is meant to contain is really
+/// present before cleanup runs.
+///
+/// Without this, a fixture step that silently failed to build its condition
+/// would leave the post-cleanup assertions vacuously satisfied — the condition
+/// would be absent afterwards because it was never there.
+fn assert_cleanup_fixture_built(store: &Path, stale: &StaleArchive, checkpoint_name: &str) {
+    let checkpoints = froe(&["checkpoints", store.to_str().unwrap()]);
+    assert!(
+        checkpoints.contains(checkpoint_name),
+        "the checkpoint {checkpoint_name} that must expire is present before \
+         cleanup: {checkpoints}"
+    );
+    let journal = std::fs::read_to_string(store.join("journal.log")).expect("read journal before");
+    assert!(
+        journal.contains("this_line_has_no_space") && journal.contains("not-a-uuid:bad"),
+        "both corrupt journal lines are present before cleanup: {journal}"
+    );
+    assert!(
+        stale.superseded.exists() && stale.winner.exists(),
+        "both letters of the stale-archive pair are present before cleanup: {} and {}",
+        stale.superseded.display(),
+        stale.winner.display()
+    );
+    assert!(
+        store.join("data00004a.tar").exists(),
+        "the orphan-bearing gen-0 archive is present before cleanup"
+    );
+}
+
+/// Confirm each condition is gone from disk and from froe's own listings,
+/// independently of the counts cleanup reported.
+fn assert_cleanup_conditions_removed(store: &Path, stale: &StaleArchive, checkpoint_name: &str) {
+    assert!(
+        !stale.superseded.exists(),
+        "the superseded archive letter {} is gone from disk after cleanup",
+        stale.superseded.display()
+    );
+    // The safety-relevant direction: cleanup removed the superseded letter and
+    // left the winner, rather than deleting the archive Oak will actually open.
+    assert!(
+        stale.winner.exists(),
+        "the winning archive letter {} survived cleanup",
+        stale.winner.display()
+    );
+    // The orphan-bearing gen-0 archive is the 727-segment condition; if it is
+    // still here, the segments task reclaimed nothing regardless of the count
+    // it printed.
+    assert!(
+        !store.join("data00004a.tar").exists(),
+        "the orphan-bearing gen-0 archive was reclaimed"
+    );
+    let journal = std::fs::read_to_string(store.join("journal.log")).expect("read journal after");
+    assert!(
+        !journal.contains("this_line_has_no_space") && !journal.contains("not-a-uuid:bad"),
+        "both corrupt journal lines are gone from the journal: {journal}"
+    );
+    assert!(
+        !journal.trim().is_empty(),
+        "cleanup left a usable journal, not an empty one"
+    );
+    let checkpoints = froe(&["checkpoints", store.to_str().unwrap()]);
+    assert!(
+        !checkpoints.contains(checkpoint_name),
+        "the expired checkpoint {checkpoint_name} is gone after cleanup: {checkpoints}"
+    );
+}
+
+/// The stale-archive condition: two files for one archive number.
+///
+/// Oak selects the highest generation letter (`tar-layer.md` §"generation
+/// letter selection"), so copying the active archive to the next letter makes
+/// the *copy* the winner and leaves the original superseded. Cleanup must
+/// remove the superseded file and must not touch the winner, so the phase
+/// needs both paths to assert either direction.
+struct StaleArchive {
+    superseded: PathBuf,
+    winner: PathBuf,
+}
+
+/// Create the stale-archive condition and return both files, so the phase can
+/// assert on exact paths rather than a hardcoded guess.
+fn make_stale_archive(store: &Path) -> StaleArchive {
     let active = std::fs::read_dir(store)
         .expect("read_dir")
         .filter_map(std::result::Result::ok)
@@ -508,15 +798,21 @@ fn make_stale_archive(store: &Path) {
     let base = active.file_name().unwrap().to_string_lossy().into_owned();
     let letter = base.as_bytes()[base.len() - 5];
     assert!(letter.is_ascii_lowercase(), "invalid generation letter");
-    if letter == b'z' {
-        eprintln!("  active archive at generation z; skipping stale-archive simulation");
-        return;
-    }
+    assert!(
+        letter != b'z',
+        "the active archive is already at generation z, so the stale-archive \
+         condition cannot be built; skipping it would leave the phase asserting \
+         nothing about stale archives"
+    );
     let next_letter = (letter + 1) as char;
     let stale_name = format!("data{}{}.tar", &base[4..base.len() - 5], next_letter);
     let stale_path = store.join(&stale_name);
     eprintln!("  creating stale archive: {base} -> {stale_name}");
     std::fs::copy(&active, &stale_path).expect("copy stale archive");
+    StaleArchive {
+        superseded: active,
+        winner: stale_path,
+    }
 }
 
 /// Truncate the journal to just the head line, exactly as Oak's `compact`
@@ -571,6 +867,20 @@ fn generate() {
 
     eprintln!("  churning content to produce orphaned segments");
     churn_content(8080);
+
+    // Pin the Oak build now, while the container is still up. The image tag
+    // is mutable, so the version inside it is the only durable coordinate.
+    // Record it for the run record, which is the artifact that makes a passing
+    // run auditable afterwards instead of an ephemeral console line.
+    let oak_version = assert_oak_build("froe-interop-gen");
+    std::fs::write(work_root().join("oak-build.txt"), &oak_version)
+        .expect("record the Oak build under test");
+
+    // Record what Oak serves before froe has touched anything. Every later
+    // phase compares against this, which is what turns "Sling still serves
+    // the root node" into "Sling serves exactly the same tree".
+    eprintln!("  recording the content baseline from Oak's own store");
+    save_content_baseline(8080);
 
     eprintln!("  stopping Sling cleanly");
     sling.stop();
@@ -691,7 +1001,7 @@ fn checkpoint() {
     let store = oak_store();
 
     eprintln!("  froe checkpoint create (lifetime 1000 ms)");
-    froe(&[
+    let created = froe(&[
         "checkpoint",
         "create",
         store.to_str().unwrap(),
@@ -699,15 +1009,30 @@ fn checkpoint() {
         "1000",
         "--yes",
     ]);
+    // Pin the identity of the checkpoint that was created. Asserting only that
+    // the listing is non-empty is satisfied by the literal string "no
+    // checkpoints", so it would pass even if nothing had been written.
+    let name = created
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("created checkpoint "))
+        .unwrap_or_else(|| panic!("create reports the checkpoint name: {created}"))
+        .trim()
+        .to_owned();
+    assert!(!name.is_empty(), "the created checkpoint has a name");
 
-    eprintln!("  froe checkpoints (the new one should be present)");
+    eprintln!("  froe checkpoints (the new one must be listed by name)");
     let checkpoints = froe(&["checkpoints", store.to_str().unwrap()]);
     assert!(
-        !checkpoints.trim().is_empty(),
-        "at least one checkpoint exists after create"
+        checkpoints.contains(&name),
+        "the checkpoint {name} froe created is listed: {checkpoints}"
     );
 
-    eprintln!("  checkpoint phase passed");
+    // Record it so the cleanup phase can prove this exact checkpoint expired
+    // and was removed, rather than trusting a count.
+    std::fs::write(work_root().join("expiring-checkpoint.txt"), &name)
+        .expect("record the expiring checkpoint name");
+
+    eprintln!("  checkpoint phase passed ({name})");
 }
 
 /// Phase 3: froe adds nodes with typed properties to the content tree.
@@ -981,11 +1306,9 @@ fn compact() {
     wait_for_sling(8083, "froe-compact-verify");
 
     eprintln!("  content snapshot from Sling after compaction");
+    assert_oak_consumed_store_as_written("froe-compact-verify", "compact");
+    assert_content_matches_baseline(8083, "compact");
     let snapshot = content_snapshot(8083);
-    assert!(
-        snapshot.contains("Interop Fixture"),
-        "content preserved: {snapshot}"
-    );
     assert!(snapshot.contains("Page 1"), "page 1 preserved: {snapshot}");
 
     // Verify the binary round-tripped.
@@ -1052,7 +1375,7 @@ fn cleanup() {
 
     // Add the remaining simulation conditions.
     eprintln!("  making stale archive");
-    make_stale_archive(&clean_store);
+    let stale = make_stale_archive(&clean_store);
 
     eprintln!("  truncating journal to head");
     truncate_journal_to_head(&clean_store);
@@ -1070,12 +1393,48 @@ fn cleanup() {
 
     // Apply: reclaim the orphan segments, stale archive, expired checkpoint,
     // and corrupt journal lines.
+    //
+    // Every assertion below names a specific effect. The obvious check —
+    // that the output contains "orphan segments removed" — is worthless,
+    // because that phrase comes from an unconditional format template and is
+    // printed even when the count is zero.
+    let expiring_checkpoint = std::fs::read_to_string(work_root().join("expiring-checkpoint.txt"))
+        .expect("the checkpoint phase records the name of the checkpoint that will expire");
+    assert_cleanup_fixture_built(&clean_store, &stale, expiring_checkpoint.trim());
+
     eprintln!("  froe cleanup --yes");
     let cleanup_output = froe(&["cleanup", clean_store.to_str().unwrap(), "--yes"]);
+
+    // Parse the reported counts and require each condition to have been acted
+    // on, so a run that removed nothing cannot pass.
+    let removed_segments = parse_count(&cleanup_output, " orphan segments removed");
+    let removed_stale = parse_count(&cleanup_output, " stale removed");
+    let removed_checkpoints = parse_count(&cleanup_output, " checkpoints and");
+    let removed_journal_lines = parse_count(&cleanup_output, " journal lines removed");
     assert!(
-        cleanup_output.contains("orphan segments removed"),
-        "cleanup removed orphan segments: {cleanup_output}"
+        removed_segments > 0,
+        "cleanup reclaimed orphan segments, not zero: {cleanup_output}"
     );
+    assert!(
+        removed_stale >= 1,
+        "cleanup removed the stale archive: {cleanup_output}"
+    );
+    assert_eq!(
+        removed_checkpoints, 1,
+        "cleanup removed the one expired checkpoint: {cleanup_output}"
+    );
+    assert_eq!(
+        removed_journal_lines, 2,
+        "cleanup removed both corrupt journal lines: {cleanup_output}"
+    );
+    assert!(
+        cleanup_output.contains("cleanup complete"),
+        "cleanup completed without deferred or failed deletions: {cleanup_output}"
+    );
+
+    // Then confirm the same effects on disk, independently of what was
+    // reported.
+    assert_cleanup_conditions_removed(&clean_store, &stale, expiring_checkpoint.trim());
 
     eprintln!("  froe summary after cleanup");
     froe(&["summary", clean_store.to_str().unwrap()]);
@@ -1094,11 +1453,8 @@ fn cleanup() {
     wait_for_sling(8082, "froe-cleanup-verify");
 
     eprintln!("  content snapshot from Sling after cleanup");
-    let snapshot = content_snapshot(8082);
-    assert!(
-        snapshot.contains("Interop Fixture"),
-        "content preserved: {snapshot}"
-    );
+    assert_oak_consumed_store_as_written("froe-cleanup-verify", "cleanup");
+    assert_content_matches_baseline(8082, "cleanup");
 
     drop(sling);
     eprintln!("  cleanup phase passed");
@@ -1130,8 +1486,18 @@ fn backup() {
     eprintln!("  froe check of the backup");
     froe(&["check", backup_dir.to_str().unwrap()]);
 
-    eprintln!("  preparing restore target (copy of the original store)");
-    copy_store(&store, &restore_store);
+    // Restore into a target whose *content* differs from the backup's, not a
+    // byte copy of the store the backup came from. Restoring into a copy of its
+    // own source cannot fail: a restore that wrote nothing would satisfy every
+    // assertion, because the target already holds the expected tree.
+    //
+    // The commit-phase store carries froe-written nodes the backup does not, so
+    // a real restore must make those nodes disappear and leave exactly the
+    // baseline tree. The post-boot baseline comparison below reports unexpected
+    // entries as well as missing ones, which is what detects a no-op.
+    eprintln!("  preparing restore target from the commit store (content differs from the backup)");
+    copy_store(&work_root().join("commit-store"), &restore_store);
+    let target_head_before = froe_head(&restore_store);
 
     eprintln!("  froe restore");
     let restore_output = froe(&[
@@ -1143,6 +1509,17 @@ fn backup() {
     assert!(
         restore_output.contains("restore complete"),
         "restore succeeded: {restore_output}"
+    );
+
+    // Restore deep-copies the backup's head into the target, so the target gets
+    // an equivalent tree at a *new* record identifier rather than the backup's
+    // own. What must hold is that the head moved at all — a restore that wrote
+    // nothing would leave it untouched.
+    let target_head_after = froe_head(&restore_store);
+    assert_ne!(
+        target_head_after, target_head_before,
+        "restore advanced the target's head; it was unchanged, so nothing was \
+         written"
     );
 
     eprintln!("  froe check after restore");
@@ -1172,11 +1549,8 @@ fn backup() {
     wait_for_sling(8085, "froe-restore-verify");
 
     eprintln!("  content snapshot from Sling after restore");
-    let snapshot = content_snapshot(8085);
-    assert!(
-        snapshot.contains("Interop Fixture"),
-        "content preserved: {snapshot}"
-    );
+    assert_oak_consumed_store_as_written("froe-restore-verify", "restore");
+    assert_content_matches_baseline(8085, "restore");
 
     drop(sling);
     eprintln!("  backup phase passed");
@@ -1194,6 +1568,13 @@ fn recover() {
     eprintln!("  copying store to {}", recover_store.display());
     copy_store(&store, &recover_store);
 
+    // Recovery's defining property is which revision it restores, so pin the
+    // head before destroying the journal. Recovery writes every surviving
+    // candidate and only verifies the newest, so "the journal resolves" is
+    // satisfied by resolving to an older revision — which would silently lose
+    // every commit after it.
+    let head_before = froe_head(&recover_store);
+
     eprintln!("  deleting journal.log");
     std::fs::remove_file(recover_store.join("journal.log")).expect("remove journal");
 
@@ -1205,7 +1586,11 @@ fn recover() {
     );
 
     eprintln!("  froe summary after recovery");
-    froe(&["summary", recover_store.to_str().unwrap()]);
+    let head_after = froe_head(&recover_store);
+    assert_eq!(
+        head_after, head_before,
+        "recovery restored the same head it started from, not an older revision"
+    );
 
     eprintln!("  froe check after recovery");
     froe(&["check", recover_store.to_str().unwrap()]);
@@ -1234,11 +1619,8 @@ fn recover() {
     wait_for_sling(8086, "froe-recover-verify");
 
     eprintln!("  content snapshot from Sling after recovery");
-    let snapshot = content_snapshot(8086);
-    assert!(
-        snapshot.contains("Interop Fixture"),
-        "content preserved: {snapshot}"
-    );
+    assert_oak_consumed_store_as_written("froe-recover-verify", "recover");
+    assert_content_matches_baseline(8086, "recover");
 
     drop(sling);
     eprintln!("  recover phase passed");
@@ -1260,5 +1642,60 @@ fn interop_full() {
     cleanup();
     backup();
     recover();
+    write_run_record();
     eprintln!("  all interop phases passed");
+}
+
+/// Write the run record: what was verified, against which Oak build, when.
+///
+/// A passing run whose only trace is a console line cannot be audited later.
+/// This is the artifact that turns "we have an interop suite" into "the round
+/// trip was performed against oak-segment-tar X on this date", which is what
+/// the interoperability requirement in `CONTRIBUTING.md` actually asks to be
+/// recorded.
+fn write_run_record() {
+    let oak_version = std::fs::read_to_string(work_root().join("oak-build.txt"))
+        .expect("the generate phase records the Oak build");
+    let manifest = std::fs::read_to_string(oak_store().join("manifest")).expect("read manifest");
+    let store_version = manifest
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("store.version="))
+        .unwrap_or("unknown")
+        .to_owned();
+    let seconds_since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let record = format!(
+        "froe Oak interoperability run record\n\
+         \n\
+         unix timestamp:      {seconds_since_epoch}\n\
+         image:               {SLING_IMAGE}\n\
+         oak-segment-tar:     {oak_version}\n\
+         store.version:       {store_version}\n\
+         froe binary:         {}\n\
+         \n\
+         Phases passed, in dependency order:\n\
+         \x20 generate    Oak wrote the fixture store\n\
+         \x20 read        froe read Oak's store (summary, tree, check, search, export)\n\
+         \x20 commit      Oak served content froe committed\n\
+         \x20 checkpoint  froe created a checkpoint, listed by name\n\
+         \x20 compact     Oak served the exact baseline tree after full compaction\n\
+         \x20 cleanup     Oak served the exact baseline tree after orphan, stale-archive,\n\
+         \x20             expired-checkpoint and corrupt-journal-line removal\n\
+         \x20 backup      Oak served the exact baseline tree after backup and restore\n\
+         \x20 recover     Oak served the exact baseline tree after journal recovery\n\
+         \n\
+         Every boot additionally asserted that Oak logged none of its repair\n\
+         messages, so Oak consumed the store as froe wrote it rather than\n\
+         reconstructing it.\n\
+         \n\
+         Not covered: native macOS or Windows execution, store.version=1,\n\
+         external blob stores, tail compaction, checkpoint removal subcommands,\n\
+         and Adobe AEM itself (this loop is Apache Sling with Oak).\n",
+        froe_bin().display()
+    );
+    let path = work_root().join("interop-run-record.txt");
+    std::fs::write(&path, &record).expect("write the interop run record");
+    eprintln!("  run record written to {}", path.display());
+    eprint!("{record}");
 }

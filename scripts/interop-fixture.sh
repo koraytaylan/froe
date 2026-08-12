@@ -34,7 +34,22 @@ fi
 
 if [[ $# -eq 0 ]]; then
     # Run all phases in dependency order.
-    cargo test -p froe-cli --features interop -- --ignored --test-threads=1 --nocapture interop_full
+    #
+    # The output is teed and then checked for the suite's completion sentinel,
+    # because `cargo test` exits zero when a filter matches nothing: a renamed
+    # test, a dropped `interop` feature, or a typo in the filter would otherwise
+    # produce a green run that executed no interop phase at all. Requiring the
+    # sentinel means green implies the chain actually ran to the end.
+    log="$(mktemp)"
+    trap 'rm -f "$log"' EXIT
+    set -o pipefail
+    cargo test -p froe-cli --features interop -- \
+        --ignored --test-threads=1 --nocapture interop_full 2>&1 | tee "$log"
+    if ! grep -q "all interop phases passed" "$log"; then
+        echo "interop: the suite reported success but never printed its completion" \
+             "sentinel, so no phase ran; refusing to report a pass" >&2
+        exit 1
+    fi
 else
     # Run a single phase.
     phase="$1"

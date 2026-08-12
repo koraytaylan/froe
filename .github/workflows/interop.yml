@@ -38,3 +38,15 @@ jobs:
         run: scripts/interop-fixture.sh
         env:
           FROE_INTEROP_WORK_ROOT: /tmp/interop-work
+
+      # The run record names the Oak build, the store version, and what each
+      # phase proved. Without it the only evidence a round trip happened is an
+      # Actions log that expires, so a later reader cannot confirm the claim
+      # the beta caveat's removal rests on.
+      - name: Publish the run record
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: interop-run-record
+          path: /tmp/interop-work/interop-run-record.txt
+          if-no-files-found: warn

@@ -46,6 +46,29 @@ the writing API refuses to open because segment identifiers require an
 operating system entropy source, which froe currently reads only from
 `/dev/urandom`.
 
+### Repository format versions
+
+Reading supports both segment-tar manifest versions: `store.version=1`
+(Oak 1.6, AEM 6.3 and earlier) and `store.version=2` (Oak 1.8 and later,
+so AEM 6.4 onwards). Maintenance is scoped to version two, and that is a
+deliberate choice rather than an omission.
+
+Every AEM line still in support has written version two for roughly eight
+years, so a version-one store encountered today is almost always an
+archive: a decommissioned instance, an old backup, a repository someone
+needs to extract content from. That work is reading, which is supported and
+carries no caveat. Spending the interoperability and maintenance-hardening
+effort on version two puts it where real repositories are.
+
+Cleanup is the one maintenance path that touches a version-one store, and
+only conditionally: if a run would write version-two state, it first
+upgrades the manifest. That upgrade is one-way, appears as an explicit
+action in the read-only preview before anything is confirmed, and is
+described in [`docs/cleanup.md`](docs/cleanup.md). The journal,
+stale-archive, stale-temporary, and recovery-backup passes never upgrade.
+If you need to keep a version-one store readable by the Oak that created
+it, copy it before running cleanup.
+
 ## Quick start
 
 ```console
