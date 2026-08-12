@@ -1495,19 +1495,23 @@ fn archive_combined_scheduling_work_includes_both_child_map_scans() {
     let repository = Repository::open(&directory.path).expect("open repository");
     let mut options = ArchiveDebugOptions::default();
     options.maximum_name_bytes_per_node = 5;
-    options.maximum_work_units = 9;
-
     // Unit one selects the root. Scheduling then attempts one child-count
     // unit, one record in the count scan, two records in enumeration, and
     // five name bytes: nine more units. The independent name cap fits; only
-    // the combined global budget refuses the absolute tenth unit.
-    assert!(matches!(
-        debug_archive_with_options(&repository, DATA_ARCHIVE, options),
-        Err(ArchiveDebugError::WorkBudgetExceeded {
-            maximum_work_units: 9,
-            attempted_work_units: 10,
-        })
-    ));
+    // the combined global budget refuses the absolute tenth unit. Both
+    // limits exercise the same exact attempt: seven leaves only six units
+    // for scheduling (less than the independent name cap after reserved
+    // work), while nine leaves eight.
+    for maximum_work_units in [7, 9] {
+        options.maximum_work_units = maximum_work_units;
+        assert!(matches!(
+            debug_archive_with_options(&repository, DATA_ARCHIVE, options),
+            Err(ArchiveDebugError::WorkBudgetExceeded {
+                maximum_work_units: observed_maximum,
+                attempted_work_units: 10,
+            }) if observed_maximum == maximum_work_units
+        ));
+    }
 }
 
 #[test]

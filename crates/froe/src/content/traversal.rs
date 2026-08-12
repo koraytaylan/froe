@@ -228,11 +228,10 @@ impl<'provider> DepthFirstTraversal<'provider> {
                                 });
                             }
                             let remaining_work = limits.work - reserved_work;
-                            let maximum_name_bytes = limits.child_name_bytes.min(remaining_work);
                             let (entries, name_bytes, enumeration_map_records) = node
                                 .child_node_entries_with_limits(
                                     child_count,
-                                    maximum_name_bytes,
+                                    limits.child_name_bytes,
                                     remaining_work,
                                 )
                                 .map_err(|error| match error {
@@ -739,6 +738,15 @@ mod tests {
         let (provider, segment) = many_child_map_fixture();
         let root =
             || crate::content::node::NodeState::new(&provider, RecordIdentifier::new(segment, 30));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        assert!(matches!(
+            traversal.next_node_with_scheduling_limits(1, 5, 6, u64::MAX),
+            Err(crate::Error::TraversalSchedulingWorkBudgetExceeded {
+                maximum_scheduling_work: 6,
+                attempted_scheduling_work: 9,
+            })
+        ));
 
         let mut traversal = DepthFirstTraversal::new(root(), "/", None);
         assert!(matches!(

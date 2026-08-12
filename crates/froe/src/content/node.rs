@@ -249,7 +249,7 @@ impl<'provider> NodeState<'provider> {
         let child_name = read_string_with_stored_byte_budget(
             self.provider,
             child_name_identifier,
-            maximum_stored_name_bytes,
+            maximum_stored_name_bytes.min(maximum_work_units),
             &mut stored_name_bytes,
         )?;
         let child_identifier = self.child_map_identifier()?;

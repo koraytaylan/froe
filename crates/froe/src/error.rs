@@ -70,7 +70,7 @@ pub enum Error {
     MapTraversalWorkBudgetExceeded {
         /// Maximum combined map enumeration work.
         maximum_work_units: u64,
-        /// Work including the rejected map record.
+        /// Work including the rejected map record or stored name bytes.
         attempted_work_units: u64,
     },
     /// A content traversal refused to materialize one node's child list
