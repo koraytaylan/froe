@@ -11,10 +11,10 @@
     reason = "test binaries have no external interface; pub only means module-visible"
 )]
 
+mod filesystem_snapshot;
 mod support;
 
-use std::collections::BTreeMap;
-
+use filesystem_snapshot::directory_snapshot;
 use froe::PropertyType;
 use froe::segment::{MAXIMUM_SEGMENT_SIZE, identifier::SegmentIdentifier};
 use froe::store::Repository;
@@ -281,19 +281,6 @@ fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> Dia
         graph_empty_identifier,
         invalid_graph_identifier,
     }
-}
-
-fn directory_snapshot(path: &std::path::Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .expect("read directory")
-        .map(|entry| {
-            let entry = entry.expect("entry");
-            (
-                entry.file_name(),
-                std::fs::read(entry.path()).expect("read file"),
-            )
-        })
-        .collect()
 }
 
 fn write_wide_production_fixture(directory: &std::path::Path, property_count: usize) {

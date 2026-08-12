@@ -9,11 +9,12 @@
     reason = "test binaries have no external interface; pub only means module-visible"
 )]
 
+mod filesystem_snapshot;
 mod support;
 
-use std::collections::BTreeMap;
 use std::io::Read;
 
+use filesystem_snapshot::directory_snapshot;
 use froe::content::value::read_binary_content;
 use froe::error::Error;
 use froe::read_binary_stream;
@@ -44,19 +45,6 @@ fn direct_record(content: &[u8]) -> Vec<u8> {
     };
     record.extend_from_slice(content);
     record
-}
-
-fn directory_snapshot(path: &std::path::Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .expect("read directory")
-        .map(|entry| {
-            let entry = entry.expect("entry");
-            (
-                entry.file_name(),
-                std::fs::read(entry.path()).expect("read file"),
-            )
-        })
-        .collect()
 }
 
 #[test]

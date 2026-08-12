@@ -21,6 +21,17 @@ const GRAPH_MAGIC: u32 = 0x0A30_470A;
 /// Size of the shared trailer footer.
 const FOOTER_SIZE: usize = 16;
 
+/// Returns the byte position immediately after a graph reference list.
+///
+/// Both operations are checked separately: a hostile count can overflow the
+/// byte length before adding the list's position, and the addition can then
+/// overflow independently.
+fn checked_references_end(position: usize, reference_count: usize) -> Option<usize> {
+    reference_count
+        .checked_mul(16)
+        .and_then(|references_size| position.checked_add(references_size))
+}
+
 /// The adjacency data of one archive: source segment to referenced segments.
 #[derive(Clone, Debug, Default)]
 pub struct SegmentGraph {
@@ -177,9 +188,7 @@ pub(crate) fn parse_segment_graph_with_limits(
         let reference_count = reference_count as usize;
         // Checked: on 32-bit targets a huge reference count could
         // otherwise wrap this bound and pass.
-        let references_end = reference_count
-            .checked_mul(16)
-            .and_then(|references_size| position.checked_add(references_size));
+        let references_end = checked_references_end(position, reference_count);
         if references_end.is_none_or(|end| end > data.len()) {
             return BoundedSegmentGraph::Unavailable { work_units };
         }
@@ -209,7 +218,7 @@ pub(crate) fn parse_segment_graph_with_limits(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedSegmentGraph, SegmentGraph, parse_segment_graph,
+        BoundedSegmentGraph, SegmentGraph, checked_references_end, parse_segment_graph,
         parse_segment_graph_with_maximum_work,
     };
     use crate::checksum::crc32;
@@ -332,5 +341,14 @@ mod tests {
             adjacency: vec![(source, vec![reference])],
         };
         assert_eq!(graph.disk_structure_size(), 16 + 20 + 16);
+    }
+
+    #[test]
+    fn reference_span_arithmetic_rejects_each_kind_of_overflow() {
+        assert_eq!(checked_references_end(20, 2), Some(52));
+        // These overflow on every pointer width. With unchecked arithmetic,
+        // they either panic in debug builds or wrap to `Some` in release.
+        assert_eq!(checked_references_end(0, usize::MAX), None);
+        assert_eq!(checked_references_end(usize::MAX, 1), None);
     }
 }

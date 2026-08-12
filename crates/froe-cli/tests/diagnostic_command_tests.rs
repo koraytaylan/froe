@@ -1,7 +1,8 @@
 //! Load-bearing CLI tests for the read-only segment and archive diagnostics.
 
-use std::collections::BTreeMap;
+mod filesystem_snapshot;
 
+use filesystem_snapshot::directory_snapshot;
 use froe::PropertyType;
 use froe::writer::record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, sort_properties_for_template,
@@ -110,6 +111,81 @@ fn write_independent_segment_fixture(
     (directory, store_path, identifier)
 }
 
+const HOSTILE_DEBUG_TEST_NAME: &str = "hostile-debug-\u{1b}]0;repository-title\u{7}-\u{202e}";
+const ESCAPED_HOSTILE_DEBUG_TEST_NAME: &str =
+    r"hostile-debug-\u{1b}]0;repository-title\u{7}-\u{202e}";
+const HOSTILE_DEBUG_NODE_NAME: &str = "node-\u{1b}]8;;https://example.invalid\u{7}link-\u{202e}";
+const ESCAPED_HOSTILE_DEBUG_NODE_NAME: &str =
+    r"node-\u{1b}]8;;https://example.invalid\u{7}link-\u{202e}";
+const HOSTILE_DEBUG_PROPERTY_NAME: &str = "property-\u{1b}[31m-red-\u{2066}";
+const ESCAPED_HOSTILE_DEBUG_PROPERTY_NAME: &str = r"property-\u{1b}[31m-red-\u{2066}";
+const HOSTILE_DEBUG_PATH_VALUE: &str = "value-\u{1b}]0;owned\u{7}-\u{202d}";
+const ESCAPED_HOSTILE_DEBUG_PATH_VALUE: &str = r"value-\u{1b}]0;owned\u{7}-\u{202d}";
+
+struct HostileDebugFixture {
+    head: froe::RecordIdentifier,
+    content_root: froe::RecordIdentifier,
+    hostile_node: froe::RecordIdentifier,
+    path_value: froe::RecordIdentifier,
+}
+
+/// Writes terminal-hostile content through the production repository writer.
+/// Separate escaped constants above keep the expected CLI text independent of
+/// the presentation sanitizer under test.
+fn populate_hostile_debug_fixture(directory: &std::path::Path) -> HostileDebugFixture {
+    let store = WritableRepository::open(directory).expect("open writable repository");
+    let generation = store.writing_generation().expect("generation");
+    let mut writer = store.record_writer(generation);
+    let path_value = writer
+        .write_string(HOSTILE_DEBUG_PATH_VALUE)
+        .expect("hostile path value");
+    let mut properties = vec![PropertyToWrite {
+        name: HOSTILE_DEBUG_PROPERTY_NAME.to_owned(),
+        property_type: PropertyType::Path,
+        values: PropertyValuesToWrite::Single(path_value),
+    }];
+    sort_properties_for_template(&mut properties);
+    let hostile_node = writer
+        .write_node(
+            Some("nt:unstructured"),
+            &[],
+            &ChildNodesToWrite::Zero,
+            &properties,
+        )
+        .expect("hostile content node");
+    let content_root = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: HOSTILE_DEBUG_NODE_NAME.to_owned(),
+                node: hostile_node,
+            },
+            &[],
+        )
+        .expect("content root");
+    let head = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "root".to_owned(),
+                node: content_root,
+            },
+            &[],
+        )
+        .expect("super root");
+    writer.finish().expect("finish");
+    assert!(store.set_head(store.head(), head));
+    store.close().expect("close");
+    HostileDebugFixture {
+        head,
+        content_root,
+        hostile_node,
+        path_value,
+    }
+}
+
 fn populate(directory: &std::path::Path) {
     let store = WritableRepository::open(directory).expect("open writable repository");
     let generation = store.writing_generation().expect("generation");
@@ -209,19 +285,6 @@ fn populate(directory: &std::path::Path) {
     store.close().expect("close");
 }
 
-fn directory_snapshot(path: &std::path::Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .expect("read directory")
-        .map(|entry| {
-            let entry = entry.expect("entry");
-            (
-                entry.file_name(),
-                std::fs::read(entry.path()).expect("read file"),
-            )
-        })
-        .collect()
-}
-
 fn corrupt_stored_graph_checksum(archive_path: &std::path::Path) {
     let mut bytes = std::fs::read(archive_path).expect("read archive");
     let graph_magic = 0x0A30_470Au32.to_be_bytes();
@@ -293,6 +356,108 @@ fn segment_hex_cli_sanitizes_hostile_info_from_an_independent_read_only_fixture(
         !output.contains('\u{2066}'),
         "bidi isolate reached terminal output"
     );
+    assert_eq!(directory_snapshot(&store_path), before);
+    assert!(!store_path.join("repo.lock").exists());
+}
+
+#[test]
+fn debug_cli_escapes_hostile_paths_names_and_non_string_values_end_to_end() {
+    let directory = TestDirectory::new(HOSTILE_DEBUG_TEST_NAME);
+    let store_path = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store_path).expect("create segment store");
+    let fixture = populate_hostile_debug_fixture(&store_path);
+    std::fs::remove_file(store_path.join("repo.lock")).expect("remove bootstrap lock file");
+
+    let repository = froe::Repository::open(&store_path).expect("open repository");
+    let archive = repository
+        .archives()
+        .iter()
+        .find(|archive| archive.contains_segment(fixture.path_value.segment))
+        .expect("archive containing hostile property value");
+    let archive_file_name = archive.file_name().to_owned();
+    let archive_file_size = archive.file_size();
+    let template_identifier = |node: froe::RecordIdentifier| {
+        let segment =
+            <froe::Repository as froe::SegmentProvider>::segment(&repository, node.segment)
+                .expect("node segment");
+        segment
+            .read_record_identifier(node.record_number, 0, 1)
+            .expect("node template identifier")
+    };
+    let head_template = template_identifier(fixture.head);
+    let content_root_template = template_identifier(fixture.content_root);
+    let hostile_node_template = template_identifier(fixture.hostile_node);
+    drop(repository);
+    let before = directory_snapshot(&store_path);
+
+    let debug = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "debug",
+            store_path.to_str().expect("store path"),
+            &archive_file_name,
+        ])
+        .output()
+        .expect("run hostile archive debug");
+    assert!(
+        debug.status.success(),
+        "archive debug failed: {}",
+        String::from_utf8_lossy(&debug.stderr)
+    );
+    assert!(debug.stderr.is_empty());
+    for &raw_control in b"\x07\x1b" {
+        assert!(
+            !debug.stdout.contains(&raw_control),
+            "raw terminal control byte {raw_control:#04x} reached stdout: {:?}",
+            String::from_utf8_lossy(&debug.stdout)
+        );
+    }
+    let debug_output = String::from_utf8(debug.stdout).expect("UTF-8 debug output");
+    for raw_bidi_control in ['\u{202d}', '\u{202e}', '\u{2066}'] {
+        assert!(
+            !debug_output.contains(raw_bidi_control),
+            "raw bidi control U+{:04X} reached stdout: {debug_output:?}",
+            u32::from(raw_bidi_control)
+        );
+    }
+
+    let archive_path = store_path.join(&archive_file_name);
+    let escaped_archive_path = archive_path
+        .to_string_lossy()
+        .replace(HOSTILE_DEBUG_TEST_NAME, ESCAPED_HOSTILE_DEBUG_TEST_NAME);
+    let expected_header = format!("Debug file {escaped_archive_path}({archive_file_size})");
+    assert_eq!(debug_output.lines().next(), Some(expected_header.as_str()));
+
+    let expected_references = format!(
+        concat!(
+            "SegmentNodeState references to {}\n",
+            "  / [SegmentNodeState@{}]\n",
+            "  /[Template@{}]\n",
+            "  /root/ [SegmentNodeState@{}]\n",
+            "  /root/[Template@{}]\n",
+            "  /root/{}/ [SegmentNodeState@{}]\n",
+            "  /root/{}/[Template@{}]\n",
+            "  /root/{}/{} = {} [SegmentPropertyState<PATH>@{}]\n",
+            "\nTar graph:\n",
+        ),
+        archive_file_name,
+        fixture.head,
+        head_template,
+        fixture.content_root,
+        content_root_template,
+        ESCAPED_HOSTILE_DEBUG_NODE_NAME,
+        fixture.hostile_node,
+        ESCAPED_HOSTILE_DEBUG_NODE_NAME,
+        hostile_node_template,
+        ESCAPED_HOSTILE_DEBUG_NODE_NAME,
+        ESCAPED_HOSTILE_DEBUG_PROPERTY_NAME,
+        ESCAPED_HOSTILE_DEBUG_PATH_VALUE,
+        fixture.path_value,
+    );
+    assert!(
+        debug_output.contains(&expected_references),
+        "exact escaped reference block was absent: {debug_output:?}"
+    );
+
     assert_eq!(directory_snapshot(&store_path), before);
     assert!(!store_path.join("repo.lock").exists());
 }

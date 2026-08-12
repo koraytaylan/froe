@@ -31,6 +31,16 @@ const SEGMENT_REFERENCE_SIZE: usize = 16;
 /// Bytes per entry of the record reference table.
 const RECORD_REFERENCE_SIZE: usize = 9;
 
+/// Returns the byte position immediately after a record reference table.
+///
+/// The table byte length and its addition to the start position can overflow
+/// independently, so both operations remain checked.
+fn checked_record_table_end(table_start: usize, record_count: usize) -> Option<usize> {
+    record_count
+        .checked_mul(RECORD_REFERENCE_SIZE)
+        .and_then(|table_size| table_start.checked_add(table_size))
+}
+
 /// One entry of the record reference table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RecordTableEntry {
@@ -240,9 +250,7 @@ impl ParsedSegment {
         let record_table_start = HEADER_SIZE + segment_reference_count * SEGMENT_REFERENCE_SIZE;
         // Checked arithmetic: on 32-bit targets a huge declared record count
         // could otherwise wrap the end position past the bounds check.
-        if record_count
-            .checked_mul(RECORD_REFERENCE_SIZE)
-            .and_then(|table_size| record_table_start.checked_add(table_size))
+        if checked_record_table_end(record_table_start, record_count)
             .is_none_or(|record_table_end| record_table_end > bytes.len())
         {
             return Err(invalid(format!(
@@ -375,7 +383,7 @@ impl ParsedSegment {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{MAXIMUM_SEGMENT_SIZE, ParsedSegment};
+    use super::{MAXIMUM_SEGMENT_SIZE, ParsedSegment, checked_record_table_end};
     use crate::segment::identifier::{SegmentIdentifier, SegmentKind};
     use crate::segment::record::RecordType;
 
@@ -625,6 +633,15 @@ pub(crate) mod tests {
         let mut hostile_records = synthetic_data_segment(&[], &[]);
         hostile_records[18..22].copy_from_slice(&0x7FFF_FFFFu32.to_be_bytes());
         assert!(ParsedSegment::parse(identifier, &hostile_records).is_err());
+    }
+
+    #[test]
+    fn record_table_span_arithmetic_rejects_each_kind_of_overflow() {
+        assert_eq!(checked_record_table_end(32, 2), Some(50));
+        // These overflow on every pointer width. With unchecked arithmetic,
+        // they either panic in debug builds or wrap to `Some` in release.
+        assert_eq!(checked_record_table_end(0, usize::MAX), None);
+        assert_eq!(checked_record_table_end(usize::MAX, 1), None);
     }
 
     #[test]

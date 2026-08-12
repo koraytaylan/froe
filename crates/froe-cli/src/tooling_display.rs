@@ -23,8 +23,21 @@ pub(crate) fn print_segment_dump(
     repository: &Repository,
     identifier: SegmentIdentifier,
 ) -> froe::Result<()> {
-    print!("{}", dump_segment(repository, identifier)?);
-    Ok(())
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_segment_dump(&mut output, repository, identifier)
+}
+
+fn write_segment_dump(
+    output: &mut dyn io::Write,
+    repository: &Repository,
+    identifier: SegmentIdentifier,
+) -> froe::Result<()> {
+    write_stdout_ignoring_broken_pipe(output, |output| {
+        let dump = dump_segment(repository, identifier)?;
+        output.write_all(dump.as_bytes())?;
+        Ok(())
+    })
 }
 
 /// `froe debug PATH file.tar...`: current-head record attribution and the
@@ -34,31 +47,58 @@ pub(crate) fn print_archive_debug(
     repository: &Repository,
     archive_file_names: &[String],
 ) -> froe::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_archive_debug(&mut output, repository, archive_file_names)
+}
+
+fn write_archive_debug(
+    output: &mut dyn io::Write,
+    repository: &Repository,
+    archive_file_names: &[String],
+) -> froe::Result<()> {
+    write_stdout_ignoring_broken_pipe(output, |output| {
+        render_archive_debug(output, repository, archive_file_names)
+    })
+}
+
+fn render_archive_debug(
+    output: &mut dyn io::Write,
+    repository: &Repository,
+    archive_file_names: &[String],
+) -> froe::Result<()> {
     for archive_file_name in archive_file_names {
         let report = debug_archive(repository, archive_file_name)?;
         match report.state {
             ArchiveDebugState::Missing => {
-                println!("file doesn't exist, skipping {}", report.archive_file_name);
+                writeln!(
+                    output,
+                    "file doesn't exist, skipping {}",
+                    report.archive_file_name
+                )?;
                 continue;
             }
             ArchiveDebugState::Inactive => {
-                println!(
+                writeln!(
+                    output,
                     "archive exists but is not active, skipping {}",
                     report.archive_file_name
-                );
+                )?;
                 continue;
             }
             ArchiveDebugState::Active => {}
             _ => {
-                println!(
+                writeln!(
+                    output,
                     "archive has an unsupported state, skipping {}",
                     report.archive_file_name
-                );
+                )?;
                 continue;
             }
         }
 
-        println!(
+        writeln!(
+            output,
             "Debug file {}({})",
             sanitize_terminal_text(
                 &repository
@@ -67,42 +107,48 @@ pub(crate) fn print_archive_debug(
                     .to_string_lossy()
             ),
             report.file_size.unwrap_or(0)
-        );
-        println!(
+        )?;
+        writeln!(
+            output,
             "SegmentNodeState references to {}",
             report.archive_file_name
-        );
+        )?;
         for reference in &report.references {
-            print_archive_reference(reference);
+            write_archive_reference(output, reference)?;
         }
-        println!();
-        println!("Tar graph:");
+        writeln!(output)?;
+        writeln!(output, "Tar graph:")?;
         match &report.graph {
             Some(graph) => {
                 for row in &graph.rows {
                     match &row.references {
                         ArchiveGraphReferences::Available(targets) => {
-                            let stdout = io::stdout();
-                            let mut output = stdout.lock();
-                            write_available_graph_row(
-                                &mut output,
-                                row.segment_identifier,
-                                targets,
-                            )?;
+                            write_available_graph_row(output, row.segment_identifier, targets)?;
                         }
-                        ArchiveGraphReferences::Unavailable { details } => println!(
+                        ArchiveGraphReferences::Unavailable { details } => writeln!(
+                            output,
                             "{}=unavailable ({})",
                             row.segment_identifier,
                             sanitize_terminal_text(details)
-                        ),
-                        _ => println!("{}=unavailable", row.segment_identifier),
+                        )?,
+                        _ => writeln!(output, "{}=unavailable", row.segment_identifier)?,
                     }
                 }
             }
-            None => println!("unavailable (archive is not active)"),
+            None => writeln!(output, "unavailable (archive is not active)")?,
         }
     }
     Ok(())
+}
+
+fn write_stdout_ignoring_broken_pipe(
+    output: &mut dyn io::Write,
+    write_output: impl FnOnce(&mut dyn io::Write) -> froe::Result<()>,
+) -> froe::Result<()> {
+    match write_output(output) {
+        Err(froe::Error::InputOutput(error)) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
 }
 
 fn write_available_graph_row(
@@ -120,19 +166,24 @@ fn write_available_graph_row(
     writeln!(output, "]")
 }
 
-fn print_archive_reference(reference: &ArchivePathReference) {
+fn write_archive_reference(
+    output: &mut dyn io::Write,
+    reference: &ArchivePathReference,
+) -> io::Result<()> {
     match reference {
         ArchivePathReference::Node {
             path,
             record_identifier,
-        } => println!(
+        } => writeln!(
+            output,
             "  {} [SegmentNodeState@{record_identifier}]",
             sanitize_terminal_text(path)
         ),
         ArchivePathReference::Template {
             path,
             record_identifier,
-        } => println!(
+        } => writeln!(
+            output,
             "  {}[Template@{record_identifier}]",
             sanitize_terminal_text(path)
         ),
@@ -146,14 +197,15 @@ fn print_archive_reference(reference: &ArchivePathReference) {
             ..
         } => {
             let display = sanitize_terminal_text(&display.oak_rendered_value());
-            println!(
+            writeln!(
+                output,
                 "  {}{} = {display} [SegmentPropertyState<{}>@{record_identifier}]",
                 sanitize_terminal_text(path),
                 sanitize_terminal_text(name),
                 oak_property_type_name(*property_type, *is_multiple),
-            );
+            )
         }
-        _ => println!("  unsupported archive reference"),
+        _ => writeln!(output, "  unsupported archive reference"),
     }
 }
 
@@ -365,9 +417,135 @@ pub(crate) fn print_search(
 
 #[cfg(test)]
 mod archive_rendering_tests {
-    use super::{oak_property_type_name, write_available_graph_row};
+    use super::{
+        oak_property_type_name, write_archive_debug, write_available_graph_row, write_segment_dump,
+    };
     use froe::segment::identifier::SegmentIdentifier;
     use froe::tooling::ArchivePropertyDisplay;
+
+    struct TestDirectory {
+        path: std::path::PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("froe-cli-tooling-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn independent_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let low_bit_mask = 0u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & low_bit_mask);
+            }
+        }
+        !crc
+    }
+
+    fn independently_encoded_info_segment() -> Vec<u8> {
+        let info = b"Oak";
+        let record_position = 44usize;
+        let record_length = 1 + info.len();
+        let size = (record_position + record_length.div_ceil(4) * 4).div_ceil(16) * 16;
+        let mut bytes = vec![0u8; size];
+        bytes[0..3].copy_from_slice(b"0aK");
+        bytes[3] = 13;
+        bytes[4..8].copy_from_slice(&0x8000_0001u32.to_be_bytes());
+        bytes[10..14].copy_from_slice(&1u32.to_be_bytes());
+        bytes[18..22].copy_from_slice(&1u32.to_be_bytes());
+        bytes[36] = 4;
+        let virtual_offset = (262_144 - (size - record_position)) as u32;
+        bytes[37..41].copy_from_slice(&virtual_offset.to_be_bytes());
+        bytes[record_position] = info.len() as u8;
+        bytes[record_position + 1..record_position + record_length].copy_from_slice(info);
+        bytes
+    }
+
+    fn write_minimal_repository(directory: &std::path::Path) -> SegmentIdentifier {
+        let segment_bytes = independently_encoded_info_segment();
+        let identifier = SegmentIdentifier::new(0x1234, 0xa000_0000_0000_5678);
+        let entry_name = format!("{identifier}.{:08x}", independent_crc32(&segment_bytes));
+
+        let mut header = vec![0u8; 512];
+        header[..entry_name.len()].copy_from_slice(entry_name.as_bytes());
+        header[100..107].copy_from_slice(b"0000400");
+        header[108..115].copy_from_slice(b"0000000");
+        header[116..123].copy_from_slice(b"0000000");
+        header[124..135].copy_from_slice(format!("{:011o}", segment_bytes.len()).as_bytes());
+        header[136..147].copy_from_slice(b"00000000000");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = b'0';
+        let header_checksum: u32 = header.iter().map(|&byte| u32::from(byte)).sum();
+        header[148..156].copy_from_slice(format!("{header_checksum:06o}\0 ").as_bytes());
+
+        let mut archive = header;
+        archive.extend_from_slice(&segment_bytes);
+        archive.resize(512 + segment_bytes.len().div_ceil(512) * 512, 0);
+        archive.extend_from_slice(&[0u8; 1024]);
+        std::fs::write(directory.join("data00000a.tar"), archive).expect("write archive");
+        std::fs::write(
+            directory.join("journal.log"),
+            format!("{identifier}:0 root 1\n"),
+        )
+        .expect("write journal");
+        std::fs::write(directory.join("manifest"), "store.version=2\n").expect("write manifest");
+        identifier
+    }
+
+    #[test]
+    fn production_diagnostic_writers_treat_only_broken_pipe_as_success() {
+        let directory = TestDirectory::new("broken-pipe");
+        let identifier = write_minimal_repository(&directory.path);
+        let repository = froe::Repository::open(&directory.path).expect("open repository");
+
+        let mut broken_pipe = FailingWriter(std::io::ErrorKind::BrokenPipe);
+        write_segment_dump(&mut broken_pipe, &repository, identifier)
+            .expect("segment dump must stop quietly at a closed pipe");
+
+        let mut broken_pipe = FailingWriter(std::io::ErrorKind::BrokenPipe);
+        write_archive_debug(
+            &mut broken_pipe,
+            &repository,
+            &["data99999a.tar".to_owned()],
+        )
+        .expect("archive debug must stop quietly at a closed pipe");
+
+        let mut other_failure = FailingWriter(std::io::ErrorKind::PermissionDenied);
+        let error = write_segment_dump(&mut other_failure, &repository, identifier)
+            .expect_err("non-pipe output errors must remain visible");
+        assert!(matches!(
+            error,
+            froe::Error::InputOutput(source)
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+
+        drop(repository);
+    }
 
     #[test]
     fn string_display_uses_java_escaping_and_utf16_truncation() {

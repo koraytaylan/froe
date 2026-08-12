@@ -20,7 +20,10 @@
 
 use std::io;
 
-use crate::content::list::{MAXIMUM_LIST_SIZE, uncounted_list_entries, uncounted_list_entry};
+use crate::content::list::{
+    MAXIMUM_LIST_SIZE, uncounted_list_entries, uncounted_list_entry,
+    uncounted_list_entry_with_provider,
+};
 use crate::content::provider::SegmentProvider;
 use crate::error::{Error, Result};
 use crate::segment::record::RecordIdentifier;
@@ -103,8 +106,12 @@ impl<Provider: SegmentProvider + ?Sized> BinaryStream<'_, Provider> {
         {
             return Ok(identifier);
         }
-        let identifier =
-            uncounted_list_entry(self.provider, list_identifier, block_count, block_index)?;
+        let identifier = uncounted_list_entry_with_provider(
+            self.provider,
+            list_identifier,
+            block_count,
+            block_index,
+        )?;
         self.resolved_block = Some((block_index, identifier));
         Ok(identifier)
     }
