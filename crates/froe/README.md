@@ -23,12 +23,16 @@ operating-system entropy source and therefore refuses to open on Windows. If
 hard-link and durable directory-fsync support to publish the new mode-`0600`
 lock safely; an unsupported filesystem fails closed.
 
-**The writing API is beta**: it is verified against byte-exact
-specifications extracted from the Oak sources and an extensive test
-suite, but has not yet been validated end-to-end against stores produced
-by — or consumed by — a real Oak/AEM instance. Until that
-interoperability round-trip lands, take a copy of your repository before
-writing to data you care about. The reading API carries no such caveat.
+**The writing API is verified against a real Oak instance**: the workspace
+interoperability suite round-trips it through Apache Jackrabbit Oak
+`oak-segment-tar` 1.90.0 — Oak writes the store, froe commits, checkpoints,
+compacts, cleans up, backs up, restores and recovers the journal, and Oak
+then boots against each result and serves a byte-identical content tree
+without logging any of its own repair messages. Still unverified against a
+live instance: `store.version=1` stores, external blob stores, native macOS
+or Windows execution, and Adobe AEM itself, which ships its own Oak build.
+Writing still requires a stopped repository, and keeping a copy before a
+destructive operation on irreplaceable data remains ordinary prudence.
 
 See the workspace repository for the complete feature map and storage
 format documentation, including the cleanup safety guide, and the `froe-cli`

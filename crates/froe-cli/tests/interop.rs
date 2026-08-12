@@ -1331,6 +1331,175 @@ fn compact() {
     eprintln!("  compact phase passed");
 }
 
+/// Tail compaction against a real Oak store.
+///
+/// A materially different reclamation path from full compaction: it advances
+/// the generation but keeps the shared full generation, reclaiming by
+/// generation alone. Covering only the full form would leave a documented flag
+/// of a maintenance command unexercised against Oak.
+#[test]
+#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
+fn compact_tail() {
+    let store = oak_store();
+    let tail_store = work_root().join("compact-tail-store");
+    eprintln!("  copying store to {}", tail_store.display());
+    copy_store(&store, &tail_store);
+
+    eprintln!("  truncating journal to head");
+    truncate_journal_to_head(&tail_store);
+
+    eprintln!("  froe compact --tail --yes");
+    froe(&["compact", tail_store.to_str().unwrap(), "--tail", "--yes"]);
+
+    eprintln!("  froe check after tail compaction");
+    froe(&["check", tail_store.to_str().unwrap()]);
+
+    eprintln!("  booting Sling against the tail-compacted store");
+    let volume = PodmanVolume::new("froe-interop-compact-tail");
+    let bootstrap = PodmanContainer::run_detached("froe-tail-bootstrap", 8087, &volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(&tail_store, &volume.name);
+    let sling = PodmanContainer::run_detached("froe-tail-verify", 8087, &volume.name);
+    wait_for_sling(8087, "froe-tail-verify");
+
+    assert_oak_consumed_store_as_written("froe-tail-verify", "compact --tail");
+    assert_content_matches_baseline(8087, "compact --tail");
+
+    drop(sling);
+    eprintln!("  compact --tail phase passed");
+}
+
+/// The checkpoint the Oak async indexer references, read from `/:async`.
+fn async_referenced_checkpoint(store: &Path) -> String {
+    let node = froe(&["node", store.to_str().unwrap(), "/:async"]);
+    let line = node
+        .lines()
+        .find(|line| line.contains("async <String>"))
+        .unwrap_or_else(|| panic!("/:async carries an async checkpoint reference: {node}"));
+    let (_, quoted) = line
+        .split_once("= \"")
+        .unwrap_or_else(|| panic!("the async property is a quoted string: {line}"));
+    quoted.trim_end().trim_end_matches('"').to_owned()
+}
+
+/// Checkpoint removal against a real Oak store.
+///
+/// Removal rewrites the super-root's `checkpoints` subtree and commits a new
+/// head, which is the structure Oak's asynchronous indexer depends on through
+/// `/:async`. The safety-relevant property is that `remove-unreferenced`
+/// removes an unreferenced checkpoint and *keeps* the one the indexer
+/// references: removing that would make Oak discard its index state and
+/// reindex the repository from scratch.
+#[test]
+#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
+fn checkpoint_removal() {
+    let store = oak_store();
+    let removal_store = work_root().join("checkpoint-removal-store");
+    eprintln!("  copying store to {}", removal_store.display());
+    copy_store(&store, &removal_store);
+
+    let referenced = async_referenced_checkpoint(&removal_store);
+    eprintln!("  Oak's async indexer references checkpoint {referenced}");
+    let listing = froe(&["checkpoints", removal_store.to_str().unwrap()]);
+    assert!(
+        listing.contains(&referenced),
+        "the async-referenced checkpoint is present to begin with: {listing}"
+    );
+
+    // Two froe-created checkpoints, neither referenced by the indexer.
+    let mut created = Vec::new();
+    for _ in 0..2 {
+        let output = froe(&[
+            "checkpoint",
+            "create",
+            removal_store.to_str().unwrap(),
+            "--lifetime-milliseconds",
+            "3600000",
+            "--yes",
+        ]);
+        created.push(
+            output
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("created checkpoint "))
+                .unwrap_or_else(|| panic!("create reports a name: {output}"))
+                .trim()
+                .to_owned(),
+        );
+    }
+    eprintln!("  created unreferenced checkpoints {created:?}");
+
+    eprintln!("  froe checkpoint remove (by name)");
+    froe(&[
+        "checkpoint",
+        "remove",
+        removal_store.to_str().unwrap(),
+        &created[0],
+        "--yes",
+    ]);
+    let after_remove = froe(&["checkpoints", removal_store.to_str().unwrap()]);
+    assert!(
+        !after_remove.contains(&created[0]),
+        "the named checkpoint was removed: {after_remove}"
+    );
+    assert!(
+        after_remove.contains(&created[1]) && after_remove.contains(&referenced),
+        "removing one checkpoint by name left the others: {after_remove}"
+    );
+
+    eprintln!("  froe checkpoint remove-unreferenced");
+    froe(&[
+        "checkpoint",
+        "remove-unreferenced",
+        removal_store.to_str().unwrap(),
+        "--yes",
+    ]);
+    let after_unreferenced = froe(&["checkpoints", removal_store.to_str().unwrap()]);
+    assert!(
+        !after_unreferenced.contains(&created[1]),
+        "the remaining unreferenced checkpoint was removed: {after_unreferenced}"
+    );
+    assert!(
+        after_unreferenced.contains(&referenced),
+        "the checkpoint Oak's async indexer references SURVIVED remove-unreferenced; \
+         removing it would force a full reindex: {after_unreferenced}"
+    );
+
+    eprintln!("  froe check after checkpoint removal");
+    froe(&["check", removal_store.to_str().unwrap()]);
+
+    eprintln!("  booting Sling against the store with a rewritten checkpoints subtree");
+    let volume = PodmanVolume::new("froe-interop-checkpoint-removal");
+    let bootstrap = PodmanContainer::run_detached("froe-cprm-bootstrap", 8088, &volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(&removal_store, &volume.name);
+    let sling = PodmanContainer::run_detached("froe-cprm-verify", 8088, &volume.name);
+    wait_for_sling(8088, "froe-cprm-verify");
+
+    assert_oak_consumed_store_as_written("froe-cprm-verify", "checkpoint removal");
+    assert_content_matches_baseline(8088, "checkpoint removal");
+    drop(sling);
+
+    // remove-all is the broadest form; assert it empties the subtree and that
+    // the store still verifies afterwards.
+    eprintln!("  froe checkpoint remove-all");
+    froe(&[
+        "checkpoint",
+        "remove-all",
+        removal_store.to_str().unwrap(),
+        "--yes",
+    ]);
+    let after_all = froe(&["checkpoints", removal_store.to_str().unwrap()]);
+    assert!(
+        after_all.contains("no checkpoints"),
+        "remove-all emptied the checkpoints subtree: {after_all}"
+    );
+    froe(&["check", removal_store.to_str().unwrap()]);
+
+    eprintln!("  checkpoint removal phase passed");
+}
+
 /// Phase 6: froe cleanup against a multi-generational store.
 ///
 /// Builds a gen 0→1→2 store by compacting twice, then restoring the
@@ -1639,6 +1808,8 @@ fn interop_full() {
     commit();
     checkpoint();
     compact();
+    compact_tail();
+    checkpoint_removal();
     cleanup();
     backup();
     recover();
@@ -1680,6 +1851,12 @@ fn write_run_record() {
          \x20 commit      Oak served content froe committed\n\
          \x20 checkpoint  froe created a checkpoint, listed by name\n\
          \x20 compact     Oak served the exact baseline tree after full compaction\n\
+         \x20 compact     Oak served the exact baseline tree after tail compaction\n\
+         \x20 --tail\n\
+         \x20 checkpoint  remove by name, remove-unreferenced and remove-all all\n\
+         \x20 removal     applied; the checkpoint Oak's async indexer references\n\
+         \x20             survived remove-unreferenced, and Oak served the exact\n\
+         \x20             baseline tree afterwards\n\
          \x20 cleanup     Oak served the exact baseline tree after orphan, stale-archive,\n\
          \x20             expired-checkpoint and corrupt-journal-line removal\n\
          \x20 backup      Oak served the exact baseline tree after backup and restore\n\
@@ -1690,8 +1867,8 @@ fn write_run_record() {
          reconstructing it.\n\
          \n\
          Not covered: native macOS or Windows execution, store.version=1,\n\
-         external blob stores, tail compaction, checkpoint removal subcommands,\n\
-         and Adobe AEM itself (this loop is Apache Sling with Oak).\n",
+         external blob stores, and Adobe AEM itself (this loop is Apache Sling\n\
+         with Oak).\n",
         froe_bin().display()
     );
     let path = work_root().join("interop-run-record.txt");

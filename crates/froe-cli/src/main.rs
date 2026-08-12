@@ -226,9 +226,9 @@ enum Command {
     /// Conservatively reclaim orphaned storage and stale repository metadata.
     ///
     /// Dry-run is strictly read-only and does not create or acquire repo.lock.
-    /// Applying cleanup is beta, Unix-only offline maintenance: stop Oak/AEM,
-    /// run as the operating-system owner of journal.log (normally the service
-    /// account, not sudo), and keep a recoverable copy of important stores.
+    /// Applying cleanup is Unix-only offline maintenance: stop Oak/AEM, run as
+    /// the operating-system owner of journal.log (normally the service account,
+    /// not sudo), and keep a recoverable copy of important stores.
     /// The repository argument is resolved once to its canonical absolute
     /// target before planning or locking, and that target is shown in the plan.
     /// Recovery backups are retained unless an explicit age/count policy is

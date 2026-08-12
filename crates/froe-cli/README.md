@@ -20,14 +20,18 @@ command also requires same-directory hard-link and durable directory-fsync
 support to publish the new mode-`0600` lock safely; an unsupported filesystem
 fails instead of using an unsafe fallback.
 
-**Maintenance commands are beta**: the write path is verified against
-byte-exact specifications extracted from the Oak sources and an extensive
-test suite, but has not yet been validated end-to-end against stores
-produced by — or consumed by — a real Oak/AEM instance. Until that
-interoperability round-trip lands, take a copy of your repository before
-running any maintenance command against data you care about. The
-read-only commands carry no such caveat. `froe cleanup --dry-run` is also
-strictly read-only: it neither creates nor acquires `repo.lock`.
+**Maintenance is verified against a real Oak instance**: every mutating
+command round-trips through Apache Jackrabbit Oak `oak-segment-tar` 1.90.0 in
+the interoperability suite — Oak writes the store, froe commits, checkpoints,
+compacts (full and tail), removes checkpoints, cleans up, backs up, restores
+and recovers the journal, and Oak then boots against each result and serves a
+byte-identical content tree without logging any of its own repair messages.
+Still unverified against a live instance: `store.version=1` stores, external
+blob stores, native macOS or Windows execution, and Adobe AEM itself, which
+ships its own Oak build. Maintenance still requires a stopped repository, and
+keeping a copy before a destructive operation on irreplaceable data remains
+ordinary prudence. `froe cleanup --dry-run` is strictly read-only: it neither
+creates nor acquires `repo.lock`.
 
 Two low-level interoperability diagnostics mirror Oak's segment tooling:
 

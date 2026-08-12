@@ -6,10 +6,16 @@ revision, reclaims eligible orphan segments, removes safe archive leftovers,
 expires checkpoints, and deletes only staging files it can prove redundant.
 It never creates or bootstraps a repository.
 
-> **Maintenance commands are beta.** Run cleanup only while Oak/AEM is stopped,
-> and keep a recoverable copy of important repositories. The writer is covered
-> by format-level and failure-path tests but has not yet completed an
-> end-to-end interoperability round-trip with a real Oak/AEM installation.
+> **Run cleanup only while Oak/AEM is stopped, and keep a recoverable copy of
+> important repositories.** Cleanup is covered by format-level and failure-path
+> tests and by the interoperability suite ([`interop.md`](interop.md)), which
+> applies it to a store written by Apache Jackrabbit Oak `oak-segment-tar`
+> 1.90.0 — reclaiming orphan segments, a stale archive, an expired checkpoint
+> and corrupt journal lines — and then boots Oak against the result, which
+> serves a byte-identical content tree and logs none of its own repair
+> messages. Not yet verified against a live instance: `store.version=1`
+> stores, external blob stores, and Adobe AEM itself, which ships its own Oak
+> build.
 
 Apply is Unix-only and must run as the operating-system user that owns
 `journal.log`—normally the Oak/AEM service account, not through `sudo`. This is

@@ -99,8 +99,11 @@ jobs:
             echo "- Linux binaries are statically linked (musl) and run on any distribution."
             echo "- The Windows binary supports the read-only commands; maintenance"
             echo "  commands refuse to run there (a Unix entropy source is required)."
-            echo "- Maintenance commands are beta: not yet validated end-to-end against"
-            echo "  a real Oak/AEM instance — copy your repository before using them."
+            echo "- Maintenance is verified against Apache Jackrabbit Oak"
+            echo "  oak-segment-tar 1.90.0 by the interoperability suite; store.version=1"
+            echo "  stores, external blob stores and Adobe AEM itself are not yet covered."
+            echo "  Stop the repository first, and copy irreplaceable data before"
+            echo "  destructive operations."
             echo "- \`sha256sum --check SHA256SUMS\` verifies any downloaded archive."
           } >> RELEASE_NOTES.md
       - uses: actions/upload-artifact@v7

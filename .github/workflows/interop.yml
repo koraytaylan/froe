@@ -7,8 +7,8 @@
 # The tests live in crates/froe-cli/tests/interop.rs behind the `interop`
 # feature flag.
 #
-# This is the regression guard for the write-path beta caveat: one-time
-# interop verification rots without a scheduled check.
+# This is the standing regression guard for the write-path interoperability
+# claim in README.md: one-time verification rots without a scheduled check.
 name: interop
 
 on:
@@ -42,7 +42,7 @@ jobs:
       # The run record names the Oak build, the store version, and what each
       # phase proved. Without it the only evidence a round trip happened is an
       # Actions log that expires, so a later reader cannot confirm the claim
-      # the beta caveat's removal rests on.
+      # the interoperability claim in README.md rests on.
       - name: Publish the run record
         if: always()
         uses: actions/upload-artifact@v7

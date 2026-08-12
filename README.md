@@ -29,13 +29,24 @@ verified against byte-exact specifications extracted from the Oak sources.
 re-render during compaction to a different — equally round-tripping —
 shortest form than Java's; see `double_to_text`.)
 
-> **Maintenance commands are beta.** The write path is verified against
-> byte-exact specifications extracted from the Oak sources and an
-> extensive test suite, but has not yet been validated end-to-end against
-> stores produced by — or consumed by — a real Oak/AEM instance. Until
-> that interoperability round-trip lands, take a copy of your repository
-> before running any maintenance command against data you care about.
-> The read-only commands never write anything and carry no such caveat.
+> **Maintenance is verified against a real Oak instance.** The
+> interoperability suite ([`docs/interop.md`](docs/interop.md)) round-trips
+> the write path through Apache Jackrabbit Oak `oak-segment-tar` 1.90.0,
+> running inside Apache Sling: Oak writes the store, froe reads it, then
+> froe commits content, creates and removes checkpoints, compacts (full and
+> tail), cleans up orphan segments, stale archives, expired checkpoints and
+> corrupt journal lines, backs up, restores, and rebuilds a deleted journal.
+> After each operation Oak boots against the result, serves a byte-identical
+> content tree, and logs none of its own repair messages — so Oak consumed
+> what froe wrote rather than reconstructing it.
+>
+> Still unverified against a live instance: `store.version=1` stores (see
+> [Repository format versions](#repository-format-versions)), external blob
+> stores, native macOS or Windows execution, and Adobe AEM itself, which
+> ships its own Oak build. Maintenance commands still require a stopped
+> repository, and keeping a copy before a destructive operation on
+> irreplaceable data remains ordinary prudence. The read-only commands never
+> write anything.
 
 ## Platform support
 
