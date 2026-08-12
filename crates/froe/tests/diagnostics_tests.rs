@@ -645,6 +645,41 @@ fn write_diff_child_map_fixture(test_name: &str) -> TestDirectory {
     directory
 }
 
+/// Independently encodes one many-arity child map so the archive diagnostic's
+/// combined scheduling budget must include both map scans as well as the
+/// child count and stored name bytes.
+fn write_one_child_map_fixture(test_name: &str) -> TestDirectory {
+    let directory = TestDirectory::new(test_name);
+    let data_uuid = data_segment_uuid(0x354);
+    let mut data = SegmentBuilder::new(data_uuid);
+    data.add_record(1, TYPE_VALUE, string_record("child"));
+    data.add_record(2, TYPE_TEMPLATE, (1u32 << 28).to_be_bytes().to_vec());
+    data.add_record(3, TYPE_TEMPLATE, (1u32 << 29).to_be_bytes().to_vec());
+
+    let mut child = record_identifier_bytes(0, 4);
+    child.extend(record_identifier_bytes(0, 3));
+    data.add_record(4, TYPE_NODE, child);
+
+    let mut child_map = 1u32.to_be_bytes().to_vec();
+    child_map.extend(independent_map_entry_hash("child").to_be_bytes());
+    child_map.extend(record_identifier_bytes(0, 1));
+    child_map.extend(record_identifier_bytes(0, 4));
+    data.add_record(5, TYPE_MAP_LEAF, child_map);
+
+    let mut head = record_identifier_bytes(0, 6);
+    head.extend(record_identifier_bytes(0, 2));
+    head.extend(record_identifier_bytes(0, 5));
+    data.add_record(6, TYPE_NODE, head);
+    let mut archive = ArchiveBuilder::new();
+    archive.add_segment(data_uuid, data.build());
+    write_repository(
+        &directory.path,
+        &[(DATA_ARCHIVE.to_owned(), archive.build(DATA_ARCHIVE))],
+        &[format!("{}:6 root 1", format_uuid(data_uuid))],
+    );
+    directory
+}
+
 fn write_duplicate_property_fixture(test_name: &str) -> TestDirectory {
     let directory = TestDirectory::new(test_name);
     let data_uuid = data_segment_uuid(0x352);
@@ -1450,6 +1485,27 @@ fn archive_work_budget_charges_each_child_map_diff_record_at_an_absolute_thresho
         Err(ArchiveDebugError::WorkBudgetExceeded {
             maximum_work_units: 2,
             attempted_work_units: 3,
+        })
+    ));
+}
+
+#[test]
+fn archive_combined_scheduling_work_includes_both_child_map_scans() {
+    let directory = write_one_child_map_fixture("debug-map-combined-work");
+    let repository = Repository::open(&directory.path).expect("open repository");
+    let mut options = ArchiveDebugOptions::default();
+    options.maximum_name_bytes_per_node = 5;
+    options.maximum_work_units = 9;
+
+    // Unit one selects the root. Scheduling then attempts one child-count
+    // unit, one record in the count scan, two records in enumeration, and
+    // five name bytes: nine more units. The independent name cap fits; only
+    // the combined global budget refuses the absolute tenth unit.
+    assert!(matches!(
+        debug_archive_with_options(&repository, DATA_ARCHIVE, options),
+        Err(ArchiveDebugError::WorkBudgetExceeded {
+            maximum_work_units: 9,
+            attempted_work_units: 10,
         })
     ));
 }

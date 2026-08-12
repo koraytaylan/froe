@@ -18,7 +18,7 @@
 //! hash's top bits. Both quirks are load-bearing and reproduced here.
 
 use crate::content::provider::SegmentProvider;
-use crate::content::value::read_string_with_stored_byte_budget;
+use crate::content::value::{read_string, read_string_stored_length};
 use crate::error::{Error, Result};
 use crate::hashing::map_entry_hash;
 use crate::segment::record::RecordIdentifier;
@@ -341,15 +341,26 @@ fn read_map_name(
     let Some(budget) = budget else {
         return Ok(provider.string(identifier)?.as_ref().to_owned());
     };
-    let maximum_from_work = budget
-        .maximum_work_units
-        .saturating_sub(budget.visited_map_records);
-    read_string_with_stored_byte_budget(
-        provider,
-        identifier,
-        budget.maximum_stored_name_bytes.min(maximum_from_work),
-        &mut budget.stored_name_bytes,
-    )
+    let stored_length = read_string_stored_length(provider, identifier)?;
+    let attempted_stored_bytes = budget.stored_name_bytes.saturating_add(stored_length);
+    if attempted_stored_bytes > budget.maximum_stored_name_bytes {
+        return Err(Error::StringMaterializationBudgetExceeded {
+            maximum_stored_bytes: budget.maximum_stored_name_bytes,
+            attempted_stored_bytes,
+            value_identifier: identifier,
+        });
+    }
+    let attempted_work_units = budget
+        .visited_map_records
+        .saturating_add(attempted_stored_bytes);
+    if attempted_work_units > budget.maximum_work_units {
+        return Err(Error::MapTraversalWorkBudgetExceeded {
+            maximum_work_units: budget.maximum_work_units,
+            attempted_work_units,
+        });
+    }
+    budget.stored_name_bytes = attempted_stored_bytes;
+    read_string(provider, identifier)
 }
 
 /// A map entry augmented with its key record identifier, needed to apply
@@ -646,6 +657,13 @@ mod tests {
             Err(crate::Error::MapTraversalWorkBudgetExceeded {
                 maximum_work_units: 1,
                 attempted_work_units: 2,
+            })
+        ));
+        assert!(matches!(
+            map_entries_with_limits(&provider, map, 1, 5, 6),
+            Err(crate::Error::MapTraversalWorkBudgetExceeded {
+                maximum_work_units: 6,
+                attempted_work_units: 7,
             })
         ));
         let (entries, name_bytes, map_records) = map_entries_with_limits(&provider, map, 1, 5, 7)

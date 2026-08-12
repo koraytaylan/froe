@@ -237,13 +237,24 @@ impl<'provider> DepthFirstTraversal<'provider> {
                                 )
                                 .map_err(|error| match error {
                                     Error::StringMaterializationBudgetExceeded {
-                                        maximum_stored_bytes,
                                         attempted_stored_bytes,
                                         ..
-                                    } => Error::TraversalChildNameBudgetExceeded {
-                                        maximum_stored_child_name_bytes: maximum_stored_bytes,
-                                        attempted_stored_child_name_bytes: attempted_stored_bytes,
-                                        scheduled_children: child_count,
+                                    } if attempted_stored_bytes > limits.child_name_bytes => {
+                                        Error::TraversalChildNameBudgetExceeded {
+                                            maximum_stored_child_name_bytes: limits
+                                                .child_name_bytes,
+                                            attempted_stored_child_name_bytes:
+                                                attempted_stored_bytes,
+                                            scheduled_children: child_count,
+                                        }
+                                    }
+                                    Error::StringMaterializationBudgetExceeded {
+                                        attempted_stored_bytes,
+                                        ..
+                                    } => Error::TraversalSchedulingWorkBudgetExceeded {
+                                        maximum_scheduling_work: limits.work,
+                                        attempted_scheduling_work: reserved_work
+                                            .saturating_add(attempted_stored_bytes),
                                     },
                                     Error::MapTraversalWorkBudgetExceeded {
                                         attempted_work_units,
@@ -615,6 +626,52 @@ mod tests {
         (provider, segment)
     }
 
+    fn many_child_map_fixture() -> (MemorySegmentProvider, crate::segment::SegmentIdentifier) {
+        let identifier_bytes = |record_number: u32| {
+            let mut bytes = [0u8; 6];
+            bytes[2..6].copy_from_slice(&record_number.to_be_bytes());
+            bytes
+        };
+        let segment = data_segment_identifier(6);
+        let mut child_name = vec![5u8];
+        child_name.extend_from_slice(b"child");
+        let mut root = Vec::new();
+        root.extend_from_slice(&identifier_bytes(30));
+        root.extend_from_slice(&identifier_bytes(21));
+        root.extend_from_slice(&identifier_bytes(10));
+        let mut child = Vec::new();
+        child.extend_from_slice(&identifier_bytes(31));
+        child.extend_from_slice(&identifier_bytes(22));
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, child_name),
+                    (10, 0, {
+                        let mut leaf = 1u32.to_be_bytes().to_vec();
+                        leaf.extend_from_slice(
+                            &crate::hashing::map_entry_hash("child").to_be_bytes(),
+                        );
+                        leaf.extend_from_slice(&identifier_bytes(1));
+                        leaf.extend_from_slice(&identifier_bytes(31));
+                        leaf
+                    }),
+                    (21, 6, (1u32 << 28).to_be_bytes().to_vec()),
+                    (
+                        22,
+                        6,
+                        template_record(None, &[], &TemplateArity::Zero, None, &[]),
+                    ),
+                    (30, 7, root),
+                    (31, 7, child),
+                ],
+            ),
+        );
+        (provider, segment)
+    }
+
     #[test]
     fn bounded_traversal_guards_every_scheduling_resource_at_exact_thresholds() {
         let (provider, segment) = single_child_fixture();
@@ -651,6 +708,15 @@ mod tests {
 
         let mut traversal = DepthFirstTraversal::new(root(), "/", None);
         assert!(matches!(
+            traversal.next_node_with_scheduling_limits(1, 5, 5, u64::MAX),
+            Err(crate::Error::TraversalSchedulingWorkBudgetExceeded {
+                maximum_scheduling_work: 5,
+                attempted_scheduling_work: 6,
+            })
+        ));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        assert!(matches!(
             traversal.next_node_with_scheduling_limits(1, 5, 6, 0),
             Err(crate::Error::TraversalPendingBudgetExceeded {
                 maximum_pending_nodes: 0,
@@ -666,5 +732,30 @@ mod tests {
         assert_eq!(visited.scheduled_children, 1);
         assert_eq!(visited.scheduled_child_name_bytes, 5);
         assert_eq!(visited.scheduled_child_map_records, 0);
+    }
+
+    #[test]
+    fn bounded_traversal_classifies_combined_map_work_with_all_record_charges() {
+        let (provider, segment) = many_child_map_fixture();
+        let root =
+            || crate::content::node::NodeState::new(&provider, RecordIdentifier::new(segment, 30));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        assert!(matches!(
+            traversal.next_node_with_scheduling_limits(1, 5, 8, u64::MAX),
+            Err(crate::Error::TraversalSchedulingWorkBudgetExceeded {
+                maximum_scheduling_work: 8,
+                attempted_scheduling_work: 9,
+            })
+        ));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        let visited = traversal
+            .next_node_with_scheduling_limits(1, 5, 9, 1)
+            .expect("all count, enumeration, and name work fits exactly")
+            .expect("root visit");
+        assert_eq!(visited.scheduled_children, 1);
+        assert_eq!(visited.scheduled_child_name_bytes, 5);
+        assert_eq!(visited.scheduled_child_map_records, 3);
     }
 }
