@@ -22,5 +22,5 @@ pub use path::normalized_path;
 pub use property::{PropertyType, PropertyValue};
 pub use provider::SegmentProvider;
 pub use template::{ChildNodeArity, PropertyTemplate, Template};
-pub use traversal::{DepthFirstTraversal, VisitedNode};
+pub use traversal::{BoundedVisitedNode, DepthFirstTraversal, VisitedNode};
 pub use value::{BinaryStream, BinaryValue, read_binary_stream};

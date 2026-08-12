@@ -71,13 +71,21 @@ pub struct VisitedNode<'traversal, 'provider> {
     pub depth: usize,
 }
 
-/// Diagnostic-only scheduling accounting kept out of the stable public
-/// [`VisitedNode`] shape.
-pub(crate) struct BoundedVisitedNode<'traversal, 'provider> {
-    pub(crate) visited: VisitedNode<'traversal, 'provider>,
-    pub(crate) scheduled_children: u64,
-    pub(crate) scheduled_child_name_bytes: u64,
-    pub(crate) scheduled_child_map_records: u64,
+/// One visited node plus the resource accounting for scheduling its children.
+///
+/// Keeping this separate from [`VisitedNode`] preserves that type's compact,
+/// destructurable compatibility surface while making the bounded traversal
+/// and its typed budget errors available to custom diagnostic callers.
+#[non_exhaustive]
+pub struct BoundedVisitedNode<'traversal, 'provider> {
+    /// The node, path, and depth returned by an ordinary traversal.
+    pub visited: VisitedNode<'traversal, 'provider>,
+    /// Children scheduled by this step.
+    pub scheduled_children: u64,
+    /// Stored child-name bytes materialized by this step.
+    pub scheduled_child_name_bytes: u64,
+    /// Child-map records inspected by this step.
+    pub scheduled_child_map_records: u64,
 }
 
 /// A depth-first walk over a subtree, in document order.
@@ -124,7 +132,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
 
     /// Advances with independent per-node child-count and stored-name-byte
     /// caps, plus a combined scheduling-work cap checked before expansion.
-    pub(crate) fn next_node_with_scheduling_limits(
+    pub fn next_node_with_scheduling_limits(
         &mut self,
         maximum_scheduled_children: u64,
         maximum_scheduled_child_name_bytes: u64,
@@ -564,5 +572,99 @@ mod tests {
 
         assert!(traversal.next_node().expect("advance").is_some());
         assert_eq!(provider.template_reads(), 1);
+    }
+
+    fn single_child_fixture() -> (MemorySegmentProvider, crate::segment::SegmentIdentifier) {
+        let identifier_bytes = |record_number: u32| {
+            let mut bytes = [0u8; 6];
+            bytes[2..6].copy_from_slice(&record_number.to_be_bytes());
+            bytes
+        };
+        let segment = data_segment_identifier(5);
+        let mut child_name = vec![5u8];
+        child_name.extend_from_slice(b"child");
+        let mut root = Vec::new();
+        root.extend_from_slice(&identifier_bytes(30));
+        root.extend_from_slice(&identifier_bytes(21));
+        root.extend_from_slice(&identifier_bytes(31));
+        let mut child = Vec::new();
+        child.extend_from_slice(&identifier_bytes(31));
+        child.extend_from_slice(&identifier_bytes(22));
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, child_name),
+                    (
+                        21,
+                        6,
+                        template_record(None, &[], &TemplateArity::One(1), None, &[]),
+                    ),
+                    (
+                        22,
+                        6,
+                        template_record(None, &[], &TemplateArity::Zero, None, &[]),
+                    ),
+                    (30, 7, root),
+                    (31, 7, child),
+                ],
+            ),
+        );
+        (provider, segment)
+    }
+
+    #[test]
+    fn bounded_traversal_guards_every_scheduling_resource_at_exact_thresholds() {
+        let (provider, segment) = single_child_fixture();
+        let root =
+            || crate::content::node::NodeState::new(&provider, RecordIdentifier::new(segment, 30));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        assert!(matches!(
+            traversal.next_node_with_scheduling_limits(0, u64::MAX, u64::MAX, u64::MAX),
+            Err(crate::Error::TraversalSchedulingBudgetExceeded {
+                maximum_scheduled_children: 0,
+                attempted_scheduled_children: 1,
+            })
+        ));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        assert!(matches!(
+            traversal.next_node_with_scheduling_limits(1, 4, u64::MAX, u64::MAX),
+            Err(crate::Error::TraversalChildNameBudgetExceeded {
+                maximum_stored_child_name_bytes: 4,
+                attempted_stored_child_name_bytes: 5,
+                scheduled_children: 1,
+            })
+        ));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        assert!(matches!(
+            traversal.next_node_with_scheduling_limits(1, u64::MAX, 0, u64::MAX),
+            Err(crate::Error::TraversalSchedulingWorkBudgetExceeded {
+                maximum_scheduling_work: 0,
+                attempted_scheduling_work: 1,
+            })
+        ));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        assert!(matches!(
+            traversal.next_node_with_scheduling_limits(1, 5, 6, 0),
+            Err(crate::Error::TraversalPendingBudgetExceeded {
+                maximum_pending_nodes: 0,
+                attempted_pending_nodes: 1,
+            })
+        ));
+
+        let mut traversal = DepthFirstTraversal::new(root(), "/", None);
+        let visited = traversal
+            .next_node_with_scheduling_limits(1, 5, 6, 1)
+            .expect("the exact scheduling limits fit")
+            .expect("root visit");
+        assert_eq!(visited.scheduled_children, 1);
+        assert_eq!(visited.scheduled_child_name_bytes, 5);
+        assert_eq!(visited.scheduled_child_map_records, 0);
     }
 }

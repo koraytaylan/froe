@@ -83,7 +83,7 @@ after which a normal AEM start consumes the result cleanly.
 | Journal append and rewrite | `TarRevisions.doFlush`, `Compact` rewrite | `WritableRepository::flush`, compaction and byte-preserving cleanup journal rewrites | **Implemented** |
 | Record identifier string forms | `RecordId.fromString`/`toString10` | `journal::parse_record_identifier_text` | **Implemented** |
 | `gc.log` writing | `GCJournal.persist` | successful offline compaction appends and syncs Oak's seven-field line | **Implemented** (reduced form: no Oak-style no-op suppression; standalone cleanup does not write it) |
-| `gc.log` parsing | `GCJournal.read`, `readAll` | `gc_journal::{read_gc_journal, read_all_gc_journal, read_gc_journal_with_options, read_all_gc_journal_with_options}` | **Implemented** (six/seven-field layouts, Java split/numeric fallbacks, line-ending and unreadable-file behavior; streaming readers default to 64 MiB/file, 1 MiB/line, and 250,000 entries, with typed configurable-limit errors; Oak-style wrappers treat limit failures as an empty optional journal) |
+| `gc.log` parsing | `GCJournal.read`, `readAll` | `gc_journal::{read_gc_journal, read_all_gc_journal, read_gc_journal_with_options, read_all_gc_journal_with_options}` | **Implemented** (six/seven-field layouts, Java split/numeric fallbacks, line-ending and unreadable-file behavior; streaming readers default to 64 MiB/file, 1 MiB/line, and 250,000 entries, with constructible custom limits and typed errors; default wrappers preserve Oak's I/O/decoding fallback but surface froe-only limit failures) |
 
 ## 2. Garbage collection and compaction
 
@@ -115,7 +115,7 @@ after which a normal AEM start consumes the result cleanly.
 | `debug PATH` (store statistics) | `tool/DebugStore` | `froe summary`, `froe archives`, `froe segments` | **Implemented** (reachability analysis **Planned**) |
 | `debug PATH uuid:record/path` | `tool/DebugSegments` | `froe segment`, `froe node` | **Implemented** |
 | `explore` (GUI) | `oak-run` + `file/proc/Proc` | `froe tree`, `froe node` | **Implemented** (terminal form) |
-| `debug PATH file.tar` | `tool/DebugTars` | `tooling::debug_archive`, `tooling::debug_archive_with_options`, `froe debug PATH file.tar…` | **Implemented** (bounded total work/result text/per-node expansion; Oak UTF-16 STRING preview and full other values; external binary `{-1 bytes}`; all-kind long-value block segment attribution; stored graph set/last-row semantics and archive-local reconstruction) |
+| `debug PATH file.tar` | `tool/DebugTars` | `tooling::debug_archive`, `tooling::debug_archive_with_options`, `froe debug PATH file.tar…` | **Implemented** (bounded total work/result text/per-node expansion; Oak UTF-16 STRING preview and full other values; unavailable or corrupt scalar binary `{-1 bytes}`; all-kind long-value block segment attribution; stored graph set/last-row semantics and archive-local reconstruction) |
 | `iotrace` | `tool/iotrace` | — | **Not applicable** (measures the Java store's IO behavior) |
 | `segment-copy` (remote persistences) | `oak-segment-azure` tooling | — | **Planned** alongside remote persistence support |
 

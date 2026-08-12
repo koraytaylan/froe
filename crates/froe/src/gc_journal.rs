@@ -78,6 +78,26 @@ impl Default for GarbageCollectionJournalReadOptions {
     }
 }
 
+impl GarbageCollectionJournalReadOptions {
+    /// Creates explicit resource limits for a journal read.
+    ///
+    /// Zero is a valid limit for every dimension. [`Default::default`]
+    /// implementation supplies the conservative library defaults, and its
+    /// public fields may also be adjusted after construction.
+    #[must_use]
+    pub const fn new(
+        maximum_file_bytes: u64,
+        maximum_line_bytes: usize,
+        maximum_entries: usize,
+    ) -> Self {
+        Self {
+            maximum_file_bytes,
+            maximum_line_bytes,
+            maximum_entries,
+        }
+    }
+}
+
 /// Failure from a bounded garbage-collection journal read.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -289,20 +309,22 @@ pub fn parse_gc_journal_entry(line: &str) -> GarbageCollectionJournalEntry {
 /// Reads the last `gc.log` line with `GCJournal.read()`'s selection and
 /// fallback behavior.
 ///
-/// A missing, unreadable, non-UTF-8, or default-limit-exceeding file, and a
-/// readable file with no lines, yields
-/// [`GarbageCollectionJournalEntry::empty`]. Diagnostics are intentionally not
-/// exposed because Oak treats this journal as optional informational state;
-/// use [`read_gc_journal_with_options`] when the distinction matters. This is
-/// a stateless helper and rereads the path on every call; Oak's long-lived
-/// `GCJournal` object caches its latest entry.
-#[must_use]
-pub fn read_gc_journal(gc_journal_path: &Path) -> GarbageCollectionJournalEntry {
-    read_gc_journal_with_options(
+/// A missing, unreadable, or non-UTF-8 file, and a readable file with no lines,
+/// succeeds with [`GarbageCollectionJournalEntry::empty`], matching Oak's
+/// optional-journal fallback. Unlike Oak, this reader applies resource limits;
+/// exceeding a default limit returns its typed error rather than silently
+/// replacing data Oak would have returned. Use [`read_gc_journal_with_options`]
+/// to diagnose input/output and UTF-8 failures or to select different limits.
+///
+/// This is a stateless helper and rereads the path on every call; Oak's
+/// long-lived `GCJournal` object caches its latest entry.
+pub fn read_gc_journal(
+    gc_journal_path: &Path,
+) -> GarbageCollectionJournalReadResult<GarbageCollectionJournalEntry> {
+    oak_optional_read_fallback(read_gc_journal_with_options(
         gc_journal_path,
         GarbageCollectionJournalReadOptions::default(),
-    )
-    .unwrap_or_default()
+    ))
 }
 
 /// Reads the last `gc.log` line with explicit resource limits and diagnostics.
@@ -326,16 +348,18 @@ pub fn read_gc_journal_with_options(
 /// `GCJournal.readAll()`.
 ///
 /// Malformed lines remain present as entries populated with field-specific
-/// fallbacks. A missing, unreadable, non-UTF-8, or default-limit-exceeding file
-/// yields an empty vector. Use [`read_all_gc_journal_with_options`] when the
-/// distinction matters.
-#[must_use]
-pub fn read_all_gc_journal(gc_journal_path: &Path) -> Vec<GarbageCollectionJournalEntry> {
-    read_all_gc_journal_with_options(
+/// fallbacks. A missing, unreadable, or non-UTF-8 file yields an empty vector,
+/// matching Oak's optional-journal fallback. Exceeding a froe resource limit
+/// instead returns its typed error so successfully readable Oak data is never
+/// silently replaced. Use [`read_all_gc_journal_with_options`] to diagnose
+/// input/output and UTF-8 failures or to select different limits.
+pub fn read_all_gc_journal(
+    gc_journal_path: &Path,
+) -> GarbageCollectionJournalReadResult<Vec<GarbageCollectionJournalEntry>> {
+    oak_optional_read_fallback(read_all_gc_journal_with_options(
         gc_journal_path,
         GarbageCollectionJournalReadOptions::default(),
-    )
-    .unwrap_or_default()
+    ))
 }
 
 /// Reads all `gc.log` lines with explicit resource limits and diagnostics.
@@ -352,6 +376,19 @@ pub fn read_all_gc_journal_with_options(
         entries.push(parse_gc_journal_entry(line));
     })?;
     Ok(entries)
+}
+
+fn oak_optional_read_fallback<Value: Default>(
+    result: GarbageCollectionJournalReadResult<Value>,
+) -> GarbageCollectionJournalReadResult<Value> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(
+            GarbageCollectionJournalReadError::InputOutput(_)
+            | GarbageCollectionJournalReadError::InvalidUtf8 { .. },
+        ) => Ok(Value::default()),
+        Err(error) => Err(error),
+    }
 }
 
 fn parse_i64_field(fields: &JavaSplitFields<'_>, index: usize) -> i64 {
@@ -771,20 +808,23 @@ mod tests {
         )
         .expect("write fixture");
 
-        let all = read_all_gc_journal(&path);
+        let all = read_all_gc_journal(&path).expect("read all line-ending variants");
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].root_record_identifier_text, "first");
         assert_eq!(all[1].root_record_identifier_text, "second");
         assert_eq!(all[2].root_record_identifier_text, "third");
-        assert_eq!(read_gc_journal(&path), all[2]);
+        assert_eq!(read_gc_journal(&path).expect("read latest line"), all[2]);
 
         std::fs::write(&path, "1,2,3,4,5,first\n\n").expect("write empty last line");
-        let all = read_all_gc_journal(&path);
+        let all = read_all_gc_journal(&path).expect("read trailing empty line");
         assert_eq!(all.len(), 2, "a physical empty line remains an entry");
         let parsed_empty_line = parse_gc_journal_entry("");
         assert_eq!(parsed_empty_line.generation.generation, -1);
         assert_eq!(all[1], parsed_empty_line);
-        assert_eq!(read_gc_journal(&path), parsed_empty_line);
+        assert_eq!(
+            read_gc_journal(&path).expect("read latest empty line"),
+            parsed_empty_line
+        );
     }
 
     #[test]
@@ -836,7 +876,7 @@ mod tests {
         fixture.push(b'\n');
         std::fs::write(&path, fixture).expect("write UTF-8 boundary fixture");
 
-        let entries = read_all_gc_journal(&path);
+        let entries = read_all_gc_journal(&path).expect("read UTF-8 boundary fixture");
         assert_eq!(entries.len(), 1);
         assert!(entries[0].root_record_identifier_text.ends_with('３'));
     }
@@ -855,10 +895,14 @@ mod tests {
         for fixture in fixtures {
             std::fs::write(&path, fixture).expect("write invalid UTF-8 fixture");
             assert_eq!(
-                read_gc_journal(&path),
+                read_gc_journal(&path).expect("Oak-style invalid UTF-8 fallback"),
                 GarbageCollectionJournalEntry::empty()
             );
-            assert!(read_all_gc_journal(&path).is_empty());
+            assert!(
+                read_all_gc_journal(&path)
+                    .expect("Oak-style invalid UTF-8 fallback")
+                    .is_empty()
+            );
             assert!(matches!(
                 read_all_gc_journal_with_options(
                     &path,
@@ -917,11 +961,20 @@ mod tests {
                 observed_file_bytes,
             } if observed_file_bytes == DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1
         ));
-        assert_eq!(
+        assert!(matches!(
             read_gc_journal(&path),
-            GarbageCollectionJournalEntry::empty()
-        );
-        assert!(read_all_gc_journal(&path).is_empty());
+            Err(GarbageCollectionJournalReadError::FileByteLimitExceeded {
+                maximum_file_bytes: DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES,
+                observed_file_bytes,
+            }) if observed_file_bytes == DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1
+        ));
+        assert!(matches!(
+            read_all_gc_journal(&path),
+            Err(GarbageCollectionJournalReadError::FileByteLimitExceeded {
+                maximum_file_bytes: DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES,
+                observed_file_bytes,
+            }) if observed_file_bytes == DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1
+        ));
         assert_eq!(
             std::fs::metadata(&path)
                 .expect("metadata after bounded reads")
@@ -1057,7 +1110,7 @@ mod tests {
         current_entry.extend_from_slice(&delimiter_only);
         std::fs::write(&path, current_entry).expect("write comma-heavy fixture");
 
-        let entries = read_all_gc_journal(&path);
+        let entries = read_all_gc_journal(&path).expect("read comma-heavy fixture");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].generation.generation, 4);
         assert_eq!(entries[0].generation.full_generation, 5);
@@ -1070,33 +1123,49 @@ mod tests {
         let directory = TestDirectory::new("read-failures");
         let missing = directory.path.join("missing.log");
         assert_eq!(
-            read_gc_journal(&missing),
+            read_gc_journal(&missing).expect("Oak-style missing-file fallback"),
             GarbageCollectionJournalEntry::empty()
         );
-        assert!(read_all_gc_journal(&missing).is_empty());
+        assert!(
+            read_all_gc_journal(&missing)
+                .expect("Oak-style missing-file fallback")
+                .is_empty()
+        );
 
         let empty = directory.path.join("empty.log");
         std::fs::write(&empty, []).expect("write empty journal");
         assert_eq!(
-            read_gc_journal(&empty),
+            read_gc_journal(&empty).expect("read empty journal"),
             GarbageCollectionJournalEntry::empty()
         );
-        assert!(read_all_gc_journal(&empty).is_empty());
+        assert!(
+            read_all_gc_journal(&empty)
+                .expect("read empty journal")
+                .is_empty()
+        );
 
         assert_eq!(
-            read_gc_journal(&directory.path),
+            read_gc_journal(&directory.path).expect("Oak-style unreadable-file fallback"),
             GarbageCollectionJournalEntry::empty(),
             "a directory is not a readable journal file"
         );
-        assert!(read_all_gc_journal(&directory.path).is_empty());
+        assert!(
+            read_all_gc_journal(&directory.path)
+                .expect("Oak-style unreadable-file fallback")
+                .is_empty()
+        );
 
         let invalid_utf8 = directory.path.join("invalid-utf8.log");
         std::fs::write(&invalid_utf8, [b'1', b',', 0xff, b'\n']).expect("write invalid UTF-8");
         assert_eq!(
-            read_gc_journal(&invalid_utf8),
+            read_gc_journal(&invalid_utf8).expect("Oak-style invalid UTF-8 fallback"),
             GarbageCollectionJournalEntry::empty()
         );
-        assert!(read_all_gc_journal(&invalid_utf8).is_empty());
+        assert!(
+            read_all_gc_journal(&invalid_utf8)
+                .expect("Oak-style invalid UTF-8 fallback")
+                .is_empty()
+        );
 
         assert!(matches!(
             read_gc_journal_with_options(

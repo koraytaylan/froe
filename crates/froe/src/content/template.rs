@@ -84,7 +84,12 @@ pub fn read_template(
 
 /// Reads a template after bounding its property-slot vector and the
 /// cumulative stored bytes of every name it materializes.
-pub(crate) fn read_template_with_limits(
+///
+/// The returned byte count is the cumulative stored size of the primary
+/// type, mixin, single-child, and property names read for this template.
+/// Callers that need cache-independent resource accounting can charge that
+/// count in addition to their record-lookup work.
+pub fn read_template_with_limits(
     provider: &dyn SegmentProvider,
     identifier: RecordIdentifier,
     maximum_properties: u64,
@@ -95,6 +100,26 @@ pub(crate) fn read_template_with_limits(
         identifier,
         Some((maximum_properties, maximum_stored_name_bytes)),
     )
+}
+
+/// Logical record lookups performed while resolving a template's names.
+///
+/// This is computed from the already-read template head so a bounded caller
+/// can reserve the complete lookup charge before following any of the name
+/// records. One unit is charged for each decoded name and for each property
+/// name-list entry selected by the parser.
+pub(crate) fn template_name_lookup_work(head: u32) -> u64 {
+    let has_primary_type = head & (1 << 31) != 0;
+    let has_mixin_types = head & (1 << 30) != 0;
+    let zero_child_nodes = head & (1 << 29) != 0;
+    let many_child_nodes = head & (1 << 28) != 0;
+    let mixin_count = u64::from((head >> 18) & 0x3ff);
+    let property_count = u64::from(head & 0x3ffff);
+
+    u64::from(has_primary_type)
+        .saturating_add(if has_mixin_types { mixin_count } else { 0 })
+        .saturating_add(u64::from(!zero_child_nodes && !many_child_nodes))
+        .saturating_add(property_count.saturating_mul(2))
 }
 
 fn read_template_internal(
@@ -228,7 +253,9 @@ fn read_template_name(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ChildNodeArity, read_template};
+    use super::{
+        ChildNodeArity, read_template, read_template_with_limits, template_name_lookup_work,
+    };
     use crate::content::property::PropertyType;
     use crate::content::provider::tests::{CountingSegmentProvider, MemorySegmentProvider};
     use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
@@ -439,5 +466,89 @@ pub(crate) mod tests {
             ),
         );
         assert!(read_template(&provider, RecordIdentifier::new(segment, 20)).is_err());
+    }
+
+    #[test]
+    fn bounded_template_refuses_property_slots_at_the_exact_boundary() {
+        let segment = data_segment_identifier(3);
+        let mut property_name_bucket = Vec::new();
+        property_name_bucket.extend_from_slice(&identifier_bytes(1));
+        property_name_bucket.extend_from_slice(&identifier_bytes(2));
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("first")),
+                    (2, 4, small_string_record("second")),
+                    (10, 2, property_name_bucket),
+                    (
+                        20,
+                        6,
+                        template_record(None, &[], &TemplateArity::Zero, Some(10), &[1, 1]),
+                    ),
+                ],
+            ),
+        );
+        let identifier = RecordIdentifier::new(segment, 20);
+
+        assert!(matches!(
+            read_template_with_limits(&provider, identifier, 1, u64::MAX),
+            Err(crate::Error::TemplatePropertyBudgetExceeded {
+                maximum_properties: 1,
+                attempted_properties: 2,
+            })
+        ));
+        let (template, stored_name_bytes) = read_template_with_limits(&provider, identifier, 2, 11)
+            .expect("the exact property and name-byte limits fit");
+        assert_eq!(template.properties.len(), 2);
+        assert_eq!(stored_name_bytes, 11);
+    }
+
+    #[test]
+    fn bounded_template_refuses_a_name_before_materializing_it() {
+        let segment = data_segment_identifier(4);
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("child")),
+                    (
+                        20,
+                        6,
+                        template_record(None, &[], &TemplateArity::One(1), None, &[]),
+                    ),
+                ],
+            ),
+        );
+        let identifier = RecordIdentifier::new(segment, 20);
+
+        assert!(matches!(
+            read_template_with_limits(&provider, identifier, 0, 4),
+            Err(crate::Error::StringMaterializationBudgetExceeded {
+                maximum_stored_bytes: 4,
+                attempted_stored_bytes: 5,
+                value_identifier,
+            }) if value_identifier == RecordIdentifier::new(segment, 1)
+        ));
+        assert_eq!(
+            read_template_with_limits(&provider, identifier, 0, 5)
+                .expect("the exact name-byte limit fits")
+                .1,
+            5
+        );
+    }
+
+    #[test]
+    fn template_lookup_work_counts_every_name_and_property_list_entry() {
+        let head = (1 << 31) // primary type
+            | (1 << 30) // mixins
+            | (3 << 18) // three mixins
+            | 2; // two properties; neither child-arity bit means one child
+        assert_eq!(template_name_lookup_work(head), 9);
+        assert_eq!(template_name_lookup_work(1 << 29), 0);
     }
 }

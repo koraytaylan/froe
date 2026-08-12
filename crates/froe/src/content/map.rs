@@ -223,7 +223,10 @@ pub fn map_entries(
 
 /// Reads all map entries while bounding concrete entries, cumulative stored
 /// key bytes, and map-record/key-byte work before allocation or materialization.
-pub(crate) fn map_entries_with_limits(
+///
+/// The returned counters are, respectively, the stored key bytes
+/// materialized and map records visited. Work is their sum.
+pub fn map_entries_with_limits(
     provider: &dyn SegmentProvider,
     map_identifier: RecordIdentifier,
     maximum_entries: u64,
@@ -447,7 +450,9 @@ pub fn is_branch_head(head: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_entries, map_entry, map_size, map_size_with_maximum_work};
+    use super::{
+        map_entries, map_entries_with_limits, map_entry, map_size, map_size_with_maximum_work,
+    };
     use crate::content::provider::tests::{CountingSegmentProvider, MemorySegmentProvider};
     use crate::hashing::map_entry_hash;
     use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
@@ -602,6 +607,51 @@ mod tests {
             map_size_with_maximum_work(&provider, map, 3).expect("exact diff budget"),
             (1, 3)
         );
+    }
+
+    #[test]
+    fn bounded_map_enumeration_guards_entries_names_and_record_work() {
+        let segment = data_segment_identifier(4);
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("child")),
+                    (4, 4, small_string_record("value")),
+                    (10, 0, leaf_record(0, &[("child", 1, 4)])),
+                ],
+            ),
+        );
+        let map = RecordIdentifier::new(segment, 10);
+
+        assert!(matches!(
+            map_entries_with_limits(&provider, map, 0, u64::MAX, u64::MAX),
+            Err(crate::Error::MapEntryBudgetExceeded {
+                maximum_entries: 0,
+                attempted_entries: 1,
+            })
+        ));
+        assert!(matches!(
+            map_entries_with_limits(&provider, map, 1, 4, u64::MAX),
+            Err(crate::Error::StringMaterializationBudgetExceeded {
+                maximum_stored_bytes: 4,
+                attempted_stored_bytes: 5,
+                value_identifier,
+            }) if value_identifier == RecordIdentifier::new(segment, 1)
+        ));
+        assert!(matches!(
+            map_entries_with_limits(&provider, map, 1, 5, 1),
+            Err(crate::Error::MapTraversalWorkBudgetExceeded {
+                maximum_work_units: 1,
+                attempted_work_units: 2,
+            })
+        ));
+        let (entries, name_bytes, map_records) = map_entries_with_limits(&provider, map, 1, 5, 7)
+            .expect("two record visits and five stored name bytes fit exactly");
+        assert_eq!(entries.len(), 1);
+        assert_eq!((name_bytes, map_records), (5, 2));
     }
 
     #[test]

@@ -19,7 +19,11 @@ use crate::segment::identifier::{SegmentIdentifier, SegmentKind};
 use crate::segment::record::RecordType;
 use crate::tar_archive::index::{read_u32, read_u64};
 
-/// The virtual segment size all record offsets are relative to.
+/// The virtual segment size all record offsets are relative to, and the
+/// maximum stored size of either a data or bulk segment.
+///
+/// This is Oak's `Segment.MAX_SEGMENT_SIZE`; see
+/// `docs/analysis/segment-layer.md` section 3.
 pub const MAXIMUM_SEGMENT_SIZE: usize = 1 << 18;
 
 /// The fixed data segment header size.
@@ -109,9 +113,10 @@ struct DataSegmentHeader {
 impl ParsedSegment {
     /// Parses a segment buffer.
     ///
-    /// Bulk segments (identifier kind `B`) are accepted as-is; data
-    /// segments are validated: magic bytes, version 12 or 13, table sizes
-    /// within bounds, and a record table sorted by record number.
+    /// Every segment is first checked against Oak's 256 KiB maximum. Bulk
+    /// segments (identifier kind `B`) then require no header or tables;
+    /// data segments are additionally validated for magic bytes, version
+    /// 12 or 13, bounded tables, and record-number ordering.
     pub fn parse(identifier: SegmentIdentifier, bytes: &[u8]) -> Result<Self> {
         Self::validate_maximum_size(identifier, bytes)?;
         let kind = Self::validate_segment_kind(identifier)?;

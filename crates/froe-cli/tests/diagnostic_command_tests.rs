@@ -346,6 +346,45 @@ fn assert_missing_archive_cli(store_path: &std::path::Path) {
 }
 
 #[test]
+fn debug_cli_preserves_a_relative_repository_path_in_the_header() {
+    let directory = TestDirectory::new("relative-debug-header");
+    let store_path = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store_path).expect("create segment store");
+    populate(&store_path);
+    std::fs::remove_file(store_path.join("repo.lock")).expect("remove bootstrap lock file");
+    let repository = froe::Repository::open(&store_path).expect("open repository");
+    let archive_file_name = repository.archives()[0].file_name().to_owned();
+    drop(repository);
+    let before = directory_snapshot(&store_path);
+    let relative_store_path = std::path::Path::new("segmentstore");
+
+    let debug = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .current_dir(&directory.path)
+        .arg("debug")
+        .arg(relative_store_path)
+        .arg(&archive_file_name)
+        .output()
+        .expect("run archive debug with a relative repository path");
+    assert!(
+        debug.status.success(),
+        "archive debug failed: {}",
+        String::from_utf8_lossy(&debug.stderr)
+    );
+    assert!(debug.stderr.is_empty());
+    let output = String::from_utf8(debug.stdout).expect("UTF-8 debug output");
+    let expected_header_prefix = format!(
+        "Debug file {}(",
+        relative_store_path.join(&archive_file_name).display()
+    );
+    assert!(
+        output.starts_with(&expected_header_prefix),
+        "Oak's File.toString preserves the relative input path: {output:?}"
+    );
+    assert_eq!(directory_snapshot(&store_path), before);
+    assert!(!store_path.join("repo.lock").exists());
+}
+
+#[test]
 fn segment_hex_cli_sanitizes_hostile_info_from_an_independent_read_only_fixture() {
     let info = "esc=\u{1b};osc=\u{1b}]0;title\u{7};bidi=\u{202e}\u{2066};literal=\\u{1b}";
     let bytes = independently_encoded_info_segment(info);

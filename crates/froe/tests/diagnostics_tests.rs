@@ -506,6 +506,7 @@ fn write_external_binary_fixture(test_name: &str) -> TestDirectory {
     data.add_record(2, TYPE_VALUE, string_record("content"));
     data.add_record(3, TYPE_VALUE, string_record("shortExternal"));
     data.add_record(4, TYPE_VALUE, string_record("longExternal"));
+    data.add_record(15, TYPE_VALUE, string_record("corruptBinary"));
 
     let mut super_root_template = 0u32.to_be_bytes().to_vec();
     super_root_template.extend(record_identifier_bytes(0, 1));
@@ -513,12 +514,13 @@ fn write_external_binary_fixture(test_name: &str) -> TestDirectory {
     let mut root_template = 0u32.to_be_bytes().to_vec();
     root_template.extend(record_identifier_bytes(0, 2));
     data.add_record(6, TYPE_TEMPLATE, root_template);
-    let mut property_names = record_identifier_bytes(0, 3);
-    property_names.extend(record_identifier_bytes(0, 4));
+    let mut property_names = record_identifier_bytes(0, 4);
+    property_names.extend(record_identifier_bytes(0, 15));
+    property_names.extend(record_identifier_bytes(0, 3));
     data.add_record(7, TYPE_LIST_BUCKET, property_names);
-    let mut content_template = ((1u32 << 29) | 2).to_be_bytes().to_vec();
+    let mut content_template = ((1u32 << 29) | 3).to_be_bytes().to_vec();
     content_template.extend(record_identifier_bytes(0, 7));
-    content_template.extend([2, 2]);
+    content_template.extend([2, 2, 2]);
     data.add_record(8, TYPE_TEMPLATE, content_template);
 
     // The short identifier deliberately declares bytes that are absent; the
@@ -529,8 +531,12 @@ fn write_external_binary_fixture(test_name: &str) -> TestDirectory {
     let mut long_external = vec![0xF0];
     long_external.extend(record_identifier_bytes(missing_reference, 99));
     data.add_record(10, TYPE_VALUE, long_external);
-    let mut property_values = record_identifier_bytes(0, 9);
-    property_values.extend(record_identifier_bytes(0, 10));
+    // SegmentBlob.length throws for 11111xxx. Oak's diagnostic catches that
+    // exception in AbstractPropertyState.getBinarySize and prints -1.
+    data.add_record(16, TYPE_VALUE, vec![0xF8]);
+    let mut property_values = record_identifier_bytes(0, 10);
+    property_values.extend(record_identifier_bytes(0, 16));
+    property_values.extend(record_identifier_bytes(0, 9));
     data.add_record(11, TYPE_LIST_BUCKET, property_values);
 
     let node_record = |record_number: u32, template: u32, extra: Option<u32>| {
@@ -658,6 +664,34 @@ fn write_duplicate_property_fixture(test_name: &str) -> TestDirectory {
     let mut node = record_identifier_bytes(0, 6);
     node.extend(record_identifier_bytes(0, 4));
     node.extend(record_identifier_bytes(0, 5));
+    data.add_record(6, TYPE_NODE, node);
+    let mut archive = ArchiveBuilder::new();
+    archive.add_segment(data_uuid, data.build());
+    write_repository(
+        &directory.path,
+        &[(DATA_ARCHIVE.to_owned(), archive.build(DATA_ARCHIVE))],
+        &[format!("{}:6 root 1", format_uuid(data_uuid))],
+    );
+    directory
+}
+
+/// One root node whose template contains one property name, stored property,
+/// and scalar value. The independent encoding keeps the archive-debug work
+/// threshold sensitive to the template's name-list entry lookup.
+fn write_template_lookup_work_fixture(test_name: &str) -> TestDirectory {
+    let directory = TestDirectory::new(test_name);
+    let data_uuid = data_segment_uuid(0x353);
+    let mut data = SegmentBuilder::new(data_uuid);
+    data.add_record(1, TYPE_VALUE, string_record("answer"));
+    data.add_record(2, TYPE_VALUE, string_record("42"));
+    data.add_record(3, TYPE_LIST_BUCKET, record_identifier_bytes(0, 1));
+    let mut template = ((1u32 << 29) | 1).to_be_bytes().to_vec();
+    template.extend(record_identifier_bytes(0, 3));
+    template.push(3); // LONG
+    data.add_record(4, TYPE_TEMPLATE, template);
+    let mut node = record_identifier_bytes(0, 6);
+    node.extend(record_identifier_bytes(0, 4));
+    node.extend(record_identifier_bytes(0, 2));
     data.add_record(6, TYPE_NODE, node);
     let mut archive = ArchiveBuilder::new();
     archive.add_segment(data_uuid, data.build());
@@ -1092,18 +1126,18 @@ fn reconstructed_graph_charges_dense_segment_bytes_before_parsing() {
         .and_then(|archive| archive.segment_data(fixture.data_identifier))
         .expect("independent data segment");
     assert_eq!(data_bytes.len(), 2_096);
-    // The independently encoded tree consumes 1,087 units before graph
+    // The independently encoded tree consumes 1,099 units before graph
     // reconstruction; graph selection and its row cost two more. Reserving
-    // the complete 2,096-byte segment therefore attempts unit 3,185 before
+    // the complete 2,096-byte segment therefore attempts unit 3,197 before
     // parsing. Removing the byte charge makes this absolute threshold pass.
     let mut options = ArchiveDebugOptions::default();
-    options.maximum_work_units = 3_184;
+    options.maximum_work_units = 3_196;
 
     assert!(matches!(
         debug_archive_with_options(&repository, DATA_ARCHIVE, options),
         Err(ArchiveDebugError::WorkBudgetExceeded {
-            maximum_work_units: 3_184,
-            attempted_work_units: 3_185,
+            maximum_work_units: 3_196,
+            attempted_work_units: 3_197,
         })
     ));
 }
@@ -1163,7 +1197,7 @@ fn hostile_reused_block_list_stops_at_the_exact_work_budget() {
         write_diagnostic_fixture("reused-list-work-budget", GraphFixture::HostileReusedList);
     let repository = Repository::open(&fixture.directory.path).expect("open repository");
     let mut options = ArchiveDebugOptions::default();
-    options.maximum_work_units = 79;
+    options.maximum_work_units = 93;
 
     let error = debug_archive_with_options(&repository, DATA_ARCHIVE, options)
         .expect_err("the twelfth reused list entry must not be resolved");
@@ -1171,8 +1205,8 @@ fn hostile_reused_block_list_stops_at_the_exact_work_budget() {
         matches!(
             &error,
             ArchiveDebugError::WorkBudgetExceeded {
-                maximum_work_units: 79,
-                attempted_work_units: 80,
+                maximum_work_units: 93,
+                attempted_work_units: 138,
             }
         ),
         "{error:?}"
@@ -1421,6 +1455,36 @@ fn archive_work_budget_charges_each_child_map_diff_record_at_an_absolute_thresho
 }
 
 #[test]
+fn archive_work_budget_charges_template_name_list_lookups_at_the_exact_threshold() {
+    let directory = write_template_lookup_work_fixture("debug-template-lookup-work");
+    let repository = Repository::open(&directory.path).expect("open repository");
+    let complete = debug_archive(&repository, DATA_ARCHIVE).expect("complete report");
+    assert_eq!(
+        complete.work.consumed_work_units, 220,
+        "the independently encoded template/list fixture pins every charged lookup"
+    );
+
+    let mut exact = ArchiveDebugOptions::default();
+    exact.maximum_work_units = complete.work.consumed_work_units;
+    let bounded = debug_archive_with_options(&repository, DATA_ARCHIVE, exact)
+        .expect("the exact complete-work limit fits");
+    assert_eq!(
+        bounded.work.consumed_work_units,
+        complete.work.consumed_work_units
+    );
+
+    let mut insufficient = exact;
+    insufficient.maximum_work_units -= 1;
+    assert!(matches!(
+        debug_archive_with_options(&repository, DATA_ARCHIVE, insufficient),
+        Err(ArchiveDebugError::WorkBudgetExceeded {
+            maximum_work_units: 219,
+            attempted_work_units: 220,
+        })
+    ));
+}
+
+#[test]
 fn deep_wide_tree_hits_total_pending_node_cap() {
     let directory = TestDirectory::new("debug-pending-cap");
     write_deep_wide_production_fixture(&directory.path);
@@ -1447,7 +1511,7 @@ fn deep_shared_name_paths_charge_each_full_path_copy() {
     let repository = Repository::open(&directory.path).expect("open repository");
     let archive_file_name = repository.archives()[0].file_name().to_owned();
     let mut options = ArchiveDebugOptions::default();
-    options.maximum_work_units = 1_116;
+    options.maximum_work_units = 1_127;
 
     // The fifth nested node's Oak path is five copies of "/shared-name"
     // plus the trailing slash used for its rows: 5 * 12 + 1 = 61 bytes.
@@ -1456,8 +1520,8 @@ fn deep_shared_name_paths_charge_each_full_path_copy() {
     assert!(matches!(
         debug_archive_with_options(&repository, &archive_file_name, options),
         Err(ArchiveDebugError::WorkBudgetExceeded {
-            maximum_work_units: 1_116,
-            attempted_work_units: 1_177,
+            maximum_work_units: 1_127,
+            attempted_work_units: 1_182,
         })
     ));
 }
@@ -1496,7 +1560,7 @@ fn hostile_template_property_name_is_refused_before_cache_materialization() {
 }
 
 #[test]
-fn external_binary_scalars_render_oak_unavailable_size_without_reading_identifiers() {
+fn unavailable_and_corrupt_binary_scalars_render_oak_negative_size() {
     let directory = write_external_binary_fixture("external-debug-display");
     let repository = Repository::open(&directory.path).expect("open repository");
     let report = debug_archive(&repository, DATA_ARCHIVE).expect("debug report");
@@ -1508,13 +1572,16 @@ fn external_binary_scalars_render_oak_unavailable_size_without_reading_identifie
                 name,
                 display: ArchivePropertyDisplay::Other(display),
                 ..
-            } if name.ends_with("External") => Some((name.as_str(), display.as_str())),
+            } if name.ends_with("External") || name == "corruptBinary" => {
+                Some((name.as_str(), display.as_str()))
+            }
             _ => None,
         })
         .collect();
     assert_eq!(
         displays,
         [
+            ("corruptBinary", "{-1 bytes}"),
             ("longExternal", "{-1 bytes}"),
             ("shortExternal", "{-1 bytes}"),
         ]

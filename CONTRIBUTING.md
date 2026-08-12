@@ -147,6 +147,21 @@ into production. The authoritative guard-neutralization, fault-harness,
 environment-wiring, scale, and mutation-test requirements are in
 [`docs/high-risk-changes.md`](docs/high-risk-changes.md).
 
+The same proof principle applies at every tier to newly introduced or
+semantically changed refusal and resource-limit guards: add a named test
+that reaches the production-facing entry, fails when only that guard is
+neutralized, and pins the exact boundary or typed error. Helper tests may
+supplement that wiring proof. A declared work or memory budget documents
+its accounting unit, charges every operation or allocation in that unit,
+and has an exact limit/limit-plus-one regression.
+
+Public configuration and diagnostic types must be usable as documented
+from a downstream crate. If a type is deliberately non-exhaustive, provide
+constructors or builders for every supported configuration; if an error is
+internal, keep it crate-private or document the public path that can
+produce it. Add an external integration test whenever Rust visibility or
+type construction is part of the contract.
+
 ## Verification and portability
 
 The executable CI matrix in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)

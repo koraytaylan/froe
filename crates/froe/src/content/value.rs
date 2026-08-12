@@ -622,20 +622,32 @@ fn verify_string_content(
 }
 
 /// Compares two inline binaries by content without materializing either,
-/// assuming their lengths are already known to be equal. Long values
-/// compare block by block: equal lengths mean both block lists chunk at
-/// the same 4096-byte boundaries.
+/// assuming their lengths are already known to equal `expected_length`.
+/// Except for the identical-record fast path, a disagreement between that
+/// supplied length and either value record is reported as corrupt format.
+/// Long values compare block by block: equal lengths mean both block lists
+/// chunk at the same 4096-byte boundaries.
 pub fn inline_binary_contents_equal(
     provider: &dyn SegmentProvider,
     first: RecordIdentifier,
     second: RecordIdentifier,
-    _length: u64,
+    expected_length: u64,
 ) -> Result<bool> {
     if first == second {
         return Ok(true);
     }
     let mut first_stream = read_binary_stream(provider, first)?;
     let mut second_stream = read_binary_stream(provider, second)?;
+    if first_stream.len() != expected_length || second_stream.len() != expected_length {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "inline binary comparison expected {expected_length} bytes, but records {first} \
+                 and {second} declare {} and {} bytes",
+                first_stream.len(),
+                second_stream.len()
+            ),
+        });
+    }
 
     let mut first_buffer = [0u8; 8192];
     let mut second_buffer = [0u8; 8192];
@@ -1381,6 +1393,32 @@ mod tests {
             provider.segment_reads(),
             18,
             "two value heads plus two three-level list traversals and block reads per chunk"
+        );
+    }
+
+    #[test]
+    fn binary_comparison_checks_the_supplied_length_against_both_records() {
+        let segment = data_segment_identifier(1);
+        let records = [
+            (10, 4, direct_binary_record(b"abc")),
+            (11, 4, direct_binary_record(b"abc")),
+        ];
+        let mut provider = MemorySegmentProvider::default();
+        provider.insert(segment, synthetic_data_segment(&[], &records));
+        let first = RecordIdentifier::new(segment, 10);
+        let second = RecordIdentifier::new(segment, 11);
+
+        let error = inline_binary_contents_equal(&provider, first, second, 2)
+            .expect_err("the caller-provided length is part of the comparison contract");
+        assert!(matches!(
+            error,
+            Error::InvalidFormat { details }
+                if details.contains("expected 2 bytes")
+                    && details.contains("declare 3 and 3 bytes")
+        ));
+        assert!(
+            inline_binary_contents_equal(&provider, first, second, 3)
+                .expect("matching declared and expected lengths")
         );
     }
 

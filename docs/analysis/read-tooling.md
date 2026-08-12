@@ -117,9 +117,11 @@ Missing journal or exception ⇒ empty list (exception also stack-traced to stde
 - **`AbstractPropertyState.toString(PropertyState)`** (oak-store-spi): `BINARIES` ⇒
   `name + " = [" + count + " binaries]"`; `BINARY` ⇒ `name + " = {" + size + " bytes}"`;
   else `name + " = " + value` (array values render as Java list `[a, b]`). Its
-  `getBinarySize` catches an unavailable binary's exception and returns `-1`, so a scalar
-  external binary without a blob store renders exactly `{-1 bytes}` rather than failing the
-  diagnostic or resolving its identifier merely to classify it.
+  `getBinarySize` catches every exception from `PropertyState.size()` and returns `-1`, so a
+  scalar external binary without a blob store or a corrupt value marker renders exactly
+  `{-1 bytes}` rather than failing the diagnostic. By contrast, invalid LONG/DOUBLE text
+  reaches `Conversions.convert(value, base)` and its numeric parser, whose exception escapes
+  `DebugTars` and fails the command.
 - **`AbstractNodeState.toString(NodeState)`** (oak-store-spi, line ~200): non-existent ⇒
   `"{N/A}"`; else `{ prop1, prop2, child1 : {...}, ... }` — properties first, then child
   entries capped at `CHILDREN_CAP` = sysprop `oak.children.cap`, default 100 (then
@@ -526,7 +528,9 @@ exception print a stack trace to stderr and return 1.
 Per tar name `t` (as given on the command line, must end `.tar`):
 
 - If `new File(path, t)` doesn't exist: `file doesn't exist, skipping {t}`.
-- Header: `Debug file {absoluteFile}({length})`.
+- Header: `Debug file {new File(path, t)}({length})`. `File.toString()` preserves the
+  supplied path shape, so a relative store argument produces a relative header; this path is
+  neither made absolute nor canonicalized.
 - Find the tar reader index entry whose key `endsWith(t)` (keys are reader file names).
   If found: `SegmentNodeState references to {t}` followed by reference paths (below), each
   prefixed with two spaces; else `No references to {t}`.

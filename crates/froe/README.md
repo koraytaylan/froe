@@ -39,9 +39,11 @@ contents through `content::read_binary_stream`, whose returned
 `BinaryStream` implements `std::io::Read`. The bounded opener does not follow a
 long external blob-identifier record merely to report that local content is
 unavailable; the legacy materializing helper retains its identifier-bearing
-error. The read-only `gc_journal` module
-parses both legacy six-field and current seven-field `gc.log` histories even
-when the repository itself cannot resolve a head.
+error. The read-only `gc_journal` module parses both legacy six-field and
+current seven-field `gc.log` histories even when the repository itself cannot
+resolve a head. Its default readers preserve Oak's empty result for unavailable
+or undecodable optional journals, while returning typed errors instead of
+silently discarding entries that exceed froe's configurable resource limits.
 
 Low-level diagnostics expose `tooling::dump_segment_bytes`, which preserves a
 raw hex dump even when segment parsing fails, and

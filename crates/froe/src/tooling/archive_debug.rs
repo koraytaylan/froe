@@ -18,8 +18,9 @@
 //! child/name, and returned-reference limits; block lists and multi-valued
 //! binary lists are visited entry by entry, not materialized. A total
 //! logical-work budget is charged before record/list/block/graph scans and
-//! path-copy work. Child counts, concrete map entries, map-record visits, and
-//! stored name lengths are checked before the corresponding expansion.
+//! path-copy work. Child counts, concrete map entries, map-record visits,
+//! template-name/list lookups, and stored name lengths are checked before the
+//! corresponding expansion.
 //! Returned path references have both a count and retained-text budget; a
 //! candidate is individually preflighted and inserted into a per-node
 //! TreeSet-equivalent, so duplicate rendered lines do not accumulate. A
@@ -31,8 +32,9 @@
 //! never an arbitrary or suffix-matched path. Valid properties use Oak's
 //! value rendering and UTF-16 ordering. STRING values stream into Oak's
 //! 60-UTF-16-unit preview; other values render fully or fail the retained-text
-//! budget. An external scalar binary whose blob store is unavailable renders
-//! `{-1 bytes}` without resolving a long identifier. Graph row/target order is
+//! budget. A scalar binary whose size cannot be read renders `{-1 bytes}`;
+//! this covers an unavailable blob store and a corrupt value marker without
+//! resolving a long external identifier. Graph row/target order is
 //! deterministic instead of Java `HashMap`/`HashSet` order, and a
 //! structurally invalid data segment encountered during graph reconstruction
 //! gets an explicit unavailable row so other archive rows remain useful.
@@ -44,7 +46,9 @@ use crate::content::list::{read_counted_list, uncounted_list_entry};
 use crate::content::node::NodeState;
 use crate::content::property::PropertyType;
 use crate::content::provider::SegmentProvider;
-use crate::content::template::{ChildNodeArity, PropertyTemplate, read_template_with_limits};
+use crate::content::template::{
+    ChildNodeArity, PropertyTemplate, read_template_with_limits, template_name_lookup_work,
+};
 use crate::content::traversal::DepthFirstTraversal;
 use crate::content::value::{BLOCK_SIZE, MEDIUM_VALUE_LIMIT};
 use crate::error::Error;
@@ -74,8 +78,9 @@ pub const DEFAULT_MAXIMUM_ARCHIVE_REFERENCE_TEXT_BYTES: usize = 64 * 1024 * 1024
 /// diagnostic.
 ///
 /// A unit is charged for each traversal step, node/template/property lookup,
-/// list element, long-value block identifier, stored name byte, graph-data
-/// byte, and graph row/edge totalization operation. Allocation-heavy
+/// list element, template-name/list lookup, long-value block identifier,
+/// stored name byte, graph-data byte, and graph row/edge totalization
+/// operation. Allocation-heavy
 /// operations preflight their complete charge before materializing. The limit
 /// therefore remains deterministic across repository cache state and bounds
 /// compact hostile records that repeatedly point at the same list.
@@ -1149,6 +1154,12 @@ fn references_for_node(
     let template_identifier =
         node_view.read_record_identifier(node_identifier.record_number, 0, 1)?;
     work_budget.charge_one()?;
+    let template_view = repository.segment(template_identifier.segment)?;
+    let template_head = template_view.read_u32(template_identifier.record_number, 0)?;
+    // Reserve every name-record resolution and property-name list entry
+    // before parsing. Stored name bytes are separately preflighted by the
+    // bounded parser and charged below.
+    work_budget.charge_amount(template_name_lookup_work(template_head))?;
     let maximum_template_name_bytes = maximum_name_bytes_per_node
         .saturating_sub(scheduled_child_name_bytes)
         .min(work_budget.remaining());
@@ -1558,12 +1569,26 @@ fn consume_utf8_prefix(
 }
 
 fn binary_scalar_display(
-    repository: &Repository,
+    provider: &dyn SegmentProvider,
     value_identifier: RecordIdentifier,
     work_budget: &mut WorkBudget,
 ) -> ArchiveDebugResult<String> {
     work_budget.charge_one()?;
-    let view = repository.segment(value_identifier.segment)?;
+    // Oak's AbstractPropertyState.getBinarySize catches every exception from
+    // SegmentPropertyState.size. Preserve that last-resort diagnostic
+    // behavior for corrupt records as well as unavailable external blobs.
+    let length = binary_scalar_length(provider, value_identifier).unwrap_or(None);
+    Ok(length.map_or_else(
+        || "{-1 bytes}".to_owned(),
+        |length| format!("{{{length} bytes}}"),
+    ))
+}
+
+fn binary_scalar_length(
+    provider: &dyn SegmentProvider,
+    value_identifier: RecordIdentifier,
+) -> crate::error::Result<Option<u64>> {
+    let view = provider.segment(value_identifier.segment)?;
     let head = view.read_u8(value_identifier.record_number, 0)?;
     let length = if head & 0x80 == 0 {
         Some(u64::from(head))
@@ -1581,13 +1606,9 @@ fn binary_scalar_display(
             details: format!(
                 "unexpected value record marker {head:#04x} in record {value_identifier}"
             ),
-        }
-        .into());
+        });
     };
-    Ok(length.map_or_else(
-        || "{-1 bytes}".to_owned(),
-        |length| format!("{{{length} bytes}}"),
-    ))
+    Ok(length)
 }
 
 fn has_matching_binary_block_segment(

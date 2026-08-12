@@ -28,10 +28,13 @@ use crate::segment::record::RecordType;
 use crate::segment::view::SegmentView;
 use crate::store::Repository;
 
-/// The separator used by Oak's `SegmentDump` between logical sections.
+/// The separator used by Oak's `SegmentDump.dumpSegment` between logical
+/// sections; see `docs/analysis/read-tooling.md` section 5.2.
 const SECTION_SEPARATOR: &str =
     "--------------------------------------------------------------------------";
 
+// SegmentDump uses Java's platform line separator (`%n`) throughout; see
+// `docs/analysis/read-tooling.md` section 5.2.
 #[cfg(windows)]
 const LINE_SEPARATOR: &str = "\r\n";
 #[cfg(not(windows))]
