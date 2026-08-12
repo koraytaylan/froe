@@ -75,7 +75,11 @@ pub struct VisitedNode<'traversal, 'provider> {
 ///
 /// Keeping this separate from [`VisitedNode`] preserves that type's compact,
 /// destructurable compatibility surface while making the bounded traversal
-/// and its typed budget errors available to custom diagnostic callers.
+/// and its typed budget errors available to custom diagnostic callers. The
+/// scheduling-work charge for a successful step is the saturating sum of
+/// `scheduled_children`, `scheduled_child_name_bytes`, and
+/// `scheduled_child_map_records`; the last counter includes records inspected
+/// by both the child-count scan and the subsequent enumeration scan.
 #[non_exhaustive]
 pub struct BoundedVisitedNode<'traversal, 'provider> {
     /// The node, path, and depth returned by an ordinary traversal.
@@ -132,6 +136,12 @@ impl<'provider> DepthFirstTraversal<'provider> {
 
     /// Advances with independent per-node child-count and stored-name-byte
     /// caps, plus a combined scheduling-work cap checked before expansion.
+    ///
+    /// One scheduling-work unit is charged for each declared child, each map
+    /// record inspected while counting children, each map record inspected
+    /// again while enumerating them, and each stored child-name byte. The
+    /// pending-node cap is independent and applies to the traversal's total
+    /// scheduled-but-not-yet-visited nodes after this expansion.
     pub fn next_node_with_scheduling_limits(
         &mut self,
         maximum_scheduled_children: u64,
