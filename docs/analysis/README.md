@@ -8,6 +8,54 @@ the distilled format description lives in
 [`../storage-format.md`](../storage-format.md) and the feature analysis
 in [`../oak-segment-tar-feature-map.md`](../oak-segment-tar-feature-map.md).
 
+## The Java these documents were read from
+
+These documents are *derived*. The prime directive in
+[`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) makes the Java implementation
+the ground truth, and that includes being ground truth over this directory: a
+claim about Oak behaviour is settled by reading the named Java method, not by
+re-reading the summary of it here.
+
+The specifications were extracted from and cross-verified against
+`https://github.com/apache/jackrabbit-oak.git` at commit
+`4984c4cf26a7ca58ae9ce12c63190b7f492bda78` (2026-08-07), where the
+`oak-segment-tar` module declares version `2.5-SNAPSHOT`. That is a trunk
+snapshot rather than a release tag, so pin the commit, not the version, when
+recording evidence. A blob-filtered clone is enough to read the sources and is
+a fraction of the size:
+
+```console
+$ git clone --filter=blob:none https://github.com/apache/jackrabbit-oak.git
+$ git -C jackrabbit-oak checkout 4984c4cf26a7ca58ae9ce12c63190b7f492bda78
+```
+
+Not all relevant behaviour lives in `oak-segment-tar`. Property rendering and
+value conversion — the semantics behind what a diagnostic prints and when it
+fails — are in `oak-store-spi`
+(`plugins/memory/AbstractPropertyState.java`, `plugins/value/Conversions.java`),
+and node-state rendering is there too. Searching only the segment module will
+miss them.
+
+When extending a specification, cite the Java file and method, and record the
+commit you read if it differs from the one above; a citation that names no
+revision cannot be re-checked once trunk moves.
+
+## Stating the scope of a documented behaviour
+
+Where a behaviour is specific to one property type, format version, or code
+path, say what it does **not** cover. A correct sentence about a narrow case
+invites generalisation to the whole class, and that generalisation then gets
+implemented or asserted in review.
+
+The concrete example this convention comes from: Oak renders an unavailable or
+corrupt `BINARY` as `{-1 bytes}` because `AbstractPropertyState.getBinarySize`
+catches the exception. That is BINARY-only. Every other property type renders
+through `property.getValue(type)` with no exception handling, so a malformed
+`LONG` or `DOUBLE` propagates a `NumberFormatException` out of
+`Conversions.toLong`/`toDouble` and aborts the command. A note that records only
+the `{-1 bytes}` behaviour reads as though Oak tolerates every malformed scalar,
+which it does not.
+
 Read-path specifications:
 
 | Document | Subsystem |

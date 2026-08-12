@@ -218,6 +218,14 @@ procedure, evidence requirements, fallback when an independent reviewer
 is unavailable, and follow-up-commit policy are in
 [`docs/high-risk-changes.md`](docs/high-risk-changes.md).
 
+What a reviewer owes in return — that a finding asserting Oak behavior
+cites the Java rather than an analysis document, that a claim about the
+language or a public API quotes the definition, that validating a
+committed range isolates it, and how severity and adversarial
+verification are calibrated — is in
+[`docs/reviewing.md`](docs/reviewing.md). A false finding costs the
+author a cycle just as a missed defect costs a release.
+
 ## License
 
 Apache-2.0. By contributing you agree to license your work under the
