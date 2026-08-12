@@ -4,14 +4,26 @@ End-to-end tests verifying that froe reads stores written by Apache
 Jackrabbit Oak, writes stores that Oak reads, and performs maintenance
 operations that leave the store in a state Oak boots against cleanly.
 
-The suite uses `apache/sling:14` (Apache-2.0) as a real Oak instance —
+The suite uses an Apache Sling image (Apache-2.0) as a real Oak instance —
 no Adobe/AEM license is involved. Sling boots Oak with TarMK by default,
 so the store is byte-for-byte what a production Oak repository produces.
+
+The image is **pinned by manifest digest** in
+`crates/froe-cli/tests/interop.rs`, because the claim in the README names an
+Oak build and a mutable tag could be re-pushed with a different one. The
+suite also asserts the `oak-segment-tar` version inside the image, so a
+substitution fails loudly rather than silently redefining what was verified.
+
+Setting `FROE_INTEROP_CANARY=1` runs against the floating `:14` tag instead.
+The two modes answer different questions: the pinned run asks whether froe
+still interoperates with the build the claim names, and the floating run asks
+whether the ecosystem has moved underneath it. On a canary run, the Oak
+version assertion failing is the useful result.
 
 ## Prerequisites
 
 - **podman** installed and runnable by the current user.
-- **Network access** to pull `docker.io/apache/sling:14` (once).
+- **Network access** to pull the pinned Sling image (once).
 - **froe** built: `cargo build --release`.
 
 ## Running
@@ -198,8 +210,24 @@ directory, or a crashed online compaction left a stale archive behind.
 
 ## CI
 
-`.github/workflows/interop.yml` runs the full suite weekly (Monday
-03:00 UTC) and on manual trigger. See the workflow file for details.
+`.github/workflows/interop.yml` runs the suite on three occasions, because
+they answer different questions:
+
+- **Push, path-filtered** on the write path, the suite, and the workflow —
+  the froe-side axis, where a regression is possible. Pinned digest.
+- **Monthly schedule** against the floating tag — the environment axis, which
+  can break with no froe commit at all: a new Oak build in the image, a new
+  runner image, a new stable compiler. This is what a timer is actually for;
+  a weekly cadence added nothing the push filter did not already cover.
+- **Manual dispatch**, for re-verifying deliberately.
+
+A failing run opens or comments on an `interop`-labelled issue, because a
+scheduled failure produces no pull request and would otherwise sit unnoticed.
+
+`.github/workflows/release.yml` runs the suite as a release gate: the release
+notes assert that maintenance is verified against a named Oak build, so the
+publishing job depends on the suite passing at the tagged commit rather than
+on a run from some earlier day.
 
 ## Implementation
 

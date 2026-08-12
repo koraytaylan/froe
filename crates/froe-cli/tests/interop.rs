@@ -88,8 +88,78 @@ use froe::writer::commit::rewrite_node_with_child_edits;
 use froe::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
 use froe::writer::store_writer::WritableRepository;
 
-/// The Sling Docker image. Apache-2.0; boots Oak with `TarMK` by default.
-const SLING_IMAGE: &str = "docker.io/apache/sling:14";
+/// The Sling image, pinned by manifest digest. Apache-2.0; boots Oak with
+/// `TarMK` by default.
+///
+/// A digest rather than the `:14` tag, because the claim in `README.md` names
+/// an Oak build: a tag can be re-pushed, which would silently change what the
+/// suite verified. Pinning makes a gate run reproducible.
+const PINNED_SLING_IMAGE: &str = "docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9";
+
+/// The floating tag, for the periodic canary that deliberately looks for
+/// ecosystem drift instead of reproducibility.
+const FLOATING_SLING_IMAGE: &str = "docker.io/apache/sling:14";
+
+/// The image to run, `PINNED_SLING_IMAGE` unless `FROE_INTEROP_SLING_IMAGE`
+/// overrides it.
+///
+/// The two modes answer different questions. A pinned run asks "does froe still
+/// interoperate with the Oak build we published a claim about" — that is the
+/// release gate. A floating run asks "has the ecosystem moved underneath the
+/// claim" — that is the canary, and there the Oak-version assertion failing is
+/// the useful result, not a nuisance.
+fn sling_image() -> String {
+    select_sling_image(
+        std::env::var("FROE_INTEROP_SLING_IMAGE").ok().as_deref(),
+        std::env::var("FROE_INTEROP_CANARY").ok().as_deref(),
+    )
+}
+
+/// The image-selection rule, separated from the environment so it can be
+/// tested without mutating process state.
+///
+/// The canary branch runs unattended once a month, which is the worst place to
+/// discover a wiring mistake, so it is covered by an ordinary test rather than
+/// only by the scheduled run itself.
+fn select_sling_image(image_override: Option<&str>, canary: Option<&str>) -> String {
+    if let Some(image) = image_override
+        && !image.trim().is_empty()
+    {
+        return image.to_owned();
+    }
+    if canary.is_some_and(|flag| flag.trim() == "1") {
+        return FLOATING_SLING_IMAGE.to_owned();
+    }
+    PINNED_SLING_IMAGE.to_owned()
+}
+
+#[test]
+fn image_selection_pins_by_default_and_floats_only_for_the_canary() {
+    assert_eq!(select_sling_image(None, None), PINNED_SLING_IMAGE);
+    assert_eq!(select_sling_image(None, Some("0")), PINNED_SLING_IMAGE);
+    assert_eq!(select_sling_image(None, Some("")), PINNED_SLING_IMAGE);
+    assert_eq!(select_sling_image(None, Some("1")), FLOATING_SLING_IMAGE);
+    assert_eq!(select_sling_image(None, Some(" 1 ")), FLOATING_SLING_IMAGE);
+    // An explicit override wins over the canary flag, and blank is not an
+    // override — a workflow that sets the variable to "" must still get the pin.
+    assert_eq!(
+        select_sling_image(Some("example/oak:1"), None),
+        "example/oak:1"
+    );
+    assert_eq!(
+        select_sling_image(Some("example/oak:1"), Some("1")),
+        "example/oak:1"
+    );
+    assert_eq!(
+        select_sling_image(Some(""), Some("1")),
+        FLOATING_SLING_IMAGE
+    );
+    assert_eq!(select_sling_image(Some("   "), None), PINNED_SLING_IMAGE);
+    // The pin is a digest and the canary target is a tag; mixing them up would
+    // silently make a "pinned" run reproducible in name only.
+    assert!(PINNED_SLING_IMAGE.contains("@sha256:"));
+    assert!(!FLOATING_SLING_IMAGE.contains("@sha256:"));
+}
 
 /// How long to wait for Sling to finish booting.
 const SLING_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -220,7 +290,7 @@ impl PodmanContainer {
             &port_arg,
             "-v",
             &volume_arg,
-            SLING_IMAGE,
+            &sling_image(),
         ]);
         Self {
             name: name.to_owned(),
@@ -474,11 +544,14 @@ fn assert_oak_build(container: &str) -> String {
         .unwrap_or_else(|| panic!("unexpected oak-segment-tar jar name: {jar}"))
         .to_owned();
     assert_eq!(
-        version, EXPECTED_OAK_SEGMENT_TAR_VERSION,
-        "{SLING_IMAGE} now ships oak-segment-tar {version}, not \
-         {EXPECTED_OAK_SEGMENT_TAR_VERSION}. The tag is mutable; re-verify \
-         deliberately and update EXPECTED_OAK_SEGMENT_TAR_VERSION rather than \
-         letting the claim drift."
+        version,
+        EXPECTED_OAK_SEGMENT_TAR_VERSION,
+        "{} ships oak-segment-tar {version}, not {EXPECTED_OAK_SEGMENT_TAR_VERSION}. \
+         On a canary run against the floating tag this is the expected signal that \
+         the ecosystem moved: re-verify deliberately, then update both \
+         PINNED_SLING_IMAGE and EXPECTED_OAK_SEGMENT_TAR_VERSION so the published \
+         claim keeps naming the build it was proved against.",
+        sling_image()
     );
     eprintln!("  Oak build under test: oak-segment-tar {version}");
     version
@@ -1840,10 +1913,10 @@ fn write_run_record() {
         "froe Oak interoperability run record\n\
          \n\
          unix timestamp:      {seconds_since_epoch}\n\
-         image:               {SLING_IMAGE}\n\
+         image:               {image}\n\
          oak-segment-tar:     {oak_version}\n\
          store.version:       {store_version}\n\
-         froe binary:         {}\n\
+         froe binary:         {binary}\n\
          \n\
          Phases passed, in dependency order:\n\
          \x20 generate    Oak wrote the fixture store\n\
@@ -1869,7 +1942,8 @@ fn write_run_record() {
          Not covered: native macOS or Windows execution, store.version=1,\n\
          external blob stores, and Adobe AEM itself (this loop is Apache Sling\n\
          with Oak).\n",
-        froe_bin().display()
+        image = sling_image(),
+        binary = froe_bin().display()
     );
     let path = work_root().join("interop-run-record.txt");
     std::fs::write(&path, &record).expect("write the interop run record");

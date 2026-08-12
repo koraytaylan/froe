@@ -22,6 +22,12 @@ to redo.
   [`high-risk-changes.md`](high-risk-changes.md). A feature whose
   interoperability gate is still open stays labelled beta, and the release
   notes say so.
+* The release pipeline runs the Oak interoperability suite itself, against the
+  digest-pinned Sling image, and the publishing job depends on it. That is
+  deliberate: the release notes assert that maintenance is verified against a
+  named Oak build, and a claim published from a run at some earlier commit is
+  not evidence about the artifact being released. Expect the tag to take
+  correspondingly longer.
 
 ## The version bump
 

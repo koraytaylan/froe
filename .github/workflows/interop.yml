@@ -1,35 +1,61 @@
-# Weekly interop round-trip: build a real Oak TarMK store with the
-# apache/sling:14 image, run froe's read and write paths against it, and
-# boot Sling against froe's output to confirm the result is consumable by
-# a real Oak instance.
+# Oak interoperability round-trip: build a real Oak TarMK store with an Apache
+# Sling image, run froe's read and write paths against it, and boot Sling
+# against froe's output to confirm the result is consumable by a real Oak.
 #
-# See docs/interop.md for the full dependency chain and phase descriptions.
-# The tests live in crates/froe-cli/tests/interop.rs behind the `interop`
-# feature flag.
+# See docs/interop.md for the dependency chain and phase descriptions. The
+# tests live in crates/froe-cli/tests/interop.rs behind the `interop` feature.
 #
-# This is the standing regression guard for the write-path interoperability
-# claim in README.md: one-time verification rots without a scheduled check.
+# This workflow is the standing regression guard for the interoperability claim
+# in README.md. It runs on three distinct occasions, because they answer
+# different questions:
+#
+#   push (filtered)  A change touched the write path, the suite, or this
+#                    workflow, so a froe-side regression is possible. Runs
+#                    against the pinned digest.
+#   schedule         Monthly canary against the *floating* tag, which asks
+#                    whether the ecosystem moved underneath the claim — a new
+#                    Oak build in the image, a new runner image, a new stable
+#                    compiler. Nothing in froe has to change for this to break,
+#                    which is the whole point of running it on a timer.
+#   workflow_dispatch  Manual, for re-verifying deliberately.
+#
+# The release pipeline runs this suite itself (see release.yml), so a release
+# cannot publish the interoperability claim without having just proved it.
 name: interop
 
 on:
+  push:
+    paths:
+      - "crates/froe/src/writer/**"
+      - "crates/froe/src/store.rs"
+      - "crates/froe-cli/src/mutation.rs"
+      - "crates/froe-cli/tests/interop.rs"
+      - "scripts/interop-fixture.sh"
+      - ".github/workflows/interop.yml"
   schedule:
-    # 03:00 UTC every Monday -- a quiet window for Apache infra.
-    - cron: '0 3 * * 1'
+    # 03:00 UTC on the first of each month. Weekly added nothing: the froe-side
+    # axis is covered by the push filter above, and the environment axis does
+    # not drift weekly. Rare-but-watched beats frequent-and-ignored.
+    - cron: "0 3 1 * *"
   workflow_dispatch:
-    # Manual trigger from the Actions tab.
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   interop:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Only the scheduled canary floats; every other trigger is reproducible
+      # against the digest pinned in the test source.
+      FROE_INTEROP_CANARY: ${{ github.event_name == 'schedule' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
-
-      - name: Build froe (release)
-        run: cargo build --release
 
       - name: Install podman
         run: sudo apt-get update && sudo apt-get install -y podman
@@ -47,6 +73,64 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: interop-run-record
+          name: interop-run-record-${{ github.run_id }}
           path: /tmp/interop-work/interop-run-record.txt
           if-no-files-found: warn
+
+  # A guard nobody watches manufactures confidence. A scheduled run that fails
+  # produces no pull request and no review, so without this the suite could be
+  # red for a month unnoticed.
+  report-failure:
+    needs: interop
+    if: failure() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'interop suite failed';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const canary = context.eventName === 'schedule';
+            const body = [
+              `The Oak interoperability suite failed on \`${context.sha}\` (${context.eventName}).`,
+              '',
+              `Run: ${runUrl}`,
+              '',
+              canary
+                ? 'This was the scheduled canary against the *floating* Sling tag, so the'
+                  + ' likely cause is ecosystem drift rather than a froe regression: a new'
+                  + ' Oak build in the image, a new runner image, or a new stable compiler.'
+                  + ' If the Oak version assertion failed, re-verify deliberately and then'
+                  + ' update PINNED_SLING_IMAGE and EXPECTED_OAK_SEGMENT_TAR_VERSION so the'
+                  + ' published claim names the build it was proved against.'
+                : 'This run used the pinned digest, so the environment did not move: treat'
+                  + ' it as a froe-side regression in the write path.',
+              '',
+              'The interoperability claim in README.md is not currently backed by a'
+              + ' passing run.',
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'interop',
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['interop'],
+              });
+            }

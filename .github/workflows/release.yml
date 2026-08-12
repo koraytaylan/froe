@@ -1,7 +1,9 @@
 # Tag-driven releases: pushing a tag `vX.Y.Z` verifies the tag matches
-# the workspace version and that the full ci.yml gate passes on the tagged
+# the workspace version, that the full ci.yml gate passes on the tagged
 # commit — on Linux and macOS, at stable and the minimum supported Rust
-# version — generates the changelog from
+# version — and that the Oak interoperability suite passes against the
+# pinned Sling image, because the release notes assert that maintenance is
+# verified against a named Oak build. Then it generates the changelog from
 # the conventional-commit history with git-cliff, builds the CLI for the
 # most compatible target of each platform (static musl on Linux, Apple
 # silicon on macOS, MSVC on Windows — where the read-only commands
@@ -73,6 +75,33 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: cargo test --workspace --release
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo doc --workspace --no-deps
+
+  # The release notes assert that maintenance is verified against a named Oak
+  # build. Publishing that claim without running the suite would make it an
+  # assertion about a run that happened at some earlier commit, so the release
+  # proves it here, against the digest pinned in the test source.
+  interop:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y podman
+      - name: Run the interop suite
+        run: scripts/interop-fixture.sh
+        env:
+          FROE_INTEROP_WORK_ROOT: /tmp/interop-work
+      # Attached to the release below, so the published artifacts carry the
+      # evidence for the claim in their own notes.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: interop-run-record
+          path: /tmp/interop-work/interop-run-record.txt
+          if-no-files-found: warn
       - run: cargo clippy --workspace --all-targets
       - run: cargo doc --workspace --no-deps
 
@@ -168,7 +197,7 @@ jobs:
             froe-*.zip
 
   release:
-    needs: [verify, changelog, build]
+    needs: [verify, interop, changelog, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
