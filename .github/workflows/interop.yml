@@ -1,0 +1,40 @@
+# Weekly interop round-trip: build a real Oak TarMK store with the
+# apache/sling:14 image, run froe's read and write paths against it, and
+# boot Sling against froe's output to confirm the result is consumable by
+# a real Oak instance.
+#
+# See docs/interop.md for the full dependency chain and phase descriptions.
+# The tests live in crates/froe-cli/tests/interop.rs behind the `interop`
+# feature flag.
+#
+# This is the regression guard for the write-path beta caveat: one-time
+# interop verification rots without a scheduled check.
+name: interop
+
+on:
+  schedule:
+    # 03:00 UTC every Monday -- a quiet window for Apache infra.
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    # Manual trigger from the Actions tab.
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build froe (release)
+        run: cargo build --release
+
+      - name: Install podman
+        run: sudo apt-get update && sudo apt-get install -y podman
+
+      - name: Run the interop suite
+        run: scripts/interop-fixture.sh
+        env:
+          FROE_INTEROP_WORK_ROOT: /tmp/interop-work
