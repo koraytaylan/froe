@@ -25,10 +25,11 @@ use std::path::Path;
 use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
 use crate::error::{Error, Result};
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::RecordIdentifier;
 use crate::store::Repository;
-use crate::writer::compaction::deep_copy_tree;
+use crate::writer::compaction::deep_copy_tree_with_progress;
 use crate::writer::repository_lock::RepositoryLock;
 use crate::writer::segment_builder::GarbageCollectionGeneration;
 use crate::writer::store_writer::WritableRepository;
@@ -37,9 +38,25 @@ use crate::writer::store_writer::WritableRepository;
 /// overwriting the target's head with the copied super-root. The target
 /// is created when absent.
 pub fn backup(source_directory: &Path, target_directory: &Path) -> Result<()> {
-    let source = Repository::open(source_directory)?;
-    let target = WritableRepository::open(target_directory)?;
-    copy_head_between(&source, source.head_record_identifier(), &target, "b")?;
+    backup_with_progress(source_directory, target_directory, &mut DiscardedProgress)
+}
+
+/// Backs up exactly like [`backup`], reporting the source scan and the
+/// node copy to `observer`.
+pub fn backup_with_progress(
+    source_directory: &Path,
+    target_directory: &Path,
+    observer: &mut dyn ProgressObserver,
+) -> Result<()> {
+    let source = Repository::open_with_progress(source_directory, observer)?;
+    let target = WritableRepository::open_with_progress(target_directory, observer)?;
+    copy_head_between(
+        &source,
+        source.head_record_identifier(),
+        &target,
+        "b",
+        observer,
+    )?;
     target.close()
 }
 
@@ -47,9 +64,25 @@ pub fn backup(source_directory: &Path, target_directory: &Path) -> Result<()> {
 /// into `target_directory` and becomes the new head. The target's earlier
 /// revisions remain in the journal until later compaction reclaims them.
 pub fn restore(backup_directory: &Path, target_directory: &Path) -> Result<()> {
-    let backup = Repository::open(backup_directory)?;
-    let target = WritableRepository::open(target_directory)?;
-    copy_head_between(&backup, backup.head_record_identifier(), &target, "r")?;
+    restore_with_progress(backup_directory, target_directory, &mut DiscardedProgress)
+}
+
+/// Restores exactly like [`restore`], reporting the backup scan and the
+/// node copy to `observer`.
+pub fn restore_with_progress(
+    backup_directory: &Path,
+    target_directory: &Path,
+    observer: &mut dyn ProgressObserver,
+) -> Result<()> {
+    let backup = Repository::open_with_progress(backup_directory, observer)?;
+    let target = WritableRepository::open_with_progress(target_directory, observer)?;
+    copy_head_between(
+        &backup,
+        backup.head_record_identifier(),
+        &target,
+        "r",
+        observer,
+    )?;
     target.close()
 }
 
@@ -64,10 +97,15 @@ fn copy_head_between(
     source_head: RecordIdentifier,
     target: &WritableRepository,
     writer_identifier: &str,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
     let generation = source_head_generation(source, source_head)?;
     let mut writer = target.record_writer_with_identifier(generation, writer_identifier);
-    let (new_head, _) = deep_copy_tree(source, &mut writer, source_head)?;
+    let (new_head, _) = crate::progress::observe(
+        observer,
+        &Step::new("copying nodes", WorkUnit::Nodes),
+        |observer| deep_copy_tree_with_progress(source, &mut writer, source_head, observer),
+    )?;
     writer.finish()?;
     target.replace_head(new_head);
     target.flush()
@@ -127,6 +165,15 @@ struct Candidate {
 /// one must still pass the full consistency gate before anything is
 /// written.
 pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
+    recover_journal_with_progress(directory, &mut DiscardedProgress)
+}
+
+/// Recovers exactly like [`recover_journal`], reporting the candidate
+/// scan and the consistency probe to `observer`.
+pub fn recover_journal_with_progress(
+    directory: &Path,
+    observer: &mut dyn ProgressObserver,
+) -> Result<RecoveryOutcome> {
     // Deliberate deviation from Java, which recovers locklessly: hold the
     // exclusive repository lock for the whole recovery, so a running AEM
     // instance can never append to a journal this function is about to
@@ -136,13 +183,23 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
 
     // A read-only view of every archive, opened without needing a
     // resolvable journal.
-    let archives = crate::store::open_all_archives(directory)?;
+    let archives = crate::store::open_all_archives_with_progress(directory, observer)?;
 
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen: HashSet<RecordIdentifier> = HashSet::new();
     let provider = crate::store::ArchiveSet::new(archives);
 
-    for segment_identifier in provider.segment_identifiers() {
+    // Every statement in this loop is infallible — an unreadable segment
+    // is skipped, not raised — so the step is closed by the single
+    // `step_ended` after it.
+    observer.step_began(
+        &Step::new("scanning segments for super-roots", WorkUnit::Segments)
+            .with_total(crate::progress::count(provider.segment_identifier_count())),
+    );
+    let mut scanned_segments = 0usize;
+    for (scanned, segment_identifier) in provider.segment_identifiers().enumerate() {
+        observer.step_advanced(crate::progress::count(scanned));
+        scanned_segments = scanned + 1;
         if segment_identifier.is_bulk_segment() {
             continue;
         }
@@ -177,6 +234,8 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
             }
         }
     }
+    observer.step_advanced(crate::progress::count(scanned_segments));
+    observer.step_ended();
     let candidates_examined = candidates.len();
 
     // Order candidates newest first — the exact reverse of Oak's
@@ -202,15 +261,29 @@ pub fn recover_journal(directory: &Path) -> Result<RecoveryOutcome> {
     // head resolution skips to when a segment of the last line later
     // goes missing.
     let mut corrupt_memory: Vec<String> = Vec::new();
+    observer.step_began(
+        &Step::new("probing candidates for consistency", WorkUnit::Revisions)
+            .with_total(crate::progress::count(candidates_examined)),
+    );
     let consistent_position = candidates
         .iter()
-        .position(|candidate| is_fully_consistent(&provider, candidate.record, &mut corrupt_memory))
-        .ok_or_else(|| Error::InvalidFormat {
-            details: format!(
-                "no consistent super-root found among {candidates_examined} candidates in {}",
-                directory.display()
-            ),
-        })?;
+        .enumerate()
+        .position(|(probed, candidate)| {
+            observer.step_advanced(crate::progress::count(probed));
+            is_fully_consistent(&provider, candidate.record, &mut corrupt_memory)
+        });
+    // Every candidate up to and including the accepted one was probed;
+    // without a match, all of them were.
+    observer.step_advanced(crate::progress::count(
+        consistent_position.map_or(candidates_examined, |position| position + 1),
+    ));
+    observer.step_ended();
+    let consistent_position = consistent_position.ok_or_else(|| Error::InvalidFormat {
+        details: format!(
+            "no consistent super-root found among {candidates_examined} candidates in {}",
+            directory.display()
+        ),
+    })?;
     let survivors = &candidates[consistent_position..];
     let recovered_head = survivors[0].record;
 

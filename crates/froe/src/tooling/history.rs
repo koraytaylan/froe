@@ -10,8 +10,9 @@ use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
 use crate::error::Result;
 use crate::journal::read_journal;
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::record::RecordIdentifier;
-use crate::store::{ArchiveSet, open_all_archives};
+use crate::store::{ArchiveSet, open_all_archives_with_progress};
 
 /// One revision's view of a node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,26 +30,49 @@ pub struct NodeHistoryEntry {
 /// newest first. `path` is relative to the content root; a leading
 /// `checkpoints` segment addresses the super-root's checkpoints.
 pub fn node_history(directory: &std::path::Path, path: &str) -> Result<Vec<NodeHistoryEntry>> {
-    let archives = open_all_archives(directory)?;
+    node_history_with_progress(directory, path, &mut DiscardedProgress)
+}
+
+/// Traces exactly like [`node_history`], reporting the archive scan and
+/// the revision walk to `observer`.
+pub fn node_history_with_progress(
+    directory: &std::path::Path,
+    path: &str,
+    observer: &mut dyn ProgressObserver,
+) -> Result<Vec<NodeHistoryEntry>> {
+    let archives = open_all_archives_with_progress(directory, observer)?;
     let provider = ArchiveSet::new(archives);
     // An unreadable journal is a loud failure, not an empty history.
     let journal_entries = read_journal(&directory.join("journal.log"))?;
 
     let mut history = Vec::new();
-    for entry in &journal_entries {
+    observer.step_began(
+        &Step::new("tracing revisions", WorkUnit::Revisions)
+            .with_total(crate::progress::count(journal_entries.len())),
+    );
+    for (traced, entry) in journal_entries.iter().enumerate() {
+        observer.step_advanced(crate::progress::count(traced));
         let Some(head) = entry.record_identifier() else {
             continue;
         };
         if provider.segment(head.segment).is_err() {
             continue;
         }
-        let record = navigate(&provider, head, path)?.map(|node| node.record_identifier());
+        let record = match navigate(&provider, head, path) {
+            Ok(node) => node.map(|node| node.record_identifier()),
+            Err(error) => {
+                observer.step_ended();
+                return Err(error);
+            }
+        };
         history.push(NodeHistoryEntry {
             revision: entry.revision_text.clone(),
             timestamp_milliseconds: entry.timestamp_milliseconds,
             record,
         });
     }
+    observer.step_advanced(crate::progress::count(journal_entries.len()));
+    observer.step_ended();
     Ok(history)
 }
 

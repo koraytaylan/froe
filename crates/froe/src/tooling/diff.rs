@@ -10,8 +10,9 @@ use crate::content::node::{NodeState, PropertyState, PropertyValues};
 use crate::content::provider::SegmentProvider;
 use crate::error::Result;
 use crate::journal::parse_record_identifier_text;
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::record::RecordIdentifier;
-use crate::store::{ArchiveSet, open_all_archives};
+use crate::store::{ArchiveSet, open_all_archives_with_progress};
 
 /// A content tree is never this deep; beyond it the node records form a
 /// cycle in a corrupt store, and the diff walk stops.
@@ -22,6 +23,9 @@ const MAXIMUM_DIFF_DEPTH: usize = 4000;
 /// exponentially while staying shallow; real diffs — even a whole-tree
 /// diff across a compaction — stay far below this.
 const MAXIMUM_DIFF_VISITS: u64 = 1_000_000_000;
+
+/// How many node pairs the walk compares between progress reports.
+const DIFF_VISIT_REPORT_STRIDE: u64 = 512;
 
 /// A property-level change within a node.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,7 +78,25 @@ pub fn diff_revisions(
     after_revision: &str,
     filter_path: &str,
 ) -> Result<Vec<NodeDifference>> {
-    let archives = open_all_archives(directory)?;
+    diff_revisions_with_progress(
+        directory,
+        before_revision,
+        after_revision,
+        filter_path,
+        &mut DiscardedProgress,
+    )
+}
+
+/// Compares exactly like [`diff_revisions`], reporting the archive scan
+/// and the comparison walk to `observer`.
+pub fn diff_revisions_with_progress(
+    directory: &std::path::Path,
+    before_revision: &str,
+    after_revision: &str,
+    filter_path: &str,
+    observer: &mut dyn ProgressObserver,
+) -> Result<Vec<NodeDifference>> {
+    let archives = open_all_archives_with_progress(directory, observer)?;
     let provider = ArchiveSet::new(archives);
 
     let before_head = resolve_revision(directory, before_revision, &provider)?;
@@ -86,14 +108,25 @@ pub fn diff_revisions(
     let base_path = normalized_filter_path(filter_path);
     let mut differences = Vec::new();
     let mut visits = 0u64;
-    diff_nodes(
-        &provider,
-        before_node.as_ref(),
-        after_node.as_ref(),
-        &base_path,
-        0,
-        &mut differences,
-        &mut visits,
+    crate::progress::observe(
+        observer,
+        &Step::new("comparing revisions", WorkUnit::Nodes),
+        |observer| {
+            let compared = diff_nodes(
+                &provider,
+                before_node.as_ref(),
+                after_node.as_ref(),
+                &base_path,
+                0,
+                &mut differences,
+                &mut visits,
+                observer,
+            );
+            // The stride suppressed the last partial batch; report the
+            // exact number of pairs the walk reached, failure included.
+            observer.step_advanced(visits);
+            compared
+        },
     )?;
     Ok(differences)
 }
@@ -167,6 +200,7 @@ fn diff_nodes(
     depth: usize,
     differences: &mut Vec<NodeDifference>,
     visits: &mut u64,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
     if depth > MAXIMUM_DIFF_DEPTH {
         return Err(crate::error::Error::InvalidFormat {
@@ -174,6 +208,11 @@ fn diff_nodes(
                 "node tree exceeds depth {MAXIMUM_DIFF_DEPTH}; the records probably form a cycle"
             ),
         });
+    }
+    // Reported before the increment: the pairs behind this one are the
+    // ones actually compared, and this one has not been yet.
+    if (*visits).is_multiple_of(DIFF_VISIT_REPORT_STRIDE) {
+        observer.step_advanced(*visits);
     }
     *visits += 1;
     if *visits > MAXIMUM_DIFF_VISITS {
@@ -206,6 +245,7 @@ fn diff_nodes(
                 depth,
                 differences,
                 visits,
+                observer,
             )?;
         }
     }
@@ -278,6 +318,7 @@ fn diff_children(
     depth: usize,
     differences: &mut Vec<NodeDifference>,
     visits: &mut u64,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
     let before_children = before.child_node_entries()?;
     let after_children = after.child_node_entries()?;
@@ -296,6 +337,7 @@ fn diff_children(
             depth + 1,
             differences,
             visits,
+            observer,
         )?;
     }
     for (name, before_child) in &before_children {
@@ -312,6 +354,7 @@ fn diff_children(
                 depth + 1,
                 differences,
                 visits,
+                observer,
             )?;
         }
     }

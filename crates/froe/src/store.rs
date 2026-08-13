@@ -30,6 +30,7 @@ use crate::content::template::{Template, read_template};
 use crate::content::value::read_string;
 use crate::error::{Error, Result};
 use crate::journal::{JournalEntry, read_journal};
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::parsed_segment::ParsedSegment;
 use crate::segment::record::RecordIdentifier;
@@ -68,6 +69,16 @@ pub struct Repository {
 impl Repository {
     /// Opens the segment store in `directory` read-only.
     pub fn open(directory: &Path) -> Result<Self> {
+        Self::open_with_progress(directory, &mut DiscardedProgress)
+    }
+
+    /// Opens the segment store in `directory` read-only, reporting the
+    /// archive scan — the part that takes real time on a large store — to
+    /// `observer`.
+    pub fn open_with_progress(
+        directory: &Path,
+        observer: &mut dyn ProgressObserver,
+    ) -> Result<Self> {
         if !directory.is_dir() {
             return Err(Error::InvalidFormat {
                 details: format!("{} is not a directory", directory.display()),
@@ -77,7 +88,7 @@ impl Repository {
         let archive_file_names = list_archive_file_names(directory)?;
         check_manifest(directory, !archive_file_names.is_empty())?;
 
-        let archives = open_archives_newest_valid_first(directory, &archive_file_names)?;
+        let archives = open_archives_newest_valid_first(directory, &archive_file_names, observer)?;
 
         let mut segment_locations = HashMap::new();
         for (archive_position, archive) in archives.iter().enumerate() {
@@ -325,6 +336,19 @@ impl ArchiveSet {
             .iter()
             .flat_map(TarArchiveReader::segment_identifiers)
     }
+
+    /// How many identifiers [`ArchiveSet::segment_identifiers`] yields.
+    /// A segment present in more than one archive is counted once per
+    /// archive, exactly as the iterator yields it, so this is the total a
+    /// progress report over that iteration counts up to — not the number
+    /// of distinct segments.
+    #[must_use]
+    pub fn segment_identifier_count(&self) -> usize {
+        self.archives
+            .iter()
+            .map(TarArchiveReader::segment_count)
+            .sum()
+    }
 }
 
 impl SegmentProvider for ArchiveSet {
@@ -374,9 +398,18 @@ impl SegmentProvider for ArchiveSet {
 /// store open: a legacy or newer-versioned store gets the categorical
 /// refusal, never segment-level parse noise.
 pub fn open_all_archives(directory: &Path) -> Result<Vec<TarArchiveReader>> {
+    open_all_archives_with_progress(directory, &mut DiscardedProgress)
+}
+
+/// Opens every archive in a directory read-only, exactly like
+/// [`open_all_archives`], reporting the scan to `observer`.
+pub fn open_all_archives_with_progress(
+    directory: &Path,
+    observer: &mut dyn ProgressObserver,
+) -> Result<Vec<TarArchiveReader>> {
     let file_names = list_archive_file_names(directory)?;
     check_manifest(directory, !file_names.is_empty())?;
-    open_archives_newest_valid_first(directory, &file_names)
+    open_archives_newest_valid_first(directory, &file_names, observer)
 }
 
 /// Opens one archive per number read-only: the highest generation letter
@@ -393,10 +426,31 @@ pub fn open_all_archives(directory: &Path) -> Result<Vec<TarArchiveReader>> {
 fn open_archives_newest_valid_first(
     directory: &Path,
     file_names: &[String],
+    observer: &mut dyn ProgressObserver,
 ) -> Result<Vec<TarArchiveReader>> {
     let groups = group_file_generations_newest_first(file_names)?;
+    crate::progress::observe(
+        observer,
+        &Step::new("opening archives", WorkUnit::Archives)
+            .with_total(crate::progress::count(groups.len())),
+        |observer| open_archive_groups(directory, groups, observer),
+    )
+}
+
+/// Opens the winning archive of each generation group, reporting one
+/// completed archive at a time.
+fn open_archive_groups(
+    directory: &Path,
+    groups: Vec<Vec<crate::tar_archive::file_name::ArchiveFileName>>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<Vec<TarArchiveReader>> {
     let mut archives = Vec::new();
-    for group in groups {
+    let group_count = groups.len();
+    for (opened, group) in groups.into_iter().enumerate() {
+        // Items *completed*: the archive being opened is not one of them
+        // until its turn ends, so a one-archive store does not sit at
+        // 100% for the whole open.
+        observer.step_advanced(crate::progress::count(opened));
         let mut recovered: Vec<TarArchiveReader> = Vec::new();
         let mut winner: Option<TarArchiveReader> = None;
         let mut first_error: Option<Error> = None;
@@ -423,9 +477,11 @@ fn open_archives_newest_valid_first(
         } else if !recovered.is_empty() {
             archives.extend(recovered);
         } else if let Some(error) = first_error {
+            observer.step_advanced(crate::progress::count(opened));
             return Err(error);
         }
     }
+    observer.step_advanced(crate::progress::count(group_count));
     Ok(archives)
 }
 

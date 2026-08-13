@@ -28,6 +28,7 @@ use crate::content::property::{PropertyType, PropertyValue};
 use crate::content::provider::SegmentProvider;
 use crate::content::value::BinaryValue;
 use crate::error::{Error, Result};
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::record::RecordIdentifier;
 use crate::writer::record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
@@ -66,15 +67,34 @@ pub fn deep_copy_tree<Sink: SegmentSink>(
     writer: &mut RecordWriter<Sink>,
     source_root: RecordIdentifier,
 ) -> Result<(RecordIdentifier, u64)> {
+    deep_copy_tree_with_progress(source, writer, source_root, &mut DiscardedProgress)
+}
+
+/// Deep-copies exactly like [`deep_copy_tree`], reporting the number of
+/// nodes rewritten so far to `observer`.
+pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
+    source: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    source_root: RecordIdentifier,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(RecordIdentifier, u64)> {
     let mut copier = Compactor {
         source,
         writer,
         rewritten_nodes: HashMap::new(),
         compacted_nodes: 0,
+        reported_nodes: 0,
+        observer,
     };
     let root = copier.compact_node(source_root, 0)?;
+    // The stride suppressed the last partial batch; report the exact
+    // total so the copy does not end short of what it wrote.
+    copier.observer.step_advanced(copier.compacted_nodes);
     Ok((root, copier.compacted_nodes))
 }
+
+/// How many nodes a deep copy rewrites between progress reports.
+const COPIED_NODE_REPORT_STRIDE: u64 = 512;
 
 /// A content tree is never this deep — JCR paths in even the largest AEM
 /// repositories stay under a few hundred levels. A greater depth means the
@@ -89,6 +109,10 @@ struct Compactor<'writer, Sink: SegmentSink> {
     writer: &'writer mut RecordWriter<Sink>,
     rewritten_nodes: HashMap<RecordIdentifier, RecordIdentifier>,
     compacted_nodes: u64,
+    /// The count at the last progress report, so the observer is called
+    /// once per stride rather than once per node.
+    reported_nodes: u64,
+    observer: &'writer mut dyn ProgressObserver,
 }
 
 impl<Sink: SegmentSink> Compactor<'_, Sink> {
@@ -151,6 +175,10 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         )?;
         self.rewritten_nodes.insert(source_node, rewritten);
         self.compacted_nodes += 1;
+        if self.compacted_nodes - self.reported_nodes >= COPIED_NODE_REPORT_STRIDE {
+            self.reported_nodes = self.compacted_nodes;
+            self.observer.step_advanced(self.compacted_nodes);
+        }
         Ok(rewritten)
     }
 
@@ -212,6 +240,16 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
 /// generation, swaps the head, reclaims the old generations, and
 /// rewrites the journal to a single line.
 pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<CompactionOutcome> {
+    compact_with_progress(store, kind, &mut DiscardedProgress)
+}
+
+/// Compacts exactly like [`compact`], reporting the deep copy, the
+/// reclamation sweep, and the journal rewrite to `observer`.
+pub fn compact_with_progress(
+    store: &mut WritableRepository,
+    kind: CompactionKind,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CompactionOutcome> {
     let size_before = store.archive_size_on_disk()?;
 
     let head = store.head();
@@ -237,10 +275,14 @@ pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<C
     // allocating the compacted copy. Reclamation certifies them again at its
     // mutation boundary, but doing the first pass here prevents every retry
     // against a pre-existing defect from durably appending another full copy.
-    store.preflight_reclaim_sources()?;
+    store.preflight_reclaim_sources_with_progress(observer)?;
 
     let mut writer = store.record_writer_with_identifier(target_generation, "c");
-    let (new_head, compacted_nodes) = deep_copy_tree(store, &mut writer, head)?;
+    let (new_head, compacted_nodes) = crate::progress::observe(
+        observer,
+        &Step::new("copying nodes into a fresh generation", WorkUnit::Nodes),
+        |observer| deep_copy_tree_with_progress(store, &mut writer, head, observer),
+    )?;
     writer.finish()?;
 
     if !store.set_head(head, new_head) {
@@ -253,7 +295,11 @@ pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<C
     // Reclaim generations older than the target. Full compaction keeps
     // only the new full generation; tail compaction keeps the shared full
     // generation, so it reclaims by generation alone.
-    store.reclaim_old_generations(target_generation, kind == CompactionKind::Full)?;
+    crate::progress::observe(
+        observer,
+        &Step::new("reclaiming old generations", WorkUnit::Archives),
+        |_observer| store.reclaim_old_generations(target_generation, kind == CompactionKind::Full),
+    )?;
     rewrite_journal_to_head(store, new_head)?;
 
     let size_after = store.archive_size_on_disk()?;

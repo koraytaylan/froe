@@ -10,8 +10,9 @@ use crate::content::node::{NodeState, PropertyValues};
 use crate::content::property::PropertyValue;
 use crate::content::provider::SegmentProvider;
 use crate::error::Result;
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::record::{RecordIdentifier, RecordType};
-use crate::store::{ArchiveSet, open_all_archives};
+use crate::store::{ArchiveSet, open_all_archives_with_progress};
 
 /// The predicates a node must satisfy to match.
 #[derive(Debug, Clone, Default)]
@@ -62,12 +63,31 @@ pub fn search_nodes(
     query: &SearchQuery,
     limit: usize,
 ) -> Result<SearchOutcome> {
-    let archives = open_all_archives(directory)?;
+    search_nodes_with_progress(directory, query, limit, &mut DiscardedProgress)
+}
+
+/// Searches exactly like [`search_nodes`], reporting the archive scan and
+/// the segment sweep to `observer`. A search that stops at `limit` ends
+/// its step where it stopped, not at the segment total.
+pub fn search_nodes_with_progress(
+    directory: &std::path::Path,
+    query: &SearchQuery,
+    limit: usize,
+    observer: &mut dyn ProgressObserver,
+) -> Result<SearchOutcome> {
+    let archives = open_all_archives_with_progress(directory, observer)?;
     let provider = ArchiveSet::new(archives);
 
     let mut matches = Vec::new();
     let mut unreadable_nodes = 0u64;
-    for segment_identifier in provider.segment_identifiers() {
+    observer.step_began(
+        &Step::new("searching segments", WorkUnit::Segments)
+            .with_total(crate::progress::count(provider.segment_identifier_count())),
+    );
+    let mut searched_segments = 0usize;
+    for (searched, segment_identifier) in provider.segment_identifiers().enumerate() {
+        observer.step_advanced(crate::progress::count(searched));
+        searched_segments = searched + 1;
         if segment_identifier.is_bulk_segment() {
             continue;
         }
@@ -98,6 +118,8 @@ pub fn search_nodes(
                         stable_identifier,
                     });
                     if limit != 0 && matches.len() >= limit {
+                        observer.step_advanced(crate::progress::count(searched_segments));
+                        observer.step_ended();
                         return Ok(SearchOutcome {
                             matches,
                             unreadable_nodes,
@@ -108,6 +130,8 @@ pub fn search_nodes(
             }
         }
     }
+    observer.step_advanced(crate::progress::count(searched_segments));
+    observer.step_ended();
     Ok(SearchOutcome {
         matches,
         unreadable_nodes,

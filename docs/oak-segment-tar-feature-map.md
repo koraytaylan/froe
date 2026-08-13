@@ -121,6 +121,12 @@ after which a normal AEM start consumes the result cleanly.
 
 ### The `froe` command surface
 
+Every command accepts the global `-s`/`--silent` and
+`--progress <auto|always|never>` flags and reports its long-running steps
+on standard error; standard output carries only the command's data. See
+[`cli-output.md`](cli-output.md) for the reporting contract and the steps
+each command reports.
+
 Read-only (safe against a live repository, under the store's
 never-modify-in-place file protocol — see the mmap note in the
 introduction above):
@@ -136,7 +142,7 @@ introduction above):
 | `froe node REPOSITORY PATH` | One node: record identifiers, typed properties, children. |
 | `froe tree REPOSITORY [PATH] [--depth N]` | Indented content tree with primary types. |
 | `froe checkpoints REPOSITORY` | Checkpoint names with creation and expiry times. |
-| `froe export REPOSITORY [--path P] [--depth N] [--format json-lines\|parquet] [--output FILE\|DIRECTORY]` | Export the subtree as JSON lines (default) or Parquet tables. |
+| `froe export REPOSITORY [--path P] [--depth N] [--format json-lines\|parquet] [--output FILE\|DIRECTORY]` | Export the subtree as JSON lines (default) or Parquet tables. Progress is reported unless the export streams to a terminal's standard output. |
 | `froe check REPOSITORY [--path P]… [--binaries]` | The newest fully consistent revision. |
 | `froe difference REPOSITORY BEFORE AFTER [--path P]` | Changes between two revisions. |
 | `froe history REPOSITORY PATH` | A node's record across journal revisions. |

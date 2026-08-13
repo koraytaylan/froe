@@ -17,13 +17,16 @@ mod output;
 mod progress;
 mod tooling_display;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use froe::progress::ProgressObserver as _;
 use froe::store::Repository;
 
 use crate::mutation::CheckpointRemoval;
+use crate::progress::{ProgressWhen, Reporter};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +46,24 @@ use crate::mutation::CheckpointRemoval;
 struct CommandLine {
     #[command(subcommand)]
     command: Command,
+    /// Suppress progress and status reports on standard error. Errors,
+    /// warnings, confirmation prompts, and every command's own output are
+    /// unaffected: --silent hides what froe is doing, never what it found
+    /// or what it is about to change.
+    #[arg(long, short = 's', global = true, alias = "quiet")]
+    silent: bool,
+    /// When to report progress on standard error. "auto" animates a live
+    /// line on a terminal, writes plain throttled lines elsewhere, and
+    /// stays quiet about anything that finishes promptly; "always" reports
+    /// every step from the moment it begins, for logs and scripts.
+    #[arg(
+        long,
+        value_enum,
+        global = true,
+        default_value = "auto",
+        conflicts_with = "silent"
+    )]
+    progress: ProgressWhen,
 }
 
 #[derive(Subcommand)]
@@ -146,9 +167,6 @@ enum Command {
         /// the existing one in place.
         #[arg(long)]
         full: bool,
-        /// Suppress the progress reports on standard error.
-        #[arg(long)]
-        quiet: bool,
     },
     /// Find each path's newest consistent revision (read-only). Exits 0
     /// when ANY checked path found a good revision — oak-run's contract
@@ -435,7 +453,12 @@ fn main() -> ExitCode {
             return exit_code;
         }
     };
-    match run(command_line.command) {
+    let reporter = Reporter::new(command_line.progress, command_line.silent);
+    let outcome = run(command_line.command, &reporter);
+    // Close any step the command left open and clear the live line, so an
+    // error message never lands on top of a progress bar.
+    reporter.finish();
+    match outcome {
         Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!(
@@ -447,23 +470,28 @@ fn main() -> ExitCode {
     }
 }
 
+/// Opens a repository read-only, reporting the archive scan.
+fn open_repository(directory: &Path, reporter: &Reporter) -> froe::Result<Repository> {
+    Repository::open_with_progress(directory, &mut reporter.clone())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one match arm per command reads best as a single dispatch"
 )]
-fn run(command: Command) -> froe::Result<ExitCode> {
+fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
     match command {
         Command::Summary { repository } => {
-            inspection::print_summary(&Repository::open(&repository)?)?;
+            inspection::print_summary(&open_repository(&repository, reporter)?)?;
         }
         Command::Journal { repository, limit } => {
-            inspection::print_journal(&Repository::open(&repository)?, limit);
+            inspection::print_journal(&open_repository(&repository, reporter)?, limit);
         }
         Command::Archives { repository } => {
-            inspection::print_archives(&Repository::open(&repository)?);
+            inspection::print_archives(&open_repository(&repository, reporter)?);
         }
         Command::Segments { repository } => {
-            inspection::print_segments(&Repository::open(&repository)?);
+            inspection::print_segments(&open_repository(&repository, reporter)?);
         }
         Command::Segment {
             repository,
@@ -471,7 +499,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             hex,
         } => {
             let segment_identifier = identifier.to_lowercase().parse()?;
-            let repository = Repository::open(&repository)?;
+            let repository = open_repository(&repository, reporter)?;
             if hex {
                 tooling_display::print_segment_dump(&repository, segment_identifier)?;
             } else {
@@ -482,10 +510,13 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             repository,
             archives,
         } => {
-            tooling_display::print_archive_debug(&Repository::open(&repository)?, &archives)?;
+            tooling_display::print_archive_debug(
+                &open_repository(&repository, reporter)?,
+                &archives,
+            )?;
         }
         Command::Node { repository, path } => {
-            if !content_display::print_node(&Repository::open(&repository)?, &path)? {
+            if !content_display::print_node(&open_repository(&repository, reporter)?, &path)? {
                 eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
                 return Ok(ExitCode::FAILURE);
             }
@@ -495,13 +526,14 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             path,
             depth,
         } => {
-            if !content_display::print_tree(&Repository::open(&repository)?, &path, depth)? {
+            if !content_display::print_tree(&open_repository(&repository, reporter)?, &path, depth)?
+            {
                 eprintln!("froe: no node at {}", output::sanitize_terminal_text(&path));
                 return Ok(ExitCode::FAILURE);
             }
         }
         Command::Checkpoints { repository } => {
-            inspection::print_checkpoints(&Repository::open(&repository)?)?;
+            inspection::print_checkpoints(&open_repository(&repository, reporter)?)?;
         }
         Command::Export {
             repository: repository_path,
@@ -510,16 +542,19 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             format,
             output,
             full,
-            quiet,
         } => {
             if full && format != ExportFormat::Parquet {
                 eprintln!("froe: --full applies only to the parquet format");
                 return Ok(ExitCode::FAILURE);
             }
             let run = match format {
-                ExportFormat::JsonLines => {
-                    run_json_lines_export(&repository_path, &path, depth, output.as_deref(), quiet)?
-                }
+                ExportFormat::JsonLines => run_json_lines_export(
+                    &repository_path,
+                    &path,
+                    depth,
+                    output.as_deref(),
+                    reporter,
+                )?,
                 ExportFormat::Parquet => {
                     let Some(output_directory) = output.as_deref() else {
                         eprintln!(
@@ -534,7 +569,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                         depth,
                         output_directory,
                         full,
-                        quiet,
+                        reporter,
                     )?
                 }
                 ExportFormat::Sqlite => {
@@ -545,34 +580,21 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                         );
                         return Ok(ExitCode::FAILURE);
                     };
-                    run_sqlite_export(&repository_path, &path, depth, output_path, quiet)?
+                    run_sqlite_export(&repository_path, &path, depth, output_path, reporter)?
                 }
             };
             match run {
                 ExportRun::Exported { nodes, elapsed } => {
-                    let rate = if elapsed.is_zero() {
-                        0.0
-                    } else {
-                        // A node count is a display figure; the precision
-                        // loss of the cast is irrelevant at the reported
-                        // scale.
-                        #[allow(clippy::cast_precision_loss)]
-                        let rate = nodes as f64 / elapsed.as_secs_f64();
-                        rate
-                    };
-                    match &output {
-                        Some(destination) => eprintln!(
-                            "froe: exported {nodes} nodes to {} in {:.1}s ({:.0} nodes/s)",
-                            destination.display(),
-                            elapsed.as_secs_f64(),
-                            rate
+                    let count = progress::format_count(nodes);
+                    let took = progress::format_duration(elapsed);
+                    let rate = progress::format_rate(nodes, elapsed);
+                    reporter.status(&match &output {
+                        Some(destination) => format!(
+                            "exported {count} nodes to {} in {took}{rate}",
+                            output::sanitize_terminal_path(destination),
                         ),
-                        None => eprintln!(
-                            "froe: exported {nodes} nodes in {:.1}s ({:.0} nodes/s)",
-                            elapsed.as_secs_f64(),
-                            rate
-                        ),
-                    }
+                        None => format!("exported {count} nodes in {took}{rate}"),
+                    });
                 }
                 // A refresh reports itself.
                 ExportRun::Reported => {}
@@ -590,7 +612,13 @@ fn run(command: Command) -> froe::Result<ExitCode> {
         } => {
             // Absent limit = examine every revision, oak-run's default.
             let revision_limit = revisions.unwrap_or(usize::MAX);
-            if !tooling_display::print_check(&repository, &paths, binaries, revision_limit)? {
+            if !tooling_display::print_check(
+                &repository,
+                &paths,
+                binaries,
+                revision_limit,
+                reporter,
+            )? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -600,10 +628,10 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             after,
             path,
         } => {
-            tooling_display::print_difference(&repository, &before, &after, &path)?;
+            tooling_display::print_difference(&repository, &before, &after, &path, reporter)?;
         }
         Command::History { repository, path } => {
-            tooling_display::print_history(&repository, &path)?;
+            tooling_display::print_history(&repository, &path, reporter)?;
         }
         Command::SearchNodes {
             repository,
@@ -628,6 +656,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                 &has_children,
                 &property_values,
                 limit,
+                reporter,
             )?;
         }
         Command::Compact {
@@ -635,7 +664,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             tail,
             yes,
         } => {
-            if !mutation::run_compact(&repository, tail, yes)? {
+            if !mutation::run_compact(&repository, tail, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -679,7 +708,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
                     return Ok(ExitCode::FAILURE);
                 }
             }
-            if !mutation::run_cleanup(&repository, options, dry_run, yes)? {
+            if !mutation::run_cleanup(&repository, options, dry_run, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -688,7 +717,7 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             target,
             yes,
         } => {
-            if !mutation::run_backup(&source, &target, yes)? {
+            if !mutation::run_backup(&source, &target, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -697,22 +726,61 @@ fn run(command: Command) -> froe::Result<ExitCode> {
             target,
             yes,
         } => {
-            if !mutation::run_restore(&backup, &target, yes)? {
+            if !mutation::run_restore(&backup, &target, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
         Command::RecoverJournal { repository, yes } => {
-            if !mutation::run_recover_journal(&repository, yes)? {
+            if !mutation::run_recover_journal(&repository, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
         Command::Checkpoint { action } => {
-            if !run_checkpoint(action)? {
+            if !run_checkpoint(action, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Begins a reported step and ends it when dropped, so a step closes on
+/// every path out of an export — including the early returns that remove
+/// a partial output file.
+///
+/// The step leaves no completion line: every command that opens one goes
+/// on to report its own outcome, naming the destination the step cannot,
+/// and two lines saying the same thing is worse than one.
+struct ReportedStep {
+    reporter: Reporter,
+}
+
+impl ReportedStep {
+    fn begin(reporter: &Reporter, description: &'static str, unit: froe::WorkUnit) -> Self {
+        let mut reporter = reporter.clone();
+        reporter.step_began(&froe::Step::new(description, unit));
+        Self { reporter }
+    }
+
+    /// The step an export's node stream advances.
+    fn exporting(reporter: &Reporter) -> Self {
+        Self::begin(reporter, "exporting nodes", froe::WorkUnit::Nodes)
+    }
+
+    /// The step a Parquet refresh's delta export advances.
+    fn refreshing(reporter: &Reporter) -> Self {
+        Self::begin(
+            reporter,
+            "re-exporting changed nodes",
+            froe::WorkUnit::Nodes,
+        )
+    }
+}
+
+impl Drop for ReportedStep {
+    fn drop(&mut self) {
+        self.reporter.end_step_without_completion_line();
+    }
 }
 
 /// What an export run did, for the summary the caller prints.
@@ -738,14 +806,15 @@ fn run_json_lines_export(
     path: &str,
     depth: Option<usize>,
     output: Option<&Path>,
-    quiet: bool,
+    reporter: &Reporter,
 ) -> froe::Result<ExportRun> {
-    let repository = Repository::open(repository_path)?;
+    let repository = open_repository(repository_path, reporter)?;
     if let Some(output_path) = output {
         let file = froe_export::create_export_output(repository_path, output_path)?;
+        let _step = ReportedStep::exporting(reporter);
         let mut sink = progress::ProgressSink::new(
             froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(1 << 20, file)),
-            quiet,
+            reporter.clone(),
         );
         match froe_export::export_subtree(&repository, path, depth, &mut sink) {
             Ok(written) => {
@@ -771,12 +840,21 @@ fn run_json_lines_export(
         }
     } else {
         let standard_output = std::io::stdout();
+        // An export streaming to a terminal shares the screen with the
+        // report, and a live line drawn across it would corrupt both. A
+        // redirected export keeps its progress.
+        let reporter = if standard_output.is_terminal() {
+            Reporter::silent()
+        } else {
+            reporter.clone()
+        };
+        let _step = ReportedStep::exporting(&reporter);
         let mut sink = progress::ProgressSink::new(
             froe_export::JsonLinesSink::new(std::io::BufWriter::with_capacity(
                 1 << 20,
                 standard_output.lock(),
             )),
-            quiet,
+            reporter.clone(),
         );
         let written = froe_export::export_subtree(&repository, path, depth, &mut sink)?;
         Ok(match written {
@@ -800,32 +878,35 @@ fn run_parquet_export(
     depth: Option<usize>,
     output_directory: &Path,
     full: bool,
-    quiet: bool,
+    reporter: &Reporter,
 ) -> froe::Result<ExportRun> {
-    let repository = Repository::open(repository_path)?;
+    let repository = open_repository(repository_path, reporter)?;
     froe_export::create_export_directory(repository_path, output_directory)?;
     if full {
         let FullExport::Completed(run) =
-            run_full_parquet_export(&repository, path, depth, output_directory, true, quiet)?
+            run_full_parquet_export(&repository, path, depth, output_directory, true, reporter)?
         else {
             unreachable!("a forced export never defers to a refresh");
         };
         return Ok(run);
     }
-    let mut reporter = progress::Reporter::new(quiet, "re-exported");
+    let mut refresh_reporter = reporter.clone();
     // A rival writer can turn the directory back into a valid export
     // between the refresh attempt and the fallback's lock; a few
     // rounds settle it either way.
     for _attempt in 0..4 {
-        let refresh = froe_export::refresh_parquet_export(
-            &repository,
-            path,
-            depth,
-            output_directory,
-            &froe_export::ParquetExportOptions::default(),
-            &mut |nodes| reporter.report(nodes),
-        )?;
-        reporter.finish_line();
+        let started = std::time::Instant::now();
+        let refresh = {
+            let _step = ReportedStep::refreshing(reporter);
+            froe_export::refresh_parquet_export(
+                &repository,
+                path,
+                depth,
+                output_directory,
+                &froe_export::ParquetExportOptions::default(),
+                &mut |nodes| refresh_reporter.step_advanced(nodes),
+            )?
+        };
         match refresh {
             froe_export::ParquetRefresh::Missing => {
                 // The full export's own missing-path verdict, reached
@@ -833,10 +914,10 @@ fn run_parquet_export(
                 return Ok(ExportRun::Missing);
             }
             froe_export::ParquetRefresh::Current { revision } => {
-                eprintln!(
-                    "froe: the export in {} is already current ({revision})",
-                    output_directory.display()
-                );
+                reporter.status(&format!(
+                    "the export in {} is already current ({revision})",
+                    output::sanitize_terminal_path(output_directory)
+                ));
                 return Ok(ExportRun::Reported);
             }
             froe_export::ParquetRefresh::Refreshed {
@@ -844,12 +925,12 @@ fn run_parquet_export(
                 ranges,
                 nodes,
             } => {
-                eprintln!(
-                    "froe: refreshed the export in {} to {revision}: \
+                reporter.status(&format!(
+                    "refreshed the export in {} to {revision}: \
                      {ranges} changed ranges, {nodes} nodes re-exported in {:.1}s",
-                    output_directory.display(),
-                    reporter.elapsed().as_secs_f64()
-                );
+                    output::sanitize_terminal_path(output_directory),
+                    started.elapsed().as_secs_f64()
+                ));
                 return Ok(ExportRun::Reported);
             }
             froe_export::ParquetRefresh::NotReusable {
@@ -876,7 +957,7 @@ fn run_parquet_export(
                 .iter()
                 .any(|name| output_directory.join(name).exists());
                 if leftovers {
-                    eprintln!("froe: {reason}; exporting from scratch");
+                    reporter.status(&format!("{reason}; exporting from scratch"));
                 }
                 match run_full_parquet_export(
                     &repository,
@@ -884,7 +965,7 @@ fn run_parquet_export(
                     depth,
                     output_directory,
                     false,
-                    quiet,
+                    reporter,
                 )? {
                     FullExport::Completed(run) => return Ok(run),
                     // A valid export appeared under the lock; the next
@@ -951,7 +1032,7 @@ fn run_full_parquet_export(
     depth: Option<usize>,
     output_directory: &Path,
     forced: bool,
-    quiet: bool,
+    reporter: &Reporter,
 ) -> froe::Result<FullExport> {
     let _lock = froe_export::lock_export_directory(output_directory)?;
     if !forced && !authorize_replacement(repository, output_directory, path, depth)? {
@@ -1007,7 +1088,8 @@ fn run_full_parquet_export(
             return Err(error);
         }
     };
-    let mut sink = progress::ProgressSink::new(parquet_sink, quiet);
+    let _step = ReportedStep::exporting(reporter);
+    let mut sink = progress::ProgressSink::new(parquet_sink, reporter.clone());
     match froe_export::export_subtree(repository, path, depth, &mut sink) {
         Ok(written) => {
             let elapsed = sink.elapsed();
@@ -1058,16 +1140,17 @@ fn run_sqlite_export(
     path: &str,
     depth: Option<usize>,
     output_path: &Path,
-    quiet: bool,
+    reporter: &Reporter,
 ) -> froe::Result<ExportRun> {
-    let repository = Repository::open(repository_path)?;
+    let repository = open_repository(repository_path, reporter)?;
+    let _step = ReportedStep::exporting(reporter);
     let mut sink = progress::ProgressSink::new(
         froe_export::SqliteSink::create(
             repository_path,
             output_path,
             froe_export::SqliteExportOptions::default(),
         )?,
-        quiet,
+        reporter.clone(),
     );
     let written = froe_export::export_subtree(&repository, path, depth, &mut sink)?;
     Ok(match written {
@@ -1080,29 +1163,39 @@ fn run_sqlite_export(
 }
 
 /// Dispatches a checkpoint subcommand. Returns whether it succeeded.
-fn run_checkpoint(action: CheckpointAction) -> froe::Result<bool> {
+fn run_checkpoint(action: CheckpointAction, reporter: &Reporter) -> froe::Result<bool> {
     match action {
         CheckpointAction::List { repository } => {
             // Read-only, exactly like `froe checkpoints`: listing must
             // never take the lock or touch the manifest.
-            inspection::print_checkpoints(&Repository::open(&repository)?)?;
+            inspection::print_checkpoints(&open_repository(&repository, reporter)?)?;
             Ok(true)
         }
         CheckpointAction::Create {
             repository,
             lifetime_milliseconds,
             yes,
-        } => mutation::run_checkpoint_create(&repository, lifetime_milliseconds, yes),
+        } => mutation::run_checkpoint_create(&repository, lifetime_milliseconds, yes, reporter),
         CheckpointAction::Remove {
             repository,
             name,
             yes,
-        } => mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::Named(name), yes),
+        } => mutation::run_checkpoint_remove(
+            &repository,
+            &CheckpointRemoval::Named(name),
+            yes,
+            reporter,
+        ),
         CheckpointAction::RemoveAll { repository, yes } => {
-            mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::All, yes)
+            mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::All, yes, reporter)
         }
         CheckpointAction::RemoveUnreferenced { repository, yes } => {
-            mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::Unreferenced, yes)
+            mutation::run_checkpoint_remove(
+                &repository,
+                &CheckpointRemoval::Unreferenced,
+                yes,
+                reporter,
+            )
         }
     }
 }
@@ -1111,7 +1204,7 @@ fn run_checkpoint(action: CheckpointAction) -> froe::Result<bool> {
 mod tests {
     use clap::Parser;
 
-    use super::{CleanupTaskArgument, Command, CommandLine, ExportFormat};
+    use super::{CleanupTaskArgument, Command, CommandLine, ExportFormat, ProgressWhen};
 
     #[test]
     fn extract_parses_as_the_hidden_export_alias() {
@@ -1127,6 +1220,7 @@ mod tests {
             "out.jsonl",
         ])
         .expect("the v0.1.0 extract invocation must keep parsing");
+        assert!(!parsed.silent);
         let Command::Export {
             repository,
             path,
@@ -1134,7 +1228,6 @@ mod tests {
             format,
             output,
             full,
-            quiet,
         } = parsed.command
         else {
             panic!("extract must dispatch to export");
@@ -1145,11 +1238,12 @@ mod tests {
         assert_eq!(format, ExportFormat::JsonLines);
         assert_eq!(output, Some(std::path::PathBuf::from("out.jsonl")));
         assert!(!full);
-        assert!(!quiet);
     }
 
     #[test]
-    fn export_parses_the_quiet_flag() {
+    fn the_export_quiet_flag_still_parses_as_silent() {
+        // `--quiet` was `export`'s own flag before reporting became
+        // uniform; the invocation must keep working.
         let parsed = CommandLine::try_parse_from([
             "froe",
             "export",
@@ -1158,11 +1252,85 @@ mod tests {
             "--output",
             "out.jsonl",
         ])
-        .expect("the quiet flag must parse");
-        let Command::Export { quiet, .. } = parsed.command else {
-            panic!("export must dispatch");
+        .expect("the v0.6.0 quiet flag must keep parsing");
+        assert!(parsed.silent);
+        assert!(matches!(parsed.command, Command::Export { .. }));
+    }
+
+    #[test]
+    fn silence_is_global_and_abbreviated() {
+        for arguments in [
+            ["froe", "cleanup", "/store", "--silent"],
+            ["froe", "cleanup", "/store", "-s"],
+            ["froe", "cleanup", "/store", "--quiet"],
+        ] {
+            let parsed =
+                CommandLine::try_parse_from(arguments).expect("silence parses on every command");
+            assert!(parsed.silent, "{arguments:?} did not request silence");
+            assert_eq!(parsed.progress, ProgressWhen::Auto);
+        }
+    }
+
+    #[test]
+    fn progress_is_global_and_defaults_to_auto() {
+        let parsed =
+            CommandLine::try_parse_from(["froe", "summary", "/store"]).expect("the default parses");
+        assert_eq!(parsed.progress, ProgressWhen::Auto);
+        for (argument, expected) in [
+            ("always", ProgressWhen::Always),
+            ("never", ProgressWhen::Never),
+            ("auto", ProgressWhen::Auto),
+        ] {
+            let parsed =
+                CommandLine::try_parse_from(["froe", "compact", "/store", "--progress", argument])
+                    .expect("every progress mode parses");
+            assert_eq!(parsed.progress, expected);
+        }
+    }
+
+    #[test]
+    fn silence_and_an_explicit_progress_mode_are_refused_together() {
+        let parsed = CommandLine::try_parse_from([
+            "froe",
+            "cleanup",
+            "/store",
+            "--silent",
+            "--progress",
+            "always",
+        ]);
+        let Err(error) = parsed else {
+            panic!("contradictory reporting requests must be refused");
         };
-        assert!(quiet);
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn the_reporting_flags_are_documented_on_every_command() {
+        let mut command = <CommandLine as clap::CommandFactory>::command();
+        // Global arguments reach the subcommands only once the command is
+        // built; an unbuilt tree would report them missing.
+        command.build();
+        for path in [&["cleanup"][..], &["export"], &["summary"], &["compact"]] {
+            let mut selected = &mut command;
+            for component in path {
+                selected = selected
+                    .find_subcommand_mut(component)
+                    .unwrap_or_else(|| panic!("missing subcommand path {path:?}"));
+            }
+            let mut help = Vec::new();
+            selected.write_long_help(&mut help).expect("render help");
+            let help = String::from_utf8(help).expect("valid UTF-8");
+            for required in ["--silent", "--progress"] {
+                assert!(
+                    help.contains(required),
+                    "help for {path:?} omitted {required}: {help}"
+                );
+            }
+            assert!(
+                !help.contains("--quiet"),
+                "the compatibility alias must stay undocumented: {help}"
+            );
+        }
     }
 
     #[test]

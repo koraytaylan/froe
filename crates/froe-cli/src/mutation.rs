@@ -15,34 +15,49 @@ use froe::writer::commit::{
 use froe::writer::compaction::CompactionKind;
 use froe::writer::store_writer::WritableRepository;
 use froe::{
-    CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupPlan, PreparedCleanup, backup,
-    compact, plan_cleanup, recover_journal, restore,
+    CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupPlan, PreparedCleanup,
+    backup_with_progress, compact_with_progress, plan_cleanup_with_progress,
+    recover_journal_with_progress, restore_with_progress,
 };
 
+use crate::progress::Reporter;
+
 /// Asks for confirmation before a mutating operation, unless `assume_yes`.
-fn confirm(action: &str, assume_yes: bool) -> bool {
+///
+/// The prompt is written with the reporter suspended, so a live progress
+/// line is erased first and nothing is drawn over the question while the
+/// operator is answering it. `--silent` never hides this prompt: it is a
+/// question about a destructive change, not a progress report.
+fn confirm(action: &str, assume_yes: bool, reporter: &Reporter) -> bool {
     if assume_yes {
         return true;
     }
-    let _ = std::io::stdout().flush();
-    eprint!("froe: {action} — this modifies the repository. Continue? [y/N] ");
-    let _ = std::io::stderr().flush();
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return false;
-    }
-    matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+    reporter.while_suspended(|| {
+        let _ = std::io::stdout().flush();
+        eprint!("froe: {action} — this modifies the repository. Continue? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            return false;
+        }
+        matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+    })
 }
 
 /// `froe compact`: offline full or tail compaction.
-pub(crate) fn run_compact(repository: &Path, tail: bool, assume_yes: bool) -> froe::Result<bool> {
+pub(crate) fn run_compact(
+    repository: &Path,
+    tail: bool,
+    assume_yes: bool,
+    reporter: &Reporter,
+) -> froe::Result<bool> {
     let kind = if tail {
         CompactionKind::Tail
     } else {
         CompactionKind::Full
     };
-    eprintln!(
-        "froe: note: post-compaction TAR rewrites require same-directory hard-link and directory-fsync support; an unsupported filesystem fails safely with source archives retained"
+    reporter.status(
+        "note: post-compaction TAR rewrites require same-directory hard-link and directory-fsync support; an unsupported filesystem fails safely with source archives retained",
     );
     if !confirm(
         &format!(
@@ -51,13 +66,15 @@ pub(crate) fn run_compact(repository: &Path, tail: bool, assume_yes: bool) -> fr
             crate::output::sanitize_terminal_path(repository)
         ),
         assume_yes,
+        reporter,
     ) {
         eprintln!("froe: compaction cancelled");
         return Ok(false);
     }
-    let mut store = WritableRepository::open(repository)?;
-    let outcome = compact(&mut store, kind)?;
+    let mut store = WritableRepository::open_with_progress(repository, &mut reporter.clone())?;
+    let outcome = compact_with_progress(&mut store, kind, &mut reporter.clone())?;
     store.close()?;
+    reporter.finish();
     println!(
         "compacted {} nodes; {} bytes -> {} bytes ({} reclaimed)",
         outcome.compacted_nodes,
@@ -82,8 +99,12 @@ pub(crate) fn run_cleanup(
     options: CleanupOptions,
     dry_run: bool,
     assume_yes: bool,
+    reporter: &Reporter,
 ) -> froe::Result<bool> {
-    let preview = plan_cleanup(repository, &options)?;
+    let preview = plan_cleanup_with_progress(repository, &options, &mut reporter.clone())?;
+    // The plan is the operator's evidence for a destructive decision: end
+    // every report before a single line of it is written.
+    reporter.finish();
     print_cleanup_plan(&preview);
     if dry_run {
         println!("dry-run: repository was not modified");
@@ -99,13 +120,19 @@ pub(crate) fn run_cleanup(
             crate::output::sanitize_terminal_path(preview.directory())
         ),
         assume_yes,
+        reporter,
     ) {
         eprintln!("froe: cleanup cancelled");
         return Ok(false);
     }
 
-    let prepared = PreparedCleanup::prepare(preview.directory(), options)?;
+    let prepared = PreparedCleanup::prepare_with_progress(
+        preview.directory(),
+        options,
+        &mut reporter.clone(),
+    )?;
     if prepared.plan() != &preview {
+        reporter.finish();
         eprintln!(
             "froe: repository state changed before the lock was acquired; authoritative plan:"
         );
@@ -113,12 +140,14 @@ pub(crate) fn run_cleanup(
         if !confirm(
             "about to apply the changed authoritative cleanup plan",
             assume_yes,
+            reporter,
         ) {
             eprintln!("froe: cleanup cancelled");
             return Ok(false);
         }
     }
-    let outcome = prepared.apply()?;
+    let outcome = prepared.apply_with_progress(&mut reporter.clone())?;
+    reporter.finish();
     let complete = outcome.is_complete();
     let status = if complete {
         "cleanup complete"
@@ -331,7 +360,12 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
 }
 
 /// `froe backup`: copy the source repository's head into a target.
-pub(crate) fn run_backup(source: &Path, target: &Path, assume_yes: bool) -> froe::Result<bool> {
+pub(crate) fn run_backup(
+    source: &Path,
+    target: &Path,
+    assume_yes: bool,
+    reporter: &Reporter,
+) -> froe::Result<bool> {
     if !confirm(
         &format!(
             "about to back up {} into {}",
@@ -339,11 +373,13 @@ pub(crate) fn run_backup(source: &Path, target: &Path, assume_yes: bool) -> froe
             crate::output::sanitize_terminal_path(target)
         ),
         assume_yes,
+        reporter,
     ) {
         eprintln!("froe: backup cancelled");
         return Ok(false);
     }
-    backup(source, target)?;
+    backup_with_progress(source, target, &mut reporter.clone())?;
+    reporter.finish();
     println!(
         "backup complete: {} -> {}",
         crate::output::sanitize_terminal_path(source),
@@ -357,6 +393,7 @@ pub(crate) fn run_restore(
     backup_directory: &Path,
     target: &Path,
     assume_yes: bool,
+    reporter: &Reporter,
 ) -> froe::Result<bool> {
     if !confirm(
         &format!(
@@ -365,11 +402,13 @@ pub(crate) fn run_restore(
             crate::output::sanitize_terminal_path(target)
         ),
         assume_yes,
+        reporter,
     ) {
         eprintln!("froe: restore cancelled");
         return Ok(false);
     }
-    restore(backup_directory, target)?;
+    restore_with_progress(backup_directory, target, &mut reporter.clone())?;
+    reporter.finish();
     println!(
         "restore complete: {} -> {}",
         crate::output::sanitize_terminal_path(backup_directory),
@@ -379,18 +418,24 @@ pub(crate) fn run_restore(
 }
 
 /// `froe recover-journal`: rebuild journal.log from the segments.
-pub(crate) fn run_recover_journal(repository: &Path, assume_yes: bool) -> froe::Result<bool> {
+pub(crate) fn run_recover_journal(
+    repository: &Path,
+    assume_yes: bool,
+    reporter: &Reporter,
+) -> froe::Result<bool> {
     if !confirm(
         &format!(
             "about to rebuild the journal of {}",
             crate::output::sanitize_terminal_path(repository)
         ),
         assume_yes,
+        reporter,
     ) {
         eprintln!("froe: recovery cancelled");
         return Ok(false);
     }
-    let outcome = recover_journal(repository)?;
+    let outcome = recover_journal_with_progress(repository, &mut reporter.clone())?;
+    reporter.finish();
     println!(
         "recovered head {} from {} candidates",
         outcome.recovered_head, outcome.candidates_examined
@@ -409,6 +454,7 @@ pub(crate) fn run_checkpoint_create(
     repository: &Path,
     lifetime_milliseconds: i64,
     assume_yes: bool,
+    reporter: &Reporter,
 ) -> froe::Result<bool> {
     if !confirm(
         &format!(
@@ -416,11 +462,12 @@ pub(crate) fn run_checkpoint_create(
             crate::output::sanitize_terminal_path(repository)
         ),
         assume_yes,
+        reporter,
     ) {
         eprintln!("froe: checkpoint creation cancelled");
         return Ok(false);
     }
-    let store = WritableRepository::open(repository)?;
+    let store = WritableRepository::open_with_progress(repository, &mut reporter.clone())?;
     let name = create_checkpoint(&store, lifetime_milliseconds, &[])?;
     store.close()?;
     println!(
@@ -436,6 +483,7 @@ pub(crate) fn run_checkpoint_remove(
     repository: &Path,
     target: &CheckpointRemoval,
     assume_yes: bool,
+    reporter: &Reporter,
 ) -> froe::Result<bool> {
     let target_description = match target {
         CheckpointRemoval::Named(name) => {
@@ -450,11 +498,12 @@ pub(crate) fn run_checkpoint_remove(
             crate::output::sanitize_terminal_path(repository)
         ),
         assume_yes,
+        reporter,
     ) {
         eprintln!("froe: checkpoint removal cancelled");
         return Ok(false);
     }
-    let store = WritableRepository::open(repository)?;
+    let store = WritableRepository::open_with_progress(repository, &mut reporter.clone())?;
     match target {
         CheckpointRemoval::Named(name) => {
             if release_checkpoint(&store, name)? {

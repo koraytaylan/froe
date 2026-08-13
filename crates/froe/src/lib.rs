@@ -67,6 +67,11 @@
 //! * [`gc_journal`] — optional garbage-collection history;
 //! * [`store`] — the assembled read-only repository.
 //!
+//! Long-running operations — opening a large store, planning a cleanup,
+//! compacting, checking consistency — have a `_with_progress` twin that
+//! reports what they are doing to a [`progress::ProgressObserver`], so a
+//! caller need not guess whether a silent minute means work or a hang.
+//!
 //! Custom backends (in-memory fixtures, remote stores) implement
 //! [`SegmentProvider`] and reuse the whole content layer unchanged.
 
@@ -76,6 +81,7 @@ pub mod error;
 pub mod gc_journal;
 pub mod hashing;
 pub mod journal;
+pub mod progress;
 pub mod segment;
 pub mod store;
 pub mod tar_archive;
@@ -89,6 +95,7 @@ pub use content::{
 pub use error::{Error, Result};
 pub use gc_journal::GarbageCollectionJournalEntry;
 pub use journal::JournalEntry;
+pub use progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 pub use segment::{
     GarbageCollectionGeneration, RecordIdentifier, RecordType, SegmentIdentifier, SegmentKind,
 };
@@ -97,5 +104,7 @@ pub use writer::{
     CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupOutcome, CleanupPlan,
     CleanupTask, CompactionKind, CompactionOutcome, JournalLineRemoval, JournalRemovalReason,
     PreparedCleanup, RecoveryBackupPolicy, RecoveryOutcome, StaleArchiveReason, WritableRepository,
-    backup, cleanup, compact, plan_cleanup, recover_journal, restore,
+    backup, backup_with_progress, cleanup, cleanup_with_progress, compact, compact_with_progress,
+    plan_cleanup, plan_cleanup_with_progress, recover_journal, recover_journal_with_progress,
+    restore, restore_with_progress,
 };

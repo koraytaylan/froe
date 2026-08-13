@@ -12,11 +12,15 @@ use froe::tooling::archive_debug::{
 };
 use froe::tooling::diff::{NodeDifference, PropertyChange};
 use froe::tooling::search::SearchQuery;
-use froe::tooling::{check_consistency, diff_revisions, dump_segment, node_history, search_nodes};
+use froe::tooling::{
+    check_consistency_with_progress, diff_revisions_with_progress, dump_segment,
+    node_history_with_progress, search_nodes_with_progress,
+};
 
 use froe_export::json::append_json_values;
 
 use crate::output::{format_timestamp, sanitize_terminal_text};
+use crate::progress::Reporter;
 
 /// `froe segment --hex`: Oak-compatible `SegmentDump` output.
 pub(crate) fn print_segment_dump(
@@ -234,8 +238,15 @@ pub(crate) fn print_check(
     paths: &[String],
     check_binaries: bool,
     revision_limit: usize,
+    reporter: &Reporter,
 ) -> froe::Result<bool> {
-    let report = check_consistency(repository, paths, check_binaries, revision_limit)?;
+    let report = check_consistency_with_progress(
+        repository,
+        paths,
+        check_binaries,
+        revision_limit,
+        &mut reporter.clone(),
+    )?;
     println!(
         "searched through {} revisions and {} checkpoints",
         report.checked_revisions,
@@ -296,8 +307,10 @@ pub(crate) fn print_difference(
     before: &str,
     after: &str,
     path: &str,
+    reporter: &Reporter,
 ) -> froe::Result<()> {
-    let differences = diff_revisions(repository, before, after, path)?;
+    let differences =
+        diff_revisions_with_progress(repository, before, after, path, &mut reporter.clone())?;
     if differences.is_empty() {
         println!("no differences");
         return Ok(());
@@ -370,8 +383,12 @@ fn render(values: &PropertyValues) -> String {
 }
 
 /// `froe history`: print a node's states across revisions.
-pub(crate) fn print_history(repository: &Path, path: &str) -> froe::Result<()> {
-    for entry in node_history(repository, path)? {
+pub(crate) fn print_history(
+    repository: &Path,
+    path: &str,
+    reporter: &Reporter,
+) -> froe::Result<()> {
+    for entry in node_history_with_progress(repository, path, &mut reporter.clone())? {
         let record = entry
             .record
             .map_or_else(|| "absent".to_owned(), |record| record.to_string());
@@ -391,6 +408,7 @@ pub(crate) fn print_search(
     has_children: &[String],
     property_values: &[(String, String)],
     limit: usize,
+    reporter: &Reporter,
 ) -> froe::Result<()> {
     let query = SearchQuery {
         has_properties: has_properties.to_vec(),
@@ -404,7 +422,7 @@ pub(crate) fn print_search(
             details: "search-nodes needs at least one predicate".to_owned(),
         });
     }
-    let outcome = search_nodes(repository, &query, limit)?;
+    let outcome = search_nodes_with_progress(repository, &query, limit, &mut reporter.clone())?;
     for node_match in &outcome.matches {
         println!(
             "{}  stable {}",

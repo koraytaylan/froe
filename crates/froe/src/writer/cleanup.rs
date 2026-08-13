@@ -30,6 +30,7 @@ use crate::content::provider::SegmentProvider;
 use crate::content::template::{Template, read_template};
 use crate::content::value::read_string;
 use crate::error::{Error, Result};
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::{RecordIdentifier, RecordType};
 use crate::segment::view::SegmentView;
@@ -47,10 +48,15 @@ use crate::writer::segment_builder::GarbageCollectionGeneration;
 use crate::writer::store_writer::{
     PlannedArchiveSweep, StandaloneSegmentCleanupOutcome, StandaloneSegmentCleanupPlan,
     WritableRepository, apply_standalone_segment_cleanup, certify_active_archive,
-    certify_active_archives, is_reclaimable, next_cleanup_archive_number,
+    certify_active_archives_with_progress, is_reclaimable, next_cleanup_archive_number,
     plan_standalone_segment_cleanup, planned_unavailable_segments, preserve_file_metadata,
     sync_directory_strict,
 };
+
+/// How many segments a closure trace visits between progress reports.
+/// The trace resolves one segment per step, so reporting every segment
+/// would call the observer millions of times on a large store.
+const SEGMENT_TRACE_REPORT_STRIDE: u64 = 256;
 
 /// One independently selectable cleanup category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -584,6 +590,17 @@ impl PreparedCleanup {
     /// validates it without mutation, acquires `repo.lock`, and rebuilds an
     /// authoritative plan while holding that lock.
     pub fn prepare(directory: &Path, options: CleanupOptions) -> Result<Self> {
+        Self::prepare_with_progress(directory, options, &mut DiscardedProgress)
+    }
+
+    /// Prepares exactly like [`PreparedCleanup::prepare`], reporting the
+    /// authoritative replan — the slow part, repeated under the lock — to
+    /// `observer`.
+    pub fn prepare_with_progress(
+        directory: &Path,
+        options: CleanupOptions,
+        observer: &mut dyn ProgressObserver,
+    ) -> Result<Self> {
         validate_options(&options)?;
         let directory = canonical_repository_directory(directory)?;
         validate_repository_shape(&directory)?;
@@ -598,7 +615,7 @@ impl PreparedCleanup {
         validate_apply_identity(&directory)?;
         repository_lock.validate_path_identity(&directory)?;
         let now = SystemTime::now();
-        let plan = build_plan(&directory, &options, now)?;
+        let plan = build_plan(&directory, &options, now, observer)?;
         validate_plan_apply_identity(&directory, &plan)?;
         Ok(Self {
             directory,
@@ -617,7 +634,18 @@ impl PreparedCleanup {
     /// Applies exactly this authoritative plan, failing before the first
     /// mutation if any directory entry changed after planning.
     pub fn apply(self) -> Result<CleanupOutcome> {
-        apply_prepared(self)
+        apply_prepared(self, &mut DiscardedProgress)
+    }
+
+    /// Applies exactly like [`PreparedCleanup::apply`], reporting the
+    /// archive rewrites and file removals to `observer`. Reporting cannot
+    /// alter the mutation sequence: the observer is told what has already
+    /// been done and never decides anything.
+    pub fn apply_with_progress(
+        self,
+        observer: &mut dyn ProgressObserver,
+    ) -> Result<CleanupOutcome> {
+        apply_prepared(self, observer)
     }
 }
 
@@ -952,17 +980,41 @@ fn append_apply_identity_preview_warning_for_credentials(
 /// [`PreparedCleanup::prepare`] so an alias cannot redirect lock acquisition
 /// after the preview.
 pub fn plan_cleanup(directory: &Path, options: &CleanupOptions) -> Result<CleanupPlan> {
+    plan_cleanup_with_progress(directory, options, &mut DiscardedProgress)
+}
+
+/// Plans exactly like [`plan_cleanup`] — still strictly read-only, still
+/// without acquiring the lock — reporting each planning step to
+/// `observer`. Planning a large store is the phase that takes minutes:
+/// it verifies the whole head tree, replays the journal, and traces the
+/// reachable segment closure before it can say anything at all.
+pub fn plan_cleanup_with_progress(
+    directory: &Path,
+    options: &CleanupOptions,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CleanupPlan> {
     validate_options(options)?;
     let directory = canonical_repository_directory(directory)?;
     validate_repository_shape(&directory)?;
-    build_plan(&directory, options, SystemTime::now())
+    build_plan(&directory, options, SystemTime::now(), observer)
 }
 
 /// Convenience non-interactive API: prepares under lock and immediately
 /// applies the authoritative plan. Interactive callers should use
 /// [`plan_cleanup`] and [`PreparedCleanup`] so they can display/reconfirm.
 pub fn cleanup(directory: &Path, options: CleanupOptions) -> Result<CleanupOutcome> {
-    PreparedCleanup::prepare(directory, options)?.apply()
+    cleanup_with_progress(directory, options, &mut DiscardedProgress)
+}
+
+/// Prepares and applies exactly like [`cleanup`], reporting both phases
+/// to `observer`.
+pub fn cleanup_with_progress(
+    directory: &Path,
+    options: CleanupOptions,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CleanupOutcome> {
+    PreparedCleanup::prepare_with_progress(directory, options, observer)?
+        .apply_with_progress(observer)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1171,18 +1223,23 @@ fn file_fingerprint(name: OsString, metadata: &Metadata) -> FileFingerprint {
     clippy::too_many_lines,
     reason = "the plan builder is one safety-ordered inventory transaction; splitting it would obscure ordering and duplicate state"
 )]
-fn build_plan(directory: &Path, options: &CleanupOptions, now: SystemTime) -> Result<CleanupPlan> {
+fn build_plan(
+    directory: &Path,
+    options: &CleanupOptions,
+    now: SystemTime,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CleanupPlan> {
     let fingerprint_before = directory_fingerprint(directory)?;
-    let repository = Repository::open(directory)?;
+    let repository = Repository::open_with_progress(directory, observer)?;
     let current_head = repository.head_record_identifier();
 
     // Repository::open deliberately binds by segment existence, matching
     // Oak. Cleanup's gate is stronger: the exact selected record and every
     // descendant (including binary blocks and checkpoints) must traverse.
-    verify_exact_super_root(&repository, current_head)?;
+    verify_exact_super_root(&repository, current_head, observer)?;
 
     let raw_journal = scan_raw_journal(directory)?;
-    let journal_analysis = analyze_journal(&repository, &raw_journal, current_head)?;
+    let journal_analysis = analyze_journal(&repository, &raw_journal, current_head, observer)?;
 
     let mut warnings = Vec::new();
     let checkpoints = plan_checkpoints(&repository, options, now, &mut warnings)?;
@@ -1198,7 +1255,12 @@ fn build_plan(directory: &Path, options: &CleanupOptions, now: SystemTime) -> Re
         reject_duplicate_active_segments(&repository)?;
     }
     let stale_archives = if options.contains(CleanupTask::StaleArchives) {
-        plan_stale_archives(directory, &repository, &mut warnings)?
+        crate::progress::observe(
+            observer,
+            &Step::new("scanning for stale archives", WorkUnit::Archives)
+                .with_total(crate::progress::count(repository.archives().len())),
+            |observer| plan_stale_archives(directory, &repository, &mut warnings, observer),
+        )?
     } else {
         Vec::new()
     };
@@ -1207,7 +1269,21 @@ fn build_plan(directory: &Path, options: &CleanupOptions, now: SystemTime) -> Re
     let mut current_closure = HashSet::new();
     if options.contains(CleanupTask::Segments) || !checkpoints.names.is_empty() {
         let active_index_generations = active_index_generations(&repository)?;
-        extend_segment_closure(&repository, [current_head.segment], &mut current_closure)?;
+        crate::progress::observe(
+            observer,
+            &Step::new(
+                "tracing segments reachable from the head",
+                WorkUnit::Segments,
+            ),
+            |observer| {
+                extend_segment_closure(
+                    &repository,
+                    [current_head.segment],
+                    &mut current_closure,
+                    observer,
+                )
+            },
+        )?;
         validate_current_generation_invariant(
             &repository,
             &current_closure,
@@ -1218,13 +1294,23 @@ fn build_plan(directory: &Path, options: &CleanupOptions, now: SystemTime) -> Re
     let mut protected_history_segments = HashSet::new();
     let segment_plan = if options.contains(CleanupTask::Segments) {
         let mut retained_closure = current_closure;
-        extend_segment_closure(
-            &repository,
-            journal_analysis
-                .retained_record_ids
-                .iter()
-                .map(|record| record.segment),
-            &mut retained_closure,
+        crate::progress::observe(
+            observer,
+            &Step::new(
+                "tracing segments reachable from history",
+                WorkUnit::Segments,
+            ),
+            |observer| {
+                extend_segment_closure(
+                    &repository,
+                    journal_analysis
+                        .retained_record_ids
+                        .iter()
+                        .map(|record| record.segment),
+                    &mut retained_closure,
+                    observer,
+                )
+            },
         )?;
         protected_history_segments.extend(
             retained_closure
@@ -1232,12 +1318,20 @@ fn build_plan(directory: &Path, options: &CleanupOptions, now: SystemTime) -> Re
                 .filter(|identifier| identifier.is_data_segment()),
         );
 
-        let plan = plan_standalone_segment_cleanup(
-            directory,
-            &repository,
-            reference_generation,
-            current_head.segment,
-            &protected_history_segments,
+        let plan = crate::progress::observe(
+            observer,
+            &Step::new("planning segment reclamation", WorkUnit::Archives)
+                .with_total(crate::progress::count(repository.archives().len())),
+            |observer| {
+                plan_standalone_segment_cleanup(
+                    directory,
+                    &repository,
+                    reference_generation,
+                    current_head.segment,
+                    &protected_history_segments,
+                    observer,
+                )
+            },
         )?;
         let retained_roots = prospective_retained_roots(
             directory,
@@ -1245,14 +1339,38 @@ fn build_plan(directory: &Path, options: &CleanupOptions, now: SystemTime) -> Re
             &plan,
             &journal_analysis.retained_record_ids,
         );
-        validate_prospective_segment_plan(directory, &repository, &plan, &retained_roots)?;
+        crate::progress::observe(
+            observer,
+            &Step::new("validating the prospective plan", WorkUnit::Nodes),
+            |observer| {
+                validate_prospective_segment_plan(
+                    directory,
+                    &repository,
+                    &plan,
+                    &retained_roots,
+                    observer,
+                )
+            },
+        )?;
         Some(plan)
     } else {
         None
     };
 
     let temporaries = if options.contains(CleanupTask::StaleTemporaries) {
-        plan_stale_temporaries(directory, &repository, &raw_journal, &mut warnings)?
+        crate::progress::observe(
+            observer,
+            &Step::new("scanning for stale temporary files", WorkUnit::Files),
+            |observer| {
+                plan_stale_temporaries(
+                    directory,
+                    &repository,
+                    &raw_journal,
+                    &mut warnings,
+                    observer,
+                )
+            },
+        )?
     } else {
         Vec::new()
     };
@@ -1488,15 +1606,30 @@ fn available_filesystem_bytes(directory: &Path) -> Option<u64> {
     }
 }
 
-fn verify_exact_super_root(repository: &Repository, head: RecordIdentifier) -> Result<()> {
-    let mut verifier = NodeTreeVerifier::new(repository);
-    verify_exact_super_root_with_verifier(repository, head, &mut verifier)
+/// Verifies the exact head tree, reporting it as one step of its own.
+/// A function that reports owns its step: wrapping this call in a step
+/// belonging to a caller would put two different counters — nodes here,
+/// whatever the caller counts — inside one report.
+fn verify_exact_super_root(
+    repository: &Repository,
+    head: RecordIdentifier,
+    observer: &mut dyn ProgressObserver,
+) -> Result<()> {
+    crate::progress::observe(
+        observer,
+        &Step::new("verifying the current head", WorkUnit::Nodes),
+        |observer| {
+            let mut verifier = NodeTreeVerifier::new(repository);
+            verify_exact_super_root_with_verifier(repository, head, &mut verifier, observer)
+        },
+    )
 }
 
 fn verify_exact_super_root_with_verifier(
     repository: &Repository,
     head: RecordIdentifier,
     verifier: &mut NodeTreeVerifier<'_>,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
     let view = repository.segment(head.segment)?;
     if view.structure.record_type(head.record_number) != Some(RecordType::Node) {
@@ -1504,7 +1637,7 @@ fn verify_exact_super_root_with_verifier(
             details: format!("current journal head {head} is not a node record"),
         });
     }
-    verifier.verify(head)?;
+    verifier.verify_with_progress(head, observer)?;
     let super_root = repository.node(head);
     super_root
         .child_node("root")?
@@ -1550,14 +1683,30 @@ fn journal_line_removal(
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "classification, exact retained-line evidence, and removal diagnostics form one auditable journal pass"
-)]
 fn analyze_journal(
     repository: &Repository,
     raw: &RawJournal,
     current_head: RecordIdentifier,
+    observer: &mut dyn ProgressObserver,
+) -> Result<JournalAnalysis> {
+    crate::progress::observe(
+        observer,
+        &Step::new("analyzing journal revisions", WorkUnit::JournalLines)
+            .with_total(crate::progress::count(raw.lines().len())),
+        |observer| analyze_journal_lines(repository, raw, current_head, observer),
+    )
+}
+
+/// The journal pass itself; [`analyze_journal`] owns the step around it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "classification, exact retained-line evidence, and removal diagnostics form one auditable journal pass"
+)]
+fn analyze_journal_lines(
+    repository: &Repository,
+    raw: &RawJournal,
+    current_head: RecordIdentifier,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<JournalAnalysis> {
     let selected = raw
         .lines()
@@ -1593,6 +1742,7 @@ fn analyze_journal(
     let mut verifier = NodeTreeVerifier::new(repository);
 
     for (index, line) in raw.lines().iter().enumerate() {
+        observer.step_advanced(crate::progress::count(index));
         match line.classification() {
             RawJournalLineClassification::ParserSkippedNoSpace => {
                 parser_ignored += 1;
@@ -1627,10 +1777,15 @@ fn analyze_journal(
                 let readable = if let Some(readable) = validity.get(&identifier) {
                     *readable
                 } else {
+                    // The historical revision's own node walk shares this
+                    // step's journal-line counter rather than reporting
+                    // nodes: a step counts one unit, and the line index is
+                    // the one the reader can act on.
                     let readable = verify_exact_super_root_with_verifier(
                         repository,
                         identifier,
                         &mut verifier,
+                        &mut DiscardedProgress,
                     )
                     .is_ok();
                     validity.insert(identifier, readable);
@@ -1651,6 +1806,7 @@ fn analyze_journal(
             }
         }
     }
+    observer.step_advanced(crate::progress::count(raw.lines().len()));
     if !retained_record_ids.contains(&current_head) {
         return Err(Error::InvalidFormat {
             details: "journal analysis would not retain the exact current head".to_owned(),
@@ -1762,6 +1918,7 @@ fn plan_stale_archives(
     directory: &Path,
     repository: &Repository,
     warnings: &mut Vec<String>,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<Vec<StaleArchive>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(directory)? {
@@ -1774,8 +1931,11 @@ fn plan_stale_archives(
         }
     }
     let groups = group_file_generations_newest_first(&names)?;
+    let group_count = groups.len();
+    observer.step_total_resolved(crate::progress::count(group_count));
     let mut stale = Vec::new();
-    for group in groups {
+    for (examined, group) in groups.into_iter().enumerate() {
+        observer.step_advanced(crate::progress::count(examined));
         let mut winner = None;
         let mut indexed_but_incomplete = None;
         for candidate in &group {
@@ -1859,6 +2019,7 @@ fn plan_stale_archives(
             }
         }
     }
+    observer.step_advanced(crate::progress::count(group_count));
     stale.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     Ok(stale)
 }
@@ -1928,15 +2089,19 @@ fn extend_segment_closure(
     provider: &dyn SegmentProvider,
     roots: impl IntoIterator<Item = SegmentIdentifier>,
     seen: &mut HashSet<SegmentIdentifier>,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
     let mut pending: VecDeque<_> = roots.into_iter().collect();
+    let mut traced = crate::progress::StrideCounter::new(SEGMENT_TRACE_REPORT_STRIDE);
     while let Some(identifier) = pending.pop_front() {
         if !seen.insert(identifier) {
             continue;
         }
         let segment = provider.segment(identifier)?;
+        traced.advance(observer);
         pending.extend(segment.structure.referenced_segments.iter().copied());
     }
+    traced.finish(observer);
     Ok(())
 }
 
@@ -2005,6 +2170,7 @@ fn validate_prospective_segment_plan(
     repository: &Repository,
     plan: &StandaloneSegmentCleanupPlan,
     retained_roots: &[RecordIdentifier],
+    observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
     let unavailable = planned_unavailable_segments(directory, plan)?;
     if unavailable.is_empty() {
@@ -2017,7 +2183,7 @@ fn validate_prospective_segment_plan(
     let mut verifier = NodeTreeVerifier::new(&provider);
     for &root in retained_roots {
         verifier
-            .verify(root)
+            .verify_with_progress(root, observer)
             .map_err(|error| Error::InvalidFormat {
                 details: format!(
                     "segment cleanup would make retained journal root {root} unreadable: {error}"
@@ -2123,6 +2289,7 @@ fn plan_stale_temporaries(
     repository: &Repository,
     canonical_journal: &RawJournal,
     warnings: &mut Vec<String>,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<Vec<PlannedFileRemoval>> {
     let canonical_records: HashSet<Vec<u8>> = canonical_journal
         .lines()
@@ -2137,6 +2304,8 @@ fn plan_stale_temporaries(
     let upgraded_manifest = (crate::store::read_manifest_store_version(&manifest_path)? < 2)
         .then(|| manifest_upgrade_bytes(&canonical_manifest));
     let mut planned = Vec::new();
+    // Every directory entry is one step, so nothing is worth batching.
+    let mut examined = crate::progress::StrideCounter::new(1);
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -2207,7 +2376,10 @@ fn plan_stale_temporaries(
                 "temporary {name} is not provably redundant and was retained"
             ));
         }
+        // Counted once the entry has been classified, not on the way in.
+        examined.advance(observer);
     }
+    examined.finish(observer);
     planned.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     Ok(planned)
 }
@@ -2322,7 +2494,10 @@ fn plan_recovery_backups(
     clippy::too_many_lines,
     reason = "the apply path intentionally presents its crash-safe mutation order as one linear transaction"
 )]
-fn apply_prepared(prepared: PreparedCleanup) -> Result<CleanupOutcome> {
+fn apply_prepared(
+    prepared: PreparedCleanup,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CleanupOutcome> {
     let PreparedCleanup {
         directory,
         options,
@@ -2346,9 +2521,9 @@ fn apply_prepared(prepared: PreparedCleanup) -> Result<CleanupOutcome> {
         // replaced. Version-two stores do this once inside the segment apply;
         // only the one-time manifest transition needs an additional pass so a
         // bad source cannot leave even a compatible metadata upgrade behind.
-        let repository = Repository::open(&directory)?;
+        let repository = Repository::open_with_progress(&directory, observer)?;
         reject_duplicate_active_segments(&repository)?;
-        certify_active_archives(&repository, repository.archives())?;
+        certify_active_archives_with_progress(&repository, repository.archives(), observer)?;
     }
     if plan.manifest_upgrade {
         repository_lock.validate_path_identity(&directory)?;
@@ -2364,69 +2539,93 @@ fn apply_prepared(prepared: PreparedCleanup) -> Result<CleanupOutcome> {
             plan.current_head.segment,
             &plan.protected_history_segments,
             Some(expected),
+            observer,
         )?;
         segment_outcome = outcome;
     }
 
     repository_lock.validate_path_identity(&directory)?;
-    let (removed_stale_archives, mut stale_not_deleted) = remove_planned_files(
-        &directory,
-        plan.stale_archives
-            .iter()
-            .map(|archive| PlannedFileRemoval {
-                file_name: archive.file_name.clone(),
-                bytes: archive.bytes,
-                fingerprint: archive.fingerprint.clone(),
-            }),
-        PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+    let (removed_stale_archives, mut stale_not_deleted) = crate::progress::observe(
+        observer,
+        &Step::new("removing stale archives", WorkUnit::Files)
+            .with_total(crate::progress::count(plan.stale_archives.len())),
+        |observer| {
+            remove_planned_files(
+                &directory,
+                plan.stale_archives
+                    .iter()
+                    .map(|archive| PlannedFileRemoval {
+                        file_name: archive.file_name.clone(),
+                        bytes: archive.bytes,
+                        fingerprint: archive.fingerprint.clone(),
+                    }),
+                PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+                observer,
+            )
+        },
     )?;
 
     let mut expected_head_after = plan.current_head;
     let removed_checkpoints = if plan.checkpoints.names.is_empty() {
         0
     } else {
-        repository_lock.validate_path_identity(&directory)?;
-        let checkpoint_archive_number =
-            plan.checkpoint_archive_number
-                .ok_or_else(|| Error::InvalidFormat {
-                    details: "checkpoint cleanup has no certified output archive number".to_owned(),
-                })?;
-        let store = WritableRepository::open_prepared(
-            &directory,
-            Arc::clone(&repository_lock),
-            checkpoint_archive_number,
+        let (removed, head_after_checkpoints) = crate::progress::observe(
+            observer,
+            // No total: the removal is one indivisible commit, so there
+            // is nothing to count up to and a declared total would stand
+            // at zero for the whole phase.
+            &Step::new("removing checkpoints", WorkUnit::Checkpoints),
+            |_observer| -> Result<(u64, RecordIdentifier)> {
+                repository_lock.validate_path_identity(&directory)?;
+                let checkpoint_archive_number =
+                    plan.checkpoint_archive_number
+                        .ok_or_else(|| Error::InvalidFormat {
+                            details: "checkpoint cleanup has no certified output archive number"
+                                .to_owned(),
+                        })?;
+                let store = WritableRepository::open_prepared(
+                    &directory,
+                    Arc::clone(&repository_lock),
+                    checkpoint_archive_number,
+                )?;
+                if store.head() != plan.current_head {
+                    return Err(Error::InvalidFormat {
+                        details: format!(
+                            "cleanup expected checkpoint base head {}, but strict writable open selected {}",
+                            plan.current_head,
+                            store.head()
+                        ),
+                    });
+                }
+                let removed = remove_checkpoints(&store, &plan.checkpoints.names)?;
+                if removed != plan.checkpoints.names.len() as u64 {
+                    return Err(Error::InvalidFormat {
+                        details: format!(
+                            "cleanup planned to remove {} checkpoints, but the locked head contained {removed}",
+                            plan.checkpoints.names.len()
+                        ),
+                    });
+                }
+                let head_after_checkpoints = store.head();
+                store.close()?;
+                sync_directory_strict(&directory)?;
+                Ok((removed, head_after_checkpoints))
+            },
         )?;
-        if store.head() != plan.current_head {
-            return Err(Error::InvalidFormat {
-                details: format!(
-                    "cleanup expected checkpoint base head {}, but strict writable open selected {}",
-                    plan.current_head,
-                    store.head()
-                ),
-            });
-        }
-        let removed = remove_checkpoints(&store, &plan.checkpoints.names)?;
-        if removed != plan.checkpoints.names.len() as u64 {
-            return Err(Error::InvalidFormat {
-                details: format!(
-                    "cleanup planned to remove {} checkpoints, but the locked head contained {removed}",
-                    plan.checkpoints.names.len()
-                ),
-            });
-        }
-        expected_head_after = store.head();
-        store.close()?;
-        sync_directory_strict(&directory)?;
+        expected_head_after = head_after_checkpoints;
         removed
     };
 
+    // No step wraps this phase: the head verification and the journal
+    // analysis inside it report steps of their own, and a step around
+    // them would mix nodes and journal lines into one count.
     let journal_outcome = if options.contains(CleanupTask::Journal) {
         repository_lock.validate_path_identity(&directory)?;
-        let repository = Repository::open(&directory)?;
+        let repository = Repository::open_with_progress(&directory, observer)?;
         let head = repository.head_record_identifier();
-        verify_exact_super_root(&repository, head)?;
+        verify_exact_super_root(&repository, head, observer)?;
         let raw = scan_raw_journal(&directory)?;
-        let analysis = analyze_journal(&repository, &raw, head)?;
+        let analysis = analyze_journal(&repository, &raw, head, observer)?;
         // Earlier archive/checkpoint work ran after the operator confirmed the
         // plan. Do not let a fresh analysis turn an unexpected loss into an
         // unconfirmed journal deletion. The final reopen repeats both proofs,
@@ -2470,7 +2669,9 @@ fn apply_prepared(prepared: PreparedCleanup) -> Result<CleanupOutcome> {
     // All old archive mappings and writable caches are out of scope here.
     // Reopen from disk and prove the exact newly selected head and every
     // readable retained journal root through fresh mappings.
-    let final_repository = Repository::open(&directory)?;
+    // As above, the reopen, the head verification, and the journal
+    // analysis each report a step of their own.
+    let final_repository = Repository::open_with_progress(&directory, observer)?;
     let head_after = final_repository.head_record_identifier();
     if head_after != expected_head_after {
         return Err(Error::InvalidFormat {
@@ -2479,10 +2680,10 @@ fn apply_prepared(prepared: PreparedCleanup) -> Result<CleanupOutcome> {
             ),
         });
     }
-    verify_exact_super_root(&final_repository, head_after)?;
+    verify_exact_super_root(&final_repository, head_after, observer)?;
     let final_raw_journal = scan_raw_journal(&directory)?;
     let mut final_journal_analysis =
-        analyze_journal(&final_repository, &final_raw_journal, head_after)?;
+        analyze_journal(&final_repository, &final_raw_journal, head_after, observer)?;
     inject_final_retained_root_fault(&mut final_journal_analysis.retained_record_ids);
     verify_retained_journal_roots(
         &plan.journal.retained_record_ids,
@@ -2505,15 +2706,31 @@ fn apply_prepared(prepared: PreparedCleanup) -> Result<CleanupOutcome> {
     // archive discovery, so their removal cannot invalidate the verified
     // state.
     repository_lock.validate_path_identity(&directory)?;
-    let (removed_temporaries, mut temporary_not_deleted) = remove_planned_files(
-        &directory,
-        plan.temporaries.iter().cloned(),
-        PlannedFileRemovalFailureMode::Partial,
+    let (removed_temporaries, mut temporary_not_deleted) = crate::progress::observe(
+        observer,
+        &Step::new("removing stale temporary files", WorkUnit::Files)
+            .with_total(crate::progress::count(plan.temporaries.len())),
+        |observer| {
+            remove_planned_files(
+                &directory,
+                plan.temporaries.iter().cloned(),
+                PlannedFileRemovalFailureMode::Partial,
+                observer,
+            )
+        },
     )?;
-    let (removed_recovery_backups, mut backup_not_deleted) = remove_planned_files(
-        &directory,
-        plan.recovery_backups.iter().cloned(),
-        PlannedFileRemovalFailureMode::Partial,
+    let (removed_recovery_backups, mut backup_not_deleted) = crate::progress::observe(
+        observer,
+        &Step::new("removing old recovery backups", WorkUnit::Files)
+            .with_total(crate::progress::count(plan.recovery_backups.len())),
+        |observer| {
+            remove_planned_files(
+                &directory,
+                plan.recovery_backups.iter().cloned(),
+                PlannedFileRemovalFailureMode::Partial,
+                observer,
+            )
+        },
     )?;
     sync_directory_strict(&directory)?;
 
@@ -2749,10 +2966,28 @@ fn remove_planned_files(
     directory: &Path,
     files: impl IntoIterator<Item = PlannedFileRemoval>,
     failure_mode: PlannedFileRemovalFailureMode,
+    observer: &mut dyn ProgressObserver,
 ) -> Result<(usize, Vec<CleanupDeletionFailure>)> {
-    remove_planned_files_with(directory, files, failure_mode, |path| {
-        std::fs::remove_file(path)
-    })
+    // Count files the engine has *finished with*. The removal engine is
+    // a lazy consumer, so pulling file N means files 0..N have been
+    // resolved — reporting the count *before* the increment is therefore
+    // exactly "items behind you". Reporting after it instead claimed a
+    // file the moment it was taken, before its removal was attempted, so
+    // a run that failed on its last file still counted it as done.
+    let mut resolved = 0u64;
+    let outcome = {
+        let observer = &mut *observer;
+        let counted = files.into_iter().inspect(|_file| {
+            observer.step_advanced(resolved);
+            resolved += 1;
+        });
+        remove_planned_files_with(directory, counted, failure_mode, |path| {
+            std::fs::remove_file(path)
+        })
+    };
+    // The last file is resolved only once the engine has stopped pulling.
+    observer.step_advanced(resolved);
+    outcome
 }
 
 fn remove_planned_files_with(
@@ -4822,6 +5057,7 @@ mod tests {
             &directory.path,
             [removable, planned],
             PlannedFileRemovalFailureMode::Partial,
+            &mut crate::progress::DiscardedProgress,
         )
         .expect("late deletion refusals are a partial outcome");
 
@@ -4872,6 +5108,7 @@ mod tests {
             &directory.path,
             [planned],
             PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+            &mut crate::progress::DiscardedProgress,
         )
         .expect("absence is a reportable partial result, not a lost cleanup outcome");
 
@@ -5005,6 +5242,7 @@ mod tests {
             &directory.path,
             [planned],
             PlannedFileRemovalFailureMode::Partial,
+            &mut crate::progress::DiscardedProgress,
         )
         .expect("late open refusal is a partial outcome");
 

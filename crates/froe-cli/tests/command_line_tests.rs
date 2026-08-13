@@ -74,6 +74,12 @@ impl InteractiveCleanup {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     fn spawn(store: &std::path::Path) -> Self {
+        Self::spawn_with(store, &[])
+    }
+
+    /// Spawns an interactive cleanup with extra command-line arguments,
+    /// so a test can choose how the run reports.
+    fn spawn_with(store: &std::path::Path, extra_arguments: &[&str]) -> Self {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
             .args([
                 "cleanup",
@@ -81,6 +87,7 @@ impl InteractiveCleanup {
                 "--task",
                 "journal",
             ])
+            .args(extra_arguments)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -959,46 +966,234 @@ fn the_export_reports_progress_and_a_summary_on_stderr() {
     );
     let stderr = String::from_utf8_lossy(&export.stderr);
     assert!(
-        stderr.contains("exported 2 nodes"),
-        "the summary must report the node count: {stderr}"
+        stderr.contains("exported 2 nodes in "),
+        "the summary must report the node count and the time it took: {stderr}"
     );
+    // Two nodes in a few milliseconds have no meaningful throughput, and
+    // extrapolating one would be a made-up number.
     assert!(
-        stderr.contains("nodes/s"),
-        "the summary must report the rate: {stderr}"
+        !stderr.contains("nodes/s"),
+        "a run too brief to measure must not claim a rate: {stderr}"
     );
 }
 
+/// Standard output is the operator's evidence for a destructive decision,
+/// so no progress report may reach it. Running the same plan under every
+/// reporting mode must produce byte-identical standard output; a report
+/// leaking there would make the three differ.
 #[test]
-fn the_quiet_flag_silences_progress_but_keeps_the_summary() {
-    let directory = TestDirectory::new("export-quiet");
+fn reporting_never_reaches_the_standard_output_of_a_cleanup_plan() {
+    let directory = TestDirectory::new("cleanup-stdout-purity");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
     populate(&store);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.join("journal.log"))
+        .expect("open journal")
+        .write_all(b"parser-skipped\n")
+        .expect("append a removable journal line");
 
-    let export = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+    let plan_under = |mode: &[&str]| {
+        let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+            .args(["cleanup", store.to_str().expect("path"), "--dry-run"])
+            .args(mode)
+            .output()
+            .expect("run the dry-run plan");
+        assert!(
+            run.status.success(),
+            "cleanup --dry-run {mode:?} must succeed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        (run.stdout, run.stderr)
+    };
+
+    let (reported_stdout, reported_stderr) = plan_under(&["--progress", "always"]);
+    let (default_stdout, _) = plan_under(&[]);
+    let (silent_stdout, silent_stderr) = plan_under(&["--silent"]);
+
+    assert!(
+        !reported_stdout.is_empty(),
+        "the plan itself must reach standard output"
+    );
+    assert_eq!(
+        reported_stdout,
+        silent_stdout,
+        "a reported plan must be byte-identical to a silent one: {}",
+        String::from_utf8_lossy(&reported_stdout)
+    );
+    assert_eq!(
+        reported_stdout, default_stdout,
+        "the default reporting mode must not change the plan either"
+    );
+    // Without this the comparison above would pass with reporting off.
+    assert!(
+        String::from_utf8_lossy(&reported_stderr).contains("froe: verifying the current head"),
+        "--progress always must actually report its steps: {}",
+        String::from_utf8_lossy(&reported_stderr)
+    );
+    assert!(
+        silent_stderr.is_empty(),
+        "--silent must leave standard error empty: {}",
+        String::from_utf8_lossy(&silent_stderr)
+    );
+}
+
+/// Reporting must never change what a command does. Standard error is a
+/// pipe often enough — `froe cleanup --yes 2>&1 | less`, quit early — and
+/// `main` restores SIGPIPE to its terminating disposition so piping data
+/// into `head` ends quietly. Together those once let a progress line kill
+/// a destructive cleanup between its mutations, leaving the journal
+/// rewrite undone.
+#[test]
+fn a_closed_standard_error_cannot_kill_a_destructive_cleanup() {
+    let directory = TestDirectory::new("cleanup-closed-stderr");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.join("journal.log"))
+        .expect("open journal")
+        .write_all(b"parser-skipped\n")
+        .expect("append a removable journal line");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
         .args([
-            "export",
+            "cleanup",
             store.to_str().expect("path"),
-            "--quiet",
-            "--output",
-            directory.path.join("content.jsonl").to_str().expect("path"),
+            "--task",
+            "journal",
+            "--yes",
+            "--progress",
+            "always",
         ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cleanup with a piped standard error");
+    // Drop the read end at once: every subsequent progress write hits a
+    // pipe with no reader.
+    drop(child.stderr.take());
+    let status = child.wait().expect("wait for cleanup");
+
+    assert!(
+        status.success(),
+        "a closed standard error must not change the outcome; exit was {status:?}"
+    );
+    assert!(
+        store.join("journal.log.bak.000").is_file(),
+        "the journal rewrite must have completed: the run was cut short"
+    );
+    assert!(
+        !std::fs::read_to_string(store.join("journal.log"))
+            .expect("read journal")
+            .contains("parser-skipped"),
+        "the removable journal line must be gone"
+    );
+    froe::Repository::open(&store).expect("the repository remains healthy");
+}
+
+/// Silence hides what froe is *doing*, never what it is about to change.
+/// A destructive cleanup under `--silent` still asks, in full.
+#[test]
+fn silence_never_hides_the_destructive_confirmation_prompt() {
+    let directory = TestDirectory::new("cleanup-silent-prompt");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.join("journal.log"))
+        .expect("open journal")
+        .write_all(b"parser-skipped\n")
+        .expect("append a removable journal line");
+
+    let mut child = InteractiveCleanup::spawn_with(&store, &["--silent"]);
+    child.expect_prompt(
+        "the confirmation prompt of a silenced cleanup",
+        &[
+            "about to apply this cleanup plan",
+            "this modifies the repository",
+        ],
+    );
+    child.send(b"n\n", "the declining answer");
+    let run = child.finish();
+    assert!(
+        !run.status.success(),
+        "a declined cleanup exits nonzero: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("cleanup plan for"),
+        "the plan must still be printed under --silent: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("cleanup cancelled"),
+        "a declined cleanup still says so: {stderr}"
+    );
+    assert!(
+        !stderr.contains("froe: opening archives"),
+        "--silent must still suppress the progress steps: {stderr}"
+    );
+}
+
+/// An error is a fact about the repository, not a progress report, and no
+/// reporting mode may hide one.
+#[test]
+fn silence_never_hides_an_error() {
+    let failed = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["cleanup", "/not/a/repository", "--dry-run", "--silent"])
         .output()
-        .expect("run export");
+        .expect("run a silenced failing cleanup");
+    assert!(!failed.status.success());
     assert!(
-        export.status.success(),
-        "export --quiet must succeed: {}",
-        String::from_utf8_lossy(&export.stderr)
+        String::from_utf8_lossy(&failed.stderr).contains("not a repository directory"),
+        "--silent must never hide an error: {}",
+        String::from_utf8_lossy(&failed.stderr)
     );
-    let stderr = String::from_utf8_lossy(&export.stderr);
-    assert!(
-        !stderr.contains("nodes ("),
-        "quiet must silence the progress reports: {stderr}"
-    );
-    assert!(
-        stderr.contains("exported 2 nodes"),
-        "the summary must still be printed: {stderr}"
-    );
+}
+
+/// `--silent` mutes every report; `--quiet` is its compatibility alias
+/// and mutes exactly the same things. Both still write the export.
+#[test]
+fn silence_mutes_every_report_without_touching_the_export() {
+    for (index, flag) in ["--silent", "-s", "--quiet"].into_iter().enumerate() {
+        let directory = TestDirectory::new(&format!("export-silent-{index}"));
+        let store = directory.path.join("segmentstore");
+        std::fs::create_dir_all(&store).expect("create store directory");
+        populate(&store);
+        let output_path = directory.path.join("content.jsonl");
+
+        let export = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+            .args([
+                "export",
+                store.to_str().expect("path"),
+                flag,
+                "--output",
+                output_path.to_str().expect("path"),
+            ])
+            .output()
+            .expect("run export");
+        assert!(
+            export.status.success(),
+            "export {flag} must succeed: {}",
+            String::from_utf8_lossy(&export.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&export.stderr),
+            "",
+            "{flag} must leave standard error empty"
+        );
+        let exported = std::fs::read_to_string(&output_path).expect("read the export");
+        assert_eq!(
+            exported.lines().count(),
+            2,
+            "{flag} must not change what was exported: {exported}"
+        );
+    }
 }
 
 /// Commits a second revision: `/content` gains a `version` property and

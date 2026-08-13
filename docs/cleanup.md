@@ -63,6 +63,13 @@ Start with a preview:
 $ froe cleanup /path/to/segmentstore --dry-run
 ```
 
+Planning a large store takes minutes: it verifies the whole head tree,
+replays the journal, and traces the reachable segment closure before it can
+say anything. Cleanup reports each of those steps on standard error while it
+works, so a long wait is legible rather than silent; `--silent` turns the
+reports off without hiding the plan, the warnings, or the confirmation
+prompt. See [`cli-output.md`](cli-output.md).
+
 Dry-run is a strict read-only operation: it writes no bytes, creates no files,
 and does not create or acquire `repo.lock`. It validates the repository and
 prints the selected task set, exact actions, warnings, verified head, and
@@ -446,6 +453,14 @@ fn main() -> froe::Result<()> {
     Ok(())
 }
 ```
+
+Every one of these has a `_with_progress` twin —
+`plan_cleanup_with_progress`, `PreparedCleanup::prepare_with_progress`,
+`PreparedCleanup::apply_with_progress`, `cleanup_with_progress` — taking a
+`froe::progress::ProgressObserver` that is told which step is running and
+how far it has got. The plain spellings above delegate to them with a
+discarding observer, so observation costs nothing when nobody is watching
+and never changes what an operation returns.
 
 For unattended callers that do not need an external confirmation boundary,
 `froe::cleanup(directory, options)` prepares under lock and applies the

@@ -25,9 +25,10 @@ pub use archive_debug::{
     debug_archive, debug_archive_with_options,
 };
 pub use check::{
-    ConsistencyReport, NodeTreeVerifier, PathVerdict, check_consistency, verify_node_tree,
+    ConsistencyReport, NodeTreeVerifier, PathVerdict, check_consistency,
+    check_consistency_with_progress, verify_node_tree,
 };
-pub use diff::{NodeDifference, PropertyChange, diff_revisions};
-pub use history::{NodeHistoryEntry, node_history};
-pub use search::{NodeMatch, SearchQuery, search_nodes};
+pub use diff::{NodeDifference, PropertyChange, diff_revisions, diff_revisions_with_progress};
+pub use history::{NodeHistoryEntry, node_history, node_history_with_progress};
+pub use search::{NodeMatch, SearchQuery, search_nodes, search_nodes_with_progress};
 pub use segment_dump::{dump_segment, dump_segment_bytes};

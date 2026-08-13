@@ -283,6 +283,17 @@ pub struct WritableRepository {
 impl WritableRepository {
     /// Opens (or bootstraps) a segment store for writing.
     pub fn open(directory: &Path) -> Result<Self> {
+        Self::open_with_progress(directory, &mut crate::progress::DiscardedProgress)
+    }
+
+    /// Opens exactly like [`WritableRepository::open`], reporting the
+    /// archive scan to `observer`. Every mutating command goes through
+    /// this open before it can do anything, and on a large store the scan
+    /// is the first thing that makes the operator wait.
+    pub fn open_with_progress(
+        directory: &Path,
+        observer: &mut dyn crate::progress::ProgressObserver,
+    ) -> Result<Self> {
         std::fs::create_dir_all(directory)?;
 
         // Deliberate deviation from Java's open order, which opens the
@@ -304,7 +315,7 @@ impl WritableRepository {
 
         check_and_update_manifest(directory)?;
 
-        let base_archives = initialize_archives_for_writing(directory)?;
+        let base_archives = initialize_archives_for_writing(directory, observer)?;
         let next_archive_number = next_archive_number(&base_archives);
 
         let store = Self {
@@ -543,26 +554,55 @@ impl WritableRepository {
     /// repeats the same fresh-reader certification immediately before
     /// mutation, because an out-of-process pathname or byte change must still
     /// fail closed even while froe holds its advisory repository lock.
-    pub(crate) fn preflight_reclaim_sources(&self) -> Result<()> {
-        drop(self.open_certified_base_repository()?);
+    /// Certifies every reclamation source before the first mutation,
+    /// reporting it. The pass parses every data segment of every base
+    /// archive, so compaction would otherwise begin with a long silence
+    /// before its first reported step.
+    pub(crate) fn preflight_reclaim_sources_with_progress(
+        &self,
+        observer: &mut dyn crate::progress::ProgressObserver,
+    ) -> Result<()> {
+        drop(self.open_certified_base_repository_with_progress(observer)?);
         Ok(())
     }
 
     fn open_certified_base_repository(&self) -> Result<crate::store::Repository> {
+        self.open_certified_base_repository_with_progress(&mut crate::progress::DiscardedProgress)
+    }
+
+    fn open_certified_base_repository_with_progress(
+        &self,
+        observer: &mut dyn crate::progress::ProgressObserver,
+    ) -> Result<crate::store::Repository> {
         let base_names: std::collections::HashSet<String> = self
             .base_archives
             .iter()
             .map(|archive| archive.file_name().to_owned())
             .collect();
-        let repository = crate::store::Repository::open(&self.directory)?;
+        let repository = crate::store::Repository::open_with_progress(&self.directory, observer)?;
         reject_duplicate_active_segments(repository.archives())?;
         let mut certified_base_names = std::collections::HashSet::new();
+        observer.step_began(
+            &crate::progress::Step::new(
+                "certifying source archives",
+                crate::progress::WorkUnit::Archives,
+            )
+            .with_total(crate::progress::count(base_names.len())),
+        );
+        let mut certified = 0usize;
         for archive in repository.archives() {
             if base_names.contains(archive.file_name()) {
-                certify_active_archive(&repository, archive)?;
+                observer.step_advanced(crate::progress::count(certified));
+                if let Err(error) = certify_active_archive(&repository, archive) {
+                    observer.step_ended();
+                    return Err(error);
+                }
+                certified += 1;
                 certified_base_names.insert(archive.file_name().to_owned());
             }
         }
+        observer.step_advanced(crate::progress::count(certified));
+        observer.step_ended();
         if certified_base_names != base_names {
             let mut missing: Vec<_> = base_names
                 .difference(&certified_base_names)
@@ -1624,6 +1664,7 @@ pub(crate) fn plan_standalone_segment_cleanup(
     reference: GarbageCollectionGeneration,
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
+    observer: &mut dyn crate::progress::ProgressObserver,
 ) -> Result<StandaloneSegmentCleanupPlan> {
     reject_duplicate_active_segments(repository.archives())?;
     certify_active_archives(repository, repository.archives())?;
@@ -1633,6 +1674,7 @@ pub(crate) fn plan_standalone_segment_cleanup(
         reference,
         current_head_segment,
         protected,
+        observer,
     )
 }
 
@@ -1689,6 +1731,7 @@ pub(crate) fn apply_standalone_segment_cleanup(
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
     expected: Option<&StandaloneSegmentCleanupPlan>,
+    observer: &mut dyn crate::progress::ProgressObserver,
 ) -> Result<(
     StandaloneSegmentCleanupPlan,
     StandaloneSegmentCleanupOutcome,
@@ -1697,9 +1740,9 @@ pub(crate) fn apply_standalone_segment_cleanup(
     // fresh, lazy provider over the exact active set and certify every source
     // before the first mutation; recovered/indexless archives and incomplete
     // graph/BRF metadata are never eligible for standalone cleanup.
-    let repository = crate::store::Repository::open(directory)?;
+    let repository = crate::store::Repository::open_with_progress(directory, observer)?;
     reject_duplicate_active_segments(repository.archives())?;
-    certify_active_archives(&repository, repository.archives())?;
+    certify_active_archives_with_progress(&repository, repository.archives(), observer)?;
     apply_standalone_segment_cleanup_from_archives(
         directory,
         repository.archives(),
@@ -1708,6 +1751,7 @@ pub(crate) fn apply_standalone_segment_cleanup(
         current_head_segment,
         protected,
         expected,
+        observer,
         #[cfg(test)]
         None,
     )
@@ -1729,17 +1773,29 @@ fn apply_standalone_segment_cleanup_from_archives(
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
     expected: Option<&StandaloneSegmentCleanupPlan>,
+    observer: &mut dyn crate::progress::ProgressObserver,
     #[cfg(test)] after_plan: Option<&StandaloneAfterPlanHook<'_>>,
 ) -> Result<(
     StandaloneSegmentCleanupPlan,
     StandaloneSegmentCleanupOutcome,
 )> {
-    let plan = analyze_standalone_segment_cleanup(
-        directory,
-        archives,
-        reference,
-        current_head_segment,
-        protected,
+    let plan = crate::progress::observe(
+        observer,
+        &crate::progress::Step::new(
+            "replanning segment reclamation",
+            crate::progress::WorkUnit::Archives,
+        )
+        .with_total(crate::progress::count(archives.len())),
+        |observer| {
+            analyze_standalone_segment_cleanup(
+                directory,
+                archives,
+                reference,
+                current_head_segment,
+                protected,
+                observer,
+            )
+        },
     )?;
     if expected.is_some_and(|expected| expected != &plan) {
         return Err(Error::InvalidFormat {
@@ -1768,39 +1824,56 @@ fn apply_standalone_segment_cleanup_from_archives(
     // only after its target has really become unavailable (or when the same
     // rewrite is about to make it unavailable). This retains conservative
     // extra edges to deferred, blocked, later, or failed sweep targets.
-    for rewrite_phase in [false, true] {
-        for archive in archives {
-            let Some(planned) = planned_archives.get(archive.file_name()) else {
-                continue;
-            };
-            let is_rewrite = matches!(planned, PlannedArchiveSweep::Rewrite { .. });
-            let is_remove = matches!(planned, PlannedArchiveSweep::Remove { .. });
-            if (!rewrite_phase && !is_remove) || (rewrite_phase && !is_rewrite) {
-                continue;
+    crate::progress::observe(
+        observer,
+        &crate::progress::Step::new("sweeping archives", crate::progress::WorkUnit::Archives)
+            .with_total(crate::progress::count(
+                plan.archives
+                    .iter()
+                    .filter(|planned| planned.changes_disk())
+                    .count(),
+            )),
+        |observer| {
+            let mut swept = 0usize;
+            for rewrite_phase in [false, true] {
+                for archive in archives {
+                    let Some(planned) = planned_archives.get(archive.file_name()) else {
+                        continue;
+                    };
+                    let is_rewrite = matches!(planned, PlannedArchiveSweep::Rewrite { .. });
+                    let is_remove = matches!(planned, PlannedArchiveSweep::Remove { .. });
+                    if (!rewrite_phase && !is_remove) || (rewrite_phase && !is_rewrite) {
+                        continue;
+                    }
+                    observer.step_advanced(crate::progress::count(swept));
+                    let outcome = sweep_one_archive(
+                        directory,
+                        archive,
+                        &plan.reclaimable,
+                        &actually_unavailable,
+                        &provider_order,
+                        &mut fallback_provider,
+                        source_certificate_provider,
+                    )?;
+                    if outcome.disposition != ArchiveSweepDisposition::Unchanged {
+                        observed_sweeps.insert(
+                            archive.file_name().to_owned(),
+                            (outcome.disposition, outcome.newly_unavailable.len()),
+                        );
+                    }
+                    deletion_failures.extend(outcome.deletion_failures);
+                    actually_unavailable.extend(outcome.newly_unavailable);
+                    swept += 1;
+                    observer.step_advanced(crate::progress::count(swept));
+                }
+                #[cfg(test)]
+                if !rewrite_phase {
+                    probe_archive_sweep_phase_boundary("sweep.removals-complete-before-rewrites")?;
+                }
             }
-            let outcome = sweep_one_archive(
-                directory,
-                archive,
-                &plan.reclaimable,
-                &actually_unavailable,
-                &provider_order,
-                &mut fallback_provider,
-                source_certificate_provider,
-            )?;
-            if outcome.disposition != ArchiveSweepDisposition::Unchanged {
-                observed_sweeps.insert(
-                    archive.file_name().to_owned(),
-                    (outcome.disposition, outcome.newly_unavailable.len()),
-                );
-            }
-            deletion_failures.extend(outcome.deletion_failures);
-            actually_unavailable.extend(outcome.newly_unavailable);
-        }
-        #[cfg(test)]
-        if !rewrite_phase {
-            probe_archive_sweep_phase_boundary("sweep.removals-complete-before-rewrites")?;
-        }
-    }
+            Ok::<(), Error>(())
+        },
+    )?;
     drop(fallback_provider);
     drop(provider_order);
     sync_directory_strict(directory)?;
@@ -2143,6 +2216,7 @@ fn analyze_standalone_segment_cleanup(
     reference: GarbageCollectionGeneration,
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
+    observer: &mut dyn crate::progress::ProgressObserver,
 ) -> Result<StandaloneSegmentCleanupPlan> {
     reject_duplicate_active_segments(archives)?;
 
@@ -2160,7 +2234,8 @@ fn analyze_standalone_segment_cleanup(
     // One shared state is normative: resetting it per archive could delete
     // valid compacted segments in every older archive.
     let mut ahead_of_root = Some(current_head_segment);
-    for archive in archives {
+    for (marked, archive) in archives.iter().enumerate() {
+        observer.step_advanced(crate::progress::count(marked));
         mark_one_archive(
             archive,
             policy,
@@ -2169,6 +2244,7 @@ fn analyze_standalone_segment_cleanup(
             &mut ahead_of_root,
         )?;
     }
+    observer.step_advanced(crate::progress::count(archives.len()));
     if let Some(missing_root) = ahead_of_root {
         return Err(Error::InvalidFormat {
             details: format!(
@@ -2694,10 +2770,39 @@ pub(crate) fn certify_active_archives(
     provider: &dyn SegmentProvider,
     archives: &[TarArchiveReader],
 ) -> Result<()> {
-    for archive in archives {
-        certify_active_archive(provider, archive)?;
-    }
-    Ok(())
+    certify_active_archives_with_progress(
+        provider,
+        archives,
+        &mut crate::progress::DiscardedProgress,
+    )
+}
+
+/// Certifies exactly like [`certify_active_archives`], reporting its own
+/// step. It parses every data segment of every archive, so on a large
+/// store it is minutes of work — and it runs immediately after the
+/// operator has confirmed a destructive cleanup, which is the worst
+/// possible moment to say nothing.
+pub(crate) fn certify_active_archives_with_progress(
+    provider: &dyn SegmentProvider,
+    archives: &[TarArchiveReader],
+    observer: &mut dyn crate::progress::ProgressObserver,
+) -> Result<()> {
+    crate::progress::observe(
+        observer,
+        &crate::progress::Step::new(
+            "certifying source archives",
+            crate::progress::WorkUnit::Archives,
+        )
+        .with_total(crate::progress::count(archives.len())),
+        |observer| {
+            for (certified, archive) in archives.iter().enumerate() {
+                observer.step_advanced(crate::progress::count(certified));
+                certify_active_archive(provider, archive)?;
+            }
+            observer.step_advanced(crate::progress::count(archives.len()));
+            Ok(())
+        },
+    )
 }
 
 fn next_archive_staging_name(directory: &Path, replacement_name: &str) -> Result<String> {
@@ -3321,7 +3426,10 @@ fn check_and_update_manifest(directory: &Path) -> Result<()> {
     clippy::case_sensitive_file_extension_comparisons,
     reason = "the Java store matches \".tar\" case-sensitively"
 )]
-fn initialize_archives_for_writing(directory: &Path) -> Result<Vec<TarArchiveReader>> {
+fn initialize_archives_for_writing(
+    directory: &Path,
+    observer: &mut dyn crate::progress::ProgressObserver,
+) -> Result<Vec<TarArchiveReader>> {
     let mut file_names = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let name = entry?.file_name();
@@ -3345,8 +3453,32 @@ fn initialize_archives_for_writing(directory: &Path) -> Result<Vec<TarArchiveRea
         }
     }
 
+    let archive_numbers = by_number.len();
+    let mut archives = crate::progress::observe(
+        observer,
+        &crate::progress::Step::new(
+            "opening archives for writing",
+            crate::progress::WorkUnit::Archives,
+        )
+        .with_total(crate::progress::count(archive_numbers)),
+        |observer| open_archive_numbers_for_writing(directory, by_number, observer),
+    )?;
+    // Newest number first: the probe order for reads.
+    archives.reverse();
+    Ok(archives)
+}
+
+/// Opens the winning generation letter of each archive number, deleting
+/// the losers, and reports one completed archive number at a time.
+fn open_archive_numbers_for_writing(
+    directory: &Path,
+    by_number: std::collections::BTreeMap<u32, Vec<ArchiveFileName>>,
+    observer: &mut dyn crate::progress::ProgressObserver,
+) -> Result<Vec<TarArchiveReader>> {
+    let archive_numbers = by_number.len();
     let mut archives = Vec::new();
-    for (_, mut generations) in by_number {
+    for (opened, (_, mut generations)) in by_number.into_iter().enumerate() {
+        observer.step_advanced(crate::progress::count(opened));
         generations.sort_by_key(|name| name.file_generation);
         let mut winner: Option<TarArchiveReader> = None;
         // Newest letter first: the first valid index wins.
@@ -3375,8 +3507,7 @@ fn initialize_archives_for_writing(directory: &Path) -> Result<Vec<TarArchiveRea
             }
         }
     }
-    // Newest number first: the probe order for reads.
-    archives.reverse();
+    observer.step_advanced(crate::progress::count(archive_numbers));
     Ok(archives)
 }
 
@@ -4041,6 +4172,7 @@ mod tests {
             reference,
             current_head_segment,
             protected,
+            &mut crate::progress::DiscardedProgress,
         )
     }
 
@@ -4063,6 +4195,7 @@ mod tests {
             current_head_segment,
             protected,
             expected,
+            &mut crate::progress::DiscardedProgress,
             None,
         )
     }
@@ -4756,6 +4889,7 @@ mod tests {
             generation(4, 4, true),
             missing_root,
             &HashSet::new(),
+            &mut crate::progress::DiscardedProgress,
         )
         .expect_err("missing root must refuse cleanup");
         assert!(error.to_string().contains("was not encountered"));
@@ -5048,6 +5182,7 @@ mod tests {
             root,
             &HashSet::new(),
             None,
+            &mut crate::progress::DiscardedProgress,
             Some(&after_plan),
         )
         .expect("an occupied immediate replan is a safe no-op");

@@ -16,8 +16,9 @@ use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
 use crate::error::{Error, Result};
 use crate::journal::read_journal;
+use crate::progress::{DiscardedProgress, ProgressObserver, Step, StrideCounter, WorkUnit};
 use crate::segment::record::RecordIdentifier;
-use crate::store::{ArchiveSet, open_all_archives};
+use crate::store::{ArchiveSet, open_all_archives_with_progress};
 
 /// The maximum content tree depth checked before assuming a cycle; set
 /// well below the stack-overflow threshold. Real trees are far shallower.
@@ -105,7 +106,25 @@ pub fn check_consistency(
     check_binaries: bool,
     revision_limit: usize,
 ) -> Result<ConsistencyReport> {
-    let archives = open_all_archives(directory)?;
+    check_consistency_with_progress(
+        directory,
+        filter_paths,
+        check_binaries,
+        revision_limit,
+        &mut DiscardedProgress,
+    )
+}
+
+/// Checks exactly like [`check_consistency`], reporting the archive scan
+/// and the revision walk to `observer`.
+pub fn check_consistency_with_progress(
+    directory: &std::path::Path,
+    filter_paths: &[String],
+    check_binaries: bool,
+    revision_limit: usize,
+    observer: &mut dyn ProgressObserver,
+) -> Result<ConsistencyReport> {
+    let archives = open_all_archives_with_progress(directory, observer)?;
     let provider = ArchiveSet::new(archives);
     // An unreadable journal is a loud failure, exactly like Java's check.
     let journal_entries = read_journal(&directory.join("journal.log"))?;
@@ -131,12 +150,36 @@ pub fn check_consistency(
     // limit of zero means unlimited.
     let mut checked_revisions = 0usize;
     let mut overall_revision = None;
+    // One step per revision, counting the nodes that revision's walk
+    // resolves. A single step spanning the whole loop could only count
+    // revisions, and a healthy store pins every path at the first one —
+    // so the report would sit at 0 of N for the entire run, which is the
+    // silence this reporting exists to remove. The revision's position is
+    // in the description instead, where a count of one unit can carry it.
+    //
+    // Every statement in this loop is infallible — a path that fails to
+    // verify becomes a verdict, not an error — so each step is closed by
+    // the `step_ended` at the end of its iteration.
+    let examinable = examinable_revisions(journal_entries.len(), revision_limit);
     for entry in &journal_entries {
         checked_revisions += 1;
+        // Java counts every *attempted* entry and tests the limit only at
+        // the end of an iteration that did not skip, so an unresolvable
+        // line can carry the count one past the limit. That rule is Oak's
+        // and stays; the label must not advertise the overshoot, so the
+        // numerator is clamped to the bound the denominator declares.
+        let position = checked_revisions.min(examinable);
+        let description = format!("checking revision {position} of {examinable}");
+        observer.step_began(&Step::new(&description, WorkUnit::Nodes));
+        let mut nodes = VerifiedNodeCount::new(observer);
         let Some(head) = entry.record_identifier() else {
+            nodes.finish();
+            observer.step_ended();
             continue;
         };
         if !provider_contains(&provider, head) {
+            nodes.finish();
+            observer.step_ended();
             continue;
         }
         let super_root = NodeState::new(&provider, head);
@@ -145,7 +188,13 @@ pub fn check_consistency(
             if path_to_check.verdict.latest_good_revision.is_some() {
                 continue;
             }
-            match check_one_path(&provider, &super_root, path_to_check, check_binaries) {
+            match check_one_path(
+                &provider,
+                &super_root,
+                path_to_check,
+                check_binaries,
+                &mut nodes,
+            ) {
                 Ok(()) => {
                     path_to_check.verdict.latest_good_revision = Some(entry.revision_text.clone());
                     path_to_check.verdict.latest_good_timestamp_milliseconds =
@@ -159,6 +208,8 @@ pub fn check_consistency(
                 }
             }
         }
+        nodes.finish();
+        observer.step_ended();
         if all_pinned {
             // The revision at which the last outstanding path verified.
             overall_revision = Some(entry.revision_text.clone());
@@ -195,6 +246,36 @@ pub fn check_consistency(
         checkpoint_paths,
         overall_revision,
     })
+}
+
+/// How many revisions a run may examine: the journal's length, bounded by
+/// an explicit limit. Java's limit of zero means unlimited, and so does
+/// froe's, so a zero limit yields the whole journal. Reporting more than
+/// this would declare a total the run is forbidden to reach.
+fn examinable_revisions(journal_length: usize, revision_limit: usize) -> usize {
+    if revision_limit == 0 {
+        journal_length
+    } else {
+        journal_length.min(revision_limit)
+    }
+}
+
+#[cfg(test)]
+mod examinable_revision_tests {
+    use super::examinable_revisions;
+
+    #[test]
+    fn a_limit_bounds_the_declared_total() {
+        assert_eq!(examinable_revisions(5_000, 2), 2);
+        assert_eq!(examinable_revisions(2, 5_000), 2);
+        assert_eq!(
+            examinable_revisions(5_000, 0),
+            5_000,
+            "a zero limit means unlimited, as it does in Java"
+        );
+        assert_eq!(examinable_revisions(5_000, usize::MAX), 5_000);
+        assert_eq!(examinable_revisions(0, 3), 0);
+    }
 }
 
 /// The paths to check: every filter path against the head, then against
@@ -270,6 +351,7 @@ fn check_one_path(
     super_root: &NodeState<'_>,
     path_to_check: &mut PathToCheck,
     check_binaries: bool,
+    progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<(), String> {
     let node = match resolve_path(super_root, &path_to_check.root, &path_to_check.path) {
         Ok(Some(node)) => node,
@@ -309,6 +391,7 @@ fn check_one_path(
             binaries: check_binaries,
             stable_identifiers: false,
         },
+        progress,
     ) {
         Ok(()) => Ok(()),
         Err(corrupt) => {
@@ -454,6 +537,10 @@ pub fn verify_node_tree(provider: &dyn SegmentProvider, root: RecordIdentifier) 
 pub struct NodeTreeVerifier<'provider> {
     provider: &'provider dyn SegmentProvider,
     verified_subtree_heights: HashMap<RecordIdentifier, usize>,
+    /// Nodes resolved across every `verify_with_progress` call, so a
+    /// caller verifying several roots inside one reported step sees one
+    /// running total rather than a count that restarts per root.
+    verified_nodes: u64,
 }
 
 impl<'provider> NodeTreeVerifier<'provider> {
@@ -463,13 +550,26 @@ impl<'provider> NodeTreeVerifier<'provider> {
         Self {
             provider,
             verified_subtree_heights: HashMap::new(),
+            verified_nodes: 0,
         }
     }
 
     /// Verifies `root`, reusing only subtrees which a previous call completed
     /// successfully against this same provider.
     pub fn verify(&mut self, root: RecordIdentifier) -> Result<()> {
-        verify_subtree_with_cache(
+        self.verify_with_progress(root, &mut DiscardedProgress)
+    }
+
+    /// Verifies exactly like [`NodeTreeVerifier::verify`], reporting the
+    /// number of nodes resolved so far to `observer`. Nodes served from
+    /// the verified-subtree cache are not counted again.
+    pub fn verify_with_progress(
+        &mut self,
+        root: RecordIdentifier,
+        observer: &mut dyn ProgressObserver,
+    ) -> Result<()> {
+        let mut progress = VerifiedNodeCount::resuming(observer, self.verified_nodes);
+        let verified = verify_subtree_with_cache(
             self.provider,
             root,
             SubtreeChecks {
@@ -477,9 +577,13 @@ impl<'provider> NodeTreeVerifier<'provider> {
                 stable_identifiers: true,
             },
             &mut self.verified_subtree_heights,
-        )
-        .map(|_| ())
-        .map_err(|corrupt| node_tree_error(&corrupt))
+            &mut progress,
+        );
+        progress.finish();
+        self.verified_nodes = progress.completed();
+        verified
+            .map(|_| ())
+            .map_err(|corrupt| node_tree_error(&corrupt))
     }
 }
 
@@ -506,9 +610,53 @@ fn verify_subtree(
     provider: &dyn SegmentProvider,
     root: RecordIdentifier,
     checks: SubtreeChecks,
+    progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<(), CorruptLocation> {
-    verify_subtree_with_cache(provider, root, checks, &mut HashMap::new()).map(|_| ())
+    verify_subtree_with_cache(provider, root, checks, &mut HashMap::new(), progress).map(|_| ())
 }
+
+/// Counts verified nodes for a [`ProgressObserver`], reporting on a stride
+/// so a million-node tree does not become a million observer calls.
+struct VerifiedNodeCount<'observer> {
+    observer: &'observer mut dyn ProgressObserver,
+    counter: StrideCounter,
+}
+
+impl<'observer> VerifiedNodeCount<'observer> {
+    fn new(observer: &'observer mut dyn ProgressObserver) -> Self {
+        Self::resuming(observer, 0)
+    }
+
+    /// A counter continuing from `already`, so a step that verifies
+    /// several roots keeps one running total instead of restarting — and
+    /// the second root, which the subtree cache makes cheaper than the
+    /// first, cannot report a smaller number than the first did.
+    fn resuming(observer: &'observer mut dyn ProgressObserver, already: u64) -> Self {
+        Self {
+            observer,
+            counter: StrideCounter::resuming(VERIFIED_NODE_REPORT_STRIDE, already),
+        }
+    }
+
+    /// How many nodes this counter has seen, including the ones it
+    /// resumed from.
+    fn completed(&self) -> u64 {
+        self.counter.completed()
+    }
+
+    fn advance(&mut self) {
+        self.counter.advance(self.observer);
+    }
+
+    /// Reports the exact number of nodes resolved, including the last
+    /// partial stride.
+    fn finish(&mut self) {
+        self.counter.finish(self.observer);
+    }
+}
+
+/// How many nodes a verification walk resolves between progress reports.
+const VERIFIED_NODE_REPORT_STRIDE: u64 = 512;
 
 /// Returns the verified subtree height. A record enters `verified` only
 /// after every descendant completed successfully.
@@ -517,7 +665,12 @@ fn verify_subtree_with_cache(
     root: RecordIdentifier,
     checks: SubtreeChecks,
     verified: &mut HashMap<RecordIdentifier, usize>,
+    progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<usize, CorruptLocation> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the recursive walk threads its provider, checks, caches, path, depth, and progress; bundling them would only rename the same state"
+    )]
     fn walk(
         provider: &dyn SegmentProvider,
         record: RecordIdentifier,
@@ -526,6 +679,7 @@ fn verify_subtree_with_cache(
         ancestors: &mut HashSet<RecordIdentifier>,
         depth: usize,
         path: &mut String,
+        progress: &mut VerifiedNodeCount<'_>,
     ) -> std::result::Result<usize, CorruptLocation> {
         let corrupt_here = |reason: String| CorruptLocation {
             path: path.clone(),
@@ -556,6 +710,7 @@ fn verify_subtree_with_cache(
             return Ok(subtree_height);
         }
         ancestors.insert(record);
+        progress.advance();
         // Not `map_err(corrupt_here)`: different clippy versions disagree
         // about the borrow there, and an explicit struct keeps both quiet.
         if let Err(reason) = check_node_shallow(provider, record, checks.binaries) {
@@ -589,6 +744,7 @@ fn verify_subtree_with_cache(
                 ancestors,
                 depth + 1,
                 path,
+                progress,
             )?;
             path.truncate(parent_length);
             subtree_height = subtree_height.max(child_height + 1);
@@ -608,6 +764,7 @@ fn verify_subtree_with_cache(
         &mut ancestors,
         0,
         &mut path,
+        progress,
     )
 }
 

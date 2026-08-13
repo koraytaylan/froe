@@ -24,18 +24,24 @@ pub mod segment_builder;
 pub mod store_writer;
 pub mod tar_writer;
 
-pub use backup::{RecoveryOutcome, backup, recover_journal, restore};
+pub use backup::{
+    RecoveryOutcome, backup, backup_with_progress, recover_journal, recover_journal_with_progress,
+    restore, restore_with_progress,
+};
 pub use cleanup::{
     CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupOutcome, CleanupPlan,
     CleanupTask, JournalLineRemoval, JournalRemovalReason, PreparedCleanup, RecoveryBackupPolicy,
-    StaleArchiveReason, cleanup, plan_cleanup,
+    StaleArchiveReason, cleanup, cleanup_with_progress, plan_cleanup, plan_cleanup_with_progress,
 };
 pub use commit::{
     CheckpointDescription, create_checkpoint, list_checkpoints, release_checkpoint,
     remove_all_checkpoints, remove_checkpoints, remove_unreferenced_checkpoints,
     replace_content_root,
 };
-pub use compaction::{CompactionKind, CompactionOutcome, compact};
+pub use compaction::{
+    CompactionKind, CompactionOutcome, compact, compact_with_progress, deep_copy_tree,
+    deep_copy_tree_with_progress,
+};
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};
 pub use record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,

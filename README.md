@@ -190,6 +190,46 @@ Archive rewrites performed by either `froe cleanup` or the cleanup phase of
 hard links. A filesystem that does not support those links cannot perform such
 a rewrite; the operation fails with the original archive still active.
 
+### Knowing what a command is doing
+
+Planning a cleanup, compacting, checking consistency, and exporting all
+run for minutes against a real repository. Every command reports what it
+is doing on **standard error**, so standard output stays pure data and a
+plan or an export can still be piped anywhere:
+
+```console
+$ froe search-nodes /path/to/segmentstore --has-property jcr:primaryType
+froe: searching segments [█████████████░░░░░░░░░░░░]  52% 64/123 0:00 eta 0:00
+```
+
+A step that cannot count its work in advance reports what it has done so
+far and how long it has been running, without a bar:
+
+```console
+$ froe cleanup /path/to/segmentstore --dry-run
+froe: verifying the current head 29,184 nodes 0:01
+```
+
+On a terminal that is one live line, rewritten in place; into a pipe or a
+CI log it becomes whole lines, at most one every two seconds. Either way
+a finished step leaves a summary — `froe: verifying the current head:
+300,004 nodes in 4.4s (67,817 nodes/s)`. Nothing is reported for a step
+that finishes within 300 milliseconds, so a command that simply did its
+job stays quiet.
+
+* `-s`, `--silent` — report nothing. Errors, warnings, confirmation
+  prompts, and every command's own output are unaffected: `--silent`
+  hides what froe is doing, never what it found or what it is about to
+  change. `--quiet` is a compatibility alias for the same thing.
+* `--progress <auto|always|never>` — `always` reports every step from the
+  moment it begins, which is what a script wanting the reports in its log
+  should pass; `never` matches `--silent`.
+
+Both flags work on every command. The full contract — which stream
+carries what, what each command reports, and the guarantees the
+destructive commands depend on — is in
+[`docs/cli-output.md`](docs/cli-output.md).
+
 Every command takes the segment store directory (the one containing
 `journal.log` and the `data*.tar` archives). `froe export` is the fast
 path for pulling content out of a repository. Its default format,
@@ -288,6 +328,9 @@ fn main() -> froe::Result<()> {
 * [`docs/cleanup.md`](docs/cleanup.md)
   — the safety model, default and opt-in tasks, retention rules, and examples
   for offline repository cleanup.
+* [`docs/cli-output.md`](docs/cli-output.md)
+  — which stream carries what, how progress is reported and silenced, and
+  what each command says while it works.
 
 ## Relationship to Apache Jackrabbit Oak
 
