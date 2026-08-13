@@ -218,8 +218,42 @@ to reclaim something.
 
 The safety gate rejects cleanup rather than guessing when, for example, a
 current-head segment appears reclaimable, index and segment-header generations
-disagree, an active segment identifier occurs in more than one archive, or a
-surviving data segment would reference removed data.
+disagree, an active segment identifier occurs in more than one archive, an
+active archive has no index metadata at all, or a surviving data segment would
+reference removed data.
+
+### An active archive with no index metadata
+
+This one is worth naming, because it is the state a crashed Oak leaves and the
+one an operator is most likely to meet. Oak writes an archive's `.gph`, `.brf`,
+and index trailers only when it closes the archive, so a JVM killed with
+`SIGKILL`, an out-of-memory kill, or a yanked container leaves its newest
+archive complete but untrailered. froe's reader serves such an archive through
+a recovery scan; the generation decisions cleanup makes are not allowed to rest
+on a scan, because a scan silently drops what it cannot read and generation
+cleanup deletes on the strength of it.
+
+Cleanup therefore refuses, and the refusal counts *every* affected archive
+number and states whether the newest one is among them — the distinction
+between a killed writer, where the bytes are all still there, and damage in the
+middle of a store, where they may not be. The refusal happens while planning:
+no archive, journal, or checkpoint is changed. It is raised before the lock on
+the read-only preview path, and under it when a caller prepares directly, in
+which case `repo.lock` itself may have been created — that file is the only
+thing a refusing run can leave behind.
+
+Recovering the store is a separate, explicit step: opening it with any froe
+write command rebuilds a missing index and retires the original to a `.bak`
+name — the write-mode archive initialization in `writer::store_writer` — after
+which cleanup plans normally. `froe archives` reports each archive's index
+state read-only, and the tasks that do not consult generations — `journal`,
+`stale-archives`, `stale-temporaries`, `recovery-backups` — still run against
+an affected store.
+
+An empty `dataNNNNN*.tar` is a related but separate artifact: it is the file a
+writer creates just before it starts filling it, so a kill inside that window
+leaves nothing but the name. It contributes no archive, blocks nothing, and
+`stale-archives` removes it as an empty incomplete archive.
 
 If every segment in an archive is reclaimable, the whole archive can be
 removed only when no other letter for that archive number could be promoted by

@@ -164,8 +164,68 @@ fn image_selection_pins_by_default_and_floats_only_for_the_canary() {
 /// How long to wait for Sling to finish booting.
 const SLING_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long to wait for a froe command to finish, when the environment does
+/// not say otherwise.
+///
+/// This is a hang detector, not a performance budget, so it is sized for the
+/// largest store anyone would point the suite at rather than the small one it
+/// generates by default. The old two-minute value was below measured reality:
+/// `froe compact` on a 10 GB, 41-archive Sling store takes 120–135 s here, so
+/// a suite run against a realistic fixture failed on commands that had exited
+/// zero — and, because the timing assertion precedes the status assertion,
+/// reported "timed out" while discarding the command's own output.
+const DEFAULT_FROE_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// How long to wait for a froe command to finish.
-const FROE_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// `FROE_INTEROP_COMMAND_TIMEOUT_SECONDS` overrides it, because the ceiling
+/// depends on the fixture: a CI run over the generated store wants a tight
+/// bound, while a run over a multi-gigabyte store copied off a real instance
+/// needs a loose one. An unparseable or zero value falls back to the default
+/// rather than disabling the detector.
+fn froe_timeout() -> Duration {
+    resolve_froe_timeout(
+        std::env::var("FROE_INTEROP_COMMAND_TIMEOUT_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The timeout rule, separated from the environment so it can be tested
+/// without mutating process state — the same split `select_sling_image` uses,
+/// and for the same reason: these tests share one process.
+fn resolve_froe_timeout(setting: Option<&str>) -> Duration {
+    setting
+        .and_then(|seconds| seconds.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(DEFAULT_FROE_TIMEOUT, Duration::from_secs)
+}
+
+#[test]
+fn the_command_timeout_is_overridable_and_fails_safe() {
+    assert_eq!(resolve_froe_timeout(None), DEFAULT_FROE_TIMEOUT);
+    assert_eq!(
+        resolve_froe_timeout(Some("30")),
+        Duration::from_secs(30),
+        "an explicit ceiling is honoured"
+    );
+    assert_eq!(
+        resolve_froe_timeout(Some("  45  ")),
+        Duration::from_secs(45),
+        "surrounding whitespace does not defeat the override"
+    );
+    for unusable in ["", "0", "-1", "soon", "12s"] {
+        assert_eq!(
+            resolve_froe_timeout(Some(unusable)),
+            DEFAULT_FROE_TIMEOUT,
+            "{unusable:?} must fall back rather than disable the hang detector"
+        );
+    }
+    assert!(
+        DEFAULT_FROE_TIMEOUT >= Duration::from_secs(300),
+        "the default must clear a compaction of a multi-gigabyte store, measured at 120-135s"
+    );
+}
 
 /// The `oak-segment-tar` build this suite is verified against.
 ///
@@ -210,16 +270,22 @@ fn froe(args: &[&str]) -> String {
         .output()
         .unwrap_or_else(|error| panic!("failed to spawn froe {args:?}: {error}"));
     let elapsed = start.elapsed();
-    assert!(
-        elapsed < FROE_TIMEOUT,
-        "froe {args:?} timed out after {elapsed:?}"
-    );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // Status first, then timing. A command that failed *and* was slow has a
+    // diagnosis in its own output; asserting the clock first would replace
+    // that diagnosis with "timed out" and discard both streams.
     assert!(
         output.status.success(),
-        "froe {args:?} exited with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        "froe {args:?} exited with {status} after {elapsed:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         status = output.status
+    );
+    let timeout = froe_timeout();
+    assert!(
+        elapsed < timeout,
+        "froe {args:?} succeeded but took {elapsed:?}, over the {timeout:?} hang-detector \
+         ceiling; raise FROE_INTEROP_COMMAND_TIMEOUT_SECONDS if this fixture is simply large\
+         \nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     stdout
 }
@@ -1047,6 +1113,11 @@ fn read() {
 
     eprintln!("  froe export (json-lines)");
     let export_path = work_root().join("oak-export.jsonl");
+    // `froe export` never overwrites, by design. Without clearing the path
+    // the phase passes once and then fails on every later run against the
+    // same `FROE_INTEROP_WORK_ROOT` — which is precisely the mode used when
+    // pointing the suite at a large fixture that is expensive to rebuild.
+    let _ = std::fs::remove_file(&export_path);
     froe(&[
         "export",
         store.to_str().unwrap(),

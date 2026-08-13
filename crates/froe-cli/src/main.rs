@@ -259,6 +259,13 @@ enum Command {
         /// Cleanup category to run (repeatable). Supplying any --task
         /// replaces the defaults: journal, segments, stale-archives,
         /// expired-checkpoints, and stale-temporaries.
+        ///
+        /// repair-archives is not a default: it rebuilds the index of an
+        /// active archive that has none — what a killed Oak writer leaves —
+        /// keeping the original under a .bak name. Every other category is
+        /// blocked until that is done, so a store in that state plans only
+        /// the repair until you opt in, and the full plan is shown again
+        /// under the lock before anything else is touched.
         #[arg(long = "task", value_enum)]
         tasks: Vec<CleanupTaskArgument>,
         /// Analyze and print the plan without taking repo.lock or writing.
@@ -405,6 +412,7 @@ enum CleanupTaskArgument {
     StaleTemporaries,
     UnreferencedCheckpoints,
     RecoveryBackups,
+    RepairArchives,
 }
 
 impl From<CleanupTaskArgument> for froe::CleanupTask {
@@ -417,6 +425,7 @@ impl From<CleanupTaskArgument> for froe::CleanupTask {
             CleanupTaskArgument::StaleTemporaries => Self::StaleTemporaries,
             CleanupTaskArgument::UnreferencedCheckpoints => Self::UnreferencedCheckpoints,
             CleanupTaskArgument::RecoveryBackups => Self::RecoveryBackups,
+            CleanupTaskArgument::RepairArchives => Self::RepairArchives,
         }
     }
 }

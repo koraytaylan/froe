@@ -22,6 +22,7 @@
 //! archives this writer produces.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -80,6 +81,37 @@ pub(crate) fn next_cleanup_archive_number(directory: &Path) -> Result<u32> {
                 .to_owned(),
         }),
     }
+}
+
+/// The next archive number a write session may allocate: above every
+/// physical Oak archive name in `directory` *and* above every archive the
+/// session actually opened. `None` is the explicit exhausted state.
+///
+/// Opening deliberately serves fewer archives than the directory holds — an
+/// archive number whose every generation letter is empty contributes none —
+/// so allocating out of the opened set alone would hand back a number a
+/// residue file still claims. For the letterless spelling that collision is
+/// unrecoverable rather than untidy: `data00007.tar` and a freshly written
+/// `data00007a.tar` both parse as number 7 generation `'a'`, which
+/// `group_file_generations_newest_first` refuses outright, so every later
+/// open of the store fails. Cleanup allocates from the same stronger view;
+/// see `next_cleanup_archive_number`.
+fn next_physical_archive_number(
+    directory: &Path,
+    opened: &[TarArchiveReader],
+) -> Result<Option<u32>> {
+    let physical = physical_archive_names(directory)?
+        .into_iter()
+        .map(|name| name.archive_number)
+        .max();
+    // The opened set is a subset of the physical names, so this only ever
+    // agrees with `physical`. It is consulted anyway so the two views can
+    // never silently drift apart.
+    let maximum = match (physical, next_archive_number(opened)) {
+        (None, next) => return Ok(next),
+        (Some(physical), _) => physical,
+    };
+    Ok(maximum.checked_add(1))
 }
 
 fn physical_archive_names(directory: &Path) -> Result<Vec<ArchiveFileName>> {
@@ -316,7 +348,7 @@ impl WritableRepository {
         check_and_update_manifest(directory)?;
 
         let base_archives = initialize_archives_for_writing(directory, observer)?;
-        let next_archive_number = next_archive_number(&base_archives);
+        let next_archive_number = next_physical_archive_number(directory, &base_archives)?;
 
         let store = Self {
             directory: directory.to_owned(),
@@ -726,9 +758,20 @@ impl WritableRepository {
         // write open ignores them.
         let mut session_archives = Vec::new();
         for file_name in crate::store::list_archive_file_names(&self.directory)? {
-            if ArchiveFileName::parse(&file_name).is_some() && !base_names.contains(&file_name) {
-                session_archives.push(TarArchiveReader::open(&self.directory.join(&file_name))?);
+            if ArchiveFileName::parse(&file_name).is_none() || base_names.contains(&file_name) {
+                continue;
             }
+            let path = self.directory.join(&file_name);
+            // A zero-length archive is not something this session wrote: it
+            // is the residue of a writer killed inside its own lazy
+            // next-archive creation, which the write open deliberately
+            // serves no archive for. Opening it would fail outright, so the
+            // skip has to hold here too or compaction inherits the failure
+            // that opening was fixed to avoid.
+            if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+                continue;
+            }
+            session_archives.push(TarArchiveReader::open(&path)?);
         }
         session_archives.sort_by_key(|archive| {
             std::cmp::Reverse(
@@ -3468,6 +3511,366 @@ fn initialize_archives_for_writing(
     Ok(archives)
 }
 
+/// One archive number rebuilt by [`repair_indexless_archive_numbers`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RepairedArchive {
+    /// The file name the rebuilt archive was installed under.
+    pub(crate) file_name: String,
+    /// Why the original index was rejected, for the plan and the record.
+    pub(crate) reason: String,
+    /// Size of the rebuilt archive on disk.
+    pub(crate) bytes: u64,
+}
+
+/// The generation letter a rebuild is installed under: the lowest *non-empty*
+/// one, not simply the lowest.
+///
+/// A zero-length letter is a writer's lazy next-archive creation, not an
+/// archive. Taking it as the target would regress the active generation
+/// letter, hard-link a bogus zero-byte `.bak`, and — because the target is
+/// also the metadata source — give the rebuilt archive the residue's
+/// ownership and mode instead of the archive's. The residue is left where it
+/// is for cleanup's stale-archive task, which already owns it.
+fn install_target_generation<'a>(
+    directory: &Path,
+    generations: &'a [ArchiveFileName],
+) -> &'a ArchiveFileName {
+    generations
+        .iter()
+        .find(|generation| {
+            std::fs::metadata(directory.join(&generation.file_name))
+                .is_ok_and(|metadata| metadata.len() != 0)
+        })
+        .unwrap_or(&generations[0])
+}
+
+/// The name of a non-empty `<archive>.recovering` file already beside one of
+/// `generations`, if any.
+///
+/// A rebuild of this number would unlink it, and it is not froe's to unlink:
+/// `recover_archive_number` removes its own staging file on every error path,
+/// so the only way one survives is a crash mid-write — which is the state
+/// cleanup's stale-temporaries task exists to adjudicate, and which it
+/// retains unless it proves the bytes redundant.
+fn existing_staging_residue(directory: &Path, generations: &[ArchiveFileName]) -> Option<String> {
+    generations.iter().find_map(|generation| {
+        let name = format!("{}.recovering", generation.file_name);
+        std::fs::symlink_metadata(directory.join(&name))
+            .ok()
+            .filter(|metadata| metadata.is_file() && metadata.len() != 0)
+            .map(|_| name)
+    })
+}
+
+/// Refuses a directory holding two spellings of one `(number, letter)` pair.
+///
+/// `data00007.tar` and `data00007a.tar` both parse as number 7 generation
+/// `'a'`. Grouping them would make the install target whichever the listing
+/// yielded first, so the repair refuses — and it must refuse before anything
+/// irreversible, not after.
+pub(crate) fn reject_duplicate_archive_generations(directory: &Path) -> Result<()> {
+    let names: Vec<String> = physical_archive_names(directory)?
+        .into_iter()
+        .map(|parsed| parsed.file_name)
+        .collect();
+    select_newest_file_generations(&names)?;
+    Ok(())
+}
+
+/// Authorizes writing version-2 data, called immediately before the first
+/// rebuilt archive is installed.
+///
+/// The repair produces a version-2 binary-references trailer, so a
+/// version-1 store has to be raised first — but only when a rebuild is
+/// actually about to land, not when one is merely predicted. Expressing that
+/// as a callback keeps the manifest policy in cleanup, where the plan that
+/// announced it lives, while the timing stays here, where the install is.
+pub(crate) trait AuthorizeVersionTwoWrite {
+    /// Called once before the first install; later calls must be no-ops.
+    fn authorize(&mut self) -> Result<()>;
+}
+
+/// The authorization a write session needs: none.
+///
+/// `WritableRepository::open` runs `check_and_update_manifest` before it
+/// touches an archive, so the store is already version 2 by the time any
+/// rebuild installs. Cleanup cannot do that — it may not upgrade a manifest
+/// it did not plan to — which is the whole reason this is a callback.
+pub(crate) struct VersionTwoAlreadyEstablished;
+
+impl AuthorizeVersionTwoWrite for VersionTwoAlreadyEstablished {
+    fn authorize(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The archive file names a repair would replace, lowest number first.
+///
+/// The install targets specifically, which is what an ownership preflight
+/// needs: those are the files `preserve_file_metadata` will try to match.
+pub(crate) fn repair_target_names(directory: &Path) -> Result<Vec<String>> {
+    let mut by_number: std::collections::BTreeMap<u32, Vec<ArchiveFileName>> =
+        std::collections::BTreeMap::new();
+    for parsed in physical_archive_names(directory)? {
+        by_number
+            .entry(parsed.archive_number)
+            .or_default()
+            .push(parsed);
+    }
+    let mut targets = Vec::new();
+    for mut generations in by_number.into_values() {
+        generations.sort_by_key(|name| name.file_generation);
+        let (winner, any_nonempty) = select_writable_generation(directory, &generations);
+        if winner.is_some() || !any_nonempty {
+            continue;
+        }
+        if any_recoverable_segment(directory, &generations) {
+            targets.push(
+                install_target_generation(directory, &generations)
+                    .file_name
+                    .clone(),
+            );
+        }
+    }
+    Ok(targets)
+}
+
+/// What a repair run would find: which archive numbers it can rebuild, and
+/// which hold bytes no scan can read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndexlessSurvey {
+    /// Numbers a rebuild would succeed on.
+    pub(crate) repairable: usize,
+    /// File names of numbers a rebuild would refuse, lowest number first.
+    pub(crate) unrepairable: Vec<String>,
+}
+
+/// Surveys the archive numbers that have no valid index.
+///
+/// One predicate, asked once, so nothing downstream can drift from it. The
+/// distinction it draws is the whole safety question of the repair task: a
+/// number whose letters scan to at least one segment can be rebuilt, and one
+/// whose letters scan to nothing cannot — `recover_archive_number` refuses
+/// it rather than install an empty archive. Gating an irreversible step on
+/// "index-less" instead of "repairable" is what let a run that repairs
+/// nothing still upgrade a manifest; planning on one and gating on the other
+/// is what let a doomed run pay for durable rewrites first.
+pub(crate) fn survey_indexless_archive_numbers(directory: &Path) -> Result<IndexlessSurvey> {
+    let mut by_number: std::collections::BTreeMap<u32, Vec<ArchiveFileName>> =
+        std::collections::BTreeMap::new();
+    for parsed in physical_archive_names(directory)? {
+        by_number
+            .entry(parsed.archive_number)
+            .or_default()
+            .push(parsed);
+    }
+    let mut survey = IndexlessSurvey::default();
+    for mut generations in by_number.into_values() {
+        generations.sort_by_key(|name| name.file_generation);
+        let (winner, any_nonempty) = select_writable_generation(directory, &generations);
+        if winner.is_some() || !any_nonempty {
+            continue;
+        }
+        if any_recoverable_segment(directory, &generations) {
+            survey.repairable += 1;
+        } else {
+            survey.unrepairable.push(
+                install_target_generation(directory, &generations)
+                    .file_name
+                    .clone(),
+            );
+        }
+    }
+    Ok(survey)
+}
+
+/// The refusal an unrepairable archive number earns, raised before anything
+/// is authorized rather than after a rewrite has been paid for.
+pub(crate) fn unrepairable_archives_refusal(unrepairable: &[String]) -> Error {
+    Error::InvalidFormat {
+        details: format!(
+            "{} active archive(s) have no valid index and no segment any recovery scan can read: \
+             {}. Repair would refuse them, so this run cannot complete however it is retried; \
+             move those files aside to proceed, and keep them — they are the only copy of \
+             whatever they hold",
+            unrepairable.len(),
+            unrepairable.join(", ")
+        ),
+    }
+}
+
+/// Rebuilds the index of every archive number that has none, and does
+/// nothing else.
+///
+/// [`initialize_archives_for_writing`] also *deletes* non-winning generation
+/// letters. That deletion is cleanup's `stale-archives` task, which plans it,
+/// shows it, and asks — so repair must not perform it as a side effect or it
+/// would delete archives the operator never authorised, under a task that
+/// only promised to repair. This is the same normalization/authorization
+/// split `open_prepared` states: cleanup may only take a side effect it has
+/// independently planned.
+///
+/// All-empty numbers are skipped rather than repaired: there is nothing to
+/// rebuild from, and the zero-byte files belong to `stale-archives` too.
+/// Requires only the repository lock — `recover_archive_number` reads the
+/// directory and writes beside it, holding no writer state.
+pub(crate) fn repair_indexless_archive_numbers(
+    directory: &Path,
+    observer: &mut dyn crate::progress::ProgressObserver,
+    authorize: &mut dyn AuthorizeVersionTwoWrite,
+) -> Result<Vec<RepairedArchive>> {
+    let names = physical_archive_names(directory)?;
+    // The same validation `initialize_archives_for_writing` performs before
+    // it groups, and for the same reason: `data00007.tar` and
+    // `data00007a.tar` both parse as number 7 generation 'a', so without this
+    // they land in one group and the install target becomes whichever the
+    // directory listing happened to yield first. Repairing into that is a
+    // nondeterministic, irreversible rewrite of a store that the very next
+    // `Repository::open` refuses outright.
+    select_newest_file_generations(
+        &names
+            .iter()
+            .map(|name| name.file_name.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut by_number: std::collections::BTreeMap<u32, Vec<ArchiveFileName>> =
+        std::collections::BTreeMap::new();
+    for parsed in names {
+        by_number
+            .entry(parsed.archive_number)
+            .or_default()
+            .push(parsed);
+    }
+    let total = by_number.len();
+    crate::progress::observe(
+        observer,
+        &crate::progress::Step::new(
+            "repairing archive indexes",
+            crate::progress::WorkUnit::Archives,
+        )
+        .with_total(crate::progress::count(total)),
+        |observer| {
+            let mut repaired = Vec::new();
+            let mut failures: Vec<String> = Vec::new();
+            for (examined, (number, mut generations)) in by_number.into_iter().enumerate() {
+                observer.step_advanced(crate::progress::count(examined));
+                generations.sort_by_key(|name| name.file_generation);
+                let (winner, any_nonempty) = select_writable_generation(directory, &generations);
+                if winner.is_some() || !any_nonempty {
+                    continue;
+                }
+                // Captured before the rebuild: afterwards the archive is
+                // indexed and the reason no longer exists to be read.
+                let reason = generations
+                    .iter()
+                    .rev()
+                    .find_map(|candidate| {
+                        TarArchiveReader::open(&directory.join(&candidate.file_name))
+                            .ok()
+                            .and_then(|reader| reader.recovery_reason().map(str::to_owned))
+                    })
+                    .unwrap_or_else(|| "the index could not be read".to_owned());
+                // `recover_archive_number` unlinks its own staging file before
+                // writing. A staging file that is already there is not ours:
+                // it is the residue of a rebuild interrupted mid-write, which
+                // cleanup's stale-temporaries task recognises, plans, and
+                // deliberately *retains* unless it is provably redundant —
+                // because its merged content can be the only assembled copy
+                // when an install was interrupted after a letter had already
+                // been retired. Repair must not delete it as a side effect of
+                // a task that only promised to rebuild an index.
+                if let Some(residue) = existing_staging_residue(directory, &generations) {
+                    failures.push(format!(
+                        "archive number {number}: {residue} is the residue of an interrupted \
+                         rebuild and may hold the only assembled copy of this archive; \
+                         cleanup's stale-temporaries task decides its fate, so repair will not \
+                         overwrite it — move it aside to retry"
+                    ));
+                    continue;
+                }
+                // Archive numbers are independent: one that cannot be rebuilt
+                // says nothing about the next, and stopping at the first would
+                // hide every later problem behind one repair-and-rerun cycle
+                // apiece — on a store damaged throughout, that is one full
+                // planning pass per archive. Collect and continue, so the
+                // operator learns the whole picture from one run.
+                match recover_archive_number(directory, &generations, authorize) {
+                    Ok(rebuilt) => repaired.push(RepairedArchive {
+                        file_name: rebuilt.file_name().to_owned(),
+                        reason,
+                        bytes: rebuilt.file_size(),
+                    }),
+                    Err(error) => failures.push(format!("archive number {number}: {error}")),
+                }
+            }
+            observer.step_advanced(crate::progress::count(total));
+            if failures.is_empty() {
+                return Ok(repaired);
+            }
+            Err(unfinished_repair_refusal(&repaired, &failures))
+        },
+    )
+}
+
+/// The refusal a partially completed repair earns.
+///
+/// It carries what *succeeded*, because those archives were rewritten and
+/// now have `.bak` files: reporting only the failure would leave the
+/// operator believing the store is as they left it. This is the same
+/// obligation `attach_planning_warnings` meets for planning, applied to the
+/// one mutation that happens before there is a plan to record it in.
+fn unfinished_repair_refusal(repaired: &[RepairedArchive], failures: &[String]) -> Error {
+    let mut details = format!(
+        "{} of {} archive index rebuild(s) failed: {}",
+        failures.len(),
+        failures.len() + repaired.len(),
+        failures.join("; ")
+    );
+    if !repaired.is_empty() {
+        let names: Vec<&str> = repaired
+            .iter()
+            .map(|archive| archive.file_name.as_str())
+            .collect();
+        let _ = write!(
+            details,
+            ". Already rebuilt and durable, with the originals retained under `.bak` names: {}. \
+             Those need no second attempt; rerunning repairs only what is left",
+            names.join(", ")
+        );
+    }
+    Error::InvalidFormat { details }
+}
+
+/// Picks the generation letter of one archive number to write against:
+/// newest letter first, the first valid index wins. Also reports whether
+/// any letter held bytes at all.
+///
+/// Zero-length letters are skipped exactly as the read path skips them
+/// (`crate::store::open_archives_newest_valid_first`): a writer creates its
+/// next archive lazily, and an empty file is that creation's race window —
+/// or what it leaves behind when it is killed inside it. Opening one yields
+/// no segments, so recovering the number would rebuild it as an archive
+/// with no entries, which is not a file `TarArchiveWriter` ever creates.
+fn select_writable_generation(
+    directory: &Path,
+    generations: &[ArchiveFileName],
+) -> (Option<TarArchiveReader>, bool) {
+    let mut any_nonempty = false;
+    for candidate in generations.iter().rev() {
+        let path = directory.join(&candidate.file_name);
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+            continue;
+        }
+        any_nonempty = true;
+        if let Ok(reader) = TarArchiveReader::open(&path)
+            && !reader.is_recovered()
+        {
+            return (Some(reader), any_nonempty);
+        }
+    }
+    (None, any_nonempty)
+}
+
 /// Opens the winning generation letter of each archive number, deleting
 /// the losers, and reports one completed archive number at a time.
 fn open_archive_numbers_for_writing(
@@ -3480,18 +3883,7 @@ fn open_archive_numbers_for_writing(
     for (opened, (_, mut generations)) in by_number.into_iter().enumerate() {
         observer.step_advanced(crate::progress::count(opened));
         generations.sort_by_key(|name| name.file_generation);
-        let mut winner: Option<TarArchiveReader> = None;
-        // Newest letter first: the first valid index wins.
-        for candidate in generations.iter().rev() {
-            let path = directory.join(&candidate.file_name);
-            match TarArchiveReader::open(&path) {
-                Ok(reader) if !reader.is_recovered() => {
-                    winner = Some(reader);
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let (winner, any_nonempty) = select_writable_generation(directory, &generations);
         match winner {
             Some(reader) => {
                 // Delete every other generation letter of this number.
@@ -3502,13 +3894,55 @@ fn open_archive_numbers_for_writing(
                 }
                 archives.push(reader);
             }
+            // Every letter of this number is empty, so there is nothing to
+            // recover and nothing to serve. Nothing is deleted here: the
+            // number simply contributes no archive, which either frees it
+            // for the next write to fill — the same thing the writer that
+            // created it was about to do — or leaves the files for
+            // cleanup's stale-archive task to remove under its own
+            // plan-and-confirm contract. Reuse can only ever land on a
+            // zero-byte file, because a single non-empty letter sends the
+            // whole number down the recovery path instead.
+            None if !any_nonempty => {}
             None => {
-                archives.push(recover_archive_number(directory, &generations)?);
+                archives.push(recover_archive_number(
+                    directory,
+                    &generations,
+                    &mut VersionTwoAlreadyEstablished,
+                )?);
             }
         }
     }
     observer.step_advanced(crate::progress::count(archive_numbers));
     Ok(archives)
+}
+
+/// The refusal an archive number earns when it holds bytes but no segment
+/// the recovery scan can read. Naming the files matters more than usual
+/// here: the operator has to decide whether to move them aside or keep them
+/// as evidence, and neither the number nor an errno tells them which files
+/// are involved.
+///
+/// The remedy deliberately does not name cleanup. `plan_stale_archives`
+/// marks only *zero-byte* letters of an unindexed number stale; a non-empty
+/// letter is preserved with a warning, precisely because it may still hold
+/// unrecovered bytes. Telling the operator to run cleanup here would send
+/// them to a command that will decline to act.
+fn unrecoverable_archive_number_refusal(generations: &[ArchiveFileName]) -> Error {
+    let names: Vec<&str> = generations
+        .iter()
+        .map(|generation| generation.file_name.as_str())
+        .collect();
+    Error::InvalidFormat {
+        details: format!(
+            "archive number {} has no valid index and no recoverable segment in {}; \
+             refusing to replace it with an empty archive. Cleanup preserves this file \
+             rather than removing it, so opening the store for writing needs it moved \
+             aside — keep it, it is the only copy of whatever it holds",
+            generations.first().map_or(0, |first| first.archive_number),
+            names.join(", ")
+        ),
+    }
 }
 
 /// Recovers one archive number with no valid index: scans every letter in
@@ -3519,11 +3953,60 @@ fn open_archive_numbers_for_writing(
 /// file name. A failure before installation leaves every original in
 /// place; a failure during installation rolls back best-effort (see
 /// [`install_recovered_archive`]).
+/// Gives a rebuilt archive the ownership and mode of the archive it replaces,
+/// rather than the process umask.
+///
+/// Every other replacement path in maintenance does this; without it a store
+/// whose archives are group-owned and setgid silently loses both on the one
+/// file that was rewritten, and a later cleanup's apply-identity preflight
+/// reads the wrong metadata. A target that does not exist yet has nothing to
+/// inherit, which is not an error.
+fn inherit_replaced_archive_metadata(
+    directory: &Path,
+    target_name: &str,
+    temporary_path: &Path,
+) -> Result<()> {
+    let Ok(source_metadata) = std::fs::metadata(directory.join(target_name)) else {
+        return Ok(());
+    };
+    let staged = std::fs::OpenOptions::new()
+        .write(true)
+        .open(temporary_path)?;
+    preserve_file_metadata(&staged, &source_metadata)
+}
+
+/// Charges the caller's version-2 price at the last instant before a rebuilt
+/// archive becomes visible.
+///
+/// The staged rebuild already exists, is durable, and has re-opened with a
+/// valid index; nothing version-2 is visible yet. If authorization fails the
+/// staging file is removed like every other pre-install failure, so the
+/// number is left exactly as it was found.
+fn authorize_before_install(
+    authorize: &mut dyn AuthorizeVersionTwoWrite,
+    temporary_path: &Path,
+) -> Result<()> {
+    if let Err(error) = authorize.authorize() {
+        let _ = std::fs::remove_file(temporary_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn recover_archive_number(
     directory: &Path,
     generations: &[ArchiveFileName],
+    authorize: &mut dyn AuthorizeVersionTwoWrite,
 ) -> Result<TarArchiveReader> {
     let recovered = scan_recoverable_segments(directory, generations);
+    // A non-empty file that yields no segment is residue this function
+    // cannot act on: writing the replacement would produce an archive with
+    // no entries, which `TarArchiveWriter` never creates at all, and the
+    // re-open below would then fail on a missing path with a bare errno.
+    // Refuse with the file names instead, and say what clears them.
+    if recovered.is_empty() {
+        return Err(unrecoverable_archive_number_refusal(generations));
+    }
 
     // Parse every segment once — data *and* bulk, so blob identifier
     // strings whose block lists spill into bulk segments resolve too.
@@ -3551,7 +4034,7 @@ fn recover_archive_number(
     // Build the replacement beside the originals; nothing is renamed or
     // deleted until it exists, is durable, and re-opens with a valid
     // index.
-    let target_name = &generations[0].file_name;
+    let target_name = &install_target_generation(directory, generations).file_name;
     let temporary_name = format!("{target_name}.recovering");
     let temporary_path = directory.join(&temporary_name);
     let _ = std::fs::remove_file(&temporary_path);
@@ -3612,6 +4095,10 @@ fn recover_archive_number(
         let _ = std::fs::remove_file(&temporary_path);
         return Err(error);
     }
+    if let Err(error) = inherit_replaced_archive_metadata(directory, target_name, &temporary_path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
     crate::writer::compaction::fsync_directory(directory);
     match TarArchiveReader::open(&temporary_path) {
         Ok(validated) if !validated.is_recovered() => drop(validated),
@@ -3626,12 +4113,31 @@ fn recover_archive_number(
             return Err(error);
         }
     }
+    authorize_before_install(authorize, &temporary_path)?;
     install_recovered_archive(directory, generations, target_name, &temporary_path)
 }
 
 /// Scans every generation letter of one archive number in ascending
 /// order — later letters overwrite duplicate segments — returning the
 /// recovered segments in scan order.
+/// Whether a rebuild of this archive number would find anything to rebuild
+/// from — the same question [`scan_recoverable_segments`] answers, without
+/// materializing an answer nobody wants.
+///
+/// The scan copies every segment's bytes into owned buffers, so asking it
+/// this question allocates the whole archive to discard it, and does so in
+/// the survey that now runs before every repair. `segment_count()` on a
+/// recovery-scanned reader is the length of that same scan's entry list,
+/// read straight off the memory map. It is also exactly what the cleanup
+/// side reads off its already-open readers, so both callers now derive the
+/// predicate the same way and cannot drift apart.
+fn any_recoverable_segment(directory: &Path, generations: &[ArchiveFileName]) -> bool {
+    generations.iter().any(|generation| {
+        TarArchiveReader::open(&directory.join(&generation.file_name))
+            .is_ok_and(|reader| reader.segment_count() > 0)
+    })
+}
+
 fn scan_recoverable_segments(
     directory: &Path,
     generations: &[ArchiveFileName],
@@ -3683,6 +4189,12 @@ fn install_recovered_archive(
     };
     for generation in generations {
         let path = directory.join(&generation.file_name);
+        // Zero-length letters hold nothing to preserve and are not archives;
+        // retiring one would only manufacture an empty `.bak`. They stay for
+        // the stale-archive task, which plans and confirms their removal.
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+            continue;
+        }
         let backup = backup_path(directory, &generation.file_name);
         if generation.file_name == *target_name {
             // The target keeps its directory entry: the backup is a
@@ -7041,6 +7553,126 @@ mod tests {
             "the regenerated archive has a valid index"
         );
         repository.content_root().expect("content root resolves");
+    }
+
+    /// An empty archive file is what a writer killed inside its own lazy
+    /// next-archive creation leaves behind — the read path has always
+    /// skipped it. Before this was mirrored here, the number fell to
+    /// `recover_archive_number`, which rebuilt it as an archive with no
+    /// entries; `TarArchiveWriter` never creates a file for that, so the
+    /// re-open failed on a missing path and every froe write command
+    /// reported a bare `No such file or directory`.
+    #[test]
+    fn an_empty_archive_file_does_not_break_opening_for_writing() {
+        let directory = TestDirectory::new("empty-archive-open");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        let empty = directory.path.join("data00009a.tar");
+        std::fs::write(&empty, b"").expect("create the empty archive");
+
+        let store = WritableRepository::open(&directory.path).expect("write open must succeed");
+        let head = store.head();
+        assert!(store.segment(head.segment).is_ok(), "head still resolves");
+        store.close().expect("close");
+
+        Repository::open(&directory.path).expect("the reader still opens");
+    }
+
+    /// The empty number contributes no archive, so nothing is deleted as a
+    /// side effect of opening. Reuse is the only other outcome, and it can
+    /// only ever overwrite zero bytes.
+    #[test]
+    fn an_empty_archive_file_is_never_deleted_by_opening_for_writing() {
+        let directory = TestDirectory::new("empty-archive-retained");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // A number above the next one froe would allocate, so the open
+        // cannot reach it by filling it.
+        let empty = directory.path.join("data00500a.tar");
+        std::fs::write(&empty, b"").expect("create the empty archive");
+
+        let store = WritableRepository::open(&directory.path).expect("write open");
+        store.close().expect("close");
+
+        assert!(
+            empty.exists(),
+            "opening for writing must not delete the empty archive; cleanup removes it \
+             under its own plan-and-confirm contract"
+        );
+    }
+
+    /// Skipping an all-empty archive number must not free it for reuse: the
+    /// letterless spelling of a number collides with the lettered one, and
+    /// `group_file_generations_newest_first` refuses that pair outright, so
+    /// a store that allocated into it could never be opened again by
+    /// anything. Allocation therefore reads the physical namespace.
+    #[test]
+    fn an_empty_archive_number_is_never_reallocated_over_its_own_residue() {
+        let directory = TestDirectory::new("empty-archive-namespace");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // Letterless: `ArchiveFileName::parse` reads this as number 1,
+        // generation 'a' — the same pair a written `data00001a.tar` claims.
+        std::fs::write(directory.path.join("data00001.tar"), b"").expect("empty residue");
+
+        {
+            let store = WritableRepository::open(&directory.path).expect("write open");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            writer.write_string("forces a new archive").expect("string");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+        }
+
+        assert!(
+            !directory.path.join("data00001a.tar").exists(),
+            "allocation must skip the number the letterless residue claims"
+        );
+        Repository::open(&directory.path).expect("the store is still openable");
+        WritableRepository::open(&directory.path)
+            .expect("and still writable")
+            .close()
+            .expect("close");
+    }
+
+    /// A non-empty letter that yields no recoverable segment is residue
+    /// `recover_archive_number` cannot act on. It must say so, not surface
+    /// the `ENOENT` of the replacement it declined to write.
+    #[test]
+    fn an_unrecoverable_archive_is_refused_with_its_file_name() {
+        let directory = TestDirectory::new("unrecoverable-archive");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // 512-byte blocks that are neither a valid index nor a parseable
+        // tar entry: the scan recovers nothing from them.
+        let junk = directory.path.join("data00009a.tar");
+        std::fs::write(&junk, vec![0x5au8; 4096]).expect("write junk archive");
+
+        let message = match WritableRepository::open(&directory.path) {
+            Ok(_) => panic!("opening for writing must refuse an unrecoverable archive"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("data00009a.tar"),
+            "the refusal names the unusable file: {message}"
+        );
+        assert!(
+            message.contains("no recoverable segment"),
+            "the refusal states why: {message}"
+        );
+        assert!(
+            !message.contains("No such file or directory"),
+            "the refusal must not surface a bare errno: {message}"
+        );
+        assert!(junk.exists(), "the refusal leaves the file in place");
     }
 
     #[test]

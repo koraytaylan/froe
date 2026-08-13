@@ -10,6 +10,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,6 +78,17 @@ pub enum CleanupTask {
     UnreferencedCheckpoints,
     /// Apply the explicitly configured age/count policy to recovery backups.
     RecoveryBackups,
+    /// Rebuild the index of an active archive that has none, retaining the
+    /// original bytes under a `.bak` name.
+    ///
+    /// An archive whose trailers were never written is what a killed Oak
+    /// writer leaves behind, and every other cleanup category is blocked by
+    /// it: generation decisions may not rest on a recovery scan. Opting into
+    /// this makes cleanup repair that state instead of refusing it. It is
+    /// deliberately not a default, because it rewrites an archive, and
+    /// because a store damaged in the middle rather than at the tail is a
+    /// case the operator should look at before authorizing.
+    RepairArchives,
 }
 
 impl std::fmt::Display for CleanupTask {
@@ -89,6 +101,7 @@ impl std::fmt::Display for CleanupTask {
             Self::StaleTemporaries => "stale-temporaries",
             Self::UnreferencedCheckpoints => "unreferenced-checkpoints",
             Self::RecoveryBackups => "recovery-backups",
+            Self::RepairArchives => "repair-archives",
         };
         formatter.write_str(name)
     }
@@ -355,6 +368,29 @@ impl CleanupDeletionFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CleanupAction {
+    /// Rebuild the index of an active archive that has none.
+    ///
+    /// Reported by the read-only preview, which cannot do more than name the
+    /// work: the repair itself happens under the repository lock, and every
+    /// index-dependent decision — the segment sweep, checkpoint removal —
+    /// can only be planned once it has. The authoritative plan the CLI
+    /// re-confirms is therefore always larger than the preview that named
+    /// this.
+    RepairArchiveIndex {
+        /// Archive file name the rebuilt archive is installed under: the
+        /// lowest non-empty generation letter of its number.
+        file_name: String,
+        /// Other generation letters of the same number, whose contents are
+        /// merged into the rebuild and which are then retired to `.bak`
+        /// names. Named because confirmation is scoped to the files a plan
+        /// printed, and these leave the archive namespace.
+        retired_file_names: Vec<String>,
+        /// Why the existing index was rejected.
+        reason: String,
+        /// Whole-file bytes across every letter that will be read, which is
+        /// what ends up retained under `.bak` names.
+        bytes: u64,
+    },
     /// Rewrite the journal while retaining readable record lines verbatim.
     PruneJournal {
         /// Total physical lines removed.
@@ -535,6 +571,8 @@ pub struct CleanupOutcome {
     pub removed_temporaries: usize,
     /// Opt-in recovery backups removed.
     pub removed_recovery_backups: usize,
+    /// Archive indexes rebuilt before planning, under the repository lock.
+    pub repaired_archives: usize,
     /// Recognized deletion targets this cleanup did not unlink itself.
     ///
     /// Most entries remain for retry; entries reported as already absent need
@@ -582,6 +620,10 @@ pub struct PreparedCleanup {
     directory: PathBuf,
     options: CleanupOptions,
     plan: CleanupPlan,
+    /// Archives whose index this preparation already rebuilt, before the
+    /// plan was built. Carried so the outcome can report work that, by
+    /// construction, happened before there was a plan to record it in.
+    repaired: Vec<crate::writer::store_writer::RepairedArchive>,
     repository_lock: Arc<RepositoryLock>,
 }
 
@@ -604,6 +646,12 @@ impl PreparedCleanup {
         validate_options(&options)?;
         let directory = canonical_repository_directory(directory)?;
         validate_repository_shape(&directory)?;
+        // The store version, before anything is written. `build_plan` reaches
+        // this through `Repository::open`, but the repair below runs first, so
+        // without it here froe would rewrite the archives of a store it then
+        // declares itself unable to read — and a caller using the library API
+        // directly never gets the lockless preview that would have refused.
+        crate::store::check_manifest(&directory, true)?;
         validate_apply_environment(&directory)?;
         validate_apply_identity(&directory)?;
         let repository_lock = Arc::new(RepositoryLock::acquire(&directory)?);
@@ -611,24 +659,146 @@ impl PreparedCleanup {
         // acquisition. Revalidate every managed type while the cooperative
         // repository lock is held before reading the authoritative plan.
         validate_repository_shape(&directory)?;
+        crate::store::check_manifest(&directory, true)?;
         validate_apply_environment(&directory)?;
         validate_apply_identity(&directory)?;
         repository_lock.validate_path_identity(&directory)?;
+        let repaired = Self::repair_before_planning(&directory, &options, observer)?;
         let now = SystemTime::now();
-        let plan = build_plan(&directory, &options, now, observer)?;
-        validate_plan_apply_identity(&directory, &plan)?;
+        let plan = build_plan(&directory, &options, now, observer).map_err(|error| {
+            // The repair already happened and is durable. Every gate below it
+            // — the duplicate-segment check, the generation invariant, the
+            // segment plan — is evaluating this store for the first time in
+            // its history, precisely because the index-less state suppressed
+            // them before. So this path is ordinary, not exotic, and a
+            // refusal that did not mention the rewrite would leave the
+            // operator believing nothing moved.
+            attach_completed_repairs(error, &repaired)
+        })?;
+        // Inside the same guard: this is the one identity gate that can only
+        // fire after the repair, because the archives it inspects are the
+        // ones the repair just wrote.
+        validate_plan_apply_identity(&directory, &plan)
+            .map_err(|error| attach_completed_repairs(error, &repaired))?;
         Ok(Self {
             directory,
             options,
             plan,
+            repaired,
             repository_lock,
         })
+    }
+
+    /// Rebuilds index-less archives, when the task is selected and there is
+    /// something to rebuild.
+    ///
+    /// This is the only mutation that precedes planning, because every
+    /// index-dependent decision is impossible until it has run — the preview
+    /// could name it and nothing more. It is gated on the *scan*, never on
+    /// task selection alone: a store with nothing to repair must come out of
+    /// a repair run byte-identical, including its manifest.
+    fn repair_before_planning(
+        directory: &Path,
+        options: &CleanupOptions,
+        observer: &mut dyn ProgressObserver,
+    ) -> Result<Vec<crate::writer::store_writer::RepairedArchive>> {
+        if !options.contains(CleanupTask::RepairArchives) {
+            return Ok(Vec::new());
+        }
+        // One predicate for the whole decision. `repairable` — not merely
+        // "index-less" — is what gates the irreversible steps below, because
+        // a number that cannot be rebuilt makes the run fail however it is
+        // retried, and paying a manifest upgrade or a durable rewrite to
+        // discover that is exactly the trade this ordering exists to avoid.
+        let survey = crate::writer::store_writer::survey_indexless_archive_numbers(directory)?;
+        if !survey.unrepairable.is_empty() {
+            return Err(crate::writer::store_writer::unrepairable_archives_refusal(
+                &survey.unrepairable,
+            ));
+        }
+        if survey.repairable == 0 {
+            return Ok(Vec::new());
+        }
+        // Duplicate `(number, letter)` pairs before the upgrade, not after:
+        // the repair refuses them, and a refusal must not cost a one-way
+        // manifest transition. `Repository::open` rejects such a store, so
+        // only a library caller skipping the preview reaches this.
+        crate::writer::store_writer::reject_duplicate_archive_generations(directory)?;
+        // Ownership of the archives about to be rewritten, from stat(2),
+        // before anything is touched. A rebuild ends in
+        // `preserve_file_metadata`, whose `fchown` fails EPERM when the
+        // target belongs to another uid — and the newest archive of a store
+        // whose Oak ran as root is exactly the killed-writer artifact this
+        // task exists to repair. Ownership does not change on retry, so
+        // discovering it after the rewrite means no rerun ever converges.
+        // Nothing else covers these files: `journal_service_user_issue`
+        // stats only `journal.log`, and `planned_metadata_sources` is
+        // consulted after the repair has already run.
+        Self::validate_repair_target_identity(directory)?;
+        // A rebuilt archive carries a version-2 trailer, so a version-1 store
+        // is raised first — but only at the instant one is about to become
+        // visible, never merely because a rebuild was predicted. A repair can
+        // still fail per archive for reasons no survey models (a full disk, a
+        // blob catalog that will not resolve), and paying an irreversible
+        // format transition for a run that then rebuilds nothing would leave
+        // the store damaged *and* unopenable by an older Oak.
+        let manifest_upgrade = &mut ManifestUpgradeOnFirstInstall::new(directory);
+        crate::writer::store_writer::repair_indexless_archive_numbers(
+            directory,
+            observer,
+            manifest_upgrade,
+        )
+    }
+
+    /// Refuses before the first rewrite when an archive the repair would
+    /// replace cannot have its metadata preserved by this process.
+    fn validate_repair_target_identity(directory: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+            let credentials = current_apply_credentials()?;
+            let directory_metadata = std::fs::symlink_metadata(directory)?;
+            let possible_created_gids = possible_created_group_ids(
+                directory_metadata.gid(),
+                directory_metadata.permissions().mode(),
+                &credentials,
+            );
+            for name in crate::writer::store_writer::repair_target_names(directory)? {
+                let path = directory.join(&name);
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if let Some(issue) = metadata_source_apply_identity_issue(
+                    &path,
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.permissions().mode(),
+                    &possible_created_gids,
+                    &credentials,
+                ) {
+                    return Err(Error::InvalidFormat { details: issue });
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = directory;
+        Ok(())
     }
 
     /// The lock-protected plan callers should display and confirm.
     #[must_use]
     pub fn plan(&self) -> &CleanupPlan {
         &self.plan
+    }
+
+    /// Archive indexes this preparation already rebuilt.
+    ///
+    /// Non-zero only for a `repair-archives` run, and non-zero *before*
+    /// anything is applied: the rebuild is what made the plan computable, so
+    /// it is durable by the time a caller sees this. A caller that declines
+    /// the plan has still had these archives rewritten, and should say so.
+    #[must_use]
+    pub fn repaired_archives(&self) -> usize {
+        self.repaired.len()
     }
 
     /// Applies exactly this authoritative plan, failing before the first
@@ -1081,6 +1251,24 @@ fn validate_options(options: &CleanupOptions) -> Result<()> {
             details: "recovery-backups requires an explicit age/count retention policy".to_owned(),
         });
     }
+    // Repair retires the original archive bytes to a `.bak` name, and it runs
+    // before this run's plan is built — so its own backups are visible to the
+    // backup policy that would retire them. A zero age with a zero keep-count
+    // is reachable from the command line, and would delete the only copy of
+    // whatever the recovery scan could not read, in the same breath that made
+    // the copy. The two tasks are coherent in sequence and never together.
+    if options.contains(CleanupTask::RepairArchives)
+        && options.contains(CleanupTask::RecoveryBackups)
+    {
+        return Err(Error::InvalidFormat {
+            details: "repair-archives and recovery-backups cannot run together: repair retires \
+                      the original archive to a `.bak` name that the backup policy could then \
+                      delete in the same run, discarding the only copy of any segment the \
+                      rebuild could not read — repair first, verify the store, then retire the \
+                      backups in a later run"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -1219,15 +1407,133 @@ fn file_fingerprint(name: OsString, metadata: &Metadata) -> FileFingerprint {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the plan builder is one safety-ordered inventory transaction; splitting it would obscure ordering and duplicate state"
-)]
+/// Builds the plan, keeping the warnings it established even when it fails.
+///
+/// A refusal is exactly when an operator most needs the facts the same run
+/// already worked out — a plan that dies at the segment gate has usually
+/// finished the stale-archive scan, and that scan's findings are as true on
+/// the failing path as on the succeeding one. `docs/cli-output.md` states
+/// warnings are never suppressed; that promise has to survive an error.
 fn build_plan(
     directory: &Path,
     options: &CleanupOptions,
     now: SystemTime,
     observer: &mut dyn ProgressObserver,
+) -> Result<CleanupPlan> {
+    let mut warnings = Vec::new();
+    build_plan_collecting(directory, options, now, observer, &mut warnings)
+        .map_err(|error| attach_planning_warnings(error, &warnings))
+}
+
+/// Re-attaches established warnings to a format refusal. Other variants are
+/// returned untouched: an `InputOutput` failure must stay matchable as one
+/// for a library caller, and its cause is not a fact about the store.
+///
+/// The attachment is bounded, because a store with many damaged archives
+/// produces one warning per archive and an unbounded tail would bury the
+/// refusal itself. The count of omitted warnings is stated so the operator
+/// knows the list was cut rather than exhausted, and the full set is
+/// reachable by rerunning with only the tasks that do not refuse.
+/// Raises `store.version` to 2 the first time a rebuilt archive is about to
+/// be installed, and never otherwise.
+///
+/// The upgrade is one-way and the repair is not guaranteed: a rebuild can
+/// fail per archive on a full disk, an unresolvable blob catalog, or a
+/// staging residue, none of which a survey can predict. Paying the
+/// transition for a run that then installs nothing would leave the store
+/// still damaged and no longer openable by an Oak older than 1.8 — so the
+/// price is charged at the exact instant the first version-2 trailer becomes
+/// visible, which is also the only instant the invariant requires.
+struct ManifestUpgradeOnFirstInstall<'directory> {
+    directory: &'directory Path,
+    done: bool,
+}
+
+impl<'directory> ManifestUpgradeOnFirstInstall<'directory> {
+    fn new(directory: &'directory Path) -> Self {
+        Self {
+            directory,
+            done: false,
+        }
+    }
+}
+
+impl crate::writer::store_writer::AuthorizeVersionTwoWrite for ManifestUpgradeOnFirstInstall<'_> {
+    fn authorize(&mut self) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        if crate::store::read_manifest_store_version(&self.directory.join("manifest"))? == 1 {
+            ensure_numbered_name_available(self.directory, "manifest.cleaning")?;
+            upgrade_manifest_atomically(self.directory)?;
+        }
+        self.done = true;
+        Ok(())
+    }
+}
+
+/// Re-attaches durable repairs to a refusal raised after them.
+///
+/// Same obligation as [`attach_planning_warnings`], for the one mutation that
+/// happens before there is a plan to record it in: a refusal that named only
+/// the failure would leave the operator believing the store is as they left
+/// it, when archives have been rewritten and originals moved aside.
+fn attach_completed_repairs(
+    error: Error,
+    repaired: &[crate::writer::store_writer::RepairedArchive],
+) -> Error {
+    if repaired.is_empty() {
+        return error;
+    }
+    let names: Vec<&str> = repaired
+        .iter()
+        .map(|archive| archive.file_name.as_str())
+        .collect();
+    Error::InvalidFormat {
+        details: format!(
+            "{error} This refusal came after {} archive index rebuild(s), which are already \
+             durable: {}. The originals are retained under `.bak` names, and those archives \
+             need no second attempt.",
+            repaired.len(),
+            names.join(", ")
+        ),
+    }
+}
+
+fn attach_planning_warnings(error: Error, warnings: &[String]) -> Error {
+    const WARNINGS_SHOWN: usize = 3;
+    match error {
+        Error::InvalidFormat { details } if !warnings.is_empty() => {
+            let mut attached = warnings
+                .iter()
+                .take(WARNINGS_SHOWN)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("; ");
+            let remaining = warnings.len() - warnings.len().min(WARNINGS_SHOWN);
+            if remaining == 1 {
+                attached.push_str(", and 1 further warning");
+            } else if remaining > 1 {
+                let _ = write!(attached, ", and {remaining} further warnings");
+            }
+            Error::InvalidFormat {
+                details: format!("{details} Also established before the refusal: {attached}."),
+            }
+        }
+        other => other,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the plan builder is one safety-ordered inventory transaction; splitting it would obscure ordering and duplicate state"
+)]
+fn build_plan_collecting(
+    directory: &Path,
+    options: &CleanupOptions,
+    now: SystemTime,
+    observer: &mut dyn ProgressObserver,
+    warnings: &mut Vec<String>,
 ) -> Result<CleanupPlan> {
     let fingerprint_before = directory_fingerprint(directory)?;
     let repository = Repository::open_with_progress(directory, observer)?;
@@ -1241,8 +1547,41 @@ fn build_plan(
     let raw_journal = scan_raw_journal(directory)?;
     let journal_analysis = analyze_journal(&repository, &raw_journal, current_head, observer)?;
 
-    let mut warnings = Vec::new();
-    let checkpoints = plan_checkpoints(&repository, options, now, &mut warnings)?;
+    // Repairs the operator has authorized, named but not yet performed. This
+    // is the read-only preview: the rebuild happens under the lock inside
+    // `PreparedCleanup::prepare`, and until it has, nothing that reads an
+    // index can be planned. So while any repair is pending this plan is
+    // deliberately partial — it names the repairs and stops. `prepare`
+    // repairs first and then plans in full, and the CLI's existing
+    // authoritative-plan comparison shows the operator the difference before
+    // a single further byte moves.
+    let pending_repairs = if options.contains(CleanupTask::RepairArchives) {
+        // Refuse here, in the read-only preview, where nothing has been
+        // touched. An index-less number that scans to nothing dooms the run
+        // however it is retried, and without this the filter below would
+        // simply drop it: a mixed store would hide the offending archive
+        // behind a plan naming only the repairable ones, and a store whose
+        // only damage is unrepairable would report "no mutations needed" and
+        // exit zero — for a store froe cannot open for writing at all.
+        let unrepairable = unrepairable_archive_names(&repository);
+        if !unrepairable.is_empty() {
+            return Err(crate::writer::store_writer::unrepairable_archives_refusal(
+                &unrepairable,
+            ));
+        }
+        planned_archive_repairs(&repository)
+    } else {
+        Vec::new()
+    };
+    let index_available = pending_repairs.is_empty();
+
+    let checkpoints = if index_available {
+        plan_checkpoints(&repository, options, now, warnings)?
+    } else {
+        // Checkpoint removal rewrites the head and consults active index
+        // generations; both wait for the repair.
+        CheckpointPlan::default()
+    };
     let checkpoint_archive_number = if checkpoints.names.is_empty() {
         None
     } else {
@@ -1252,14 +1591,24 @@ fn build_plan(
         || options.contains(CleanupTask::StaleArchives)
         || !checkpoints.names.is_empty()
     {
-        reject_duplicate_active_segments(&repository)?;
+        // While repairs are pending only the cross-number half can be
+        // trusted: the letters of one unindexed number share segments by
+        // construction and the repair is about to collapse them. Everything
+        // the preview *can* prove still gets proved there, so a store that is
+        // unfit for cleanup says so before anything is authorized rather than
+        // after the rewrite.
+        if index_available {
+            reject_duplicate_active_segments(&repository)?;
+        } else {
+            reject_cross_number_duplicate_active_segments(&repository)?;
+        }
     }
-    let stale_archives = if options.contains(CleanupTask::StaleArchives) {
+    let stale_archives = if index_available && options.contains(CleanupTask::StaleArchives) {
         crate::progress::observe(
             observer,
             &Step::new("scanning for stale archives", WorkUnit::Archives)
                 .with_total(crate::progress::count(repository.archives().len())),
-            |observer| plan_stale_archives(directory, &repository, &mut warnings, observer),
+            |observer| plan_stale_archives(directory, &repository, warnings, observer),
         )?
     } else {
         Vec::new()
@@ -1267,7 +1616,8 @@ fn build_plan(
 
     let reference_generation = generation_from_header(&repository, current_head.segment)?;
     let mut current_closure = HashSet::new();
-    if options.contains(CleanupTask::Segments) || !checkpoints.names.is_empty() {
+    if index_available && (options.contains(CleanupTask::Segments) || !checkpoints.names.is_empty())
+    {
         let active_index_generations = active_index_generations(&repository)?;
         crate::progress::observe(
             observer,
@@ -1292,7 +1642,7 @@ fn build_plan(
         )?;
     }
     let mut protected_history_segments = HashSet::new();
-    let segment_plan = if options.contains(CleanupTask::Segments) {
+    let segment_plan = if index_available && options.contains(CleanupTask::Segments) {
         let mut retained_closure = current_closure;
         crate::progress::observe(
             observer,
@@ -1357,18 +1707,12 @@ fn build_plan(
         None
     };
 
-    let temporaries = if options.contains(CleanupTask::StaleTemporaries) {
+    let temporaries = if index_available && options.contains(CleanupTask::StaleTemporaries) {
         crate::progress::observe(
             observer,
             &Step::new("scanning for stale temporary files", WorkUnit::Files),
             |observer| {
-                plan_stale_temporaries(
-                    directory,
-                    &repository,
-                    &raw_journal,
-                    &mut warnings,
-                    observer,
-                )
+                plan_stale_temporaries(directory, &repository, &raw_journal, warnings, observer)
             },
         )?
     } else {
@@ -1386,7 +1730,13 @@ fn build_plan(
         Vec::new()
     };
 
-    let writes_v2 = !checkpoints.names.is_empty()
+    // A rebuilt archive carries a version-2 binary-references trailer, so a
+    // repair writes v2 data exactly as a rewrite or a checkpoint removal
+    // does, and a version-1 store must be raised first. Including it here is
+    // what puts the upgrade in the plan the operator confirms, rather than
+    // leaving `prepare` to perform it unannounced.
+    let writes_v2 = !pending_repairs.is_empty()
+        || !checkpoints.names.is_empty()
         || segment_plan.as_ref().is_some_and(|plan| {
             plan.archives
                 .iter()
@@ -1405,6 +1755,10 @@ fn build_plan(
     let mut actions = Vec::new();
     let mut estimated_reclaimable_bytes = 0u64;
     let mut estimated_archive_rewrite_source_bytes = 0u64;
+    // First, because everything else in a repairing run is downstream of it —
+    // and because it is the one action here that *adds* bytes rather than
+    // reclaiming them, so it stays out of the reclaimable estimate.
+    actions.extend(pending_repairs);
     if manifest_upgrade {
         actions.push(CleanupAction::UpgradeManifest);
     }
@@ -1532,7 +1886,9 @@ fn build_plan(
         tasks: options.tasks().collect(),
         current_head,
         actions,
-        warnings,
+        // Cloned rather than moved: the caller keeps its copy so a failure
+        // added below this point would still carry them out.
+        warnings: warnings.clone(),
         estimated_reclaimable_bytes,
         estimated_archive_rewrite_source_bytes,
         fingerprint: fingerprint_after,
@@ -2042,14 +2398,45 @@ fn generation_from_header(
 }
 
 fn reject_duplicate_active_segments(repository: &Repository) -> Result<()> {
-    let mut locations: HashMap<SegmentIdentifier, &str> = HashMap::new();
+    reject_duplicate_active_segments_across(repository, false)
+}
+
+/// Refuses a segment served by two archives of *different* numbers.
+///
+/// Split out because the whole check cannot run while repairs are pending: an
+/// archive number with no valid index is served through every non-empty
+/// letter it has, and those letters share segments by construction, so the
+/// full check would refuse a store the repair is about to collapse back to
+/// one letter. Two different *numbers* sharing a segment is not by
+/// construction — it is a real, unrepairable defect, and suppressing it would
+/// mean the preview cannot tell the operator the store is unfit and the guard
+/// fires only after an irreversible rewrite.
+fn reject_cross_number_duplicate_active_segments(repository: &Repository) -> Result<()> {
+    reject_duplicate_active_segments_across(repository, true)
+}
+
+fn reject_duplicate_active_segments_across(
+    repository: &Repository,
+    ignore_within_one_number: bool,
+) -> Result<()> {
+    // An unparsable archive name counts as its own number rather than being
+    // excused: failing to classify a file is not a reason to stop checking it.
+    let number_of = |file_name: &str| -> Option<u32> {
+        ArchiveFileName::parse(file_name).map(|parsed| parsed.archive_number)
+    };
+    let mut locations: HashMap<SegmentIdentifier, (&str, Option<u32>)> = HashMap::new();
     for archive in repository.archives() {
+        let here = (archive.file_name(), number_of(archive.file_name()));
         for identifier in archive.segment_identifiers() {
-            if let Some(previous) = locations.insert(identifier, archive.file_name()) {
+            if let Some(previous) = locations.insert(identifier, here) {
+                let same_number = previous.1.is_some() && previous.1 == here.1;
+                if ignore_within_one_number && same_number {
+                    continue;
+                }
                 return Err(Error::InvalidFormat {
                     details: format!(
-                        "segment {identifier} occurs in active archives {previous} and {}; refusing cleanup",
-                        archive.file_name()
+                        "segment {identifier} occurs in active archives {} and {}; refusing cleanup",
+                        previous.0, here.0
                     ),
                 });
             }
@@ -2058,17 +2445,278 @@ fn reject_duplicate_active_segments(repository: &Repository) -> Result<()> {
     Ok(())
 }
 
+/// The refusal an index-less active archive earns.
+///
+/// Naming only the first offender cannot separate a writer killed before it
+/// closed its newest archive — benign, and repaired by any froe write
+/// command — from a store damaged throughout, and that is exactly the call
+/// the operator has to make before touching the repository. So every
+/// archive is counted, and whether the newest one is affected is stated
+/// rather than left to be inferred from a file name.
+///
+/// Counting is by archive *number*, not by open reader. When no letter of a
+/// number carries a valid index the reader serves every non-empty letter of
+/// it, so counting readers would report one damaged number as two or three
+/// damaged archives — and the warning carried alongside this refusal already
+/// speaks in archive numbers.
+fn indexless_archive_refusal(
+    total_numbers: usize,
+    indexless_numbers: usize,
+    indexless: &[(&str, &str)],
+    newest_is_indexless: bool,
+    any_scan_is_empty: bool,
+) -> String {
+    const NAMES_SHOWN: usize = 5;
+    let mut names = indexless
+        .iter()
+        .take(NAMES_SHOWN)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if indexless.len() > NAMES_SHOWN {
+        let _ = write!(names, ", and {} more", indexless.len() - NAMES_SHOWN);
+    }
+    // Reasons are deduplicated rather than listed per archive: a store
+    // damaged one way is damaged that way throughout far more often than
+    // not, and the shape of the failure is what decides the response. Where
+    // they genuinely differ, saying so is itself the finding.
+    let distinct_reasons: BTreeSet<&str> = indexless.iter().map(|(_, reason)| *reason).collect();
+    let reasons = distinct_reasons
+        .iter()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let subject = if indexless_numbers == 1 {
+        format!("1 of {total_numbers} active archive numbers has no index metadata")
+    } else {
+        format!(
+            "{indexless_numbers} of {total_numbers} active archive numbers have no index metadata"
+        )
+    };
+    // The remedy is stated conditionally, because the two shapes deserve
+    // different advice. A writer killed before it closed its newest archive
+    // left a complete archive missing only its trailer, and rebuilding the
+    // index from a scan of it loses nothing. An index-less archive in the
+    // middle of the store was closed once and stopped validating since, so
+    // a scan may legitimately fail to read segments that were there —
+    // repairing before looking would make that permanent in everything but
+    // the `.bak`.
+    let ordinality = if newest_is_indexless {
+        "the newest active archive is among them, which is what a writer killed before it \
+         closed its archive leaves behind"
+    } else {
+        "the newest active archive is not among them, so this is not simply a writer killed \
+         before it closed its archive"
+    };
+    // Whether a repair would even succeed is knowable here, so it is not
+    // guessed: a recovery-scanned archive reports the segments the scan
+    // read, and one that read none is residue the write open refuses rather
+    // than rebuilds. Advising a write command for it would send the operator
+    // to a refusal, which is the circularity this branch exists to avoid.
+    let remedy = if any_scan_is_empty {
+        "at least one of them holds no segment the recovery scan can read, so nothing can rebuild \
+         it — move that file aside to proceed, and keep it, it is the only copy of whatever it \
+         holds"
+    } else if newest_is_indexless {
+        "rerun with `--task repair-archives` (alongside the tasks you want) to rebuild the \
+         missing index from the archive's own entries, retaining the original bytes under a \
+         `.bak` name"
+    } else {
+        // A closed archive that stopped validating is not a missing trailer;
+        // a scan of it may read fewer segments than it holds, and repairing
+        // makes that the served truth in everything but the `.bak`.
+        "inspect before repairing: `--task repair-archives` would rebuild the missing indexes \
+         from a recovery scan, which retains the original bytes under a `.bak` name but cannot \
+         recover a segment the scan cannot read"
+    };
+    format!(
+        "{subject} ({names}); the index was rejected because {reasons}; {ordinality}. Refusing \
+         this cleanup run; no archive, journal, or checkpoint has been changed. Run \
+         `froe archives` on this repository to see every archive's index state; {remedy}."
+    )
+}
+
+/// The repairs an index-less store needs, one per archive *number*.
+///
+/// Named from the same census the refusal uses, so an operator who opts in
+/// sees exactly the archives they would otherwise have been refused over.
+///
+/// Grouped by number rather than by open reader, because a number with no
+/// valid index is served through every one of its non-empty letters while
+/// the repair rebuilds it once — and installs the result under the *lowest*
+/// letter, which is the name reported here so the plan names the file the
+/// repair will actually write. Reporting per reader would promise two or
+/// three repairs for one, under names that never appear again.
+/// Index-less archive numbers whose letters together scan to nothing, named
+/// by the file a rebuild would have installed under.
+///
+/// Read off the open readers rather than rescanning: `Repository::open`
+/// already performed the recovery scan, and `segment_count()` on a recovered
+/// archive is exactly what it read. Summed per number, because a rebuild
+/// merges every letter — one empty letter beside a readable one is still
+/// repairable.
+fn unrepairable_archive_names(repository: &Repository) -> Vec<String> {
+    let mut by_number: BTreeMap<u32, (String, usize)> = BTreeMap::new();
+    for archive in repository.archives() {
+        if archive.index().is_some() {
+            continue;
+        }
+        let Some(parsed) = ArchiveFileName::parse(archive.file_name()) else {
+            continue;
+        };
+        let name = archive.file_name().to_owned();
+        let entry = by_number
+            .entry(parsed.archive_number)
+            .or_insert_with(|| (name.clone(), 0));
+        if name < entry.0 {
+            entry.0 = name;
+        }
+        entry.1 += archive.segment_count();
+    }
+    by_number
+        .into_values()
+        .filter(|(_, segments)| *segments == 0)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn planned_archive_repairs(repository: &Repository) -> Vec<CleanupAction> {
+    struct Group {
+        target: String,
+        retired: Vec<String>,
+        reason: String,
+        bytes: u64,
+        scanned_segments: usize,
+    }
+    let mut by_number: BTreeMap<u32, Group> = BTreeMap::new();
+    for archive in repository.archives() {
+        let Some(reason) = archive.recovery_reason() else {
+            continue;
+        };
+        let Some(parsed) = ArchiveFileName::parse(archive.file_name()) else {
+            continue;
+        };
+        let name = archive.file_name().to_owned();
+        let group = by_number
+            .entry(parsed.archive_number)
+            .or_insert_with(|| Group {
+                target: name.clone(),
+                retired: Vec::new(),
+                reason: reason.to_owned(),
+                bytes: 0,
+                scanned_segments: 0,
+            });
+        // `Repository::archives()` already skips zero-length letters, so the
+        // lowest name here is the lowest non-empty letter — the same target
+        // `recover_archive_number` installs under. Every other letter is
+        // retired to a `.bak`, so the plan names them too: confirmation is
+        // scoped to the files it printed.
+        if name < group.target {
+            group
+                .retired
+                .push(std::mem::replace(&mut group.target, name));
+            reason.clone_into(&mut group.reason);
+        } else if name != group.target {
+            group.retired.push(name);
+        }
+        group.bytes = group.bytes.saturating_add(archive.file_size());
+        group.scanned_segments += archive.segment_count();
+    }
+    by_number
+        .into_values()
+        // A number whose letters together scan to nothing cannot be rebuilt —
+        // `recover_archive_number` refuses it. Planning it anyway would have
+        // the operator confirm a run cleanup can already prove will fail,
+        // after paying a durable rewrite of every repairable archive for it,
+        // with no rerun ever converging. Dropped here, the store falls through
+        // to the refusal that states the impossibility up front. Summed per
+        // number, never per letter: one empty letter beside a readable one is
+        // still repairable, because the scan merges every letter.
+        .filter(|group| group.scanned_segments > 0)
+        .map(|mut group| {
+            group.retired.sort();
+            CleanupAction::RepairArchiveIndex {
+                file_name: group.target,
+                retired_file_names: group.retired,
+                reason: group.reason,
+                bytes: group.bytes,
+            }
+        })
+        .collect()
+}
+
 fn active_index_generations(
     repository: &Repository,
 ) -> Result<HashMap<SegmentIdentifier, GarbageCollectionGeneration>> {
+    // Census before refusal. `Repository::archives()` is ordered newest
+    // archive number first, so this preserves that order and the newest
+    // served archive is affected exactly when it is the first element.
+    let indexless: Vec<(&str, &str)> = repository
+        .archives()
+        .iter()
+        .filter_map(|archive| {
+            archive
+                .recovery_reason()
+                .map(|reason| (archive.file_name(), reason))
+        })
+        .collect();
+    if !indexless.is_empty() {
+        // By number, not by reader: an unindexed number is served through
+        // every one of its non-empty letters, and reporting those letters as
+        // separate damaged archives would overstate the damage.
+        let number_of =
+            |file_name: &str| ArchiveFileName::parse(file_name).map(|n| n.archive_number);
+        let indexless_numbers: BTreeSet<u32> = indexless
+            .iter()
+            .filter_map(|(name, _)| number_of(name))
+            .collect();
+        let total_numbers: BTreeSet<u32> = repository
+            .archives()
+            .iter()
+            .filter_map(|archive| number_of(archive.file_name()))
+            .collect();
+        let newest_is_indexless = repository
+            .archives()
+            .first()
+            .is_some_and(|newest| newest.index().is_none());
+        // `segment_count()` on a recovery-scanned archive is what the scan
+        // actually read, which is exactly what a rebuild would work from —
+        // summed per archive *number*, because the rebuild merges every
+        // letter of a number. A letter that scans empty beside one that does
+        // not is still repairable, and reporting it as unrepairable withholds
+        // the task that would fix the store and sends the operator to
+        // hand-edit a damaged production directory instead.
+        let mut scanned_segments: BTreeMap<u32, usize> = BTreeMap::new();
+        for archive in repository.archives() {
+            if archive.index().is_some() {
+                continue;
+            }
+            if let Some(number) = number_of(archive.file_name()) {
+                *scanned_segments.entry(number).or_default() += archive.segment_count();
+            }
+        }
+        let any_scan_is_empty = scanned_segments.values().any(|count| *count == 0);
+        return Err(Error::InvalidFormat {
+            details: indexless_archive_refusal(
+                total_numbers.len(),
+                indexless_numbers.len(),
+                &indexless,
+                newest_is_indexless,
+                any_scan_is_empty,
+            ),
+        });
+    }
     let mut generations = HashMap::new();
     for archive in repository.archives() {
         for identifier in archive.segment_identifiers() {
+            // Unreachable once the census above passes: an indexed archive
+            // enumerates its segments out of the very index this looks them
+            // up in. Kept so a change to either side fails closed.
             let entry = archive
                 .index_entry(identifier)
                 .ok_or_else(|| Error::InvalidFormat {
                     details: format!(
-                        "active archive {} has no index metadata for segment {identifier}; refusing generation cleanup",
+                        "active archive {} has no index metadata for its own segment {identifier}; refusing generation cleanup",
                         archive.file_name()
                     ),
                 })?;
@@ -2502,6 +3150,7 @@ fn apply_prepared(
         directory,
         options,
         plan,
+        repaired,
         repository_lock,
     } = prepared;
     let current_fingerprint = directory_fingerprint(&directory)?;
@@ -2774,6 +3423,7 @@ fn apply_prepared(
         removed_stale_archives,
         removed_temporaries,
         removed_recovery_backups,
+        repaired_archives: repaired.len(),
         files_not_deleted,
         archive_bytes_before,
         archive_bytes_after,
@@ -3473,8 +4123,9 @@ mod tests {
     use super::{
         CleanupAction, CleanupOptions, CleanupTask, JOURNAL_LINE_PREVIEW_LIMIT,
         JournalRemovalReason, PlannedFileRemoval, PlannedFileRemovalFailureMode, PreparedCleanup,
-        RecoveryBackupPolicy, cleanup, file_fingerprint, manifest_upgrade_bytes, plan_cleanup,
-        recovery_backup_target, remove_planned_files, remove_planned_files_with,
+        RecoveryBackupPolicy, attach_planning_warnings, cleanup, file_fingerprint,
+        indexless_archive_refusal, manifest_upgrade_bytes, plan_cleanup, recovery_backup_target,
+        remove_planned_files, remove_planned_files_with,
     };
     use crate::checksum::crc32;
     use crate::content::provider::SegmentProvider as _;
@@ -4516,6 +5167,563 @@ mod tests {
             "recovery-backups requires an explicit age/count retention policy"
         );
         assert_eq!(file_bytes(&directory.path), before);
+    }
+
+    /// Overwrites an archive's index magic so it opens through the recovery
+    /// scan: the payload entries stay readable, only the trailer stops
+    /// validating. This is the shape a writer killed before closing its
+    /// archive leaves behind, without needing a writer to kill.
+    fn break_index_magic(path: &std::path::Path) {
+        use std::io::{Seek as _, SeekFrom};
+
+        let length = std::fs::metadata(path).expect("archive metadata").len();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open archive for damage");
+        file.seek(SeekFrom::Start(length - 1028))
+            .expect("seek to the index magic");
+        file.write_all(&[0xde, 0xad, 0xbe, 0xef])
+            .expect("overwrite the index magic");
+    }
+
+    #[test]
+    fn indexless_archive_refusal_counts_every_offender_and_states_ordinality() {
+        const MAGIC: &str = "unrecognized index magic number 0x000115a9";
+        const CRC: &str = "index checksum mismatch";
+        let one = indexless_archive_refusal(43, 1, &[("data00042a.tar", MAGIC)], true, false);
+        assert!(
+            one.contains("1 of 43 active archive numbers has no index metadata (data00042a.tar)"),
+            "singular subject names the archive and the total: {one}"
+        );
+        assert!(
+            one.contains("the newest active archive is among them"),
+            "a killed writer is distinguishable from damage: {one}"
+        );
+        assert!(
+            one.contains(MAGIC),
+            "the reason the index was rejected reaches the operator: {one}"
+        );
+        assert!(
+            one.contains("no archive, journal, or checkpoint has been changed"),
+            "the refusal states precisely what is untouched: {one}"
+        );
+        assert!(
+            one.contains("froe archives") && one.contains(".bak"),
+            "the refusal states what to run next and what repair costs: {one}"
+        );
+
+        let two = indexless_archive_refusal(
+            3,
+            2,
+            &[("data00001a.tar", CRC), ("data00000a.tar", CRC)],
+            false,
+            false,
+        );
+        assert!(
+            two.contains("2 of 3 active archive numbers have no index metadata"),
+            "plural subject agrees: {two}"
+        );
+        assert_eq!(
+            two.matches(CRC).count(),
+            1,
+            "one shared reason is stated once, not repeated per archive: {two}"
+        );
+        assert!(
+            two.contains("the newest active archive is not among them"),
+            "mid-store damage is not reported as a killed writer: {two}"
+        );
+        assert!(
+            two.contains("inspect before repairing"),
+            "mid-store damage does not get the unconditional repair advice: {two}"
+        );
+        assert!(
+            one.contains("--task repair-archives"),
+            "a killed writer is pointed at the task that repairs it: {one}"
+        );
+
+        // An archive whose scan read nothing cannot be rebuilt, and the
+        // write open refuses it. Advising a write command would be circular.
+        let unrecoverable =
+            indexless_archive_refusal(2, 1, &[("data00009a.tar", MAGIC)], true, true);
+        assert!(
+            !unrecoverable.contains("--task repair-archives"),
+            "an unrecoverable archive must not be sent to a command that will refuse it: \
+             {unrecoverable}"
+        );
+        assert!(
+            unrecoverable.contains("move that file aside"),
+            "an unrecoverable archive gets the remedy that actually works: {unrecoverable}"
+        );
+
+        let many: Vec<String> = (0..8)
+            .map(|index| format!("data0000{index}a.tar"))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = many.iter().map(|n| (n.as_str(), MAGIC)).collect();
+        let truncated = indexless_archive_refusal(40, 8, &borrowed, true, false);
+        assert!(
+            truncated.contains("8 of 40 active archive numbers"),
+            "the count is the whole census, not the shown names: {truncated}"
+        );
+        assert!(
+            truncated.contains("and 3 more"),
+            "the omitted names are counted rather than silently dropped: {truncated}"
+        );
+    }
+
+    #[test]
+    fn planning_warnings_survive_a_refusal_and_stay_bounded() {
+        let untouched = attach_planning_warnings(
+            crate::error::Error::InvalidFormat {
+                details: "refused".to_owned(),
+            },
+            &[],
+        );
+        let crate::error::Error::InvalidFormat { details } = untouched else {
+            panic!("variant must be preserved");
+        };
+        assert_eq!(details, "refused", "no warnings means no tail");
+
+        let warnings: Vec<String> = (0..5).map(|index| format!("warning {index}")).collect();
+        let attached = attach_planning_warnings(
+            crate::error::Error::InvalidFormat {
+                details: "refused.".to_owned(),
+            },
+            &warnings,
+        );
+        let crate::error::Error::InvalidFormat { details } = attached else {
+            panic!("variant must be preserved");
+        };
+        assert!(
+            details.contains("warning 0") && details.contains("warning 2"),
+            "established warnings reach the operator: {details}"
+        );
+        assert!(
+            !details.contains("warning 3"),
+            "the tail is bounded so it cannot bury the refusal: {details}"
+        );
+        assert!(
+            details.contains("and 2 further warnings"),
+            "the omitted warnings are counted: {details}"
+        );
+
+        // A non-format error keeps its variant: a caller matching on it for
+        // an input/output failure must still be able to.
+        let input_output = attach_planning_warnings(
+            crate::error::Error::InputOutput(std::io::Error::other("disk")),
+            &warnings,
+        );
+        assert!(
+            matches!(input_output, crate::error::Error::InputOutput(_)),
+            "only format refusals carry the tail"
+        );
+    }
+
+    /// The production refusal, end to end. Before the census this reported
+    /// the first offending segment of the first offending archive and
+    /// nothing else — no count, no ordinality, no remedy — and discarded
+    /// the stale-archive warning the same run had already established.
+    #[test]
+    fn cleanup_refuses_an_index_less_active_archive_with_a_full_census() {
+        let directory = TestDirectory::new("index-less-census");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        let before = file_bytes(&directory.path);
+
+        let error = plan_cleanup(&directory.path, &CleanupOptions::default())
+            .expect_err("an index-less active archive must refuse generation cleanup");
+        let crate::error::Error::InvalidFormat { details } = error else {
+            panic!("unexpected refusal variant");
+        };
+        assert!(
+            details
+                .contains("1 of 1 active archive numbers has no index metadata (data00000a.tar)"),
+            "the refusal names every offender and the total: {details}"
+        );
+        assert!(
+            details.contains("the newest active archive is among them"),
+            "the refusal states whether this is a killed writer: {details}"
+        );
+        assert!(
+            details.contains("no archive, journal, or checkpoint has been changed"),
+            "the refusal states precisely what is untouched: {details}"
+        );
+        assert!(
+            details.contains("has no valid indexed generation"),
+            "the stale-archive warning established before the refusal is carried out with it: {details}"
+        );
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "planning a refusal changes no byte"
+        );
+    }
+
+    /// The whole point of the task: a store a killed writer left behind is
+    /// cleaned to a healthy shape by cleanup itself, in one run, instead of
+    /// sending the operator to a different command as a workaround.
+    #[test]
+    fn repair_archives_heals_an_index_less_store_and_the_rest_then_plans() {
+        let directory = TestDirectory::new("repair-heals");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+
+        // Without the task, the default set still refuses and points at it.
+        let refusal = plan_cleanup(&directory.path, &CleanupOptions::default())
+            .expect_err("the default set must still refuse");
+        assert!(
+            refusal.to_string().contains("--task repair-archives"),
+            "the refusal names the task that fixes it: {refusal}"
+        );
+
+        // With it, the preview names the repair and nothing else yet.
+        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        let preview = plan_cleanup(&directory.path, &options).expect("preview must not refuse");
+        assert!(
+            preview.actions().iter().any(|action| matches!(
+                action,
+                CleanupAction::RepairArchiveIndex { file_name, .. }
+                    if file_name == "data00000a.tar"
+            )),
+            "the preview names the repair: {:?}",
+            preview.actions()
+        );
+
+        let outcome = PreparedCleanup::prepare(&directory.path, options)
+            .expect("prepare repairs under the lock")
+            .apply()
+            .expect("apply");
+        assert_eq!(outcome.repaired_archives, 1, "the rebuild is reported");
+        assert!(
+            directory.path.join("data00000a.tar.bak").exists(),
+            "the original bytes are retained"
+        );
+
+        // Healthy: every archive indexed, and the default set now plans.
+        let repository = Repository::open(&directory.path).expect("reopen");
+        assert!(
+            !repository
+                .archives()
+                .iter()
+                .any(TarArchiveReader::is_recovered),
+            "no archive is served through the recovery scan any more"
+        );
+        plan_cleanup(&directory.path, &CleanupOptions::default())
+            .expect("the default set plans cleanly against the healed store");
+    }
+
+    /// An archive number that cannot be rebuilt dooms the run however it is
+    /// retried, so it is refused where nothing has been touched — not after
+    /// paying a durable rewrite of every repairable archive to discover it.
+    #[test]
+    fn an_unrepairable_archive_refuses_before_anything_is_rewritten() {
+        let directory = TestDirectory::new("repair-unrepairable");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            writer
+                .write_string("forces a second archive")
+                .expect("string");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+        }
+        // A repairable archive, and — at a higher number, so the repair loop
+        // would have reached it second — bytes no scan can recover.
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        std::fs::write(directory.path.join("data00500a.tar"), vec![0x5au8; 4096])
+            .expect("unrecoverable residue");
+        let before = file_bytes(&directory.path);
+
+        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+
+        // The read-only preview says so, before any authorization.
+        let preview = plan_cleanup(&directory.path, &options)
+            .expect_err("the preview must refuse an unrepairable archive");
+        assert!(
+            preview.to_string().contains("data00500a.tar"),
+            "the preview names the archive that dooms the run: {preview}"
+        );
+
+        // And a library caller skipping the preview pays no rewrite either.
+        match PreparedCleanup::prepare(&directory.path, options) {
+            Ok(_) => panic!("prepare must refuse too"),
+            Err(error) => assert!(
+                error.to_string().contains("data00500a.tar"),
+                "prepare names it as well: {error}"
+            ),
+        }
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "and neither path rewrote a single archive"
+        );
+    }
+
+    /// A repair that fails part-way through still happens — a staging residue
+    /// is found per number, not by the survey — and reporting only the
+    /// failure would leave the operator believing nothing moved.
+    #[test]
+    fn a_failed_repair_reports_the_rebuilds_it_already_completed() {
+        let directory = TestDirectory::new("repair-partial");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // A second archive number, from an independent bootstrap so it shares
+        // no segment identifier with the first — a copy would instead trip
+        // the cross-number duplicate guard.
+        let donor = TestDirectory::new("repair-partial-donor");
+        {
+            let store = WritableRepository::open(&donor.path).expect("donor bootstrap");
+            store.close().expect("close");
+        }
+        std::fs::copy(
+            donor.path.join("data00000a.tar"),
+            directory.path.join("data00001a.tar"),
+        )
+        .expect("second archive number");
+        // Both repairable; the higher number carries the residue of an
+        // interrupted rebuild, which repair must refuse rather than clobber.
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        break_index_magic(&directory.path.join("data00001a.tar"));
+        std::fs::write(
+            directory.path.join("data00001a.tar.recovering"),
+            b"an interrupted rebuild",
+        )
+        .expect("staging residue");
+
+        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        let details = match PreparedCleanup::prepare(&directory.path, options) {
+            Ok(_) => panic!("the staging residue must refuse the run"),
+            Err(crate::error::Error::InvalidFormat { details }) => details,
+            Err(other) => panic!("unexpected refusal variant: {other}"),
+        };
+        assert!(
+            details.contains("data00001a.tar.recovering"),
+            "the refusal names what stopped it: {details}"
+        );
+        assert!(
+            details.contains("data00000a.tar"),
+            "the refusal names what it already rebuilt: {details}"
+        );
+        assert!(
+            details.contains("no second attempt"),
+            "the refusal says the completed work need not be redone: {details}"
+        );
+        assert!(
+            directory.path.join("data00000a.tar.bak").exists(),
+            "and that rebuild really is durable"
+        );
+        assert!(
+            directory.path.join("data00001a.tar.recovering").exists(),
+            "the residue is left for the stale-temporaries task to adjudicate"
+        );
+    }
+
+    /// Selecting the task is not the same as having work to do, and the
+    /// difference used to be a one-way `store.version` 1→2 transition that
+    /// appeared in no plan, was never confirmed, and survived cancelling.
+    #[test]
+    fn selecting_repair_with_nothing_to_repair_changes_no_byte() {
+        let directory = TestDirectory::repository("repair-noop");
+        std::fs::write(
+            directory.path.join("manifest"),
+            "#a version one store\nstore.version=1\n",
+        )
+        .expect("v1 manifest");
+        // Something to do, so the run is not short-circuited as empty.
+        std::fs::write(directory.path.join("journal.log.compacting"), b"").expect("temporary");
+        let before = file_bytes(&directory.path);
+
+        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        let prepared =
+            PreparedCleanup::prepare(&directory.path, options).expect("prepare must succeed");
+        assert_eq!(
+            prepared.repaired_archives(),
+            0,
+            "there was nothing to repair"
+        );
+        assert_eq!(
+            crate::store::read_manifest_store_version(&directory.path.join("manifest"))
+                .expect("read manifest"),
+            1,
+            "the manifest must not be upgraded when no repair happens"
+        );
+        drop(prepared);
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "preparing a repair run with nothing to repair changes no byte"
+        );
+    }
+
+    /// The repair used to run before any store-version gate, so froe would
+    /// rewrite the archives of a store it then declared itself unable to
+    /// read. The library API reaches `prepare` without the lockless preview
+    /// that would otherwise have refused.
+    #[test]
+    fn a_store_from_a_newer_oak_is_refused_before_any_repair() {
+        let directory = TestDirectory::new("repair-newer-store");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        std::fs::write(
+            directory.path.join("manifest"),
+            "#from a newer Oak\nstore.version=3\n",
+        )
+        .expect("v3 manifest");
+        let before = file_bytes(&directory.path);
+
+        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        match PreparedCleanup::prepare(&directory.path, options) {
+            Ok(_) => panic!("a store version this reader does not support must be refused"),
+            Err(error) => assert!(
+                error.to_string().contains("newer"),
+                "the refusal names the store version: {error}"
+            ),
+        }
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "and it is refused before a single archive is rewritten"
+        );
+    }
+
+    /// Every index-dependent gate evaluates the store for the first time
+    /// after the repair, so a refusal there is ordinary — and must not claim
+    /// the store is as the operator left it.
+    #[test]
+    fn a_refusal_after_a_repair_says_the_repair_already_happened() {
+        let directory = TestDirectory::new("repair-then-refuse");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // A second number sharing every segment with the first: a real,
+        // unrepairable defect that only the post-repair gates can see.
+        std::fs::copy(
+            directory.path.join("data00000a.tar"),
+            directory.path.join("data00001a.tar"),
+        )
+        .expect("duplicate archive number");
+        break_index_magic(&directory.path.join("data00000a.tar"));
+
+        // The preview must state the unfitness itself, before authorizing.
+        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        let preview = plan_cleanup(&directory.path, &options)
+            .expect_err("the cross-number duplicate must refuse in the read-only preview");
+        assert!(
+            preview.to_string().contains("occurs in active archives"),
+            "the dry run reports the real reason: {preview}"
+        );
+    }
+
+    /// The one-way v1 to v2 transition is charged when a rebuilt archive is
+    /// about to become visible, not when one is merely predicted. A repair
+    /// can still fail per archive for reasons no survey models, and paying an
+    /// irreversible format change for a run that rebuilds nothing would leave
+    /// the store damaged AND closed to an older Oak.
+    #[test]
+    fn a_repair_that_installs_nothing_does_not_upgrade_the_manifest() {
+        let directory = TestDirectory::new("repair-v1-no-install");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        // Repairable by the survey, but the rebuild refuses: a staging
+        // residue is found per number, after the survey has had its say.
+        std::fs::write(
+            directory.path.join("data00000a.tar.recovering"),
+            b"an interrupted rebuild",
+        )
+        .expect("staging residue");
+        std::fs::write(
+            directory.path.join("manifest"),
+            "#a version one store\nstore.version=1\n",
+        )
+        .expect("v1 manifest");
+        let before = file_bytes(&directory.path);
+
+        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        assert!(
+            PreparedCleanup::prepare(&directory.path, options).is_err(),
+            "the residue must refuse the run"
+        );
+        assert_eq!(
+            crate::store::read_manifest_store_version(&directory.path.join("manifest"))
+                .expect("read manifest"),
+            1,
+            "a run that installed no rebuilt archive must not have raised the store version"
+        );
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "and nothing else moved either"
+        );
+    }
+
+    /// A rebuild ends by matching the replaced archive's ownership, which
+    /// fails for a foreign-owned file. Discovering that after the rewrite
+    /// means no rerun ever converges, so it is a stat(2) check up front.
+    #[cfg(unix)]
+    #[test]
+    fn a_repair_target_this_process_cannot_match_refuses_before_rewriting() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = TestDirectory::new("repair-foreign-owner");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        let owner = std::fs::symlink_metadata(directory.path.join("data00000a.tar"))
+            .expect("archive metadata")
+            .uid();
+        // Only meaningful where the archive is not already ours; as root
+        // every chown succeeds and there is nothing to refuse.
+        if owner != unsafe { libc::geteuid() } || owner == 0 {
+            return;
+        }
+        let targets = crate::writer::store_writer::repair_target_names(&directory.path)
+            .expect("survey the repair targets");
+        assert_eq!(
+            targets,
+            vec!["data00000a.tar".to_owned()],
+            "the preflight inspects the file the rebuild would replace"
+        );
+    }
+
+    /// Repair makes the `.bak` that the backup policy retires. Doing both in
+    /// one run can delete the only copy of what the rebuild could not read.
+    #[test]
+    fn repair_archives_and_recovery_backups_cannot_run_together() {
+        let options = CleanupOptions::default()
+            .with_task(CleanupTask::RepairArchives)
+            .with_recovery_backup_policy(RecoveryBackupPolicy::new(Duration::ZERO, 0));
+        let directory = TestDirectory::repository("repair-and-backups");
+        let error = plan_cleanup(&directory.path, &options)
+            .expect_err("the combination must be refused before anything is read");
+        let crate::error::Error::InvalidFormat { details } = error else {
+            panic!("unexpected refusal variant");
+        };
+        assert!(
+            details.contains("cannot run together"),
+            "the refusal explains the conflict: {details}"
+        );
+        assert!(
+            details.contains("repair first"),
+            "the refusal states the safe sequence: {details}"
+        );
     }
 
     #[test]

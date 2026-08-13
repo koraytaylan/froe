@@ -92,6 +92,27 @@ fn kind_name(kind: CompactionKind) -> &'static str {
     }
 }
 
+/// Introduces the lock-protected plan, attributing why it differs.
+///
+/// When repairs were selected the plan changed because cleanup itself
+/// rebuilt the indexes under the lock — that is the task working, not an
+/// outside writer, and saying otherwise sends the operator hunting for a
+/// process that does not exist.
+fn announce_authoritative_plan(plan: &froe::CleanupPlan, repaired: usize) {
+    if repaired == 0 {
+        eprintln!(
+            "froe: repository state changed before the lock was acquired; authoritative plan:"
+        );
+    } else {
+        eprintln!(
+            "froe: rebuilt the index of {repaired} archive(s) under the repository lock, \
+             retaining the originals under .bak names; everything below could only be planned \
+             once that was done:"
+        );
+    }
+    print_cleanup_plan(plan);
+}
+
 /// `froe cleanup`: read-only preview, lock-protected replan, confirmation,
 /// application, and fresh final verification.
 pub(crate) fn run_cleanup(
@@ -133,16 +154,23 @@ pub(crate) fn run_cleanup(
     )?;
     if prepared.plan() != &preview {
         reporter.finish();
-        eprintln!(
-            "froe: repository state changed before the lock was acquired; authoritative plan:"
-        );
-        print_cleanup_plan(prepared.plan());
+        let repaired = prepared.repaired_archives();
+        announce_authoritative_plan(prepared.plan(), repaired);
         if !confirm(
             "about to apply the changed authoritative cleanup plan",
             assume_yes,
             reporter,
         ) {
             eprintln!("froe: cleanup cancelled");
+            if repaired != 0 {
+                // The repair is already durable. Saying "cancelled" alone
+                // would imply the store is untouched, and it is not.
+                eprintln!(
+                    "froe: note: the {repaired} archive index rebuild(s) above were already \
+                     applied and are not undone by cancelling; the originals remain under \
+                     .bak names"
+                );
+            }
             return Ok(false);
         }
     }
@@ -170,6 +198,12 @@ pub(crate) fn run_cleanup(
         outcome.archive_bytes_before,
         outcome.archive_bytes_after,
     );
+    if outcome.repaired_archives != 0 {
+        println!(
+            "archive indexes rebuilt: {} (originals retained under .bak names; a later run with --task recovery-backups can retire them once the store is verified)",
+            outcome.repaired_archives
+        );
+    }
     if outcome.removed_temporaries != 0 || outcome.removed_recovery_backups != 0 {
         println!(
             "files: {} stale temporaries and {} recovery backups removed",
@@ -266,6 +300,33 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
     }
     for action in plan.actions() {
         match action {
+            CleanupAction::RepairArchiveIndex {
+                file_name,
+                retired_file_names,
+                reason,
+                bytes,
+            } => {
+                println!(
+                    "  repair the index of {} ({}; original retained as {}.bak)",
+                    crate::output::sanitize_terminal_text(file_name),
+                    crate::output::sanitize_terminal_text(reason),
+                    crate::output::sanitize_terminal_text(file_name),
+                );
+                if !retired_file_names.is_empty() {
+                    // These leave the archive namespace, so they are named
+                    // rather than counted: the confirmation covers the files
+                    // the plan printed.
+                    let names: Vec<_> = retired_file_names
+                        .iter()
+                        .map(|name| crate::output::sanitize_terminal_text(name))
+                        .collect();
+                    println!(
+                        "    merging and retiring {} to .bak names",
+                        names.join(", ")
+                    );
+                }
+                println!("    {bytes} bytes retained across the retired originals");
+            }
             CleanupAction::PruneJournal {
                 lines,
                 parser_ignored,
@@ -345,6 +406,23 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
         eprintln!(
             "froe: warning: {}",
             crate::output::sanitize_terminal_text(warning)
+        );
+    }
+    // Every other estimate here describes space the run gives back. Repair is
+    // the one action that takes space and keeps it, so it is stated
+    // separately rather than netted against a reclaim figure it would
+    // silently contradict.
+    let repair_bytes: u64 = plan
+        .actions()
+        .iter()
+        .filter_map(|action| match action {
+            CleanupAction::RepairArchiveIndex { bytes, .. } => Some(*bytes),
+            _ => None,
+        })
+        .sum();
+    if repair_bytes != 0 {
+        println!(
+            "index rebuilds need {repair_bytes} bytes of transient space and leave {repair_bytes} bytes of .bak files: the repository grows until those are retired"
         );
     }
     println!(

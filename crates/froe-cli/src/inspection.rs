@@ -60,8 +60,16 @@ pub(crate) fn print_journal(repository: &Repository, limit: usize) {
 /// `froe archives`: per-archive statistics.
 pub(crate) fn print_archives(repository: &Repository) {
     for archive in repository.archives() {
-        let index_state = if archive.is_recovered() {
-            "recovered (no valid index)".to_owned()
+        // The rejection reason is the whole diagnostic value of this line for
+        // a damaged store: it separates a trailer that was never written from
+        // one that no longer validates. It is repository-controlled only in
+        // the sense that its numbers come from the file, so it is sanitized
+        // like every other borrowed string.
+        let index_state = if let Some(reason) = archive.recovery_reason() {
+            format!(
+                "recovered (no valid index: {})",
+                crate::output::sanitize_terminal_text(reason)
+            )
         } else {
             format!(
                 "index version {}",

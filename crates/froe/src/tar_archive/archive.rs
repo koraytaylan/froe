@@ -44,6 +44,16 @@ enum ArchiveContent {
     /// The archive had no valid index; segments were recovered by scanning
     /// tar entry headers. Ranges point into the memory-mapped file.
     Recovered {
+        /// Why the index was rejected, from [`parse_segment_index`].
+        ///
+        /// Kept because "no index" alone cannot separate the two cases an
+        /// operator has to tell apart: a trailer that was never written —
+        /// a writer killed before it closed the archive, where every byte
+        /// is still present — from one that is present and no longer
+        /// validates, which is real damage. The rejection reason is the
+        /// only place that distinction survives, and it used to be
+        /// discarded at the point of the fallback.
+        reason: String,
         /// Recovered segments in scan order.
         entries: Vec<(SegmentIdentifier, Range<usize>)>,
         /// Segment identifier to position in `entries`.
@@ -99,11 +109,24 @@ impl TarArchiveReader {
         // give up zero-copy segment access.
         let bytes = unsafe { memmap2::Mmap::map(file)? };
 
-        let content = if let Ok(index) = parse_segment_index(&bytes) {
-            ArchiveContent::Indexed(index)
-        } else {
-            let (entries, lookup) = recover_segment_entries(&bytes, &file_name);
-            ArchiveContent::Recovered { entries, lookup }
+        let content = match parse_segment_index(&bytes) {
+            Ok(index) => ArchiveContent::Indexed(index),
+            Err(error) => {
+                let (entries, lookup) = recover_segment_entries(&bytes, &file_name);
+                ArchiveContent::Recovered {
+                    // `parse_segment_index` only ever fails with
+                    // `InvalidFormat`, whose `Display` prefixes "invalid
+                    // segment-tar data:". The detail alone is kept so a
+                    // caller can embed it in its own sentence without
+                    // nesting that prefix inside another error.
+                    reason: match error {
+                        Error::InvalidFormat { details } => details,
+                        other => other.to_string(),
+                    },
+                    entries,
+                    lookup,
+                }
+            }
         };
         Ok(Self {
             path: path.to_owned(),
@@ -148,6 +171,22 @@ impl TarArchiveReader {
         matches!(self.content, ArchiveContent::Recovered { .. })
     }
 
+    /// Why the index was rejected, or `None` for an indexed archive.
+    ///
+    /// The distinction this carries is operational, not cosmetic. An
+    /// unrecognized magic number on an archive with no terminating zero
+    /// blocks is a trailer that was never written, which is what a killed
+    /// writer leaves and what a rebuild restores losslessly. A checksum
+    /// mismatch, or entries that do not sort, is a trailer that was written
+    /// and no longer validates — the same symptom, the opposite prognosis.
+    #[must_use]
+    pub fn recovery_reason(&self) -> Option<&str> {
+        match &self.content {
+            ArchiveContent::Indexed(_) => None,
+            ArchiveContent::Recovered { reason, .. } => Some(reason.as_str()),
+        }
+    }
+
     /// The number of segments this archive provides.
     #[must_use]
     pub fn segment_count(&self) -> usize {
@@ -177,7 +216,9 @@ impl TarArchiveReader {
                 let end = start.checked_add(entry.size as usize)?;
                 self.bytes.get(start..end)
             }
-            ArchiveContent::Recovered { entries, lookup } => {
+            ArchiveContent::Recovered {
+                entries, lookup, ..
+            } => {
                 let position = *lookup.get(&segment_identifier)?;
                 self.bytes.get(entries[position].1.clone())
             }

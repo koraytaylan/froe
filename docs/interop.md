@@ -26,6 +26,28 @@ version assertion failing is the useful result.
 - **Network access** to pull the pinned Sling image (once).
 - **froe** built: `cargo build --release`.
 
+## Environment
+
+| Variable | Effect |
+| --- | --- |
+| `FROE_INTEROP_WORK_ROOT` | Where fixtures are built. Defaults to the system temporary directory, which on many hosts is a small tmpfs — point it at real disk before generating anything large. |
+| `FROE_INTEROP_SLING_IMAGE` | Overrides the image outright. |
+| `FROE_INTEROP_CANARY=1` | Runs against the floating `:14` tag (see above). |
+| `FROE_INTEROP_COMMAND_TIMEOUT_SECONDS` | Ceiling on a single froe command. Defaults to 900. |
+
+The command timeout is a hang detector, not a performance budget. It defaults
+high because it has to clear the slowest legitimate command on the largest
+fixture anyone points the suite at: `froe compact` over a 10 GB, 41-archive
+Sling store measures 120–135 s here. A CI run over the small generated store
+can tighten it; an unparseable or zero value falls back to the default rather
+than disabling the check. The command's exit status is asserted before its
+duration, so a command that fails *and* is slow reports its own output rather
+than being relabelled a timeout.
+
+Phases share their fixture through an in-process `OnceLock`, so a subset must
+be named in one `cargo test` invocation — `generate` first, since everything
+later reads what it produced.
+
 ## Running
 
 ```console
