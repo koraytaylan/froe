@@ -5177,7 +5177,9 @@ mod tests {
         use std::io::{Seek as _, SeekFrom};
 
         let length = std::fs::metadata(path).expect("archive metadata").len();
-        let mut file = OpenOptions::new()
+        // Fully qualified: the module's `OpenOptions` import is Unix-only,
+        // and this helper is not.
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
             .expect("open archive for damage");

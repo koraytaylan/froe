@@ -3608,6 +3608,9 @@ impl AuthorizeVersionTwoWrite for VersionTwoAlreadyEstablished {
 ///
 /// The install targets specifically, which is what an ownership preflight
 /// needs: those are the files `preserve_file_metadata` will try to match.
+/// Unix-only for the same reason that preflight is — ownership and mode are
+/// what it compares, and `preserve_file_metadata` only enforces them there.
+#[cfg(unix)]
 pub(crate) fn repair_target_names(directory: &Path) -> Result<Vec<String>> {
     let mut by_number: std::collections::BTreeMap<u32, Vec<ArchiveFileName>> =
         std::collections::BTreeMap::new();
