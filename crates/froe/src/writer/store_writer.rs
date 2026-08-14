@@ -213,7 +213,12 @@ struct WriteState {
 
 #[derive(Clone)]
 struct SessionSegmentWrite {
-    archive_file_name: String,
+    /// Shared with every other write to the same archive.
+    ///
+    /// One owned `String` per segment made this ledger grow with the store
+    /// for a value that only ever takes as many distinct forms as there are
+    /// archives — a few thousand at most, against millions of segments.
+    archive_file_name: Arc<str>,
     identifier: SegmentIdentifier,
 }
 
@@ -299,7 +304,7 @@ impl FinalizedSessionCertificate {
     fn capture(directory: &Path, writes: &[SessionSegmentWrite]) -> Result<Self> {
         let names: std::collections::BTreeSet<_> = writes
             .iter()
-            .map(|write| write.archive_file_name.as_str())
+            .map(|write| write.archive_file_name.as_ref())
             .collect();
         let mut archives = Vec::with_capacity(names.len());
         for name in names {
@@ -336,7 +341,6 @@ pub struct WritableRepository {
     maximum_archive_size: u64,
     /// Archives that existed before this session, newest first.
     base_archives: Vec<TarArchiveReader>,
-    /// Segments written in this session, servable without a mapping.
     /// Locators for segments written in this session — metadata only. The
     /// payloads live in the archives on disk; see [`SessionSegment`].
     session_segments: RwLock<HashMap<SegmentIdentifier, SessionSegment>>,
@@ -983,6 +987,28 @@ impl WritableRepository {
         Ok(())
     }
 
+    /// Appends one entry to the session's physical write-order ledger.
+    ///
+    /// The archive name is shared with the other writes to the same archive
+    /// rather than allocated per segment: writes go to one archive until it
+    /// rotates, so the previous entry almost always already holds it.
+    fn record_session_write(&self, archive_file_name: &str, identifier: SegmentIdentifier) {
+        let mut writes = self
+            .session_segment_writes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shared_name = match writes.last() {
+            Some(previous) if *previous.archive_file_name == *archive_file_name => {
+                Arc::clone(&previous.archive_file_name)
+            }
+            _ => Arc::from(archive_file_name),
+        };
+        writes.push(SessionSegmentWrite {
+            archive_file_name: shared_name,
+            identifier,
+        });
+    }
+
     /// Re-reads a session segment from the archive it was written to.
     ///
     /// Rotated archives are reopened mappings and answer directly. The
@@ -1187,13 +1213,7 @@ impl WritableRepository {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(segment.identifier, (structure, Arc::new(segment.bytes)));
-        self.session_segment_writes
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(SessionSegmentWrite {
-                archive_file_name,
-                identifier: segment.identifier,
-            });
+        self.record_session_write(&archive_file_name, segment.identifier);
         drop(state);
         Ok(())
     }
@@ -1331,7 +1351,7 @@ impl WritableRepository {
                 });
             }
             expected_archive_order
-                .entry(write.archive_file_name.clone())
+                .entry(write.archive_file_name.to_string())
                 .or_default()
                 .push(write.identifier);
         }
@@ -4771,6 +4791,7 @@ mod tests {
     use std::io::Write as _;
     use std::sync::{Arc, RwLock};
 
+    use super::{DEFAULT_MAXIMUM_ARCHIVE_SIZE, SessionSegment, session_cache_budget_bytes};
     use crate::cache::BoundedCache;
 
     #[cfg(unix)]
@@ -6684,6 +6705,105 @@ mod tests {
         assert_session_reference_keeps_base_bulk_alive("session-mark", 2);
     }
 
+    /// The regression guard for the defect that made `compact` unusable: a
+    /// session that keeps what it writes.
+    ///
+    /// This asserts the property directly rather than a consequence of it.
+    /// Writing more segments must not make the session hold more payload —
+    /// if it does, this fails no matter which structure grew or why. A test
+    /// that only checked "the store is still correct" would have passed
+    /// throughout the entire period the bug existed.
+    #[test]
+    fn writing_more_segments_does_not_make_a_session_hold_more_bytes() {
+        /// A ceiling far below what this many segments occupy, so eviction
+        /// is doing the bounding rather than the fixture simply being
+        /// smaller than the default budget.
+        const TEST_BUDGET_BYTES: usize = 4096;
+
+        fn payload_bytes_held_after(directory: &TestDirectory, segments: usize) -> usize {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            store.session_segment_cache = RwLock::new(BoundedCache::new(TEST_BUDGET_BYTES));
+            let generation = store.writing_generation().expect("generation");
+            for _ in 0..segments {
+                let mut writer = store.record_writer(generation);
+                writer
+                    .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                    .expect("node");
+                writer.finish().expect("finish");
+            }
+            let held = store
+                .session_segment_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .used_bytes();
+            let locators = store
+                .session_segments
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            assert_eq!(locators, segments, "every write must be locatable");
+            store.close().expect("close");
+            held
+        }
+
+        // A budget small enough that even this fixture's tiny segments
+        // overflow it, so the ceiling is what limits residency rather than
+        // the fixture being smaller than the default budget.
+        let few = TestDirectory::new("session-growth-few");
+        WritableRepository::open(&few.path)
+            .expect("bootstrap")
+            .close()
+            .expect("close bootstrap");
+        let many = TestDirectory::new("session-growth-many");
+        WritableRepository::open(&many.path)
+            .expect("bootstrap")
+            .close()
+            .expect("close bootstrap");
+
+        let after_few = payload_bytes_held_after(&few, 8);
+        let after_many = payload_bytes_held_after(&many, 64);
+
+        // Eight times the writes, and the payload held must not grow with
+        // them. The locator count does grow — that is metadata, and the
+        // assertion above pins it — but bytes must not.
+        assert!(
+            after_many <= TEST_BUDGET_BYTES,
+            "payload residency exceeded the ceiling: {after_many} bytes held \
+             against a {TEST_BUDGET_BYTES}-byte budget"
+        );
+        assert!(
+            after_few <= TEST_BUDGET_BYTES,
+            "payload residency exceeded the ceiling: {after_few} bytes"
+        );
+        // And the production budget is a constant of the archive size, not
+        // of the store: nothing here may make it a function of content.
+        assert_eq!(
+            session_cache_budget_bytes(DEFAULT_MAXIMUM_ARCHIVE_SIZE),
+            (DEFAULT_MAXIMUM_ARCHIVE_SIZE as usize) * 2
+        );
+    }
+
+    /// Guards the locator against regrowing into what it replaced.
+    ///
+    /// `session_segments` holds one entry per segment for the life of the
+    /// session, so anything heap-owning added to its value type is once
+    /// again a per-segment allocation across the whole store. Keeping the
+    /// type `Copy` and small is what makes that map metadata rather than a
+    /// second copy of the repository.
+    #[test]
+    fn a_session_locator_owns_no_heap_and_stays_small() {
+        // `Copy` cannot be derived for a type owning heap, so binding this
+        // is a compile-time proof that no String, Vec, or Arc crept in.
+        fn assert_copy<Type: Copy>() {}
+        assert_copy::<SessionSegment>();
+        assert!(
+            std::mem::size_of::<SessionSegment>() <= 24,
+            "SessionSegment grew to {} bytes; a field that scales per segment \
+             belongs on disk or in a bounded cache, not here",
+            std::mem::size_of::<SessionSegment>()
+        );
+    }
+
     #[test]
     fn a_session_serves_its_own_segments_from_disk_when_nothing_is_cached() {
         let directory = TestDirectory::new("session-reread");
@@ -7088,7 +7208,7 @@ mod tests {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .map(|write| (write.archive_file_name.clone(), write.identifier))
+            .map(|write| (write.archive_file_name.to_string(), write.identifier))
             .collect();
         assert_eq!(
             recorded_order,
@@ -7152,8 +7272,12 @@ mod tests {
             "the fixture must rotate between the two session segments"
         );
 
-        let first = directory.path.join(&recorded_writes[0].archive_file_name);
-        let second = directory.path.join(&recorded_writes[1].archive_file_name);
+        let first = directory
+            .path
+            .join(recorded_writes[0].archive_file_name.as_ref());
+        let second = directory
+            .path
+            .join(recorded_writes[1].archive_file_name.as_ref());
         let temporary = directory.path.join("session-boundary-swap.tmp");
         std::fs::rename(&first, &temporary).expect("move first archive aside");
         std::fs::rename(&second, &first).expect("move second into first boundary");

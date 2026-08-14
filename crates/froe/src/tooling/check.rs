@@ -1184,6 +1184,53 @@ mod tests {
     }
 
     #[test]
+    fn verifying_a_larger_tree_does_not_make_the_memo_larger() {
+        // The memo's ceiling must be a property of its configuration, not of
+        // the tree. Checking only that verification succeeds would pass just
+        // as happily with the unbounded map that made `check` and both
+        // `cleanup` modes exhaust memory on a large store.
+        const TEST_BUDGET_BYTES: usize = 512;
+
+        let directory = TestDirectory::new("verify-memo-bounded");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let mut deepest = None;
+        for depth in 0..64 {
+            let mut writer = store.record_writer(generation);
+            let node = match deepest {
+                None => writer
+                    .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                    .expect("leaf"),
+                Some(child) => writer
+                    .write_node(
+                        None,
+                        &[],
+                        &ChildNodesToWrite::One {
+                            name: format!("level{depth}"),
+                            node: child,
+                        },
+                        &[],
+                    )
+                    .expect("branch"),
+            };
+            writer.finish().expect("finish");
+            deepest = Some(node);
+        }
+        let root = deepest.expect("a root was written");
+
+        let provider = CountingProvider::new(&store);
+        let mut verifier = NodeTreeVerifier::with_memo_budget(&provider, TEST_BUDGET_BYTES);
+        verifier.verify(root).expect("verifies");
+
+        assert!(
+            verifier.verified_subtree_heights.used_bytes() <= TEST_BUDGET_BYTES,
+            "the verified-subtree memo held {} bytes against a {TEST_BUDGET_BYTES}-byte budget",
+            verifier.verified_subtree_heights.used_bytes()
+        );
+        store.close().expect("close");
+    }
+
+    #[test]
     fn an_evicting_memo_costs_reads_but_never_changes_the_verdict() {
         let directory = TestDirectory::new("verify-memo-evicts");
         let store = WritableRepository::open(&directory.path).expect("open");

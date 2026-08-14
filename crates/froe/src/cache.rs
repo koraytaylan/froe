@@ -214,6 +214,149 @@ impl<Left: CacheWeight, Right: CacheWeight> CacheWeight for (Left, Right) {
 }
 
 #[cfg(test)]
+mod long_lived_state_tests {
+    /// Field types that may appear in long-lived store state, each with the
+    /// reason it does not grow without bound. Everything else must be a
+    /// `BoundedCache`, or live on disk.
+    ///
+    /// The pairing is deliberate: adding a field here forces writing down
+    /// why it is safe, which is the step that was missing when the writer
+    /// session became an in-memory copy of the repository.
+    const ALLOWED_UNBOUNDED_FIELDS: &[(&str, &str)] = &[
+        (
+            "archives",
+            "one reader per archive file; each holds a mapping, not payload bytes",
+        ),
+        (
+            "base_archives",
+            "one reader per pre-existing archive; mappings, not payload bytes",
+        ),
+        (
+            "session_archives",
+            "one reader per archive this session finished; mappings, not payload bytes",
+        ),
+        (
+            "segment_locations",
+            "one small entry per segment, the index every lookup needs; reserved up front",
+        ),
+        (
+            "journal_entries",
+            "one entry per journal line, bounded by the journal rather than by content",
+        ),
+        (
+            "session_segments",
+            "one Copy locator per written segment; pinned small by \
+             a_session_locator_owns_no_heap_and_stays_small",
+        ),
+        (
+            "session_segment_writes",
+            "one entry per written segment, archive names shared; the exact write \
+             order certification requires",
+        ),
+    ];
+
+    /// Extracts the field name and type of every field in a struct body.
+    fn struct_fields(source: &str, declaration: &str) -> Vec<(String, String)> {
+        let start = source
+            .find(declaration)
+            .unwrap_or_else(|| panic!("{declaration} not found; update this guard"));
+        let body_start = source[start..].find('{').expect("struct body") + start + 1;
+        let mut depth = 1usize;
+        let mut end = body_start;
+        for (offset, character) in source[body_start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut fields = Vec::new();
+        for line in source[body_start..end].lines() {
+            let line = line.trim();
+            if line.starts_with("//") || line.starts_with('#') || !line.contains(':') {
+                continue;
+            }
+            let (name, type_text) = line.split_once(':').expect("a field line has a colon");
+            let name = name
+                .trim()
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ");
+            if name.is_empty() || name.contains(' ') {
+                continue;
+            }
+            fields.push((
+                name.to_owned(),
+                type_text.trim().trim_end_matches(',').to_owned(),
+            ));
+        }
+        fields
+    }
+
+    /// Fails when long-lived store state gains a collection that grows with
+    /// the repository.
+    ///
+    /// This is the guard the codebase did not have. Every OOM in these
+    /// commands came from a structure that was correct, tested, and simply
+    /// kept everything; no behavioural test could have caught it, because
+    /// the behaviour was right. What was missing was anything that noticed
+    /// the shape of the state itself.
+    #[test]
+    fn long_lived_store_state_holds_nothing_that_grows_with_the_repository() {
+        let sources = [
+            (
+                "WritableRepository",
+                include_str!("writer/store_writer.rs"),
+                "pub struct WritableRepository {",
+            ),
+            (
+                "Repository",
+                include_str!("store.rs"),
+                "pub struct Repository {",
+            ),
+            (
+                "ArchiveSet",
+                include_str!("store.rs"),
+                "pub struct ArchiveSet {",
+            ),
+        ];
+        let unbounded = ["HashMap<", "HashSet<", "BTreeMap<", "BTreeSet<", "Vec<"];
+
+        let mut offences = Vec::new();
+        for (type_name, source, declaration) in sources {
+            for (field, field_type) in struct_fields(source, declaration) {
+                if ALLOWED_UNBOUNDED_FIELDS
+                    .iter()
+                    .any(|(allowed, _)| *allowed == field)
+                {
+                    continue;
+                }
+                if unbounded.iter().any(|shape| field_type.contains(shape)) {
+                    offences.push(format!("{type_name}::{field}: {field_type}"));
+                }
+            }
+        }
+
+        assert!(
+            offences.is_empty(),
+            "long-lived store state gained an unbounded collection:\n  {}\n\n\
+             A structure that lives for a whole session and grows with the \
+             repository is how `compact` came to need hundreds of gigabytes. \
+             Either give it a byte budget with `BoundedCache`, keep it on disk \
+             and re-read it, or add it to ALLOWED_UNBOUNDED_FIELDS in \
+             crates/froe/src/cache.rs with the reason it cannot grow without \
+             bound.",
+            offences.join("\n  ")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{BoundedCache, CacheWeight};
 
