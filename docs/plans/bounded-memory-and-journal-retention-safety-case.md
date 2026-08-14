@@ -164,11 +164,16 @@ interoperability**, not a froe-to-froe round trip.
 
 ## Known gaps
 
-1. **No independent human review.** The reviewer must not be whoever wrote the
-   patch. Under the guide's own fallback this keeps
-   `--retain-journal-revisions` **beta**, and the loosened survivor check — a
-   change to an existing stable surface — needs an explicit maintainer
-   exception plus independent review before release.
+1. **Independent human review waived by maintainer exception.** The review of
+   this range was performed by automated reviewers against the frozen
+   candidate, not by a second person. It found and corrected a fabricated
+   evidence row, an unarmed regression on the loosened refusal, and a
+   retention-counting defect that retired a readable revision at `N ≥ 2`;
+   those fixes are in `cca15be`. The maintainer has exercised the exception
+   [`high-risk-changes.md`](../high-risk-changes.md) provides and released the
+   range without a second reviewer. Recorded here because the exception is a
+   decision, not an absence — a later reader is entitled to know which
+   evidence rests on review by a person and which does not.
 2. **`--retain-journal-revisions` has no interoperability evidence.** No
    interop phase bounds the journal and then asks Oak to boot the result. It
    is the one new destructive operation with no Oak-verified post-state.
