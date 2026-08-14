@@ -116,6 +116,13 @@ cleanup
    │  archives, expired checkpoints, and corrupt journal lines
    │  If this fails: the write path's plan-and-apply machinery is broken.
    ▼
+journal_retention
+   │  froe cleanup --retain-journal-revisions 1 retires resolvable
+   │  journal history and sweeps the segments behind it; Oak boots the
+   │  result and serves the baseline tree from the one revision kept
+   │  If this fails: froe's only by-policy destruction of reachable
+   │  history leaves a store Oak cannot open.
+   ▼
 repair
    │  Oak's own JVM is killed with SIGKILL while it holds an archive
    │  open; froe cleanup --task repair-archives rebuilds the index and
@@ -206,6 +213,24 @@ froe cleanup removes all four conditions. Sling boots against the
 cleaned store.
 
 Depends on `compact` (to build the gen 0→1→2 fixture).
+
+### journal_retention
+
+`--retain-journal-revisions` is the only froe operation that makes repository
+bytes unreachable *by policy* rather than by Oak's generation predicate. It
+removes journal lines whose revisions still resolve, and the segments behind
+them are swept in the same run.
+
+That is precisely the case a froe-to-froe round trip cannot answer: froe
+agreeing with its own reachability rules says nothing about whether Oak can
+open what is left. So this phase bounds the journal to one revision on a copy
+of the Oak fixture, asserts the plan names the revisions it retires and that
+exactly one line survives on disk beside a numbered backup, and then boots
+Sling against the result — which must serve the exact baseline tree from the
+single revision froe kept.
+
+Depends on `generate` only; it uses the Oak-written journal directly, because
+Oak's own history is the thing being retired.
 
 ### repair
 

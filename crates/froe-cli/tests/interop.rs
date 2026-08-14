@@ -1835,6 +1835,117 @@ fn cleanup() {
     eprintln!("  cleanup phase passed");
 }
 
+/// Phase 6b: froe retires journal history, and Oak boots the result.
+///
+/// `--retain-journal-revisions` is the only froe operation that makes
+/// repository bytes unreachable *by policy* rather than by Oak's own
+/// generation predicate: it removes journal lines whose revisions still
+/// resolve, and the segments behind them are then swept in the same run. A
+/// froe-to-froe round trip cannot be evidence for that — froe agreeing with
+/// its own reachability rules proves nothing about whether Oak can still open
+/// what is left.
+///
+/// So the assertion that matters is the last one: a real Oak boots a store
+/// whose history froe deliberately destroyed, and serves the exact baseline
+/// tree from the one revision froe kept.
+#[test]
+#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
+fn journal_retention() {
+    let store = oak_store();
+    let retention_store = work_root().join("retention-store");
+    eprintln!("  copying store to {}", retention_store.display());
+    copy_store(&store, &retention_store);
+
+    let journal_path = retention_store.join("journal.log");
+    let revisions_before = std::fs::read_to_string(&journal_path)
+        .expect("read journal")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    eprintln!("  Oak left {revisions_before} journal revisions");
+    assert!(
+        revisions_before > 1,
+        "the fixture needs history to retire; Oak wrote {revisions_before} revisions"
+    );
+
+    // The default task set includes expired-checkpoints, which moves the head
+    // and is refused beside a retention bound. Name the two tasks the bound
+    // needs instead.
+    eprintln!("  froe cleanup --retain-journal-revisions 1 --dry-run");
+    let dry_run = froe(&[
+        "cleanup",
+        retention_store.to_str().unwrap(),
+        "--task",
+        "journal",
+        "--task",
+        "segments",
+        "--retain-journal-revisions",
+        "1",
+        "--dry-run",
+    ]);
+    assert!(
+        dry_run.contains("beyond retention"),
+        "the plan names the revisions the bound retires: {dry_run}"
+    );
+
+    eprintln!("  froe cleanup --retain-journal-revisions 1 --yes");
+    let output = froe(&[
+        "cleanup",
+        retention_store.to_str().unwrap(),
+        "--task",
+        "journal",
+        "--task",
+        "segments",
+        "--retain-journal-revisions",
+        "1",
+        "--yes",
+    ]);
+    let removed_lines = parse_count(&output, " journal lines removed");
+    assert!(
+        removed_lines > 0,
+        "the bound retired journal revisions, not zero: {output}"
+    );
+    assert!(
+        output.contains("cleanup complete"),
+        "cleanup completed without deferred or failed deletions: {output}"
+    );
+
+    // On disk, independently of what was reported: exactly one revision left.
+    let revisions_after = std::fs::read_to_string(&journal_path)
+        .expect("read journal after")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(
+        revisions_after, 1,
+        "a bound of one leaves one revision; {revisions_after} remain"
+    );
+    assert!(
+        retention_store.join("journal.log.bak.000").is_file(),
+        "the pre-rewrite journal is retained under a numbered backup"
+    );
+
+    eprintln!("  froe check after retiring history");
+    froe(&["check", retention_store.to_str().unwrap()]);
+
+    // Boot Sling against the store whose history froe destroyed.
+    eprintln!("  booting Sling against the history-retired store");
+    let volume = PodmanVolume::new("froe-interop-retention");
+    let bootstrap = PodmanContainer::run_detached("froe-retention-bootstrap", 8089, &volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(&retention_store, &volume.name);
+    let sling = PodmanContainer::run_detached("froe-retention-verify", 8089, &volume.name);
+    wait_for_sling(8089, "froe-retention-verify");
+
+    eprintln!("  content snapshot from Sling after retiring history");
+    assert_oak_consumed_store_as_written("froe-retention-verify", "journal-retention");
+    assert_content_matches_baseline(8089, "journal-retention");
+
+    drop(sling);
+    eprintln!("  journal-retention phase passed");
+}
+
 /// Phase 7: froe repairs an archive Oak left untrailered, and Oak reads it.
 ///
 /// The only phase whose damage is produced by Oak itself rather than
@@ -2154,6 +2265,7 @@ fn interop_full() {
     compact_tail();
     checkpoint_removal();
     cleanup();
+    journal_retention();
     repair();
     backup();
     recover();
@@ -2203,6 +2315,10 @@ fn write_run_record() {
          \x20             baseline tree afterwards\n\
          \x20 cleanup     Oak served the exact baseline tree after orphan, stale-archive,\n\
          \x20             expired-checkpoint and corrupt-journal-line removal\n\
+         \x20 journal     froe retired resolvable journal history with\n\
+         \x20 retention   --retain-journal-revisions 1 and swept the segments behind\n\
+         \x20             it; Oak booted the result and served the exact baseline\n\
+         \x20             tree from the single revision froe kept\n\
          \x20 repair      Oak's own JVM was killed with SIGKILL while it held an archive\n\
          \x20             open, leaving it without its trailers; froe cleanup\n\
          \x20             --task repair-archives rebuilt the index, and Oak then served\n\
