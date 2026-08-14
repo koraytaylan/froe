@@ -977,6 +977,25 @@ mod tests {
             // is the table's own occupancy: two `u64` vectors over its slots.
             // Resident size tracked it within a few bytes a node when measured
             // in isolation (44 at a million entries, 35 at four million).
+            // `len` is a counter, so it would still be right if a growth
+            // dropped entries. Retrieval is what actually pins the invariant:
+            // the table crosses many growths at these sizes, and losing one
+            // entry means re-copying that node's whole subtree.
+            for index in 0..count {
+                let record = RecordIdentifier {
+                    segment: SegmentIdentifier {
+                        most_significant_bits: (index / 8192) as u64,
+                        least_significant_bits: 0x5eed,
+                    },
+                    record_number: index as u32,
+                };
+                let packed = interner.pack(record);
+                assert_eq!(
+                    memo.get(packed),
+                    Some(packed),
+                    "entry {index} of {count} survives every growth"
+                );
+            }
             let bytes_per_node = memo.keys.len() * 2 * std::mem::size_of::<u64>() / count;
             assert_eq!(memo.len, count);
             assert!(
@@ -1012,6 +1031,41 @@ mod tests {
             store.close().expect("close");
             assert_eq!(copied as usize, distinct, "the copy is exact at {fanout}");
         }
+    }
+
+    /// Throughput of the exact copy, for extrapolating to a field-scale head.
+    /// Ignored by default: it writes about a million nodes.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_copy_throughput() {
+        let directory = TestDirectory::new("throughput");
+        let build_started = std::time::Instant::now();
+        build_wide_store(&directory, 1000);
+        let built = build_started.elapsed();
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let head = store.head();
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let started = std::time::Instant::now();
+        let (_root, copied) = deep_copy_tree_with_progress(
+            &store,
+            &mut writer,
+            head,
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect("deep copy");
+        let elapsed = started.elapsed();
+        writer.finish().expect("finish");
+        store.close().expect("close");
+        let per_second =
+            u32::try_from(copied).map_or(f64::INFINITY, f64::from) / elapsed.as_secs_f64();
+        println!(
+            "built {copied} nodes in {:.1}s; copied in {:.2}s = {per_second:.0} nodes/s; \
+             18.8M nodes extrapolates to {:.1} min",
+            built.as_secs_f64(),
+            elapsed.as_secs_f64(),
+            18_800_000.0 / per_second / 60.0,
+        );
     }
 
     #[test]
