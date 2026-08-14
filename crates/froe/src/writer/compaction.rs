@@ -134,7 +134,12 @@ const MAXIMUM_COMPACTION_DEPTH: usize = 4000;
 /// fixed-capacity compaction caches. Beyond it, a shared subtree met again
 /// is copied a second time: the compacted store stays correct and complete,
 /// and the cost lands on output size rather than on resident memory.
-const COMPACTION_MEMO_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const COMPACTION_MEMO_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Roughly what one sharing-memo entry charges against the budget: two
+/// record identifiers plus the cache's per-entry overhead. Used only to turn
+/// a budget into an intelligible node count for operators.
+pub const COMPACTION_MEMO_BYTES_PER_NODE: usize = 112;
 
 /// Deep-copies nodes into a fresh generation, sharing rewritten records
 /// through a source-record cache.
@@ -294,6 +299,25 @@ pub fn compact_with_progress(
     kind: CompactionKind,
     observer: &mut dyn ProgressObserver,
 ) -> Result<CompactionOutcome> {
+    compact_with_memo_budget(store, kind, COMPACTION_MEMO_BUDGET_BYTES, observer)
+}
+
+/// Compacts exactly like [`compact_with_progress`], with an explicit budget
+/// for the sharing memo.
+///
+/// The memo maps each source node to its rewritten copy, so a subtree the
+/// live root and a checkpoint both reference is copied once. A miss copies
+/// it again: correct output, duplicated work and bytes. The budget therefore
+/// trades memory against output size and time, and the right value depends
+/// on the tree — roughly [`COMPACTION_MEMO_BYTES_PER_NODE`] per node to hold
+/// all of it. A compaction reporting more copied nodes than the head
+/// contains is the observable symptom of a budget below that.
+pub fn compact_with_memo_budget(
+    store: &mut WritableRepository,
+    kind: CompactionKind,
+    memo_budget_bytes: usize,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CompactionOutcome> {
     let size_before = store.archive_size_on_disk()?;
 
     let head = store.head();
@@ -325,7 +349,9 @@ pub fn compact_with_progress(
     let (new_head, compacted_nodes) = crate::progress::observe(
         observer,
         &Step::new("copying nodes into a fresh generation", WorkUnit::Nodes),
-        |observer| deep_copy_tree_with_progress(store, &mut writer, head, observer),
+        |observer| {
+            deep_copy_tree_with_memo_budget(store, &mut writer, head, memo_budget_bytes, observer)
+        },
     )?;
     writer.finish()?;
 

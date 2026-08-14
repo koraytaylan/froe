@@ -238,6 +238,16 @@ enum Command {
         /// Run a tail compaction instead of a full one.
         #[arg(long)]
         tail: bool,
+        /// Memory budget in MiB for the sharing memo that keeps a subtree
+        /// referenced by several roots from being copied more than once.
+        ///
+        /// Roughly 112 bytes per node in the head, so a repository of 20
+        /// million nodes holds its whole tree at about 2200. Below that,
+        /// compaction still produces a correct store but copies shared
+        /// subtrees repeatedly — visible as a copied-node count climbing
+        /// past the number of nodes the head actually contains.
+        #[arg(long, default_value_t = 256)]
+        memo_budget_mb: usize,
         /// Proceed without the interactive confirmation.
         #[arg(long)]
         yes: bool,
@@ -686,8 +696,9 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
             repository,
             tail,
             yes,
+            memo_budget_mb,
         } => {
-            if !mutation::run_compact(&repository, tail, yes, reporter)? {
+            if !mutation::run_compact(&repository, tail, memo_budget_mb, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -1428,6 +1439,24 @@ mod tests {
         assert!(!yes);
         assert_eq!(backup_min_age_days, Some(30));
         assert_eq!(backup_keep_latest, Some(3));
+    }
+
+    #[test]
+    fn compact_carries_a_memo_budget_with_a_documented_default() {
+        let parsed = CommandLine::try_parse_from(["froe", "compact", "/store"])
+            .expect("compact parses without a budget");
+        let Command::Compact { memo_budget_mb, .. } = parsed.command else {
+            panic!("compact must dispatch");
+        };
+        assert_eq!(memo_budget_mb, 256, "the default budget is stable");
+
+        let parsed =
+            CommandLine::try_parse_from(["froe", "compact", "/store", "--memo-budget-mb", "2200"])
+                .expect("an explicit budget parses");
+        let Command::Compact { memo_budget_mb, .. } = parsed.command else {
+            panic!("compact must dispatch");
+        };
+        assert_eq!(memo_budget_mb, 2200);
     }
 
     #[test]

@@ -39,8 +39,8 @@ pub use commit::{
     replace_content_root,
 };
 pub use compaction::{
-    CompactionKind, CompactionOutcome, compact, compact_with_progress, deep_copy_tree,
-    deep_copy_tree_with_progress,
+    COMPACTION_MEMO_BYTES_PER_NODE, CompactionKind, CompactionOutcome, compact,
+    compact_with_memo_budget, compact_with_progress, deep_copy_tree, deep_copy_tree_with_progress,
 };
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};
 pub use record_writer::{

@@ -1,7 +1,9 @@
 # Safety case: bounded memory and `--retain-journal-revisions`
 
 The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for the
-range `bdcbe55..HEAD`. In scope on three counts: it adds a task that makes
+range `bdcbe55..HEAD`, extended after `v0.8.0` by three further write-path
+changes: record reuse in the writer, binary value sharing in compaction, and a
+configurable sharing-memo budget. In scope on three counts: it adds a task that makes
 repository bytes unreachable by design (`--retain-journal-revisions`), it
 rewrites how a write session holds and certifies what it wrote, and it
 *loosens* a refusal on the destructive path — the last reaching the default
@@ -79,6 +81,8 @@ early.
 | Retained journal roots stay readable (`validate_prospective_segment_plan`, first half) | `prospective_plan_refuses_a_survivor_that_references_a_planned_removal`, plus the armed cutpoint `cleanup.before-prospective-retained-root-verification` | Pre-existing; unchanged by this range | — |
 | Live survivors must not dangle (`validate_prospective_segment_plan`, second half — **loosened here**; default `--task segments` path) | `a_dead_survivor_pointing_at_a_removed_segment_is_handled` | Removed `\|\| reclaimable.contains(&identifier)`, restoring the stricter check | `a dead survivor pointing at removed garbage must not refuse the plan: InvalidFormat { details: "surviving data segment 84dbbc74… references segment 595eb34c…, which the cleanup plan would remove" }` |
 | Retention bound counts only revisions that resolve (`journal_retention_boundary`) | `a_bound_counts_only_revisions_that_actually_resolve` | Counted every line whose segment exists, ignoring the verdict | `a readable revision was retired to make room for an unreadable one` — the older readable revision removed as `BeyondRetention` beside the unreadable one |
+| Writer reuses an identical value or template record (`RecordWriter::write_string`, `write_template`; every write path — commit, backup, restore, compact) | `a_repeated_string_or_template_reuses_the_record_it_already_wrote` | Not neutralized — the test asserts identifier equality directly, which no disabling change leaves true | — |
+| A block is shared only when it lives in a bulk segment (`copy_binary_value`) | interop `compact` and `compact --tail` phases | Not neutralized — the froe-authored unit fixtures all take the copy path, so only an Oak-written store exercises sharing | — |
 | Zero-budget memos reach the same verdict (`NodeTreeVerifier`, `Compactor`, session cache) | `an_evicting_memo_costs_reads_but_never_changes_the_verdict`, `a_deep_copy_with_no_sharing_memo_still_produces_the_whole_tree`, `a_session_serves_its_own_segments_from_disk_when_nothing_is_cached` | Budget set to 0 by the test itself | Not applicable — the starved configuration *is* the experiment |
 
 Neutralizations ran serially against an isolated target directory, each
@@ -93,7 +97,8 @@ configuration, not of repository size:
 * Writer base-segment cache: 192 MiB. Session read-back cache: twice the
   archive rotation threshold (512 MiB by default), sized so the archive being
   written is always resident.
-* Compaction sharing memo 256 MiB; verified-subtree memo 192 MiB; recovery
+* Compaction sharing memo 256 MiB by default and settable per run with
+  `froe compact --memo-budget-mb`, at roughly 112 bytes per node in the head; verified-subtree memo 192 MiB; recovery
   visited memo 128 MiB; SQLite string dictionary 64 MiB.
 
 Planning is *not* bounded by configuration. On the default `--task segments`
@@ -102,11 +107,20 @@ path, under the lock, peak store-scale sets are `head_data_segments`,
 marking pass's own `references` and `reclaimable` — five, where before this
 range there were three. An applied run plans twice (preview and authoritative).
 
-Temporary disk is likewise unbounded by configuration. The compaction sharing
-memo is now an evicting FIFO, and a miss re-copies a shared subtree including
-its binary payload, so a store with many checkpoints can stage an output
-larger than its source before `reclaim_old_generations` retires anything.
-No test measures that amplification.
+Temporary disk is bounded by the live set rather than by the store, and the
+two record-reuse changes cut what "live set" means in practice. Measured on
+4000 identically shaped nodes: the authored store fell 3.35x and its compacted
+output 2.80x once the writer stopped re-writing the same value and template
+records. Compaction no longer copies binary content at all when the source
+blocks live in bulk segments, which on a store written by Oak is most of the
+bytes.
+
+What remains is the sharing memo. It is an evicting FIFO, and a miss re-copies
+a shared subtree, so a budget below the tree inflates the output; the
+observable symptom is a copied-node count climbing past the number of nodes
+the head contains, which is what a 256 MiB budget did on an 18.8M-node
+repository. The budget is now a per-run flag so it can be matched to the tree.
+No test measures the amplification at a given budget.
 
 Still proportional to the store, and unavoidable without an on-disk index:
 one decoded index entry per segment (~40 B), one `segment_locations` entry per
@@ -132,6 +146,15 @@ Direction froe-to-Oak for every maintenance phase; Oak served the *exact*
 baseline tree after full compaction, tail compaction, all three checkpoint
 removals, and cleanup, and after `repair` with Oak's own JVM killed by
 `SIGKILL` while holding an archive. `backup` and `recover` passed.
+
+Re-verified twice after `v0.8.0` for the later write-path changes, most
+importantly binary value sharing: `compact` and `compact --tail` passed with
+sharing active, so Oak served the exact baseline tree from bulk segments froe
+referenced rather than rewrote. That run also replaced the `cleanup` phase's
+reclaimable condition, which had built itself by restoring the pre-compaction
+gen-0 archive — an assumption that only held while froe copied binaries, and
+which failed loudly once it did not. The phase now writes 2000 nodes at
+generation zero and never links them to a head.
 
 This is the evidence the session rewrite rests on: the certificate now proves
 payload identity by recorded CRC rather than by retained bytes, and Oak read
@@ -170,27 +193,33 @@ interoperability**, not a froe-to-froe round trip.
 
 ## Known gaps
 
-1. **The loosened survivor check reaches the default path.** `--task segments`
+1. **Record reuse and value sharing have no neutralization evidence.** Both
+   guards are asserted by tests that pass or fail on identity rather than on a
+   refusal, so the disabling experiment the guide asks for does not apply
+   cleanly; value sharing additionally has no unit coverage at all, because
+   every froe-authored fixture puts blocks in data segments and takes the copy
+   path. Interop is the only thing exercising it.
+2. **The loosened survivor check reaches the default path.** `--task segments`
    can now proceed where it previously refused. One synthetic fixture on the
    default task set covers it and fails when the stricter check is restored;
    no real store has exercised it.
-2. **No RSS measurement.** Budgets are asserted against `cache_weight`, which
+3. **No RSS measurement.** Budgets are asserted against `cache_weight`, which
    is an approximation. A leak outside the budgeted structures would not be
    caught.
-3. **macOS untested.** Only CI covers it.
-4. **The reopen boundary has no armed fault cutpoint.** It is argued
+4. **macOS untested.** Only CI covers it.
+5. **The reopen boundary has no armed fault cutpoint.** It is argued
    prefix-safe above rather than tested by injection.
-5. **The source-shape guard has known blind spots.** It matches literal type
+6. **The source-shape guard has known blind spots.** It matches literal type
    substrings against single-line field text of three named structs, so it
    does not see `VecDeque`, a field whose type rustfmt wrapped across lines, a
    collection behind a type alias, or state inside a nested struct such as
    `write_state: Mutex<WriteState>`. It also cannot see accumulators held in
    function locals, which is the class the `recover-journal` defect belonged
    to. It raises the cost of reintroducing the defect; it does not prevent it.
-6. **`CleanupAction::PruneJournal` gained a required field.** The enum is
+7. **`CleanupAction::PruneJournal` gained a required field.** The enum is
    `#[non_exhaustive]`, which does not make its variants so; a downstream
    struct-pattern match on that variant is source-breaking. Record it in the
    version bump rationale.
-7. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
+8. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
    returns an owned `Vec`. Bounded by the widest single node, not by the
    store; fixing it needs an additive streaming API.
