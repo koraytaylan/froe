@@ -48,6 +48,14 @@ Phases share their fixture through an in-process `OnceLock`, so a subset must
 be named in one `cargo test` invocation — `generate` first, since everything
 later reads what it produced.
 
+That sharing is also why the whole suite must never be run by selecting every
+ignored test. `interop_full` runs the chain itself and claims the same
+`OnceLock` `generate` does, and the harness orders tests by name rather than
+by dependency, so an unfiltered run starts `compact` before any store exists
+and then has `interop_full` collide with `generate`. The result is a wall of
+failures that look like real interoperability breakage and are nothing of the
+kind — always name `interop_full`, or one phase.
+
 ## Running
 
 ```console
@@ -57,8 +65,9 @@ $ scripts/interop-fixture.sh
 # A single phase (generate runs first automatically):
 $ scripts/interop-fixture.sh compact
 
-# Direct cargo invocation:
-$ cargo test -p froe-cli --features interop -- --ignored --test-threads=1
+# Direct cargo invocation — `interop_full` is the whole chain, and naming it
+# is required: an unfiltered `--ignored` run collides with itself as above.
+$ cargo test -p froe-cli --features interop -- --ignored --test-threads=1 interop_full
 
 # A single phase via cargo:
 $ cargo test -p froe-cli --features interop -- --ignored interop::read
