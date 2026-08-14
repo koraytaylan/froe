@@ -174,9 +174,13 @@ every readable journal revision while pruning dangling or unreadable journal
 entries, reclaiming eligible segments, removing expired checkpoints, and
 cleaning only proven stale files. See the [cleanup guide](docs/cleanup.md) for
 task selection, retention rules, resource expectations, and failure behavior.
-When a planned checkpoint removal or segment-archive rewrite needs to write
-version-two state, the plan also shows the one-way `store.version=1` to `2`
-manifest upgrade before apply.
+When a planned checkpoint removal, segment-archive rewrite, or archive-index
+repair needs to write version-two state, the plan also shows the one-way
+`store.version=1` to `2` manifest upgrade before apply.
+
+The opt-in `--task repair-archives` rebuilds the index of an archive a killed
+Oak left untrailered — the state that otherwise blocks every generation-
+dependent task — retaining each original under a `.bak` name.
 
 Every mutating command takes `repo.lock`. If that file is absent, froe first
 creates and fsyncs a mode-`0600` staging inode, then publishes it with an

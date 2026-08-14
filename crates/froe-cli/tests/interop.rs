@@ -290,6 +290,29 @@ fn froe(args: &[&str]) -> String {
     stdout
 }
 
+/// Run froe expecting it to refuse; assert failure and return stderr.
+///
+/// A refusal is part of the contract for a destructive tool — that cleanup
+/// declines a store it cannot safely act on is as much a claim as what it
+/// does when it can — so the suite asserts refusals the same way it asserts
+/// successes, rather than only exercising the happy path.
+fn froe_failure(args: &[&str]) -> String {
+    let output = Command::new(froe_bin())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to spawn froe {args:?}: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success(),
+        "froe {args:?} was expected to refuse but succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stderr
+}
+
 // ---------------------------------------------------------------------------
 // Podman orchestration
 // ---------------------------------------------------------------------------
@@ -366,6 +389,45 @@ impl PodmanContainer {
     fn stop(&self) {
         let _ = Command::new("podman").args(["stop", &self.name]).output();
         let _ = Command::new("podman").args(["rm", &self.name]).output();
+    }
+
+    /// Kills the JVM outright, the way an OOM kill or a yanked host does.
+    ///
+    /// [`Self::stop`] is graceful — SIGTERM with a grace period — and Oak's
+    /// shutdown hook comfortably beats it, which is exactly the behaviour
+    /// this must not have: a cleanly closed archive carries its index, and
+    /// the condition under test never arises. The image's entrypoint `exec`s
+    /// the JVM, so PID 1 in the container *is* Oak and the signal lands on
+    /// it with no shell in between.
+    fn kill_uncleanly(&self) {
+        podman(&["kill", "-s", "KILL", &self.name]);
+        // Reaping is not synchronous with the kill returning. The exit code
+        // is the evidence that the JVM died on the signal rather than
+        // exiting, so it is read before `Drop` removes the container.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = podman(&[
+                "inspect",
+                "-f",
+                "{{.State.Status}} {{.State.ExitCode}}",
+                &self.name,
+            ]);
+            let status = status.trim();
+            if let Some(code) = status.strip_prefix("exited ") {
+                assert_eq!(
+                    code, "137",
+                    "the JVM must have died on SIGKILL (128 + 9), not exited on its own; \
+                     a clean exit means Oak closed its archives and wrote their indexes, \
+                     so the condition this phase exercises would not exist"
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the container did not report an exit status after SIGKILL: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 
@@ -1773,7 +1835,144 @@ fn cleanup() {
     eprintln!("  cleanup phase passed");
 }
 
-/// Phase 7: froe backup and restore.
+/// Phase 7: froe repairs an archive Oak left untrailered, and Oak reads it.
+///
+/// The only phase whose damage is produced by Oak itself rather than
+/// simulated: the JVM is killed with SIGKILL while it holds an archive open,
+/// which is what an OOM kill or a yanked host does and what leaves the
+/// newest archive complete but without its `.gph`, `.brf` and index
+/// trailers. Every other froe command refuses such a store; `--task
+/// repair-archives` rebuilds it.
+///
+/// This phase exists because a froe-to-froe round trip is not evidence for a
+/// format-writing feature — `CONTRIBUTING.md` says so in as many words. The
+/// assertion that matters is the last one: a real Oak opens the rebuilt
+/// archive and serves the same tree, without logging any of its own repair
+/// messages, so it consumed froe's index rather than reconstructing one.
+#[test]
+#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
+fn repair() {
+    let store = oak_store();
+    let repair_store = work_root().join("repair-store");
+
+    // Give Oak the store, let it open an archive, and kill it mid-life.
+    let volume = PodmanVolume::new("froe-interop-repair");
+    let bootstrap = PodmanContainer::run_detached("froe-repair-bootstrap", 8086, &volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(&store, &volume.name);
+    let sling = PodmanContainer::run_detached("froe-repair-kill", 8086, &volume.name);
+    wait_for_sling(8086, "froe-repair-kill");
+
+    // Written outside /content/interop so the baseline fingerprint still
+    // describes the same tree after the repair; this content is incidental,
+    // its only job is to make Oak hold an archive open with segments in it.
+    eprintln!("  writing content so Oak's open archive holds segments");
+    sling_post(8086, "/content/repairzone", "sling:Folder", "Repair Zone");
+    for i in 1..=5u32 {
+        sling_post(
+            8086,
+            &format!("/content/repairzone/page{i}"),
+            "sling:OrderedFolder",
+            &format!("Page {i}"),
+        );
+    }
+    // Oak's flush thread runs on a timer; without this the kill can land
+    // before anything reached the open archive at all.
+    eprintln!("  waiting for Oak's flush thread");
+    std::thread::sleep(Duration::from_secs(15));
+
+    eprintln!("  killing the JVM with SIGKILL");
+    sling.kill_uncleanly();
+    drop(sling);
+
+    let _ = std::fs::remove_dir_all(&repair_store);
+    store_from_volume(&volume.name, &repair_store);
+
+    // Read-only from here until cleanup runs: every froe *write* command
+    // repairs an index-less archive on open, so touching one would heal the
+    // fixture and the phase would assert nothing.
+    eprintln!("  confirming Oak left an archive without an index");
+    let archives = froe(&["archives", repair_store.to_str().unwrap()]);
+    let indexless: Vec<&str> = archives
+        .lines()
+        .filter(|line| line.contains("recovered (no valid index"))
+        .collect();
+    assert_eq!(
+        indexless.len(),
+        1,
+        "the killed JVM must leave exactly one untrailered archive:\n{archives}"
+    );
+    let damaged = indexless[0]
+        .split_whitespace()
+        .next()
+        .expect("archive file name")
+        .to_owned();
+    eprintln!("  Oak left {damaged} untrailered");
+
+    // The default task set must still refuse, and name the task that fixes it.
+    eprintln!("  froe cleanup without the task must refuse");
+    let refusal = froe_failure(&["cleanup", repair_store.to_str().unwrap(), "--dry-run"]);
+    assert!(
+        refusal.contains("--task repair-archives"),
+        "the refusal points at the task that repairs it: {refusal}"
+    );
+
+    eprintln!("  froe cleanup --task repair-archives");
+    let output = froe(&[
+        "cleanup",
+        repair_store.to_str().unwrap(),
+        "--yes",
+        "--task",
+        "journal",
+        "--task",
+        "segments",
+        "--task",
+        "stale-archives",
+        "--task",
+        "expired-checkpoints",
+        "--task",
+        "stale-temporaries",
+        "--task",
+        "repair-archives",
+    ]);
+    assert!(
+        parse_count(&output, " (originals retained") > 0
+            || output.contains("archive indexes rebuilt"),
+        "cleanup reports the rebuild: {output}"
+    );
+    assert!(
+        repair_store.join(format!("{damaged}.bak")).exists(),
+        "the original bytes are retained beside the rebuilt archive"
+    );
+
+    eprintln!("  every archive is indexed again");
+    let after = froe(&["archives", repair_store.to_str().unwrap()]);
+    assert!(
+        !after.contains("recovered (no valid index"),
+        "no archive is served through the recovery scan any more:\n{after}"
+    );
+    froe(&["check", repair_store.to_str().unwrap()]);
+
+    // The claim this phase exists for: Oak opens what froe rebuilt.
+    eprintln!("  booting Sling against the froe-repaired store");
+    let verify_volume = PodmanVolume::new("froe-interop-repair-verify");
+    let bootstrap =
+        PodmanContainer::run_detached("froe-repair-bootstrap2", 8086, &verify_volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(&repair_store, &verify_volume.name);
+    let verify = PodmanContainer::run_detached("froe-repair-verify", 8086, &verify_volume.name);
+    wait_for_sling(8086, "froe-repair-verify");
+
+    assert_oak_consumed_store_as_written("froe-repair-verify", "repair");
+    assert_content_matches_baseline(8086, "repair");
+
+    drop(verify);
+    eprintln!("  repair phase passed");
+}
+
+/// Phase 8: froe backup and restore.
 ///
 /// Depends on `read` and `checkpoint` (writer). Independent of compact/
 /// cleanup but later in the chain because it is lower-risk.
@@ -1955,6 +2154,7 @@ fn interop_full() {
     compact_tail();
     checkpoint_removal();
     cleanup();
+    repair();
     backup();
     recover();
     write_run_record();
@@ -2003,6 +2203,10 @@ fn write_run_record() {
          \x20             baseline tree afterwards\n\
          \x20 cleanup     Oak served the exact baseline tree after orphan, stale-archive,\n\
          \x20             expired-checkpoint and corrupt-journal-line removal\n\
+         \x20 repair      Oak's own JVM was killed with SIGKILL while it held an archive\n\
+         \x20             open, leaving it without its trailers; froe cleanup\n\
+         \x20             --task repair-archives rebuilt the index, and Oak then served\n\
+         \x20             the exact baseline tree from the rebuilt archive\n\
          \x20 backup      Oak served the exact baseline tree after backup and restore\n\
          \x20 recover     Oak served the exact baseline tree after journal recovery\n\
          \n\

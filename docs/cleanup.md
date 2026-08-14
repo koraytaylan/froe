@@ -233,22 +233,21 @@ a recovery scan; the generation decisions cleanup makes are not allowed to rest
 on a scan, because a scan silently drops what it cannot read and generation
 cleanup deletes on the strength of it.
 
-Cleanup therefore refuses, and the refusal counts *every* affected archive
-number and states whether the newest one is among them — the distinction
-between a killed writer, where the bytes are all still there, and damage in the
-middle of a store, where they may not be. The refusal happens while planning:
-no archive, journal, or checkpoint is changed. It is raised before the lock on
-the read-only preview path, and under it when a caller prepares directly, in
-which case `repo.lock` itself may have been created — that file is the only
-thing a refusing run can leave behind.
+Without `--task repair-archives`, cleanup refuses, and the refusal counts
+*every* affected archive number, states why the index was rejected, and says
+whether the newest one is among them — the distinction between a killed
+writer, where the bytes are all still there, and damage in the middle of a
+store, where they may not be. The refusal happens while planning: no archive,
+journal, or checkpoint is changed. It is raised before the lock on the
+read-only preview path, and under it when a caller prepares directly, in which
+case `repo.lock` itself may have been created — that file is the only thing a
+refusing run can leave behind.
 
-Recovering the store is a separate, explicit step: opening it with any froe
-write command rebuilds a missing index and retires the original to a `.bak`
-name — the write-mode archive initialization in `writer::store_writer` — after
-which cleanup plans normally. `froe archives` reports each archive's index
+Selecting [`repair-archives`](#repairing-index-less-archives) makes cleanup
+rebuild those indexes instead. `froe archives` reports each archive's index
 state read-only, and the tasks that do not consult generations — `journal`,
-`stale-archives`, `stale-temporaries`, `recovery-backups` — still run against
-an affected store.
+`stale-archives`, `stale-temporaries` — still run against an affected store
+without the repair task.
 
 An empty `dataNNNNN*.tar` is a related but separate artifact: it is the file a
 writer creates just before it starts filling it, so a kill inside that window
@@ -280,7 +279,61 @@ for completed compaction cycles.
 
 ## Opt-in tasks
 
-Two policies are intentionally outside the defaults.
+Three categories are intentionally outside the defaults.
+
+### Repairing index-less archives
+
+`--task repair-archives` rebuilds the index of an active archive that has
+none, which is the state described under [the safety
+gate](#an-active-archive-with-no-index-metadata). It is not a default because
+it rewrites an archive, and because a store damaged in the middle rather than
+at the tail is a case worth looking at before authorizing. Its full safety
+case — scope, mutation ordering, interruption prefixes, resource bounds, and
+known gaps — is
+[`plans/repair-archives-safety-case.md`](plans/repair-archives-safety-case.md).
+
+```console
+$ froe cleanup /path/to/segmentstore \
+    --task repair-archives \
+    --task journal --task segments --task stale-archives \
+    --task expired-checkpoints --task stale-temporaries
+```
+
+Four things about it differ from every other task.
+
+**The plan arrives in two stages.** Every index-dependent decision — the
+segment sweep, checkpoint removal — is impossible until the index exists, so
+while a repair is pending the read-only preview names the repairs and stops.
+The full plan appears only at the second, lock-protected confirmation, and the
+banner says so rather than blaming an outside writer. Declining at that second
+prompt does **not** undo the repair: it has already happened, and the CLI says
+that too. `--yes` answers both prompts, so a scripted run authorizes the
+rebuild and everything the replan then finds.
+
+**The repository grows.** Every generation letter the rebuild reads is retired
+to a `<archive>.bak` name — `<archive>.2.bak` and so on if one exists already —
+so a repaired archive costs its own size again on disk, transiently twice.
+The plan states the figure. Retiring the backups is a *separate, later* run of
+`--task recovery-backups`, deliberately: repair and recovery-backups are
+refused together, because the run that made the only copy of unrecoverable
+bytes must not be the run that deletes it.
+
+**A version-1 store is raised to version 2.** A rebuilt archive carries a
+version-2 binary-references trailer, so the manifest is upgraded first — but
+only at the instant a rebuilt archive is about to become visible, never merely
+because the task was selected. The upgrade appears in the plan as
+`UpgradeManifest`. It is one-way: an Oak older than 1.8 cannot open the store
+afterwards.
+
+**An archive no scan can read stops the run.** If any index-less number holds
+bytes but yields no segment, cleanup refuses the whole run in the read-only
+preview rather than rebuilding the others first — the run cannot complete
+however it is retried, and the refusal names the file to move aside. Keep that
+file: it is the only copy of whatever it holds.
+
+The repair itself is reversible — every original is under a `.bak` — but the
+segment sweep it unblocks is not. Repair, run `froe check`, and only then
+cleanup, if you want those separated.
 
 ### Unreferenced checkpoints
 

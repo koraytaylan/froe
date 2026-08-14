@@ -107,6 +107,13 @@ cleanup
    │  archives, expired checkpoints, and corrupt journal lines
    │  If this fails: the write path's plan-and-apply machinery is broken.
    ▼
+repair
+   │  Oak's own JVM is killed with SIGKILL while it holds an archive
+   │  open; froe cleanup --task repair-archives rebuilds the index and
+   │  Oak boots against the result
+   │  If this fails: froe cannot repair the state a crashed Oak leaves,
+   │  or Oak will not read what froe rebuilt.
+   ▼
 backup
    │  froe backup + restore, Sling boots against the result
    │  Independent of compact/cleanup but later because lower-risk.
@@ -190,6 +197,27 @@ froe cleanup removes all four conditions. Sling boots against the
 cleaned store.
 
 Depends on `compact` (to build the gen 0→1→2 fixture).
+
+### repair
+
+Loads the fixture store into a volume, boots Oak, writes content so Oak holds
+an archive open, then kills the JVM with `SIGKILL` and asserts the container
+exited 137. The extracted store has exactly one archive without an index —
+Oak writes the `.gph`, `.brf` and index trailers only on close, so this is the
+authentic artifact of a crash rather than a simulated one.
+
+Then, read-only until the repair runs, because every froe *write* command
+rebuilds a missing index on open and would heal the fixture: `froe archives`
+confirms the damage, and `froe cleanup --dry-run` without the task confirms
+the refusal names `--task repair-archives`. The repair itself runs through
+`froe cleanup --yes` with that task selected, and the original is asserted
+present under its `.bak` name.
+
+The assertion that makes this phase worth having is the last one: Oak boots
+against the rebuilt archive, serves the byte-identical baseline tree, and logs
+none of its own repair messages — so it consumed froe's index rather than
+reconstructing one. `CONTRIBUTING.md` is explicit that a froe-to-froe round
+trip is not a substitute for that.
 
 ### backup
 
