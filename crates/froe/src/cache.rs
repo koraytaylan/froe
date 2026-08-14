@@ -177,6 +177,17 @@ impl CacheWeight for Arc<crate::content::template::Template> {
     }
 }
 
+/// A record identifier value in a writer dedup cache is fixed-size; the key
+/// carries the weight, and `BoundedCache` charges its per-entry overhead.
+/// (`RecordIdentifier` already implements `CacheWeight` above.)
+///
+/// A key of raw bytes: the vector's contents are the cost.
+impl CacheWeight for Vec<u8> {
+    fn cache_weight(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.len())
+    }
+}
+
 /// A membership memo carries no value; the key and the slot are the cost.
 impl CacheWeight for () {
     fn cache_weight(&self) -> usize {

@@ -19,6 +19,7 @@
 //!   reader in [`crate::content`] parses, which the round-trip tests
 //!   assert.
 
+use crate::cache::BoundedCache;
 use crate::content::property::PropertyType;
 use crate::error::{Error, Result};
 use crate::hashing::{compare_utf16_strings, map_entry_hash};
@@ -34,6 +35,19 @@ use crate::writer::segment_builder::{
 
 /// The block size long values are split into.
 const BLOCK_SIZE: usize = 4096;
+
+/// Byte budgets for the writer's record-reuse caches.
+///
+/// Oak sizes the equivalents by entry count — 15000 strings, 3000 templates
+/// (`WriterCacheManager`). Bytes rather than entries here, matching the rest
+/// of froe's caches, and generous because the whole point is to hold the
+/// repeated vocabulary of a tree rather than a sample of it.
+const VALUE_DEDUP_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+const TEMPLATE_DEDUP_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// The largest value worth remembering for reuse. Repetition lives in short
+/// values; a long one neither repeats nor earns its place in the budget.
+const MAXIMUM_DEDUPLICATED_VALUE_BYTES: usize = 1024;
 
 /// Lengths below this use the one-byte small value encoding.
 const SMALL_VALUE_LIMIT: usize = 128;
@@ -112,6 +126,78 @@ pub struct RecordWriter<Sink: SegmentSink> {
     writer_identifier: String,
     segment_sequence: u32,
     current: SegmentBufferBuilder,
+    /// Value records already written by this writer, keyed by their bytes.
+    ///
+    /// Oak's `SegmentWriter` carries the same dedup (`WriterCacheManager`,
+    /// 15000 strings / 3000 templates by default) and a port without it
+    /// writes a fresh record for every repetition. On a real tree that is
+    /// enormous amplification: a primary type takes a handful of distinct
+    /// values across millions of nodes, and each one was becoming its own
+    /// record, its own bytes, and eventually its own segment.
+    ///
+    /// Reuse is a plain cross-segment reference — the same thing a node
+    /// makes to a child in an earlier segment — and the buffer accounts for
+    /// the added reference before it commits, rolling the segment when the
+    /// table is full. A miss simply writes the record again, so any budget
+    /// including zero stays correct.
+    value_cache: BoundedCache<Vec<u8>, RecordIdentifier>,
+    /// Template records already written by this writer, keyed by shape.
+    template_cache: BoundedCache<TemplateKey, RecordIdentifier>,
+}
+
+/// The identity of a template: everything that decides its serialized form.
+///
+/// Two nodes share a template when their primary type, mixins, child-node
+/// arity and property slots agree; the property *values* differ per node and
+/// are not part of it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TemplateKey {
+    primary_type: Option<String>,
+    mixin_types: Vec<String>,
+    child_arity: u8,
+    single_child_name: Option<String>,
+    properties: Vec<(String, u8)>,
+}
+
+impl TemplateKey {
+    fn of(
+        primary_type: Option<&str>,
+        mixin_types: &[String],
+        child_nodes: &ChildNodesToWrite,
+        properties: &[PropertyToWrite],
+    ) -> Self {
+        // Only the arity and, for the single-child case, the child's name
+        // are serialized into a template; which node it points at is part of
+        // the node record, not the shape.
+        let (child_arity, single_child_name) = match child_nodes {
+            ChildNodesToWrite::Zero => (0u8, None),
+            ChildNodesToWrite::One { name, .. } => (1u8, Some(name.clone())),
+            ChildNodesToWrite::Many(_) | ChildNodesToWrite::ManyExistingMap(_) => (2u8, None),
+        };
+        Self {
+            primary_type: primary_type.map(str::to_owned),
+            mixin_types: mixin_types.to_vec(),
+            child_arity,
+            single_child_name,
+            properties: properties
+                .iter()
+                .map(|property| {
+                    (
+                        property.name.clone(),
+                        property_slot_tag(property.property_type, &property.values),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The per-slot type byte a template records: the property type, negated
+/// when the slot is multi-valued, exactly as the serialized form encodes it.
+fn property_slot_tag(property_type: PropertyType, values: &PropertyValuesToWrite) -> u8 {
+    let multiple = matches!(values, PropertyValuesToWrite::Multiple(_));
+    let tag = property_type as i8;
+    (if multiple { -tag } else { tag }) as u8
 }
 
 impl<Sink: SegmentSink> RecordWriter<Sink> {
@@ -135,6 +221,8 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
             writer_identifier: writer_identifier.to_owned(),
             segment_sequence: 0,
             current: SegmentBufferBuilder::new(new_data_segment_identifier(), generation),
+            value_cache: BoundedCache::new(VALUE_DEDUP_BUDGET_BYTES),
+            template_cache: BoundedCache::new(TEMPLATE_DEDUP_BUDGET_BYTES),
         };
         writer.write_segment_info_record();
         writer
@@ -254,9 +342,28 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
         RecordIdentifier::new(self.current.identifier(), record_number)
     }
 
-    /// Writes a string value record and returns its identifier.
+    /// Writes a string value record and returns its identifier, reusing an
+    /// identical record this writer already produced.
     pub fn write_string(&mut self, text: &str) -> Result<RecordIdentifier> {
-        self.write_value_bytes(text.as_bytes())
+        self.write_deduplicated_value(text.as_bytes())
+    }
+
+    /// Writes a value record, returning an existing identical one instead
+    /// when this writer has already written it.
+    ///
+    /// Only short values are worth remembering: the cache exists to collapse
+    /// the endlessly repeated ones — primary types, property names, small
+    /// flags — and a large value neither repeats nor fits a budget usefully.
+    fn write_deduplicated_value(&mut self, bytes: &[u8]) -> Result<RecordIdentifier> {
+        if bytes.len() > MAXIMUM_DEDUPLICATED_VALUE_BYTES {
+            return self.write_value_bytes(bytes);
+        }
+        if let Some(existing) = self.value_cache.get(&bytes.to_vec()) {
+            return Ok(existing);
+        }
+        let written = self.write_value_bytes(bytes)?;
+        self.value_cache.insert(bytes.to_vec(), written);
+        Ok(written)
     }
 
     /// Writes an inline binary value record and returns its identifier.
@@ -595,6 +702,28 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
         child_nodes: &ChildNodesToWrite,
         properties: &[PropertyToWrite],
     ) -> Result<RecordIdentifier> {
+        // A template is the *shape* of a node, and a tree has far fewer
+        // shapes than nodes — Oak caps its own template cache at 3000 for
+        // that reason. Without this every node wrote its own copy, which on
+        // a large repository is the single largest source of write
+        // amplification in the whole path.
+        let key = TemplateKey::of(primary_type, mixin_types, child_nodes, properties);
+        if let Some(existing) = self.template_cache.get(&key) {
+            return Ok(existing);
+        }
+        let written =
+            self.write_template_record(primary_type, mixin_types, child_nodes, properties)?;
+        self.template_cache.insert(key, written);
+        Ok(written)
+    }
+
+    fn write_template_record(
+        &mut self,
+        primary_type: Option<&str>,
+        mixin_types: &[String],
+        child_nodes: &ChildNodesToWrite,
+        properties: &[PropertyToWrite],
+    ) -> Result<RecordIdentifier> {
         if mixin_types.len() >= 1 << 10 {
             return Err(Error::InvalidFormat {
                 details: format!(
@@ -829,6 +958,48 @@ pub fn sort_properties_for_template(properties: &mut [PropertyToWrite]) {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn a_repeated_string_or_template_reuses_the_record_it_already_wrote() {
+        // Oak's writer dedups both (WriterCacheManager, 15000 strings /
+        // 3000 templates). Without it every node wrote its own copy of a
+        // shape a whole tree shares, which is the write path's largest
+        // source of amplification. A miss is still correct — it writes the
+        // record again — so this pins the reuse rather than any byte layout.
+        let mut writer = new_writer();
+
+        let first = writer.write_string("nt:unstructured").expect("first");
+        let second = writer.write_string("nt:unstructured").expect("second");
+        assert_eq!(first, second, "an identical value reuses its record");
+
+        let distinct = writer.write_string("cq:Page").expect("distinct");
+        assert_ne!(first, distinct, "a different value gets its own record");
+
+        let shape = |writer: &mut RecordWriter<MemoryStore>| {
+            writer
+                .write_template(
+                    Some("nt:unstructured"),
+                    &["mix:versionable".to_owned()],
+                    &ChildNodesToWrite::Zero,
+                    &[],
+                )
+                .expect("template")
+        };
+        let first_template = shape(&mut writer);
+        let second_template = shape(&mut writer);
+        assert_eq!(
+            first_template, second_template,
+            "an identical shape reuses its template record"
+        );
+
+        let other_template = writer
+            .write_template(Some("cq:Page"), &[], &ChildNodesToWrite::Zero, &[])
+            .expect("other template");
+        assert_ne!(
+            first_template, other_template,
+            "a different shape gets its own template record"
+        );
+    }
 
     use super::{
         ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
