@@ -7102,6 +7102,93 @@ mod tests {
             .expect("durable root remains readable");
     }
 
+    /// Rewrites a finalized session archive so one segment carries payload
+    /// bytes the session never wrote, with a self-consistent tar entry.
+    ///
+    /// Self-consistent is the point: the entry name's CRC matches the bytes
+    /// beside it, so the archive's own structural validation is satisfied.
+    /// Only the checksum the session recorded at write time can tell that
+    /// the payload is not the one it produced.
+    fn rewrite_session_archive_with_foreign_payload(
+        store: &WritableRepository,
+        target: SegmentIdentifier,
+    ) {
+        let file_name = crate::store::list_archive_file_names(&store.directory)
+            .expect("list archives")
+            .into_iter()
+            .find(|file_name| {
+                TarArchiveReader::open(&store.directory.join(file_name))
+                    .is_ok_and(|archive| archive.contains_segment(target))
+            })
+            .expect("archive containing target session segment");
+        let view = store.segment(target).expect("target belongs to session");
+        let structure = Arc::clone(&view.structure);
+        let mut bytes = view.bytes.to_vec();
+        let generation = stored_segment_generation(target, &structure);
+        let binary_references =
+            read_blob_identifiers(store, &structure).expect("reconstruct fixture BRF");
+        // Flip a payload byte well past the header the parser needs.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        std::fs::remove_file(store.directory.join(&file_name)).expect("remove session TAR");
+        let mut writer = TarArchiveWriter::new(&store.directory, &file_name);
+        writer
+            .write_segment(
+                target,
+                &bytes,
+                generation,
+                &structure.referenced_segments,
+                &binary_references,
+            )
+            .expect("write foreign payload");
+        writer.close().expect("finalize foreign payload");
+    }
+
+    /// The regression for the session payload certificate.
+    ///
+    /// The certificate used to compare the archive against a retained copy
+    /// of every byte the session wrote. It now compares the checksum the
+    /// session recorded against the archive's own tar entry name, which the
+    /// archive separately proves against its payload. This asserts the
+    /// changed mechanism still refuses a payload the session did not write —
+    /// and refuses it before the journal moves.
+    #[test]
+    fn a_session_payload_the_writer_never_produced_fails_closed() {
+        let directory = TestDirectory::new("session-foreign-payload");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let journal_path = directory.path.join("journal.log");
+        let journal_before = std::fs::read(&journal_path).expect("journal before");
+
+        let repository_lock =
+            Arc::new(RepositoryLock::acquire(&directory.path).expect("maintenance lock"));
+        let mut store = open_prepared_store(&directory.path, Arc::clone(&repository_lock));
+        store.maximum_archive_size = 1;
+        let previous = store.head();
+        let generation = store.writing_generation().expect("generation");
+        let (head, child) = write_session_semantic_fixture(&store, generation);
+        rewrite_session_archive_with_foreign_payload(&store, child.segment);
+        assert!(store.set_head(previous, head));
+
+        let error = store
+            .flush()
+            .expect_err("the payload certificate must precede the journal append");
+        assert!(
+            error.to_string().contains("changed the payload of segment"),
+            "unexpected validation error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&journal_path).expect("journal after refusal"),
+            journal_before,
+            "a payload the session never wrote cannot reach the journal"
+        );
+        drop(store);
+        drop(repository_lock);
+    }
+
     fn assert_prepared_session_trailer_omission_fails_closed(
         name: &str,
         omitted: OmittedSessionTrailer,
