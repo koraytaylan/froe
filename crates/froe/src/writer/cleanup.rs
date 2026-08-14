@@ -2289,13 +2289,39 @@ fn journal_retention_boundary(
     repository: &Repository,
     raw: &RawJournal,
     retention: NonZeroUsize,
+    validity: &mut HashMap<RecordIdentifier, bool>,
+    verifier: &mut NodeTreeVerifier<'_>,
 ) -> Option<usize> {
     let mut remaining = retention.get();
     for (index, line) in raw.lines().iter().enumerate().rev() {
         let RawJournalLineClassification::Record(record) = line.classification() else {
             continue;
         };
-        if !repository.contains_segment(record.record_identifier.segment) {
+        let identifier = record.record_identifier;
+        if !repository.contains_segment(identifier.segment) {
+            continue;
+        }
+        // Only revisions that actually resolve fill a slot. Counting on
+        // segment existence alone let a line that fails its walk consume one
+        // and then be removed as unreadable anyway, so a bound of N kept
+        // fewer than N revisions and irreversibly retired a readable one to
+        // make room for it. Verdicts are memoised into the same map the
+        // classification pass uses, so nothing is walked twice and the lines
+        // beyond the bound are still never walked at all.
+        let readable = if let Some(readable) = validity.get(&identifier) {
+            *readable
+        } else {
+            let readable = verify_exact_super_root_with_verifier(
+                repository,
+                identifier,
+                verifier,
+                &mut DiscardedProgress,
+            )
+            .is_ok();
+            validity.insert(identifier, readable);
+            readable
+        };
+        if !readable {
             continue;
         }
         remaining -= 1;
@@ -2342,9 +2368,6 @@ fn analyze_journal_lines(
         });
     }
 
-    let retention_boundary =
-        retention.and_then(|bound| journal_retention_boundary(repository, raw, bound));
-
     let mut parser_ignored = 0usize;
     let mut missing_segments = 0usize;
     let mut unreadable_revisions = 0usize;
@@ -2355,6 +2378,9 @@ fn analyze_journal_lines(
     let mut validity: HashMap<RecordIdentifier, bool> = HashMap::new();
     validity.insert(current_head, true);
     let mut verifier = NodeTreeVerifier::new(repository);
+    let retention_boundary = retention.and_then(|bound| {
+        journal_retention_boundary(repository, raw, bound, &mut validity, &mut verifier)
+    });
 
     for (index, line) in raw.lines().iter().enumerate() {
         observer.step_advanced(crate::progress::count(index));
@@ -7856,34 +7882,35 @@ mod tests {
             head
         };
 
-        let options = CleanupOptions::default()
-            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
-            .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"));
-        let planned = plan_cleanup(&directory.path, &options);
+        // The default task set, with no retention bound: the loosened check
+        // lives on this path, so this is where it must be pinned.
+        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
 
-        match planned {
-            Ok(plan) => {
-                // Whatever it decides to remove, the store must still open
-                // and the head must still verify afterwards.
-                let outcome = cleanup(&directory.path, options).expect("apply the plan");
-                assert_eq!(outcome.head_after, new_head);
-                let repository = Repository::open(&directory.path).expect("healthy store");
-                assert_eq!(repository.head_record_identifier(), new_head);
-                crate::tooling::verify_node_tree(&repository, new_head).expect("head verifies");
-                let _ = plan;
-            }
-            Err(error) => {
-                // Fail-closed is acceptable — nothing was mutated — but the
-                // operator has to be able to act on it, so the message must
-                // name the surviving reference rather than blame the store.
-                let text = error.to_string();
-                assert!(
-                    text.contains("references segment"),
-                    "unexpected refusal: {text}"
-                );
-                Repository::open(&directory.path).expect("refusal mutates nothing");
-            }
-        }
+        // Unconditional. Restoring the stricter check must fail this, so the
+        // plan is required to exist rather than merely be well-explained if
+        // it does not.
+        let plan = plan_cleanup(&directory.path, &options)
+            .expect("a dead survivor pointing at removed garbage must not refuse the plan");
+        let removed: usize = plan
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                CleanupAction::RemoveReclaimableArchive { segments, .. }
+                | CleanupAction::RewriteArchive { segments, .. } => Some(*segments),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            removed != 0,
+            "the fixture must actually remove something, or it proves nothing"
+        );
+
+        let outcome = cleanup(&directory.path, options).expect("apply the plan");
+        assert_eq!(outcome.head_after, new_head);
+        assert!(outcome.removed_segments() != 0);
+        let repository = Repository::open(&directory.path).expect("healthy store");
+        assert_eq!(repository.head_record_identifier(), new_head);
+        crate::tooling::verify_node_tree(&repository, new_head).expect("head verifies");
     }
 
     #[test]
@@ -8087,6 +8114,50 @@ mod tests {
         assert!(
             error.to_string().contains("requires the journal task"),
             "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn a_bound_counts_only_revisions_that_actually_resolve() {
+        // A line whose segment exists but whose tree does not verify used to
+        // fill a slot in the bound and then be removed as unreadable anyway,
+        // so `N = 2` kept one revision and irreversibly retired a readable
+        // one to make room for it. Every earlier retention test used N = 1,
+        // which cannot expose this: the head is always the newest resolvable
+        // line and always verifies.
+        let (directory, old_head, new_head) = history_veto_fixture("retention-counts-readable");
+
+        // A journal line naming a record that resolves to a segment but not
+        // to a readable node tree: the head's own segment, at a record
+        // number that is not a node record.
+        let unreadable = RecordIdentifier::new(new_head.segment, new_head.record_number + 1);
+        // Second newest, not newest: the newest line is the head, and a
+        // head that is not a node record is refused long before any bound.
+        let journal_path = directory.path.join("journal.log");
+        let journal = std::fs::read_to_string(&journal_path).expect("read journal");
+        let mut lines: Vec<&str> = journal.lines().collect();
+        let head_line = lines.pop().expect("a head line");
+        let unreadable_line = format!("{unreadable} root 0");
+        lines.push(&unreadable_line);
+        lines.push(head_line);
+        std::fs::write(&journal_path, format!("{}\n", lines.join("\n")))
+            .expect("insert unreadable line");
+
+        let options = CleanupOptions::default()
+            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(2).expect("two revisions"));
+        let plan = plan_cleanup(&directory.path, &options).expect("bounded plan");
+
+        // The unreadable line goes, as it always did. What must not happen is
+        // the older *readable* revision going with it to satisfy a bound the
+        // unreadable line was counted against.
+        assert!(
+            !plan.journal_line_removals().iter().any(|removal| {
+                removal.reason() == JournalRemovalReason::BeyondRetention
+                    && removal.record_identifier() == Some(old_head)
+            }),
+            "a readable revision was retired to make room for an unreadable one: {:?}",
+            plan.journal_line_removals()
         );
     }
 

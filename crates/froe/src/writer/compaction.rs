@@ -4,9 +4,12 @@
 //! the content root and every checkpoint — into new segments stamped with
 //! an advanced garbage collection generation, then swaps the head to the
 //! rewritten super-root and reclaims the now-unreferenced old generations.
-//! A source-record-keyed cache preserves the sharing of the content
-//! graph: a checkpoint whose `root` shares records with the live root
-//! stays shared after compaction, and the walk terminates over the DAG.
+//! A bounded source-record-keyed cache preserves the sharing of the
+//! content graph where it fits: a checkpoint whose `root` shares records
+//! with the live root stays shared after compaction. Past the cache's byte
+//! budget a shared subtree met again is copied a second time, so the output
+//! can exceed the source on a store with many checkpoints — correctness is
+//! unaffected, size is not. The walk terminates by the depth bound.
 //!
 //! This is the *classic* deep-copy compaction — the checkpoint-aware and
 //! parallel compactors in Oak are throughput optimizations that produce
@@ -58,10 +61,11 @@ pub struct CompactionOutcome {
 }
 
 /// Deep-copies a node tree from a source provider into a record writer,
-/// rewriting every reachable record and sharing results through a
-/// source-record cache so the content DAG's sharing is preserved and the
-/// walk terminates. Returns the rewritten root and the number of nodes
-/// copied. Used by compaction, backup, and restore.
+/// rewriting every reachable record and sharing results through a bounded
+/// source-record cache, so the content DAG's sharing is preserved as far as
+/// that cache reaches; beyond it a shared subtree is copied again and the
+/// output grows. Returns the rewritten root and the number of nodes copied.
+/// Used by compaction, backup, and restore.
 pub fn deep_copy_tree<Sink: SegmentSink>(
     source: &dyn SegmentProvider,
     writer: &mut RecordWriter<Sink>,

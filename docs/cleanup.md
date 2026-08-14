@@ -217,8 +217,11 @@ checkpoints: that removal installs a new head and appends its journal line, so
 a bound counted afterwards would retire the head the plan retained and abort
 the apply with the checkpoint removal already committed. Remove the
 checkpoints first, then bound the journal in a second run. The removed history
-is not recoverable from the store afterwards, so the numbered
-`journal.log.bak.NNN` copy is the only way back. Whether the bound
+is not recoverable afterwards. The segment sweep runs before the journal
+rewrite in the same run, so the numbered `journal.log.bak.NNN` copy restores
+the journal *file* but not the history: by the time it exists it names
+revisions whose segments are already unlinked. Take a repository backup first
+if the history matters. Whether the bound
 actually frees bytes still depends on the store: the released segments must be
 old enough for the generation predicate, and the archives holding them must
 still clear the 25% rewrite gate below.

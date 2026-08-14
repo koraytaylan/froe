@@ -26,10 +26,11 @@ data segments by their index generation triple alone
 `journal.log`. Nothing in this range changes that default.
 
 **Opt-in retirement.** `--retain-journal-revisions N` keeps the newest `N`
-resolvable revisions and removes the rest. The removed history is **not
-recoverable from the store**; the numbered `journal.log.bak.NNN` copy is the
-only way back, and it is written before the rewrite. The flag selects
-`CleanupTask::Journal`, because the bounded lines must leave the journal in
+revisions that actually resolve and removes the rest. The removed history is
+**not recoverable**: the segment sweep runs before the journal rewrite in the
+same run, so by the time `journal.log.bak.NNN` exists it names revisions whose
+segments are already unlinked. The backup restores the journal *file*, not the
+history. The flag selects `CleanupTask::Journal`, because the bounded lines must leave the journal in
 the same run — see Guards.
 
 **Deliberately not retained.** Payload bytes of segments this session wrote,
@@ -76,7 +77,8 @@ early.
 | Retention bound requires the journal task (`validate_options`; `plan_cleanup`, `PreparedCleanup::prepare`, `cleanup`) | `a_retention_bound_without_the_journal_task_is_refused` | Refusal condition → `if false` | Test failed at `expect_err`: the bound planned without pruning the lines it un-rooted |
 | Retention bound refuses beside a checkpoint head update (`build_plan_collecting`) | `a_retention_bound_beside_a_checkpoint_head_update_is_refused_while_planning` | Refusal condition → `if false` | Test failed at `expect_err`: the plan proceeded toward an apply that aborts after committing the checkpoint removal |
 | Retained journal roots stay readable (`validate_prospective_segment_plan`, first half) | `prospective_plan_refuses_a_survivor_that_references_a_planned_removal`, plus the armed cutpoint `cleanup.before-prospective-retained-root-verification` | Pre-existing; unchanged by this range | — |
-| Live survivors must not dangle (`validate_prospective_segment_plan`, second half — **loosened here**) | `a_dead_survivor_pointing_at_a_removed_segment_is_handled` | Observed directly: before the change the same fixture took the refusal branch | `surviving data segment e706a735… references segment 1ca97719…, which the cleanup plan would remove` |
+| Live survivors must not dangle (`validate_prospective_segment_plan`, second half — **loosened here**; default `--task segments` path) | `a_dead_survivor_pointing_at_a_removed_segment_is_handled` | Removed `\|\| reclaimable.contains(&identifier)`, restoring the stricter check | `a dead survivor pointing at removed garbage must not refuse the plan: InvalidFormat { details: "surviving data segment 84dbbc74… references segment 595eb34c…, which the cleanup plan would remove" }` |
+| Retention bound counts only revisions that resolve (`journal_retention_boundary`) | `a_bound_counts_only_revisions_that_actually_resolve` | Counted every line whose segment exists, ignoring the verdict | `a readable revision was retired to make room for an unreadable one` — the older readable revision removed as `BeyondRetention` beside the unreadable one |
 | Zero-budget memos reach the same verdict (`NodeTreeVerifier`, `Compactor`, session cache) | `an_evicting_memo_costs_reads_but_never_changes_the_verdict`, `a_deep_copy_with_no_sharing_memo_still_produces_the_whole_tree`, `a_session_serves_its_own_segments_from_disk_when_nothing_is_cached` | Budget set to 0 by the test itself | Not applicable — the starved configuration *is* the experiment |
 
 Neutralizations ran serially against an isolated target directory, each
@@ -93,6 +95,18 @@ configuration, not of repository size:
   written is always resident.
 * Compaction sharing memo 256 MiB; verified-subtree memo 192 MiB; recovery
   visited memo 128 MiB; SQLite string dictionary 64 MiB.
+
+Planning is *not* bounded by configuration. On the default `--task segments`
+path, under the lock, peak store-scale sets are `head_data_segments`,
+`protected_history_segments`, the plan's `reclaimable`, and the second
+marking pass's own `references` and `reclaimable` — five, where before this
+range there were three. An applied run plans twice (preview and authoritative).
+
+Temporary disk is likewise unbounded by configuration. The compaction sharing
+memo is now an evicting FIFO, and a miss re-copies a shared subtree including
+its binary payload, so a store with many checkpoints can stage an output
+larger than its source before `reclaim_old_generations` retires anything.
+No test measures that amplification.
 
 Still proportional to the store, and unavoidable without an on-disk index:
 one decoded index entry per segment (~40 B), one `segment_locations` entry per
@@ -159,14 +173,26 @@ interoperability**, not a froe-to-froe round trip.
    interop phase bounds the journal and then asks Oak to boot the result. It
    is the one new destructive operation with no Oak-verified post-state.
 3. **The loosened survivor check reaches the default path.** `--task segments`
-   can now proceed where it previously refused. One synthetic fixture covers
-   it; no real store has exercised it.
+   can now proceed where it previously refused. One synthetic fixture on the
+   default task set covers it and fails when the stricter check is restored;
+   no real store has exercised it.
 4. **No RSS measurement.** Budgets are asserted against `cache_weight`, which
    is an approximation. A leak outside the budgeted structures would not be
    caught.
 5. **macOS untested.** Only CI covers it.
 6. **The reopen boundary has no armed fault cutpoint.** It is argued
    prefix-safe above rather than tested by injection.
-7. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
+7. **The source-shape guard has known blind spots.** It matches literal type
+   substrings against single-line field text of three named structs, so it
+   does not see `VecDeque`, a field whose type rustfmt wrapped across lines, a
+   collection behind a type alias, or state inside a nested struct such as
+   `write_state: Mutex<WriteState>`. It also cannot see accumulators held in
+   function locals, which is the class the `recover-journal` defect belonged
+   to. It raises the cost of reintroducing the defect; it does not prevent it.
+8. **`CleanupAction::PruneJournal` gained a required field.** The enum is
+   `#[non_exhaustive]`, which does not make its variants so; a downstream
+   struct-pattern match on that variant is source-breaking. Record it in the
+   version bump rationale.
+9. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
    returns an owned `Vec`. Bounded by the widest single node, not by the
    store; fixing it needs an additive streaming API.
