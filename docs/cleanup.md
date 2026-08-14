@@ -185,6 +185,44 @@ silently falling back to an older revision. Segment cleanup also checks the
 prospective archive set against every retained readable journal root, so the
 default pass does not exchange historical readability for disk space.
 
+**Expect the default pass to reclaim approximately nothing on a long-lived
+store, and understand that this is the design rather than a failure.** Oak
+judges data segments by their index generation triple alone and never rewrites
+`journal.log`; froe additionally treats every readable revision as a tracing
+root. A store whose journal holds tens of thousands of resolvable revisions
+therefore protects nearly every segment those revisions reach, and only garbage
+that was never part of any persisted head can be reclaimed. The plan and the
+final summary both state the size of that protection: how many data segments
+the head does not reach but history does, and what this same sweep would free
+if that history were retired. The second figure is measured by replanning with
+the veto lifted rather than estimated beside it, because the veto holds bulk
+segments only through the data segments that reference them—on a store of
+inline binaries the data segments are a rounding error next to the content
+behind them—and because releasing more of an archive can carry it over the
+rewrite gate below. Pricing it costs one extra marking pass over the archives
+whenever the veto protects anything.
+
+Two ways retire it. A full `froe compact` rewrites the reachable head into a
+fresh generation, reclaims the older ones without any history veto, and
+truncates `journal.log` to a single line; it is the reliable option and the
+one to reach for first. Alternatively `--retain-journal-revisions N` keeps only
+the newest `N` resolvable revisions, removes the older lines, and releases
+their closure to the ordinary generation predicate—`N=1` leaves the current
+head as the only root, which is the closest standalone cleanup comes to Oak's
+own retention. The bound selects the journal task, because un-rooting a line
+without removing it would leave the run refusing its own plan; naming an
+explicit task set that excludes `journal` is refused rather than silently
+widened. It is also refused while planning when the same run would remove
+checkpoints: that removal installs a new head and appends its journal line, so
+a bound counted afterwards would retire the head the plan retained and abort
+the apply with the checkpoint removal already committed. Remove the
+checkpoints first, then bound the journal in a second run. The removed history
+is not recoverable from the store afterwards, so the numbered
+`journal.log.bak.NNN` copy is the only way back. Whether the bound
+actually frees bytes still depends on the store: the released segments must be
+old enough for the generation predicate, and the archives holding them must
+still clear the 25% rewrite gate below.
+
 Checkpoint removal is a logical head update. The default segment sweep is
 planned and applied first against the pre-removal roots, so it does not claim
 bytes that become unreachable only after that new head is installed. The old
@@ -215,6 +253,15 @@ Data segments old enough under that predicate may be marked; unreferenced bulk
 segments are discovered from a single store-wide reference graph. Readable
 journal-history data segments are an additional keep-veto and never a reason
 to reclaim something.
+
+Marking a segment is not deciding to move it. An archive is rewritten only when
+dropping its marked entries saves more than a quarter of the file—Oak's gate,
+reproduced with Java's integer arithmetic—and an archive whose entries are all
+marked is unlinked whole instead. Real stores interleave live and dead segments,
+so a scattered handful per archive is normally identified and then left in
+place. The plan and the summary report that population as `identified but
+retained` with its byte total, so a reclaimable estimate of zero can be told
+apart from a store that holds no garbage at all.
 
 The safety gate rejects cleanup rather than guessing when, for example, a
 current-head segment appears reclaimable, index and segment-header generations
@@ -367,6 +414,11 @@ $ froe cleanup /path/to/segmentstore \
     --backup-min-age-days 30 \
     --backup-keep-latest 3
 ```
+
+Backups sit outside the archive byte figures, which count active archive names
+only. A run that rebuilds an index therefore retires the original to a `.bak`
+and grows the directory while reporting the archive total as unchanged, so the
+summary states the bytes those retained backups still hold whenever any exist.
 
 A backup is removable only if it is at least the requested age *and* falls
 outside the newest count for the same original target. All four archive forms

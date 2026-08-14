@@ -283,6 +283,19 @@ enum Command {
         /// recovery-backups.
         #[arg(long, requires = "backup_min_age_days")]
         backup_keep_latest: Option<usize>,
+        /// Keep only this many newest journal revisions, removing the older
+        /// lines and releasing their segments from the history keep-veto.
+        ///
+        /// By default froe treats every readable journal revision as a
+        /// garbage-collection root. That is stricter than Oak, which judges
+        /// data segments by their index generation alone and never rewrites
+        /// journal.log, and on a long-lived store it is usually why cleanup
+        /// reclaims nothing. A bound of 1 leaves the current head as the only
+        /// root. The removed history is not recoverable from the store
+        /// afterwards; journal.log is backed up to a numbered .bak first.
+        /// This selects the journal task.
+        #[arg(long)]
+        retain_journal_revisions: Option<std::num::NonZeroUsize>,
     },
     /// Copy a repository's head into a target store (modifies the target).
     ///
@@ -684,6 +697,7 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
             yes,
             backup_min_age_days,
             backup_keep_latest,
+            retain_journal_revisions,
         } => {
             let recovery_backups_selected = tasks.contains(&CleanupTaskArgument::RecoveryBackups);
             if recovery_backups_selected
@@ -694,6 +708,8 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                 );
                 return Ok(ExitCode::FAILURE);
             }
+            let journal_task_withheld =
+                !tasks.is_empty() && !tasks.contains(&CleanupTaskArgument::Journal);
             let mut options = froe::CleanupOptions::default();
             if !tasks.is_empty() {
                 options = options.with_tasks(tasks.into_iter().map(Into::into));
@@ -716,6 +732,19 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                     );
                     return Ok(ExitCode::FAILURE);
                 }
+            }
+            if let Some(revisions) = retain_journal_revisions {
+                // Selecting an explicit task set and then bounding the journal
+                // would otherwise silently re-add the journal task. Say so
+                // instead: this rewrites journal.log, which is not what
+                // "--task segments --retain-journal-revisions 1" reads like.
+                if journal_task_withheld {
+                    eprintln!(
+                        "froe: --retain-journal-revisions rewrites journal.log; add --task journal to confirm"
+                    );
+                    return Ok(ExitCode::FAILURE);
+                }
+                options = options.with_journal_revision_retention(revisions);
             }
             if !mutation::run_cleanup(&repository, options, dry_run, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
@@ -1380,10 +1409,12 @@ mod tests {
             yes,
             backup_min_age_days,
             backup_keep_latest,
+            retain_journal_revisions,
         } = parsed.command
         else {
             panic!("cleanup must dispatch");
         };
+        assert_eq!(retain_journal_revisions, None);
         assert_eq!(repository, std::path::PathBuf::from("/store"));
         assert_eq!(
             tasks,
@@ -1396,6 +1427,67 @@ mod tests {
         assert!(!yes);
         assert_eq!(backup_min_age_days, Some(30));
         assert_eq!(backup_keep_latest, Some(3));
+    }
+
+    #[test]
+    fn cleanup_parses_a_journal_retention_bound() {
+        let parsed = CommandLine::try_parse_from([
+            "froe",
+            "cleanup",
+            "/store",
+            "--retain-journal-revisions",
+            "1",
+        ])
+        .expect("retention bound parses");
+        let Command::Cleanup {
+            retain_journal_revisions,
+            tasks,
+            ..
+        } = parsed.command
+        else {
+            panic!("cleanup must dispatch");
+        };
+        assert_eq!(
+            retain_journal_revisions,
+            Some(std::num::NonZeroUsize::new(1).expect("one revision"))
+        );
+        assert!(tasks.is_empty(), "the bound alone keeps the default tasks");
+    }
+
+    #[test]
+    fn a_journal_retention_bound_of_zero_is_rejected_at_parse_time() {
+        // A bound of zero would retain no revision at all, including the
+        // current head. The type refuses it before froe ever opens the store.
+        assert!(
+            CommandLine::try_parse_from([
+                "froe",
+                "cleanup",
+                "/store",
+                "--retain-journal-revisions",
+                "0",
+            ])
+            .is_err(),
+            "zero is not a retention bound"
+        );
+    }
+
+    #[test]
+    fn cleanup_help_states_the_journal_retention_bound_rewrites_the_journal() {
+        let mut command = <CommandLine as clap::CommandFactory>::command();
+        let cleanup = command
+            .find_subcommand_mut("cleanup")
+            .expect("cleanup subcommand");
+        let mut help = Vec::new();
+        cleanup.write_long_help(&mut help).expect("render help");
+        let help = String::from_utf8(help).expect("help is UTF-8");
+        // The flag deletes history irreversibly. The operator must be able to
+        // learn that from the help, not from the diff afterwards.
+        for required in ["not recoverable", "journal task", "keep-veto"] {
+            assert!(
+                help.contains(required),
+                "cleanup help omitted {required:?}: {help}"
+            );
+        }
     }
 
     #[test]

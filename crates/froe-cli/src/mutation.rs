@@ -174,9 +174,57 @@ pub(crate) fn run_cleanup(
             return Ok(false);
         }
     }
+    // Captured from the authoritative plan before it is consumed: the
+    // preview's figures can be stale, and the operator reads the summary
+    // after minutes of progress output has scrolled the warnings away.
+    let retention = RetentionSummary::of(prepared.plan());
     let outcome = prepared.apply_with_progress(&mut reporter.clone())?;
     reporter.finish();
     let complete = outcome.is_complete();
+    print_cleanup_summary(&outcome, retention, complete);
+    for failure in outcome.deletion_failures() {
+        eprintln!("{}", cleanup_deletion_warning(failure));
+    }
+    if !complete {
+        eprintln!("{}", cleanup_partial_summary(outcome.deletion_failures()));
+    }
+    Ok(complete)
+}
+
+/// What the applied plan identified as reclaimable and then kept.
+///
+/// Read off the authoritative plan before it is consumed, so the summary can
+/// restate it once the progress output has scrolled the plan's own warnings
+/// out of view. Without this the run's last word on a store full of retained
+/// garbage is a bare "0 bytes".
+#[derive(Clone, Copy)]
+struct RetentionSummary {
+    segments: usize,
+    bytes: u64,
+    history_segments: usize,
+    history_reclaimable_segments: usize,
+    history_reclaimable_bytes: u64,
+}
+
+impl RetentionSummary {
+    fn of(plan: &froe::CleanupPlan) -> Self {
+        let (history_reclaimable_segments, history_reclaimable_bytes) =
+            plan.history_protected_reclaimable();
+        Self {
+            segments: plan.retained_reclaimable_segments(),
+            bytes: plan.retained_reclaimable_bytes(),
+            history_segments: plan.history_protected_segments(),
+            history_reclaimable_segments,
+            history_reclaimable_bytes,
+        }
+    }
+}
+
+fn print_cleanup_summary(
+    outcome: &froe::CleanupOutcome,
+    retention: RetentionSummary,
+    complete: bool,
+) {
     let status = if complete {
         "cleanup complete"
     } else {
@@ -198,10 +246,34 @@ pub(crate) fn run_cleanup(
         outcome.archive_bytes_before,
         outcome.archive_bytes_after,
     );
+    if retention.segments != 0 {
+        println!(
+            "identified but retained: {} segments / {} bytes of reclaimable garbage were left in place; rewriting their archives does not repay the rewrite",
+            retention.segments, retention.bytes,
+        );
+    }
+    if retention.history_segments != 0 {
+        println!(
+            "journal history still protects {} data segments the head does not reach; retiring it would let this sweep free a further {} segments ({} bytes)",
+            retention.history_segments,
+            retention.history_reclaimable_segments,
+            retention.history_reclaimable_bytes,
+        );
+    }
     if outcome.repaired_archives != 0 {
         println!(
             "archive indexes rebuilt: {} (originals retained under .bak names; a later run with --task recovery-backups can retire them once the store is verified)",
             outcome.repaired_archives
+        );
+    }
+    // The archive byte figures above count active archive names only, so a
+    // run that retires an original to a `.bak` reports no change while the
+    // directory grew. State the held bytes rather than let the summary imply
+    // the store stayed the same size.
+    if outcome.retained_recovery_backup_bytes != 0 {
+        println!(
+            "recovery backups on disk: {} bytes (outside the archive figures above; retire with --task recovery-backups)",
+            outcome.retained_recovery_backup_bytes
         );
     }
     if outcome.removed_temporaries != 0 || outcome.removed_recovery_backups != 0 {
@@ -216,13 +288,6 @@ pub(crate) fn run_cleanup(
             crate::output::sanitize_terminal_path(backup_path)
         );
     }
-    for failure in outcome.deletion_failures() {
-        eprintln!("{}", cleanup_deletion_warning(failure));
-    }
-    if !complete {
-        eprintln!("{}", cleanup_partial_summary(outcome.deletion_failures()));
-    }
-    Ok(complete)
 }
 
 fn cleanup_deletion_warning(failure: &CleanupDeletionFailure) -> String {
@@ -332,8 +397,9 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
                 parser_ignored,
                 missing_segments,
                 unreadable_revisions,
+                beyond_retention,
             } => println!(
-                "  prune {lines} journal lines ({parser_ignored} parser-ignored, {missing_segments} missing-segment, {unreadable_revisions} unreadable historical)"
+                "  prune {lines} journal lines ({parser_ignored} parser-ignored, {missing_segments} missing-segment, {unreadable_revisions} unreadable historical, {beyond_retention} beyond retention)"
             ),
             CleanupAction::UpgradeManifest => {
                 println!("  atomically upgrade manifest to store.version=2");
@@ -429,6 +495,31 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
         "estimated reclaimable bytes: {}",
         plan.estimated_reclaimable_bytes()
     );
+    // A zero estimate has two very different meanings — "no garbage" and
+    // "garbage this run declined to move" — and the run used to print the
+    // same line for both. These two say which one it is.
+    if plan.retained_reclaimable_segments() != 0 {
+        println!(
+            "identified but retained: {} segments / {} bytes of reclaimable garbage, left in place because rewriting their archives does not repay the rewrite (see the warnings above)",
+            plan.retained_reclaimable_segments(),
+            plan.retained_reclaimable_bytes(),
+        );
+    }
+    let (history_reclaimable_segments, history_reclaimable_bytes) =
+        plan.history_protected_reclaimable();
+    if plan.history_protected_segments() != 0 {
+        println!(
+            "journal history protects {} data segments the current head does not reach; retiring that history would let this same sweep free {} segments ({} bytes), binary content included",
+            plan.history_protected_segments(),
+            history_reclaimable_segments,
+            history_reclaimable_bytes,
+        );
+        if history_reclaimable_segments != 0 {
+            println!(
+                "  to retire it: run `froe compact` on a stopped repository, or bound the journal with --retain-journal-revisions"
+            );
+        }
+    }
     if plan.estimated_archive_rewrite_source_bytes() != 0 {
         println!(
             "archive rewrite working-space proxy: {} source bytes (additional headroom may be required)",

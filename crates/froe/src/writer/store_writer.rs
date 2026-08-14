@@ -1697,6 +1697,15 @@ struct ArchiveSweepOutcome {
     newly_unavailable: std::collections::HashSet<SegmentIdentifier>,
 }
 
+/// Whether standalone cleanup marks with Oak's FULL garbage-collection
+/// predicate. Named so plan reporting cannot silently drift from the mark
+/// phase it describes.
+pub(crate) const STANDALONE_FULL_GARBAGE_COLLECTION: bool = true;
+
+/// Generations standalone cleanup retains behind the reference. Oak's
+/// `SegmentGCOptions` default, and the same constant the mark phase uses.
+pub(crate) const STANDALONE_RETAINED_GENERATIONS: i32 = 2;
+
 /// Plans Oak's standalone cleanup predicate: FULL GC, the current committed
 /// head generation as reference, and two retained generations. `protected`
 /// is a conservative keep-veto for journal history; it never makes a segment
@@ -1719,6 +1728,67 @@ pub(crate) fn plan_standalone_segment_cleanup(
         protected,
         observer,
     )
+}
+
+/// Segments and bytes a plan's actionable dispositions would physically
+/// free. Deferred and blocked archives free nothing and contribute nothing.
+///
+/// A whole-file removal frees the archive's own size — index and trailers
+/// included — while a rewrite frees only the entry bytes it drops.
+pub(crate) fn plan_reclaimed_totals(plan: &StandaloneSegmentCleanupPlan) -> (usize, u64) {
+    let mut segments = 0usize;
+    let mut bytes = 0u64;
+    for archive in &plan.archives {
+        let (archive_segments, archive_bytes) = match archive {
+            PlannedArchiveSweep::Remove {
+                segment_count,
+                file_bytes,
+                ..
+            } => (*segment_count, *file_bytes),
+            PlannedArchiveSweep::Rewrite {
+                segment_count,
+                eligible_entry_bytes,
+                ..
+            } => (*segment_count, *eligible_entry_bytes),
+            PlannedArchiveSweep::DeferredBySavings { .. }
+            | PlannedArchiveSweep::DeferredAtLastGeneration { .. }
+            | PlannedArchiveSweep::BlockedByOccupiedGeneration { .. } => continue,
+        };
+        segments = segments.saturating_add(archive_segments);
+        bytes = bytes.saturating_add(archive_bytes);
+    }
+    (segments, bytes)
+}
+
+/// Replans the same sweep with the journal-history keep-veto lifted, to
+/// price what retiring that history would actually release.
+///
+/// Reusing the real mark and sweep rather than reasoning about the veto
+/// separately is the point: the veto holds bulk segments only indirectly —
+/// a vetoed data segment keeps seeding its references — and it interacts
+/// with the 25% rewrite gate, since releasing more of an archive can push
+/// it over the threshold. Only the sweep itself accounts for both, so any
+/// hand-rolled estimate would understate the price of the veto, badly on a
+/// store whose history holds inline binaries.
+///
+/// The caller has already certified these archives for the vetoed plan;
+/// this is the mark and sweep alone.
+pub(crate) fn measure_unvetoed_reclamation(
+    directory: &Path,
+    repository: &crate::store::Repository,
+    reference: GarbageCollectionGeneration,
+    current_head_segment: SegmentIdentifier,
+    observer: &mut dyn crate::progress::ProgressObserver,
+) -> Result<(usize, u64)> {
+    let unvetoed = analyze_standalone_segment_cleanup(
+        directory,
+        repository.archives(),
+        reference,
+        current_head_segment,
+        &std::collections::HashSet::new(),
+        observer,
+    )?;
+    Ok(plan_reclaimed_totals(&unvetoed))
 }
 
 /// Segment identifiers that the actionable archive dispositions in `plan`
@@ -2267,8 +2337,8 @@ fn analyze_standalone_segment_cleanup(
     let mut reclaimable = std::collections::HashSet::new();
     let policy = ReclaimPolicy {
         reference,
-        full: true,
-        retained_generations: 2,
+        full: STANDALONE_FULL_GARBAGE_COLLECTION,
+        retained_generations: STANDALONE_RETAINED_GENERATIONS,
         protected_data_segments: protected,
     };
     // A skipped standalone compaction uses the exact durable head as Oak's
@@ -3744,11 +3814,16 @@ pub(crate) fn repair_indexless_archive_numbers(
             .or_default()
             .push(parsed);
     }
+    // Every archive number is examined to decide whether it needs a rebuild,
+    // so the total is the whole population. The step is named for what it
+    // counts: naming it for the repair would report the survey population as
+    // archives repaired, which is how a single-archive rebuild came to print
+    // as "535 archives".
     let total = by_number.len();
     crate::progress::observe(
         observer,
         &crate::progress::Step::new(
-            "repairing archive indexes",
+            "checking archive indexes for repair",
             crate::progress::WorkUnit::Archives,
         )
         .with_total(crate::progress::count(total)),

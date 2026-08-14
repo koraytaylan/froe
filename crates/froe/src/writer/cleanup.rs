@@ -13,6 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -151,6 +152,7 @@ impl RecoveryBackupPolicy {
 pub struct CleanupOptions {
     tasks: BTreeSet<CleanupTask>,
     recovery_backup_policy: Option<RecoveryBackupPolicy>,
+    journal_revision_retention: Option<NonZeroUsize>,
 }
 
 impl Default for CleanupOptions {
@@ -164,6 +166,9 @@ impl Default for CleanupOptions {
                 CleanupTask::StaleTemporaries,
             ]),
             recovery_backup_policy: None,
+            // Unbounded: every readable revision stays a tracing root, which
+            // is the conservative default froe has always applied.
+            journal_revision_retention: None,
         }
     }
 }
@@ -195,6 +200,28 @@ impl CleanupOptions {
     pub fn with_recovery_backup_policy(mut self, policy: RecoveryBackupPolicy) -> Self {
         self.tasks.insert(CleanupTask::RecoveryBackups);
         self.recovery_backup_policy = Some(policy);
+        self
+    }
+
+    /// Keeps only the newest `revisions` resolvable journal revisions,
+    /// removing the older lines and — decisively — releasing their segment
+    /// closure from the history keep-veto.
+    ///
+    /// Without a bound, froe treats every readable revision as a tracing
+    /// root, which is stricter than Oak: Oak judges data segments by their
+    /// index generation triple alone and leaves `journal.log` untouched. On a
+    /// long-lived store that veto is normally why cleanup reclaims nothing.
+    /// A bound of one leaves the current head as the only root, which is the
+    /// closest standalone cleanup comes to Oak's own retention.
+    ///
+    /// This implies [`CleanupTask::Journal`]: the bounded lines must actually
+    /// leave the journal in the same run. A line that stopped being a root
+    /// while remaining in the file would still be verified as retained
+    /// history when the plan is validated, and the run would refuse itself.
+    #[must_use]
+    pub fn with_journal_revision_retention(mut self, revisions: NonZeroUsize) -> Self {
+        self.tasks.insert(CleanupTask::Journal);
+        self.journal_revision_retention = Some(revisions);
         self
     }
 
@@ -242,6 +269,11 @@ pub enum JournalRemovalReason {
     MissingSegment,
     /// The non-current historical node revision does not fully traverse.
     UnreadableRevision,
+    /// The revision resolves, but an explicit retention bound keeps only
+    /// newer revisions. Removing the line is what releases its closure from
+    /// the history keep-veto; without it the line stays a tracing root and
+    /// the segments behind it stay protected.
+    BeyondRetention,
 }
 
 impl std::fmt::Display for JournalRemovalReason {
@@ -251,6 +283,7 @@ impl std::fmt::Display for JournalRemovalReason {
             Self::InvalidRecordIdentifier => "invalid record identifier",
             Self::MissingSegment => "missing segment",
             Self::UnreadableRevision => "unreadable historical revision",
+            Self::BeyondRetention => "beyond the journal retention bound",
         })
     }
 }
@@ -401,6 +434,8 @@ pub enum CleanupAction {
         missing_segments: usize,
         /// Non-current historical node roots that do not fully traverse.
         unreadable_revisions: usize,
+        /// Resolvable revisions older than an explicit retention bound.
+        beyond_retention: usize,
     },
     /// Atomically raise `store.version` from 1 to 2 before writing v2 data.
     UpgradeManifest,
@@ -458,6 +493,59 @@ pub enum CleanupAction {
     },
 }
 
+/// Segments this run identified as reclaimable and then declined to remove.
+///
+/// Every count here is garbage the mark phase proved removable; the archive
+/// sweep kept it anyway, because rewriting the archive that holds it would
+/// not repay the rewrite. Reporting it is what separates "this store holds no
+/// garbage" from "this store holds garbage that is not worth moving".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RetainedReclaimable {
+    /// Segments kept by Oak's 25% savings gate.
+    below_savings_gate: usize,
+    /// Segments kept because the archive exhausted the `a`–`z` namespace.
+    at_last_generation: usize,
+    /// Segments kept because another generation pathname is occupied.
+    blocked_by_occupied_generation: usize,
+    /// TAR entry bytes those segments occupy, summed across every reason.
+    bytes: u64,
+}
+
+impl RetainedReclaimable {
+    /// Segments identified as reclaimable and left in place, all reasons.
+    fn segments(self) -> usize {
+        self.below_savings_gate
+            .saturating_add(self.at_last_generation)
+            .saturating_add(self.blocked_by_occupied_generation)
+    }
+}
+
+/// What the journal-history keep-veto protects, and what it costs.
+///
+/// froe retains every readable journal revision as a tracing root, which Oak
+/// does not do: Oak judges data segments by their index generation triple
+/// alone. The veto is strictly conservative, so it can never delete anything
+/// Oak would keep — but on a long-lived store it is normally the single
+/// largest reason a cleanup reclaims nothing, and nothing in the run used to
+/// say so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryProtection {
+    /// Data segments reachable only from a historical journal revision, and
+    /// not from the current head.
+    history_only_segments: usize,
+    /// Segments this same sweep would physically free with the veto lifted
+    /// and nothing else changed. Measured by replanning rather than reasoned
+    /// about: the veto holds bulk segments only through the data segments
+    /// that reference them, and releasing more of an archive can carry it
+    /// over the 25% rewrite gate. Counting protected data segments alone
+    /// understates this by orders of magnitude on a store whose history
+    /// holds inline binaries.
+    would_be_reclaimable_segments: usize,
+    /// Bytes those segments occupy, whole archive files included where the
+    /// unvetoed sweep would unlink one outright.
+    would_be_reclaimable_bytes: u64,
+}
+
 /// A strictly read-only cleanup analysis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CleanupPlan {
@@ -468,6 +556,8 @@ pub struct CleanupPlan {
     warnings: Vec<String>,
     estimated_reclaimable_bytes: u64,
     estimated_archive_rewrite_source_bytes: u64,
+    retained_reclaimable: RetainedReclaimable,
+    history_protection: HistoryProtection,
     fingerprint: DirectoryFingerprint,
     journal: JournalPlan,
     checkpoints: CheckpointPlan,
@@ -542,6 +632,40 @@ impl CleanupPlan {
         self.estimated_archive_rewrite_source_bytes
     }
 
+    /// Segments proved reclaimable that this run will nevertheless leave in
+    /// place, because rewriting the archives holding them is not worthwhile
+    /// or not possible. Nonzero alongside a zero reclaimable estimate means
+    /// the store holds garbage this cleanup declined, not that it holds none.
+    #[must_use]
+    pub fn retained_reclaimable_segments(&self) -> usize {
+        self.retained_reclaimable.segments()
+    }
+
+    /// TAR entry bytes occupied by [`Self::retained_reclaimable_segments`].
+    #[must_use]
+    pub fn retained_reclaimable_bytes(&self) -> u64 {
+        self.retained_reclaimable.bytes
+    }
+
+    /// Data segments kept alive only because a historical journal revision
+    /// still reaches them. Zero unless [`CleanupTask::Segments`] ran.
+    #[must_use]
+    pub fn history_protected_segments(&self) -> usize {
+        self.history_protection.history_only_segments
+    }
+
+    /// Those of [`Self::history_protected_segments`] that Oak's generation
+    /// predicate would have reclaimed, and the bytes they occupy. This is
+    /// what retiring the journal history — a full compaction — would make
+    /// eligible; standalone cleanup never will.
+    #[must_use]
+    pub fn history_protected_reclaimable(&self) -> (usize, u64) {
+        (
+            self.history_protection.would_be_reclaimable_segments,
+            self.history_protection.would_be_reclaimable_bytes,
+        )
+    }
+
     /// Whether application would request any mutation.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -582,6 +706,13 @@ pub struct CleanupOutcome {
     pub archive_bytes_before: u64,
     /// Bytes in recognized archive files after application.
     pub archive_bytes_after: u64,
+    /// Bytes still held by retained recovery backups after application.
+    ///
+    /// These sit outside [`Self::archive_bytes_after`], which counts only
+    /// active archive names. A run that rebuilds an index retires the
+    /// original under a `.bak` name, so the directory grows by this much
+    /// while the archive figures report no change at all.
+    pub retained_recovery_backup_bytes: u64,
     removed_segments: usize,
     journal_backup_path: Option<PathBuf>,
     deletion_failures: Vec<CleanupDeletionFailure>,
@@ -1196,6 +1327,7 @@ struct JournalPlan {
     parser_ignored: usize,
     missing_segments: usize,
     unreadable_revisions: usize,
+    beyond_retention: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1266,6 +1398,19 @@ fn validate_options(options: &CleanupOptions) -> Result<()> {
                       delete in the same run, discarding the only copy of any segment the \
                       rebuild could not read — repair first, verify the store, then retire the \
                       backups in a later run"
+                .to_owned(),
+        });
+    }
+    // The bound and the pruning are one operation. Un-rooting a line without
+    // removing it leaves it in the journal, where the prospective-plan check
+    // still verifies it as retained history and refuses the very plan the
+    // bound was set to enable. The builder selects the task, so this only
+    // fires for a caller that deselected it afterwards.
+    if options.journal_revision_retention.is_some() && !options.contains(CleanupTask::Journal) {
+        return Err(Error::InvalidFormat {
+            details: "a journal revision retention bound requires the journal task: the bounded \
+                      lines must leave the journal in the same run, or they remain retained \
+                      history and the segments behind them stay protected"
                 .to_owned(),
         });
     }
@@ -1545,7 +1690,13 @@ fn build_plan_collecting(
     verify_exact_super_root(&repository, current_head, observer)?;
 
     let raw_journal = scan_raw_journal(directory)?;
-    let journal_analysis = analyze_journal(&repository, &raw_journal, current_head, observer)?;
+    let journal_analysis = analyze_journal(
+        &repository,
+        &raw_journal,
+        current_head,
+        options.journal_revision_retention,
+        observer,
+    )?;
 
     // Repairs the operator has authorized, named but not yet performed. This
     // is the read-only preview: the rebuild happens under the lock inside
@@ -1582,6 +1733,23 @@ fn build_plan_collecting(
         // generations; both wait for the repair.
         CheckpointPlan::default()
     };
+    // Checkpoint removal installs a new head and appends its journal line, so
+    // by the time the journal is rewritten the newest revision is one this
+    // plan never saw. A bound counted from there retires the head this plan
+    // retained, and the apply aborts on its own retained-root proof — with
+    // the checkpoint removal already committed. Refuse here instead, where
+    // nothing has moved and the operator can simply run the two in sequence.
+    if options.journal_revision_retention.is_some() && !checkpoints.names.is_empty() {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "a journal revision retention bound cannot run beside the removal of {} checkpoint(s): \
+                 checkpoint removal moves the head and appends a journal line, which would put the \
+                 bound's newest revision beyond the one this plan retained — remove the checkpoints \
+                 first, then bound the journal in a second run",
+                checkpoints.names.len()
+            ),
+        });
+    }
     let checkpoint_archive_number = if checkpoints.names.is_empty() {
         None
     } else {
@@ -1642,7 +1810,16 @@ fn build_plan_collecting(
         )?;
     }
     let mut protected_history_segments = HashSet::new();
+    let mut history_protection = HistoryProtection::default();
     let segment_plan = if index_available && options.contains(CleanupTask::Segments) {
+        // Captured before the head closure is consumed as the history seed:
+        // afterwards the two are indistinguishable, and the difference is
+        // exactly what the journal history costs.
+        let head_data_segments: HashSet<SegmentIdentifier> = current_closure
+            .iter()
+            .copied()
+            .filter(|identifier| identifier.is_data_segment())
+            .collect();
         let mut retained_closure = current_closure;
         crate::progress::observe(
             observer,
@@ -1667,6 +1844,10 @@ fn build_plan_collecting(
                 .into_iter()
                 .filter(|identifier| identifier.is_data_segment()),
         );
+        history_protection.history_only_segments = protected_history_segments
+            .iter()
+            .filter(|identifier| !head_data_segments.contains(identifier))
+            .count();
 
         let plan = crate::progress::observe(
             observer,
@@ -1683,6 +1864,32 @@ fn build_plan_collecting(
                 )
             },
         )?;
+        // What the veto costs, priced by the sweep itself rather than
+        // estimated beside it. Skipped when the veto protects nothing the
+        // head does not already reach, because then there is nothing to
+        // price and the second pass would be pure cost.
+        if history_protection.history_only_segments != 0 {
+            let (unvetoed_segments, unvetoed_bytes) = crate::progress::observe(
+                observer,
+                &Step::new("pricing the journal-history protection", WorkUnit::Archives)
+                    .with_total(crate::progress::count(repository.archives().len())),
+                |observer| {
+                    crate::writer::store_writer::measure_unvetoed_reclamation(
+                        directory,
+                        &repository,
+                        reference_generation,
+                        current_head.segment,
+                        observer,
+                    )
+                },
+            )?;
+            let (vetoed_segments, vetoed_bytes) =
+                crate::writer::store_writer::plan_reclaimed_totals(&plan);
+            history_protection.would_be_reclaimable_segments =
+                unvetoed_segments.saturating_sub(vetoed_segments);
+            history_protection.would_be_reclaimable_bytes =
+                unvetoed_bytes.saturating_sub(vetoed_bytes);
+        }
         let retained_roots = prospective_retained_roots(
             directory,
             &repository,
@@ -1755,6 +1962,7 @@ fn build_plan_collecting(
     let mut actions = Vec::new();
     let mut estimated_reclaimable_bytes = 0u64;
     let mut estimated_archive_rewrite_source_bytes = 0u64;
+    let mut retained_reclaimable = RetainedReclaimable::default();
     // First, because everything else in a repairing run is downstream of it —
     // and because it is the one action here that *adds* bytes rather than
     // reclaiming them, so it stays out of the reclaimable estimate.
@@ -1798,25 +2006,37 @@ fn build_plan_collecting(
                 PlannedArchiveSweep::DeferredBySavings {
                     file_name,
                     segment_count,
-                    ..
-                } => warnings.push(format!(
-                    "{file_name}: {segment_count} reclaimable segments retained because savings do not exceed Oak's 25% rewrite gate"
-                )),
+                    eligible_entry_bytes,
+                } => {
+                    retained_reclaimable.below_savings_gate += segment_count;
+                    add_estimate(&mut retained_reclaimable.bytes, *eligible_entry_bytes)?;
+                    warnings.push(format!(
+                        "{file_name}: {segment_count} reclaimable segments ({eligible_entry_bytes} bytes) retained because savings do not exceed Oak's 25% rewrite gate"
+                    ));
+                }
                 PlannedArchiveSweep::DeferredAtLastGeneration {
                     file_name,
                     segment_count,
-                    ..
-                } => warnings.push(format!(
-                    "{file_name}: {segment_count} reclaimable segments retained because archive generation z cannot be rewritten"
-                )),
+                    eligible_entry_bytes,
+                } => {
+                    retained_reclaimable.at_last_generation += segment_count;
+                    add_estimate(&mut retained_reclaimable.bytes, *eligible_entry_bytes)?;
+                    warnings.push(format!(
+                        "{file_name}: {segment_count} reclaimable segments ({eligible_entry_bytes} bytes) retained because archive generation z cannot be rewritten"
+                    ));
+                }
                 PlannedArchiveSweep::BlockedByOccupiedGeneration {
                     file_name,
                     occupied_name,
                     segment_count,
-                    ..
-                } => warnings.push(format!(
-                    "{file_name}: {segment_count} reclaimable segments retained because {occupied_name} already exists"
-                )),
+                    eligible_entry_bytes,
+                } => {
+                    retained_reclaimable.blocked_by_occupied_generation += segment_count;
+                    add_estimate(&mut retained_reclaimable.bytes, *eligible_entry_bytes)?;
+                    warnings.push(format!(
+                        "{file_name}: {segment_count} reclaimable segments ({eligible_entry_bytes} bytes) retained because {occupied_name} already exists"
+                    ));
+                }
             }
         }
     }
@@ -1856,6 +2076,7 @@ fn build_plan_collecting(
             parser_ignored: journal_analysis.plan.parser_ignored,
             missing_segments: journal_analysis.plan.missing_segments,
             unreadable_revisions: journal_analysis.plan.unreadable_revisions,
+            beyond_retention: journal_analysis.plan.beyond_retention,
         });
     }
     for temporary in &temporaries {
@@ -1891,6 +2112,8 @@ fn build_plan_collecting(
         warnings: warnings.clone(),
         estimated_reclaimable_bytes,
         estimated_archive_rewrite_source_bytes,
+        retained_reclaimable,
+        history_protection,
         fingerprint: fingerprint_after,
         journal: journal_analysis.plan,
         checkpoints,
@@ -2043,14 +2266,45 @@ fn analyze_journal(
     repository: &Repository,
     raw: &RawJournal,
     current_head: RecordIdentifier,
+    retention: Option<NonZeroUsize>,
     observer: &mut dyn ProgressObserver,
 ) -> Result<JournalAnalysis> {
     crate::progress::observe(
         observer,
         &Step::new("analyzing journal revisions", WorkUnit::JournalLines)
             .with_total(crate::progress::count(raw.lines().len())),
-        |observer| analyze_journal_lines(repository, raw, current_head, observer),
+        |observer| analyze_journal_lines(repository, raw, current_head, retention, observer),
     )
+}
+
+/// The first line index within the newest `retention` resolvable revisions.
+///
+/// Resolvability here is only "parses and its head segment exists" — the
+/// cheap half of the classification. That is deliberate: a line older than
+/// the bound is removed whether or not its tree verifies, so bounding before
+/// the walk skips the expensive per-revision verification for exactly the
+/// lines being discarded. On a store with tens of thousands of journal lines
+/// that is the difference between minutes and seconds.
+fn journal_retention_boundary(
+    repository: &Repository,
+    raw: &RawJournal,
+    retention: NonZeroUsize,
+) -> Option<usize> {
+    let mut remaining = retention.get();
+    for (index, line) in raw.lines().iter().enumerate().rev() {
+        let RawJournalLineClassification::Record(record) = line.classification() else {
+            continue;
+        };
+        if !repository.contains_segment(record.record_identifier.segment) {
+            continue;
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            return Some(index);
+        }
+    }
+    // Fewer resolvable revisions than the bound allows: nothing is beyond it.
+    None
 }
 
 /// The journal pass itself; [`analyze_journal`] owns the step around it.
@@ -2062,6 +2316,7 @@ fn analyze_journal_lines(
     repository: &Repository,
     raw: &RawJournal,
     current_head: RecordIdentifier,
+    retention: Option<NonZeroUsize>,
     observer: &mut dyn ProgressObserver,
 ) -> Result<JournalAnalysis> {
     let selected = raw
@@ -2087,9 +2342,13 @@ fn analyze_journal_lines(
         });
     }
 
+    let retention_boundary =
+        retention.and_then(|bound| journal_retention_boundary(repository, raw, bound));
+
     let mut parser_ignored = 0usize;
     let mut missing_segments = 0usize;
     let mut unreadable_revisions = 0usize;
+    let mut beyond_retention = 0usize;
     let mut removals = Vec::new();
     let mut retained_indexes = Vec::new();
     let mut retained_record_ids = Vec::new();
@@ -2127,6 +2386,20 @@ fn analyze_journal_lines(
                         line,
                         Some(identifier),
                         JournalRemovalReason::MissingSegment,
+                    ));
+                    continue;
+                }
+                // Before the verification walk, not after: a line the bound
+                // discards is discarded whether or not its tree reads, so
+                // proving readability first would be work spent on a line
+                // already destined for removal.
+                if retention_boundary.is_some_and(|boundary| index < boundary) {
+                    beyond_retention += 1;
+                    removals.push(journal_line_removal(
+                        index,
+                        line,
+                        Some(identifier),
+                        JournalRemovalReason::BeyondRetention,
                     ));
                     continue;
                 }
@@ -2171,6 +2444,7 @@ fn analyze_journal_lines(
     let removed_lines = parser_ignored
         .checked_add(missing_segments)
         .and_then(|count| count.checked_add(unreadable_revisions))
+        .and_then(|count| count.checked_add(beyond_retention))
         .ok_or_else(|| Error::InvalidFormat {
             details: "journal line accounting overflow".to_owned(),
         })?;
@@ -2186,6 +2460,7 @@ fn analyze_journal_lines(
             parser_ignored,
             missing_segments,
             unreadable_revisions,
+            beyond_retention,
         },
         retained_indexes,
         retained_record_ids,
@@ -2778,7 +3053,12 @@ fn validate_current_generation_invariant(
                 ),
             });
         }
-        if is_reclaimable(reference, header, true, 2) {
+        if is_reclaimable(
+            reference,
+            header,
+            crate::writer::store_writer::STANDALONE_FULL_GARBAGE_COLLECTION,
+            crate::writer::store_writer::STANDALONE_RETAINED_GENERATIONS,
+        ) {
             return Err(Error::InvalidFormat {
                 details: format!(
                     "current head reaches data segment {identifier} in reclaimable generation {header:?}; refusing to trust generation cleanup"
@@ -3194,25 +3474,30 @@ fn apply_prepared(
     }
 
     repository_lock.validate_path_identity(&directory)?;
-    let (removed_stale_archives, mut stale_not_deleted) = crate::progress::observe(
-        observer,
-        &Step::new("removing stale archives", WorkUnit::Files)
-            .with_total(crate::progress::count(plan.stale_archives.len())),
-        |observer| {
-            remove_planned_files(
-                &directory,
-                plan.stale_archives
-                    .iter()
-                    .map(|archive| PlannedFileRemoval {
-                        file_name: archive.file_name.clone(),
-                        bytes: archive.bytes,
-                        fingerprint: archive.fingerprint.clone(),
-                    }),
-                PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+    let (removed_stale_archives, mut stale_not_deleted) =
+        if options.contains(CleanupTask::StaleArchives) {
+            crate::progress::observe(
                 observer,
-            )
-        },
-    )?;
+                &Step::new("removing stale archives", WorkUnit::Files)
+                    .with_total(crate::progress::count(plan.stale_archives.len())),
+                |observer| {
+                    remove_planned_files(
+                        &directory,
+                        plan.stale_archives
+                            .iter()
+                            .map(|archive| PlannedFileRemoval {
+                                file_name: archive.file_name.clone(),
+                                bytes: archive.bytes,
+                                fingerprint: archive.fingerprint.clone(),
+                            }),
+                        PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+                        observer,
+                    )
+                },
+            )?
+        } else {
+            (0, Vec::new())
+        };
 
     let mut expected_head_after = plan.current_head;
     let removed_checkpoints = if plan.checkpoints.names.is_empty() {
@@ -3274,7 +3559,16 @@ fn apply_prepared(
         let head = repository.head_record_identifier();
         verify_exact_super_root(&repository, head, observer)?;
         let raw = scan_raw_journal(&directory)?;
-        let analysis = analyze_journal(&repository, &raw, head, observer)?;
+        // The same bound the plan was built with: a fresh analysis that
+        // retained every readable revision would disagree with the plan's
+        // retained roots and abort the run the bound was set to enable.
+        let analysis = analyze_journal(
+            &repository,
+            &raw,
+            head,
+            options.journal_revision_retention,
+            observer,
+        )?;
         // Earlier archive/checkpoint work ran after the operator confirmed the
         // plan. Do not let a fresh analysis turn an unexpected loss into an
         // unconfirmed journal deletion. The final reopen repeats both proofs,
@@ -3331,8 +3625,16 @@ fn apply_prepared(
     }
     verify_exact_super_root(&final_repository, head_after, observer)?;
     let final_raw_journal = scan_raw_journal(&directory)?;
-    let mut final_journal_analysis =
-        analyze_journal(&final_repository, &final_raw_journal, head_after, observer)?;
+    // After the rewrite the journal holds at most the bound's worth of
+    // resolvable revisions, so the boundary finds nothing beyond it and the
+    // "no removable lines remain" assertion below stays exact.
+    let mut final_journal_analysis = analyze_journal(
+        &final_repository,
+        &final_raw_journal,
+        head_after,
+        options.journal_revision_retention,
+        observer,
+    )?;
     inject_final_retained_root_fault(&mut final_journal_analysis.retained_record_ids);
     verify_retained_journal_roots(
         &plan.journal.retained_record_ids,
@@ -3355,32 +3657,45 @@ fn apply_prepared(
     // archive discovery, so their removal cannot invalidate the verified
     // state.
     repository_lock.validate_path_identity(&directory)?;
-    let (removed_temporaries, mut temporary_not_deleted) = crate::progress::observe(
-        observer,
-        &Step::new("removing stale temporary files", WorkUnit::Files)
-            .with_total(crate::progress::count(plan.temporaries.len())),
-        |observer| {
-            remove_planned_files(
-                &directory,
-                plan.temporaries.iter().cloned(),
-                PlannedFileRemovalFailureMode::Partial,
+    // Each step is reported only when its task was selected. An unselected
+    // task has nothing to remove, and announcing the work anyway told the
+    // operator froe had considered backups it was never asked to touch.
+    let (removed_temporaries, mut temporary_not_deleted) =
+        if options.contains(CleanupTask::StaleTemporaries) {
+            crate::progress::observe(
                 observer,
-            )
-        },
-    )?;
-    let (removed_recovery_backups, mut backup_not_deleted) = crate::progress::observe(
-        observer,
-        &Step::new("removing old recovery backups", WorkUnit::Files)
-            .with_total(crate::progress::count(plan.recovery_backups.len())),
-        |observer| {
-            remove_planned_files(
-                &directory,
-                plan.recovery_backups.iter().cloned(),
-                PlannedFileRemovalFailureMode::Partial,
+                &Step::new("removing stale temporary files", WorkUnit::Files)
+                    .with_total(crate::progress::count(plan.temporaries.len())),
+                |observer| {
+                    remove_planned_files(
+                        &directory,
+                        plan.temporaries.iter().cloned(),
+                        PlannedFileRemovalFailureMode::Partial,
+                        observer,
+                    )
+                },
+            )?
+        } else {
+            (0, Vec::new())
+        };
+    let (removed_recovery_backups, mut backup_not_deleted) =
+        if options.contains(CleanupTask::RecoveryBackups) {
+            crate::progress::observe(
                 observer,
-            )
-        },
-    )?;
+                &Step::new("removing old recovery backups", WorkUnit::Files)
+                    .with_total(crate::progress::count(plan.recovery_backups.len())),
+                |observer| {
+                    remove_planned_files(
+                        &directory,
+                        plan.recovery_backups.iter().cloned(),
+                        PlannedFileRemovalFailureMode::Partial,
+                        observer,
+                    )
+                },
+            )?
+        } else {
+            (0, Vec::new())
+        };
     sync_directory_strict(&directory)?;
 
     let archive_bytes_after = archive_file_bytes(&directory)?;
@@ -3427,6 +3742,7 @@ fn apply_prepared(
         files_not_deleted,
         archive_bytes_before,
         archive_bytes_after,
+        retained_recovery_backup_bytes: recovery_backup_file_bytes(&directory)?,
         removed_segments: segment_outcome.removed_segments,
         journal_backup_path,
         deletion_failures,
@@ -3793,6 +4109,27 @@ fn archive_file_bytes(directory: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// Bytes held by every recognized recovery backup in the directory.
+///
+/// Counted with the same predicate that decides what the backup retention
+/// policy may retire, so the reported figure is exactly the material a later
+/// `--task recovery-backups` run can reclaim — and, before that run, exactly
+/// the growth the archive byte line does not show.
+fn recovery_backup_file_bytes(directory: &Path) -> Result<u64> {
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if recovery_backup_target(&name).is_none() {
+            continue;
+        }
+        add_estimate(&mut bytes, std::fs::symlink_metadata(entry.path())?.len())?;
+    }
+    Ok(bytes)
+}
+
 fn read_optional_regular_file(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(Some(std::fs::read(path)?)),
@@ -4123,13 +4460,15 @@ mod tests {
     use super::{
         CleanupAction, CleanupOptions, CleanupTask, JOURNAL_LINE_PREVIEW_LIMIT,
         JournalRemovalReason, PlannedFileRemoval, PlannedFileRemovalFailureMode, PreparedCleanup,
-        RecoveryBackupPolicy, attach_planning_warnings, cleanup, file_fingerprint,
-        indexless_archive_refusal, manifest_upgrade_bytes, plan_cleanup, recovery_backup_target,
-        remove_planned_files, remove_planned_files_with,
+        RecoveryBackupPolicy, attach_planning_warnings, cleanup, cleanup_with_progress,
+        file_fingerprint, indexless_archive_refusal, manifest_upgrade_bytes, plan_cleanup,
+        recovery_backup_target, remove_planned_files, remove_planned_files_with,
     };
     use crate::checksum::crc32;
     use crate::content::provider::SegmentProvider as _;
+    use crate::progress::{ProgressObserver, Step};
     use crate::segment::identifier::SegmentIdentifier;
+    use crate::segment::record::RecordIdentifier;
     use crate::store::Repository;
     use crate::tar_archive::archive::TarArchiveReader;
     use crate::tar_archive::file_name::ArchiveFileName;
@@ -4138,6 +4477,7 @@ mod tests {
     use crate::writer::segment_builder::GarbageCollectionGeneration;
     use crate::writer::store_writer::WritableRepository;
     use crate::writer::tar_writer::TarArchiveWriter;
+    use std::num::NonZeroUsize;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -6984,6 +7324,34 @@ mod tests {
     }
 
     #[test]
+    fn a_retention_bound_beside_a_checkpoint_head_update_is_refused_while_planning() {
+        let directory = TestDirectory::repository("retention-with-checkpoint");
+        let store = WritableRepository::open(&directory.path).expect("open writer");
+        create_checkpoint(&store, 1, &[]).expect("checkpoint");
+        store.close().expect("close writer");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Checkpoint removal installs a new head and appends its journal
+        // line, which moves the newest resolvable revision. The bound would
+        // then retire the very head the plan retained, and the run would
+        // abort its own apply — after the checkpoint removal had already
+        // been committed. Refuse while planning, where nothing has moved.
+        let options = CleanupOptions::default()
+            .with_tasks([CleanupTask::ExpiredCheckpoints, CleanupTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"));
+        let error = plan_cleanup(&directory.path, &options).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("checkpoint"),
+            "unexpected refusal: {error}"
+        );
+
+        // Nothing was touched: the checkpoint is still there to be removed
+        // by a run that does not also bound the journal.
+        let repository = Repository::open(&directory.path).expect("healthy repository");
+        assert_eq!(repository.checkpoints().expect("checkpoints").len(), 1);
+    }
+
+    #[test]
     fn checkpoint_planning_rejects_a_physically_exhausted_archive_namespace() {
         let directory = TestDirectory::repository("checkpoint-archive-number-exhausted");
         let store = WritableRepository::open(&directory.path).expect("open writer");
@@ -7361,6 +7729,430 @@ mod tests {
         assert_eq!(repository.head_record_identifier(), new_head);
         crate::tooling::verify_node_tree(&repository, old_head)
             .expect("historical root remains readable");
+    }
+
+    /// Builds the fixture the field report reduces to: an independent
+    /// generation-two head, plus a generation-zero archive that only the
+    /// original journal line still roots. Oak's predicate would reclaim that
+    /// archive; froe's history keep-veto does not. Returns the old head, the
+    /// new head, and the directory.
+    fn history_veto_fixture(name: &str) -> (TestDirectory, RecordIdentifier, RecordIdentifier) {
+        let directory = TestDirectory::repository(name);
+        let old_head = Repository::open(&directory.path)
+            .expect("old repository")
+            .head_record_identifier();
+        let new_head = {
+            let store = WritableRepository::open(&directory.path).expect("open new head writer");
+            let mut writer = store.record_writer(GarbageCollectionGeneration {
+                generation: 2,
+                full_generation: 2,
+                is_compacted: false,
+            });
+            let root = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("new content root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("new super root");
+            writer.finish().expect("finish new head");
+            assert!(store.set_head(store.head(), head));
+            store.close().expect("close new head writer");
+            head
+        };
+        (directory, old_head, new_head)
+    }
+
+    #[test]
+    fn the_plan_prices_the_history_veto_against_oaks_own_predicate() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-price");
+
+        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
+        let plan = plan_cleanup(&directory.path, &options).expect("segment plan");
+
+        // The bootstrap revision's segments are reachable from the old
+        // journal line and from nothing else.
+        assert!(
+            plan.history_protected_segments() != 0,
+            "the bootstrap revision must be counted as history-only"
+        );
+        // And they are two full generations behind the head, so Oak would
+        // have reclaimed them. That difference is the veto's price, and
+        // reporting it is the whole point: it is what turns "reclaimed
+        // nothing" into a number the operator can act on.
+        let (reclaimable_segments, reclaimable_bytes) = plan.history_protected_reclaimable();
+        assert!(
+            reclaimable_segments != 0,
+            "generation-zero history must be priced as reclaimable-but-protected"
+        );
+        assert!(reclaimable_bytes != 0);
+        assert!(reclaimable_segments <= plan.history_protected_segments());
+    }
+
+    #[test]
+    fn the_history_price_counts_the_bulk_segments_held_behind_the_data_ones() {
+        // The veto holds bulk segments only indirectly: a vetoed data segment
+        // keeps seeding its references, so its binary content stays too.
+        // Counting protected *data* segments alone therefore prices a store
+        // full of inline binaries at a rounding error, and an operator
+        // reading that figure would decline a run worth most of the store.
+        let directory = TestDirectory::repository("history-price-bulk");
+        {
+            let store = WritableRepository::open(&directory.path).expect("open binary writer");
+            let mut writer = store.record_writer(GarbageCollectionGeneration {
+                generation: 0,
+                full_generation: 0,
+                is_compacted: false,
+            });
+            // Comfortably past the 256 KiB segment limit, so the content
+            // lands in bulk segments rather than inline in the data segment.
+            let content: Vec<u8> = (0..1024 * 1024).map(|index| (index % 251) as u8).collect();
+            let binary = writer.write_binary_content(&content).expect("binary");
+            let file = writer
+                .write_node(
+                    Some("nt:file"),
+                    &[],
+                    &ChildNodesToWrite::Zero,
+                    &[PropertyToWrite {
+                        name: "data".to_owned(),
+                        property_type: crate::content::property::PropertyType::Binary,
+                        values: PropertyValuesToWrite::Single(binary),
+                    }],
+                )
+                .expect("file node");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: file,
+                    },
+                    &[],
+                )
+                .expect("binary super root");
+            writer.finish().expect("finish binary segments");
+            assert!(store.set_head(store.head(), head));
+            store.close().expect("close binary writer");
+        }
+        // An independent generation-two head that reaches none of it.
+        {
+            let store = WritableRepository::open(&directory.path).expect("open new head writer");
+            let mut writer = store.record_writer(GarbageCollectionGeneration {
+                generation: 2,
+                full_generation: 2,
+                is_compacted: false,
+            });
+            let root = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("new content root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("new super root");
+            writer.finish().expect("finish new head");
+            assert!(store.set_head(store.head(), head));
+            store.close().expect("close new head writer");
+        }
+
+        let priced = plan_cleanup(
+            &directory.path,
+            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+        )
+        .expect("priced plan");
+        let (_priced_segments, priced_bytes) = priced.history_protected_reclaimable();
+
+        // Now actually retire the history and compare. The quoted price must
+        // be what the operation delivers, not the data-segment fraction of it.
+        let outcome = cleanup(
+            &directory.path,
+            CleanupOptions::default()
+                .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+                .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
+        )
+        .expect("bounded cleanup");
+        let freed = outcome.archive_bytes_before - outcome.archive_bytes_after;
+        assert!(
+            freed > 1024 * 1024,
+            "retiring the history must free the binary content: {freed}"
+        );
+        assert_eq!(
+            priced_bytes, freed,
+            "the quoted price must be what retiring the history delivers"
+        );
+    }
+
+    #[test]
+    fn a_journal_retention_bound_retires_the_history_the_veto_protects() {
+        let (directory, old_head, new_head) = history_veto_fixture("history-veto-retention");
+        let protected = plan_cleanup(
+            &directory.path,
+            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+        )
+        .expect("unbounded plan");
+        assert!(protected.history_protected_reclaimable().0 != 0);
+        assert!(
+            !protected.actions().iter().any(|action| matches!(
+                action,
+                CleanupAction::RemoveReclaimableArchive { file_name, .. }
+                    if file_name == "data00000a.tar"
+            )),
+            "without a bound the veto must keep the bootstrap archive"
+        );
+
+        let bounded = CleanupOptions::default()
+            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"));
+        let plan = plan_cleanup(&directory.path, &bounded).expect("bounded plan");
+
+        // The older line is pruned for the retention reason, not for damage.
+        assert!(
+            plan.journal_line_removals().iter().any(|removal| {
+                removal.reason() == JournalRemovalReason::BeyondRetention
+                    && removal.record_identifier() == Some(old_head)
+            }),
+            "the superseded revision must be removed as beyond retention"
+        );
+        // Releasing that root is what makes the archive eligible.
+        assert!(
+            plan.actions().iter().any(|action| matches!(
+                action,
+                CleanupAction::RemoveReclaimableArchive { file_name, .. }
+                    if file_name == "data00000a.tar"
+            )),
+            "the bound must release the bootstrap archive to Oak's predicate"
+        );
+        assert!(plan.estimated_reclaimable_bytes() != 0);
+
+        let outcome = cleanup(&directory.path, bounded).expect("bounded cleanup");
+        assert_eq!(outcome.head_after, new_head);
+        assert!(!directory.path.join("data00000a.tar").exists());
+        let repository = Repository::open(&directory.path).expect("healthy final repository");
+        assert_eq!(repository.head_record_identifier(), new_head);
+        // The journal keeps exactly the bound's worth of revisions, and the
+        // retired history is genuinely gone rather than merely unrooted.
+        let journal =
+            std::fs::read_to_string(directory.path.join("journal.log")).expect("read journal");
+        assert_eq!(
+            journal.lines().count(),
+            1,
+            "a bound of one leaves one journal line"
+        );
+        assert!(
+            crate::tooling::verify_node_tree(&repository, old_head).is_err(),
+            "the retired revision must no longer resolve"
+        );
+    }
+
+    #[test]
+    fn a_retention_bound_without_the_journal_task_is_refused() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-task-guard");
+        // Un-rooting without pruning would leave the line in the journal for
+        // the prospective-plan check to verify as retained history, and the
+        // run would refuse itself with a far less actionable message.
+        let options = CleanupOptions::default()
+            .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"))
+            .with_tasks([CleanupTask::Segments]);
+        let error = plan_cleanup(&directory.path, &options).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("requires the journal task"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn a_bound_larger_than_the_journal_removes_nothing() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-wide-bound");
+        let options = CleanupOptions::default()
+            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(64).expect("wide bound"));
+        let plan = plan_cleanup(&directory.path, &options).expect("wide plan");
+        assert!(
+            !plan
+                .journal_line_removals()
+                .iter()
+                .any(|removal| { removal.reason() == JournalRemovalReason::BeyondRetention }),
+            "a bound wider than the journal must retire nothing"
+        );
+        assert!(plan.history_protected_reclaimable().0 != 0);
+    }
+
+    #[test]
+    fn gate_deferred_garbage_is_counted_rather_than_reported_as_nothing() {
+        let directory = TestDirectory::repository("retained-reclaimable");
+        // One archive holding a single dead generation-zero segment beside
+        // enough live head-generation segments that removing the dead one
+        // cannot repay a rewrite. This is the field report in miniature:
+        // real garbage, correctly identified, correctly declined.
+        let new_head = {
+            let store = WritableRepository::open(&directory.path).expect("open writer");
+            let mut dead = store.record_writer(GarbageCollectionGeneration {
+                generation: 0,
+                full_generation: 0,
+                is_compacted: false,
+            });
+            dead.write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("dead node");
+            dead.finish().expect("finish dead segment");
+
+            let live_generation = GarbageCollectionGeneration {
+                generation: 2,
+                full_generation: 2,
+                is_compacted: false,
+            };
+            for _ in 0..8 {
+                let mut live = store.record_writer(live_generation);
+                live.write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                    .expect("live node");
+                live.finish().expect("finish live segment");
+            }
+            let mut writer = store.record_writer(live_generation);
+            let root = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("content root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("super root");
+            writer.finish().expect("finish head segment");
+            assert!(store.set_head(store.head(), head));
+            store.close().expect("close writer");
+            head
+        };
+
+        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
+        let plan = plan_cleanup(&directory.path, &options).expect("segment plan");
+        assert_eq!(plan.current_head(), new_head);
+        let deferred = plan
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("25% rewrite gate"));
+        assert!(
+            deferred,
+            "expected a savings deferral: {:?}",
+            plan.warnings()
+        );
+        assert!(
+            plan.retained_reclaimable_segments() != 0,
+            "declined garbage must be counted, not silently dropped"
+        );
+        assert!(plan.retained_reclaimable_bytes() != 0);
+        // The distinction the old output could not express: nothing is
+        // reclaimable *by this run*, yet the store is not clean.
+        assert_eq!(plan.estimated_reclaimable_bytes(), 0);
+    }
+
+    /// Records the step names an operation reports, so a test can assert
+    /// what the operator was told froe was doing.
+    struct StepNameObserver {
+        names: Vec<String>,
+    }
+
+    impl ProgressObserver for StepNameObserver {
+        fn step_began(&mut self, step: &Step<'_>) {
+            self.names.push(step.description().to_owned());
+        }
+
+        fn step_advanced(&mut self, _completed: u64) {}
+
+        fn step_ended(&mut self) {}
+    }
+
+    #[test]
+    fn an_unselected_task_reports_no_step_of_its_own() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("unselected-task-step");
+        let mut observer = StepNameObserver { names: Vec::new() };
+        // recovery-backups is not among the defaults, so announcing its
+        // removal step told the operator froe had considered backups it was
+        // never asked to touch.
+        cleanup_with_progress(
+            &directory.path,
+            CleanupOptions::default()
+                .with_tasks([
+                    CleanupTask::Segments,
+                    CleanupTask::Journal,
+                    CleanupTask::StaleTemporaries,
+                ])
+                .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
+            &mut observer,
+        )
+        .expect("bounded cleanup");
+        for unselected in ["removing old recovery backups", "removing stale archives"] {
+            assert!(
+                !observer.names.iter().any(|name| name == unselected),
+                "unselected task reported {unselected:?}: {:?}",
+                observer.names
+            );
+        }
+        assert!(
+            observer
+                .names
+                .iter()
+                .any(|name| name == "removing stale temporary files"),
+            "a selected task still reports its step: {:?}",
+            observer.names
+        );
+    }
+
+    #[test]
+    fn the_outcome_states_the_backup_bytes_the_archive_figures_omit() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("retained-backup-bytes");
+        // What a preceding index repair leaves behind: bytes on disk that no
+        // archive figure counts, so a run that grew the directory reported
+        // its size as unchanged.
+        let retired = directory.path.join("data00000a.tar.bak");
+        std::fs::write(&retired, vec![7u8; 4096]).expect("write retired original");
+
+        let outcome = cleanup(
+            &directory.path,
+            CleanupOptions::default()
+                .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+                .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
+        )
+        .expect("bounded cleanup");
+
+        // Summed independently here rather than trusting the crate's own
+        // predicate: every retained backup form, straight off the directory.
+        let mut expected = 0u64;
+        for entry in std::fs::read_dir(&directory.path).expect("read directory") {
+            let entry = entry.expect("directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let journal_backup = name.starts_with("journal.log.bak.")
+                && name.len() == "journal.log.bak.".len() + 3
+                && name.ends_with(|last: char| last.is_ascii_digit());
+            let archive_backup = std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "bak");
+            if archive_backup || journal_backup {
+                expected += entry.metadata().expect("entry metadata").len();
+            }
+        }
+        assert!(expected >= 4096, "the retired original must be counted");
+        assert_eq!(outcome.retained_recovery_backup_bytes, expected);
+        // The two figures are disjoint: the archive line falls, while the
+        // backup bytes it does not count stay on disk.
+        assert!(outcome.archive_bytes_after < outcome.archive_bytes_before);
     }
 
     #[test]

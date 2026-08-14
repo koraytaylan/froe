@@ -686,6 +686,34 @@ fn recovery_backup_task_without_policy_is_a_cli_configuration_error() {
 }
 
 #[test]
+fn a_journal_bound_beside_an_explicit_task_set_without_journal_is_refused() {
+    // Bounding the journal rewrites journal.log. An operator who named an
+    // explicit task set that excludes the journal did not ask for that, and
+    // silently re-adding the task would delete history they never selected.
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "cleanup",
+            "/not/consulted",
+            "--task",
+            "segments",
+            "--retain-journal-revisions",
+            "1",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run invalid cleanup configuration");
+
+    assert!(!run.status.success());
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("--retain-journal-revisions rewrites journal.log"),
+        "{stderr}"
+    );
+    // Refused on the arguments alone: the store is never opened.
+    assert!(!stderr.contains("not a repository"), "{stderr}");
+}
+
+#[test]
 fn cleanup_preview_escapes_invalid_utf8_and_terminal_control_bytes_exactly() {
     let directory = TestDirectory::new("cleanup-byte-preview");
     let store = directory.path.join("segmentstore");
