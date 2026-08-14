@@ -203,13 +203,26 @@ Before final review:
    committed, record an immutable artifact or permalink, its revision,
    and a content hash. A later edit invalidates the affected final review
    and gates; review of a moving diff is preliminary.
-3. Use an independent reviewer who did not implement the patch. The
-   reviewer audits production code, tests, subprocess/fault harnesses,
-   public API and documentation, and the wording of evidence claims—not
-   only the happy-path implementation. If unavailable, the review remains
-   incomplete: keep a new feature beta, or obtain an explicit maintainer
-   exception for a fix to an existing stable surface and complete
-   independent review before release.
+3. Review the frozen candidate with a reviewer that did not author it,
+   auditing production code, tests, subprocess/fault harnesses, public API
+   and documentation, and the wording of evidence claims—not only the
+   happy-path implementation. This project is single-maintainer, so that
+   reviewer is normally an adversarial automated pass rather than a second
+   person: several reviewers over the frozen range, each briefed on a
+   distinct lens, each finding independently verified before it counts.
+
+   Record which it was. An automated pass is weaker in a specific way — it
+   is briefed by the author, so it inherits the author's framing of what
+   the change is for, and it cannot notice a question nobody thought to
+   ask. It is not a substitute for a second person and must not be
+   described as one. It is what this project can actually sustain, and a
+   gate nobody performs protects nothing.
+
+   Do not skip the lens that audits the evidence wording. On the v0.8.0
+   range it caught a safety-case row citing a test's *accept* condition as
+   an observed failure, and behind it a regression that passed in both
+   branches — a guard on the destructive path that was documented as armed
+   and was not.
 4. Address review findings in follow-up commits so the reviewed base stays
    stable unless amendment or squashing is explicitly requested. Review
    both each delta and the cumulative result.

@@ -19,9 +19,11 @@ to redo.
   gate cannot stand in for it, because platform-specific failures are
   invisible until the other runner executes them.
 * Any high-risk change in the range has completed the review in
-  [`high-risk-changes.md`](high-risk-changes.md). A feature whose
-  interoperability gate is still open stays labelled beta, and the release
-  notes say so.
+  [`high-risk-changes.md`](high-risk-changes.md), and its safety case records
+  whether that review was performed by a person or by an automated
+  adversarial pass. A feature whose interoperability gate is still open stays
+  labelled beta, and the release notes say so; a closed gate needs no
+  caveat.
 * The release pipeline runs the Oak interoperability suite itself, against the
   digest-pinned Sling image, and the publishing job depends on it. That is
   deliberate: the release notes assert that maintenance is verified against a

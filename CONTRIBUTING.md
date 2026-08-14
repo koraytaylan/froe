@@ -213,11 +213,12 @@ HEAD`. For committed work, check the complete review range with `git diff
 
 ### Review discipline
 
-High-risk final review uses a committed, frozen `BASE..HEAD` range and an
-independent reviewer who did not implement the patch. Later edits
-invalidate the affected review and gates. The authoritative review
-procedure, evidence requirements, fallback when an independent reviewer
-is unavailable, and follow-up-commit policy are in
+High-risk final review uses a committed, frozen `BASE..HEAD` range and a
+reviewer that did not author the patch — normally an adversarial automated
+pass, since this project is single-maintainer. Later edits invalidate the
+affected review and gates. The authoritative review procedure, evidence
+requirements, what an automated pass can and cannot stand in for, and the
+follow-up-commit policy are in
 [`docs/high-risk-changes.md`](docs/high-risk-changes.md).
 
 What a reviewer owes in return — that a finding asserting Oak behavior
