@@ -19,10 +19,11 @@
 //!    scope) or must wait for an explicit rebuild.
 //! 3. **Diff.** The store's head is pinned once
 //!    ([`Repository::head_record_identifier`]), so a live repository
-//!    cannot tear the refresh, and [`diff_revisions`] between the
-//!    stamped and the pinned revision yields the changed paths. The
+//!    cannot tear the refresh, and [`diff_revisions_visiting`] between
+//!    the stamped and the pinned revision yields the changed paths. The
 //!    diff prunes unchanged subtrees by record identifier, so this
-//!    walks only the divergent spine.
+//!    walks only the divergent spine, and each difference is folded into
+//!    a dirty range as it arrives rather than collected first.
 //! 4. **Delta.** Changed paths become *dirty ranges*: an added node
 //!    re-exports its whole subtree, a removed node excises its subtree's
 //!    rows, a property change re-exports just that node's rows. The
