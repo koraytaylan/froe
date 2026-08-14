@@ -266,8 +266,17 @@ apart from a store that holds no garbage at all.
 The safety gate rejects cleanup rather than guessing when, for example, a
 current-head segment appears reclaimable, index and segment-header generations
 disagree, an active segment identifier occurs in more than one archive, an
-active archive has no index metadata at all, or a surviving data segment would
-reference removed data.
+active archive has no index metadata at all, or a *live* surviving data segment
+would reference removed data.
+
+Live is the operative word there. A segment the mark phase proved reclaimable
+also survives whenever the rewrite gate declines to rewrite its archive, and
+such a segment may point at other reclaimed data — that is the ordinary state
+Oak leaves behind every partial sweep, and nothing reachable reads it.
+Rejecting on those would abort reclamation on precisely the stores it exists
+for. What must not dangle is what is still reachable, and that is proved
+separately and exactly: every retained journal root is re-verified through a
+provider that excludes the planned removals before a single byte moves.
 
 ### An active archive with no index metadata
 
