@@ -30,8 +30,8 @@ revisions that actually resolve and removes the rest. The removed history is
 **not recoverable**: the segment sweep runs before the journal rewrite in the
 same run, so by the time `journal.log.bak.NNN` exists it names revisions whose
 segments are already unlinked. The backup restores the journal *file*, not the
-history. The flag selects `CleanupTask::Journal`, because the bounded lines must leave the journal in
-the same run — see Guards.
+history. The flag selects `CleanupTask::Journal`, because the bounded lines
+must leave the journal in the same run — see Guards.
 
 **Deliberately not retained.** Payload bytes of segments this session wrote,
 once they are durable in an archive. They were retained before; they are the
@@ -164,40 +164,30 @@ interoperability**, not a froe-to-froe round trip.
 
 ## Known gaps
 
-1. **Independent human review waived by maintainer exception.** The review of
-   this range was performed by automated reviewers against the frozen
-   candidate, not by a second person. It found and corrected a fabricated
-   evidence row, an unarmed regression on the loosened refusal, and a
-   retention-counting defect that retired a readable revision at `N ≥ 2`;
-   those fixes are in `cca15be`. The maintainer has exercised the exception
-   [`high-risk-changes.md`](../high-risk-changes.md) provides and released the
-   range without a second reviewer. Recorded here because the exception is a
-   decision, not an absence — a later reader is entitled to know which
-   evidence rests on review by a person and which does not.
-2. **`--retain-journal-revisions` has no interoperability evidence.** No
+1. **`--retain-journal-revisions` has no interoperability evidence.** No
    interop phase bounds the journal and then asks Oak to boot the result. It
    is the one new destructive operation with no Oak-verified post-state.
-3. **The loosened survivor check reaches the default path.** `--task segments`
+2. **The loosened survivor check reaches the default path.** `--task segments`
    can now proceed where it previously refused. One synthetic fixture on the
    default task set covers it and fails when the stricter check is restored;
    no real store has exercised it.
-4. **No RSS measurement.** Budgets are asserted against `cache_weight`, which
+3. **No RSS measurement.** Budgets are asserted against `cache_weight`, which
    is an approximation. A leak outside the budgeted structures would not be
    caught.
-5. **macOS untested.** Only CI covers it.
-6. **The reopen boundary has no armed fault cutpoint.** It is argued
+4. **macOS untested.** Only CI covers it.
+5. **The reopen boundary has no armed fault cutpoint.** It is argued
    prefix-safe above rather than tested by injection.
-7. **The source-shape guard has known blind spots.** It matches literal type
+6. **The source-shape guard has known blind spots.** It matches literal type
    substrings against single-line field text of three named structs, so it
    does not see `VecDeque`, a field whose type rustfmt wrapped across lines, a
    collection behind a type alias, or state inside a nested struct such as
    `write_state: Mutex<WriteState>`. It also cannot see accumulators held in
    function locals, which is the class the `recover-journal` defect belonged
    to. It raises the cost of reintroducing the defect; it does not prevent it.
-8. **`CleanupAction::PruneJournal` gained a required field.** The enum is
+7. **`CleanupAction::PruneJournal` gained a required field.** The enum is
    `#[non_exhaustive]`, which does not make its variants so; a downstream
    struct-pattern match on that variant is source-breaking. Record it in the
    version bump rationale.
-9. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
+8. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
    returns an owned `Vec`. Bounded by the widest single node, not by the
    store; fixing it needs an additive streaming API.
