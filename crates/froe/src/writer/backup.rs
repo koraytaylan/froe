@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
+use crate::cache::BoundedCache;
 use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
 use crate::error::{Error, Result};
@@ -186,7 +187,6 @@ pub fn recover_journal_with_progress(
     let archives = crate::store::open_all_archives_with_progress(directory, observer)?;
 
     let mut candidates: Vec<Candidate> = Vec::new();
-    let mut seen: HashSet<RecordIdentifier> = HashSet::new();
     let provider = crate::store::ArchiveSet::new(archives);
 
     // Every statement in this loop is infallible — an unreadable segment
@@ -197,7 +197,14 @@ pub fn recover_journal_with_progress(
             .with_total(crate::progress::count(provider.segment_identifier_count())),
     );
     let mut scanned_segments = 0usize;
-    for (scanned, segment_identifier) in provider.segment_identifiers().enumerate() {
+    // Distinct segments, not every archive occurrence. This scan used to
+    // dedupe with a `HashSet<RecordIdentifier>` over every node record in
+    // every data segment — live and garbage alike, the largest set in the
+    // codebase. It was never needed at that grain: a segment's record table
+    // is rejected unless it is strictly ascending by record number, so one
+    // segment cannot yield a duplicate record. Only a segment served by two
+    // archives could, and that is settled here for free.
+    for (scanned, segment_identifier) in provider.distinct_segment_identifiers().enumerate() {
         observer.step_advanced(crate::progress::count(scanned));
         scanned_segments = scanned + 1;
         if segment_identifier.is_bulk_segment() {
@@ -223,9 +230,6 @@ pub fn recover_journal_with_progress(
             .collect();
         for record_number in node_records {
             let record = RecordIdentifier::new(segment_identifier, record_number);
-            if !seen.insert(record) {
-                continue;
-            }
             if is_super_root(&provider, record) {
                 candidates.push(Candidate {
                     record,
@@ -335,6 +339,13 @@ fn signed_uuid_key(record: RecordIdentifier) -> (i64, i64) {
 /// corrupt data. Bounded below the stack-overflow threshold.
 const MAXIMUM_RECOVERY_DEPTH: usize = 4000;
 
+/// Byte budget for the recovery walk's shared visited memo.
+///
+/// One candidate probe walks the head and every checkpoint; the memo exists
+/// so a subtree those trees share is verified once. A miss re-walks, which
+/// is time rather than a different answer.
+const RECOVERY_VISITED_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
 /// Whether a candidate super-root passes Oak's consistency gate: the
 /// tree under its `root` child and the tree under every checkpoint's
 /// `root` snapshot must traverse without a missing segment or malformed
@@ -362,7 +373,11 @@ fn is_fully_consistent(
     corrupt_memory: &mut Vec<String>,
 ) -> bool {
     let super_root = NodeState::new(provider, record);
-    let mut visited = HashSet::new();
+    // Bounded rather than exact: this memo only skips re-walking a subtree
+    // two trees share. Cycle detection is the separate `ancestors` set, so
+    // an eviction costs a re-walk and never a wrong verdict. Unbounded it
+    // held every node reachable from the candidate.
+    let mut visited = BoundedCache::new(RECOVERY_VISITED_BUDGET_BYTES);
 
     // Java's per-tree interleave, order included: the head is probed and
     // walked first — recording its corrupt path before any checkpoint is
@@ -478,12 +493,12 @@ fn check_node_shallow(provider: &dyn SegmentProvider, record: RecordIdentifier) 
 fn verify_tree(
     provider: &dyn SegmentProvider,
     record: RecordIdentifier,
-    visited: &mut HashSet<RecordIdentifier>,
+    visited: &mut BoundedCache<RecordIdentifier, ()>,
 ) -> std::result::Result<(), String> {
     fn walk(
         provider: &dyn SegmentProvider,
         record: RecordIdentifier,
-        visited: &mut HashSet<RecordIdentifier>,
+        visited: &mut BoundedCache<RecordIdentifier, ()>,
         ancestors: &mut HashSet<RecordIdentifier>,
         depth: usize,
         path: &mut String,
@@ -500,9 +515,10 @@ fn verify_tree(
         if ancestors.contains(&record) {
             return Err(path.clone());
         }
-        if !visited.insert(record) {
+        if visited.get(&record).is_some() {
             return Ok(());
         }
+        visited.insert(record, ());
         ancestors.insert(record);
         check_node_shallow(provider, record).map_err(|_| path.clone())?;
         let node = NodeState::new(provider, record);

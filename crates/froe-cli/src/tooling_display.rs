@@ -14,7 +14,7 @@ use froe::tooling::diff::{NodeDifference, PropertyChange};
 use froe::tooling::search::SearchQuery;
 use froe::tooling::{
     check_consistency_with_progress, diff_revisions_with_progress, dump_segment,
-    node_history_with_progress, search_nodes_with_progress,
+    node_history_with_progress, search_nodes_visiting,
 };
 
 use froe_export::json::append_json_values;
@@ -422,18 +422,45 @@ pub(crate) fn print_search(
             details: "search-nodes needs at least one predicate".to_owned(),
         });
     }
-    let outcome = search_nodes_with_progress(repository, &query, limit, &mut reporter.clone())?;
-    for node_match in &outcome.matches {
-        println!(
-            "{}  stable {}",
-            node_match.record, node_match.stable_identifier
+    // Streamed, not collected: the scan visits every node record in the
+    // store, so a broad predicate would otherwise buffer every match before
+    // printing the first. Printing as they are found also means the operator
+    // sees results during the scan rather than after it.
+    let mut found = 0usize;
+    let mut lines = Vec::new();
+    let unreadable_nodes = search_nodes_visiting(
+        repository,
+        &query,
+        &mut reporter.clone(),
+        &mut |node_match| {
+            found += 1;
+            lines.push(format!(
+                "{}  stable {}",
+                node_match.record, node_match.stable_identifier
+            ));
+            if limit != 0 && found >= limit {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        },
+    )?;
+    // The reporter owns the terminal until the scan ends, so the lines are
+    // held for the moment it releases it rather than interleaved with the
+    // progress it is drawing.
+    reporter.finish();
+    for line in lines {
+        println!("{line}");
+    }
+    println!("{found} matching nodes");
+    if limit != 0 && found >= limit {
+        eprintln!(
+            "froe: stopped at the --limit of {limit}; raise it or pass --limit 0 for every match"
         );
     }
-    println!("{} matching nodes", outcome.matches.len());
-    if outcome.unreadable_nodes > 0 {
+    if unreadable_nodes > 0 {
         eprintln!(
-            "froe: {} record table entries could not be read and were skipped",
-            outcome.unreadable_nodes
+            "froe: {unreadable_nodes} record table entries could not be read and were skipped"
         );
     }
     Ok(())

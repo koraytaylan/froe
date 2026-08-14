@@ -96,6 +96,34 @@ pub fn diff_revisions_with_progress(
     filter_path: &str,
     observer: &mut dyn ProgressObserver,
 ) -> Result<Vec<NodeDifference>> {
+    let mut differences = Vec::new();
+    diff_revisions_visiting(
+        directory,
+        before_revision,
+        after_revision,
+        filter_path,
+        observer,
+        &mut |difference| differences.push(difference),
+    )?;
+    Ok(differences)
+}
+
+/// Compares exactly like [`diff_revisions_with_progress`], handing each
+/// difference to `emit` as the walk finds it instead of collecting them.
+///
+/// Prefer this wherever differences are folded into something smaller than
+/// themselves. The collecting form holds the entire change set, and each
+/// entry carries full before and after property state, so a diff against a
+/// stale base — a refresh weeks behind, a repository-wide property rewrite —
+/// buffers a result the caller was only going to reduce anyway.
+pub fn diff_revisions_visiting(
+    directory: &std::path::Path,
+    before_revision: &str,
+    after_revision: &str,
+    filter_path: &str,
+    observer: &mut dyn ProgressObserver,
+    emit: &mut dyn FnMut(NodeDifference),
+) -> Result<()> {
     let archives = open_all_archives_with_progress(directory, observer)?;
     let provider = ArchiveSet::new(archives);
 
@@ -106,7 +134,6 @@ pub fn diff_revisions_with_progress(
     let after_node = content_node_at(&provider, after_head, filter_path)?;
 
     let base_path = normalized_filter_path(filter_path);
-    let mut differences = Vec::new();
     let mut visits = 0u64;
     crate::progress::observe(
         observer,
@@ -118,7 +145,7 @@ pub fn diff_revisions_with_progress(
                 after_node.as_ref(),
                 &base_path,
                 0,
-                &mut differences,
+                emit,
                 &mut visits,
                 observer,
             );
@@ -128,7 +155,7 @@ pub fn diff_revisions_with_progress(
             compared
         },
     )?;
-    Ok(differences)
+    Ok(())
 }
 
 /// Resolves a revision string to a head record identifier. `"head"`
@@ -187,7 +214,7 @@ fn normalized_filter_path(path: &str) -> String {
     }
 }
 
-/// Diffs two node states, appending differences.
+/// Diffs two node states, handing each difference to `emit`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the walk threads its path, depth, output, and work budget"
@@ -198,7 +225,7 @@ fn diff_nodes(
     after: Option<&NodeState<'_>>,
     path: &str,
     depth: usize,
-    differences: &mut Vec<NodeDifference>,
+    emit: &mut dyn FnMut(NodeDifference),
     visits: &mut u64,
     observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
@@ -225,10 +252,10 @@ fn diff_nodes(
     }
     match (before, after) {
         (None, None) => {}
-        (None, Some(_)) => differences.push(NodeDifference::NodeAdded {
+        (None, Some(_)) => emit(NodeDifference::NodeAdded {
             path: display_path(path),
         }),
-        (Some(_), None) => differences.push(NodeDifference::NodeRemoved {
+        (Some(_), None) => emit(NodeDifference::NodeRemoved {
             path: display_path(path),
         }),
         (Some(before_node), Some(after_node)) => {
@@ -236,14 +263,14 @@ fn diff_nodes(
             if before_node.record_identifier() == after_node.record_identifier() {
                 return Ok(());
             }
-            diff_properties(provider, before_node, after_node, path, differences)?;
+            diff_properties(provider, before_node, after_node, path, emit)?;
             diff_children(
                 provider,
                 before_node,
                 after_node,
                 path,
                 depth,
-                differences,
+                emit,
                 visits,
                 observer,
             )?;
@@ -258,7 +285,7 @@ fn diff_properties(
     before: &NodeState<'_>,
     after: &NodeState<'_>,
     path: &str,
-    differences: &mut Vec<NodeDifference>,
+    emit: &mut dyn FnMut(NodeDifference),
 ) -> Result<()> {
     let before_properties = before.properties()?;
     let after_properties = after.properties()?;
@@ -268,7 +295,7 @@ fn diff_properties(
             .iter()
             .find(|property| property.name == after_property.name)
         {
-            None => differences.push(NodeDifference::PropertyChanged {
+            None => emit(NodeDifference::PropertyChanged {
                 path: display_path(path),
                 change: PropertyChange::Added(after_property.clone()),
             }),
@@ -280,7 +307,7 @@ fn diff_properties(
                         &after_property.values,
                     )? =>
             {
-                differences.push(NodeDifference::PropertyChanged {
+                emit(NodeDifference::PropertyChanged {
                     path: display_path(path),
                     change: PropertyChange::Changed {
                         before: before_property.clone(),
@@ -296,7 +323,7 @@ fn diff_properties(
             .iter()
             .any(|property| property.name == before_property.name)
         {
-            differences.push(NodeDifference::PropertyChanged {
+            emit(NodeDifference::PropertyChanged {
                 path: display_path(path),
                 change: PropertyChange::Removed(before_property.clone()),
             });
@@ -316,7 +343,7 @@ fn diff_children(
     after: &NodeState<'_>,
     path: &str,
     depth: usize,
-    differences: &mut Vec<NodeDifference>,
+    emit: &mut dyn FnMut(NodeDifference),
     visits: &mut u64,
     observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
@@ -335,7 +362,7 @@ fn diff_children(
             Some(after_child),
             &child_path,
             depth + 1,
-            differences,
+            emit,
             visits,
             observer,
         )?;
@@ -352,7 +379,7 @@ fn diff_children(
                 None,
                 &child_path,
                 depth + 1,
-                differences,
+                emit,
                 visits,
                 observer,
             )?;

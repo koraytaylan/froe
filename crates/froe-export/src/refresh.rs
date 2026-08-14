@@ -60,9 +60,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use froe::content::node::NodeState;
+use froe::progress::DiscardedProgress;
 use froe::segment::record::RecordIdentifier;
 use froe::store::Repository;
-use froe::tooling::diff::{NodeDifference, diff_revisions};
+use froe::tooling::diff::{NodeDifference, diff_revisions_visiting};
 
 use crate::export::{ExportSink, ExportedNode, export_node};
 use crate::output_file::{
@@ -162,13 +163,33 @@ pub fn refresh_parquet_export(
             revision: revision_text,
         });
     }
-    let differences = match diff_revisions(
+    // Folded as the diff produces them: the change set is reduced to dirty
+    // ranges and then discarded, so collecting it first only meant holding
+    // the larger of the two representations alongside the smaller.
+    let mut ranges = Vec::new();
+    let mut root_removed = false;
+    match diff_revisions_visiting(
         repository.directory(),
         provenance.revision(),
         &revision_text,
         provenance.root_path(),
+        &mut DiscardedProgress,
+        &mut |difference| {
+            // A removed export root is the full export's missing-path
+            // verdict: definitive — no retry can change it — and the
+            // existing tables stay untouched.
+            if matches!(
+                &difference,
+                NodeDifference::NodeRemoved { path } if path == provenance.root_path()
+            ) {
+                root_removed = true;
+            }
+            if let Some(range) = dirty_range_for(&difference, provenance.root_path(), depth) {
+                ranges.push(range);
+            }
+        },
     ) {
-        Ok(differences) => differences,
+        Ok(()) => {}
         Err(error) => {
             // Validation resolved the stamped revision moments ago, so
             // this is a segment vanishing mid-refresh — a compaction
@@ -182,20 +203,11 @@ pub fn refresh_parquet_export(
                 replaceable: true,
             });
         }
-    };
-    // A removed export root is the full export's missing-path verdict:
-    // definitive — no retry can change it — and the existing tables
-    // stay untouched.
-    let root_removed = differences.iter().any(|difference| {
-        matches!(
-            difference,
-            NodeDifference::NodeRemoved { path } if path == provenance.root_path()
-        )
-    });
+    }
     if root_removed {
         return Ok(ParquetRefresh::Missing);
     }
-    let ranges = dirty_ranges(&differences, provenance.root_path(), depth);
+    normalize_dirty_ranges(&mut ranges);
     if ranges.is_empty() {
         // The head moved without touching the exported subtree — a
         // commit elsewhere or a checkpoint change — so the exported
@@ -617,14 +629,35 @@ fn path_depth(path: &str) -> usize {
 /// export's depth limit carry no rows — the old file has none there
 /// and a full re-export would write none — so they are dropped; an
 /// added subtree inside the limit re-exports with its remaining depth.
+#[cfg(test)]
 fn dirty_ranges(
     differences: &[NodeDifference],
     root_path: &str,
     depth_limit: Option<usize>,
 ) -> Vec<DirtyRange> {
+    let mut ranges: Vec<DirtyRange> = differences
+        .iter()
+        .filter_map(|difference| dirty_range_for(difference, root_path, depth_limit))
+        .collect();
+    normalize_dirty_ranges(&mut ranges);
+    ranges
+}
+
+/// The dirty range one difference implies, or `None` when the change falls
+/// outside the export's depth limit.
+///
+/// Split out from [`dirty_ranges`] so a refresh can fold each difference as
+/// the diff produces it. Holding the whole change set only to reduce it to
+/// ranges meant both collections were live at once, and the change set is
+/// far the larger of the two — every entry carries full before and after
+/// property state.
+fn dirty_range_for(
+    difference: &NodeDifference,
+    root_path: &str,
+    depth_limit: Option<usize>,
+) -> Option<DirtyRange> {
     let root_depth = path_depth(root_path);
-    let mut ranges = Vec::new();
-    for difference in differences {
+    {
         let (path, subtree, replacement) = match difference {
             NodeDifference::NodeAdded { path } => {
                 (path, true, Replacement::ReExport { depth: None })
@@ -640,7 +673,7 @@ fn dirty_ranges(
         // range here keeps a deep removal from rewriting both tables
         // for zero effect.
         if depth_limit.is_some_and(|limit| range_depth > limit) {
-            continue;
+            return None;
         }
         let replacement = match (replacement, depth_limit) {
             (Replacement::Excise, _) => Replacement::Excise,
@@ -649,12 +682,16 @@ fn dirty_ranges(
             },
             (reexport @ Replacement::ReExport { .. }, _) => reexport,
         };
-        ranges.push(DirtyRange {
+        Some(DirtyRange {
             path: path.clone(),
             subtree,
             replacement,
-        });
+        })
     }
+}
+
+/// Sorts and folds dirty ranges into the canonical set the refresh applies.
+fn normalize_dirty_ranges(ranges: &mut Vec<DirtyRange>) {
     ranges.sort_by(|first, second| first.path.cmp(&second.path));
     // The diff never reports nested or duplicated ranges, but the merge
     // relies on it: fold any duplicate defensively — the subtree shape
@@ -671,7 +708,6 @@ fn dirty_ranges(
         }
         true
     });
-    ranges
 }
 
 /// Whether `path` lies inside `range`: the range root itself, or — for

@@ -75,17 +75,49 @@ pub fn search_nodes_with_progress(
     limit: usize,
     observer: &mut dyn ProgressObserver,
 ) -> Result<SearchOutcome> {
+    let mut matches = Vec::new();
+    let unreadable_nodes = search_nodes_visiting(directory, query, observer, &mut |found| {
+        matches.push(found);
+        if limit != 0 && matches.len() >= limit {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })?;
+    Ok(SearchOutcome {
+        matches,
+        unreadable_nodes,
+    })
+}
+
+/// Searches exactly like [`search_nodes_with_progress`], handing each match
+/// to `visit` as it is found instead of collecting them.
+///
+/// This is the form to prefer for anything that consumes matches one at a
+/// time — printing them, counting them, streaming them onward. The collecting
+/// form has to hold every match until the scan ends, and the scan covers every
+/// node record in the store including dead revisions, so a broad predicate on
+/// a large repository buffers far more than the caller ever needed at once.
+/// Returning [`std::ops::ControlFlow::Break`] stops the scan.
+///
+/// Returns the number of node records that could not be read, the same count
+/// [`SearchOutcome::unreadable_nodes`] carries.
+pub fn search_nodes_visiting(
+    directory: &std::path::Path,
+    query: &SearchQuery,
+    observer: &mut dyn ProgressObserver,
+    visit: &mut dyn FnMut(NodeMatch) -> std::ops::ControlFlow<()>,
+) -> Result<u64> {
     let archives = open_all_archives_with_progress(directory, observer)?;
     let provider = ArchiveSet::new(archives);
 
-    let mut matches = Vec::new();
     let mut unreadable_nodes = 0u64;
     observer.step_began(
         &Step::new("searching segments", WorkUnit::Segments)
             .with_total(crate::progress::count(provider.segment_identifier_count())),
     );
     let mut searched_segments = 0usize;
-    for (searched, segment_identifier) in provider.segment_identifiers().enumerate() {
+    for (searched, segment_identifier) in provider.distinct_segment_identifiers().enumerate() {
         observer.step_advanced(crate::progress::count(searched));
         searched_segments = searched + 1;
         if segment_identifier.is_bulk_segment() {
@@ -113,17 +145,14 @@ pub fn search_nodes_with_progress(
                     let stable_identifier = NodeState::new(&provider, record)
                         .stable_identifier()
                         .unwrap_or_else(|_| record.to_string());
-                    matches.push(NodeMatch {
+                    let found = NodeMatch {
                         record,
                         stable_identifier,
-                    });
-                    if limit != 0 && matches.len() >= limit {
+                    };
+                    if visit(found).is_break() {
                         observer.step_advanced(crate::progress::count(searched_segments));
                         observer.step_ended();
-                        return Ok(SearchOutcome {
-                            matches,
-                            unreadable_nodes,
-                        });
+                        return Ok(unreadable_nodes);
                     }
                 }
                 Err(_) => unreadable_nodes += 1,
@@ -132,10 +161,7 @@ pub fn search_nodes_with_progress(
     }
     observer.step_advanced(crate::progress::count(searched_segments));
     observer.step_ended();
-    Ok(SearchOutcome {
-        matches,
-        unreadable_nodes,
-    })
+    Ok(unreadable_nodes)
 }
 
 /// Whether one node satisfies every predicate of the query.

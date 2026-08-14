@@ -19,11 +19,11 @@
 //! [`SegmentProvider`] with bounded caches for parsed segments, strings,
 //! and templates — the hot metadata of any traversal.
 
-use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::cache::BoundedCache;
 use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
 use crate::content::template::{Template, read_template};
@@ -42,11 +42,17 @@ use crate::tar_archive::file_name::group_file_generations_newest_first;
 /// (`store.version` in the manifest; 2 since Oak 1.8).
 const MAXIMUM_STORE_VERSION: i64 = 2;
 
-/// Bounded cache capacities. Parsed segment structures are the largest
-/// entries (their record tables), so their cap is the smallest.
-const SEGMENT_CACHE_CAPACITY: usize = 4096;
-const STRING_CACHE_CAPACITY: usize = 65_536;
-const TEMPLATE_CACHE_CAPACITY: usize = 16_384;
+/// Cache budgets, in bytes.
+///
+/// Bytes rather than entries: a parsed segment's resident size follows the
+/// number of records the segment happens to hold, which spans two orders of
+/// magnitude across real stores. The previous entry caps held about 120 MB
+/// of parsed segments on a typical AEM store and about 1.4 GB on a dense
+/// one — the same configuration, an order of magnitude apart. These figures
+/// are what the process actually holds, whatever the segments look like.
+pub(crate) const SEGMENT_CACHE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+const STRING_CACHE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
+const TEMPLATE_CACHE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
 
 /// A read-only segment store repository.
 pub struct Repository {
@@ -90,7 +96,12 @@ impl Repository {
 
         let archives = open_archives_newest_valid_first(directory, &archive_file_names, observer)?;
 
-        let mut segment_locations = HashMap::new();
+        // Reserved up front from the archives' own entry counts. Growing a
+        // map of this size by doubling holds the old and new tables at once
+        // at every rehash, so the peak was half again the steady size for a
+        // total that is knowable before the first insert.
+        let expected_segments: usize = archives.iter().map(TarArchiveReader::segment_count).sum();
+        let mut segment_locations = HashMap::with_capacity(expected_segments);
         for (archive_position, archive) in archives.iter().enumerate() {
             for segment_identifier in archive.segment_identifiers() {
                 segment_locations
@@ -118,9 +129,9 @@ impl Repository {
             segment_locations,
             journal_entries,
             head_record_identifier,
-            parsed_segment_cache: RwLock::new(BoundedCache::new(SEGMENT_CACHE_CAPACITY)),
-            string_cache: RwLock::new(BoundedCache::new(STRING_CACHE_CAPACITY)),
-            template_cache: RwLock::new(BoundedCache::new(TEMPLATE_CACHE_CAPACITY)),
+            parsed_segment_cache: RwLock::new(BoundedCache::new(SEGMENT_CACHE_BUDGET_BYTES)),
+            string_cache: RwLock::new(BoundedCache::new(STRING_CACHE_BUDGET_BYTES)),
+            template_cache: RwLock::new(BoundedCache::new(TEMPLATE_CACHE_BUDGET_BYTES)),
         })
     }
 
@@ -317,7 +328,8 @@ impl ArchiveSet {
     /// Wraps a set of already-opened archives.
     #[must_use]
     pub fn new(archives: Vec<TarArchiveReader>) -> Self {
-        let mut segment_locations = HashMap::new();
+        let expected_segments: usize = archives.iter().map(TarArchiveReader::segment_count).sum();
+        let mut segment_locations = HashMap::with_capacity(expected_segments);
         for (position, archive) in archives.iter().enumerate() {
             for identifier in archive.segment_identifiers() {
                 segment_locations.entry(identifier).or_insert(position);
@@ -326,15 +338,34 @@ impl ArchiveSet {
         Self {
             archives,
             segment_locations,
-            parsed_segment_cache: RwLock::new(BoundedCache::new(SEGMENT_CACHE_CAPACITY)),
+            parsed_segment_cache: RwLock::new(BoundedCache::new(SEGMENT_CACHE_BUDGET_BYTES)),
         }
     }
 
-    /// Every segment identifier across the archives.
+    /// Every segment identifier across the archives, duplicates included:
+    /// one segment served by two archives is yielded once per archive.
     pub fn segment_identifiers(&self) -> impl Iterator<Item = SegmentIdentifier> + '_ {
         self.archives
             .iter()
             .flat_map(TarArchiveReader::segment_identifiers)
+    }
+
+    /// Every segment identifier exactly once, in archive probe order.
+    ///
+    /// A scan over the whole store that must not process a segment twice can
+    /// use this instead of accumulating its own seen-set. The location map
+    /// that decides which archive owns a duplicate is already built, so
+    /// deduplicating here costs nothing, where the caller would have paid
+    /// per-segment — or worse, per-record — for the same answer.
+    pub fn distinct_segment_identifiers(&self) -> impl Iterator<Item = SegmentIdentifier> + '_ {
+        self.archives
+            .iter()
+            .enumerate()
+            .flat_map(move |(position, archive)| {
+                archive.segment_identifiers().filter(move |identifier| {
+                    self.segment_locations.get(identifier) == Some(&position)
+                })
+            })
     }
 
     /// How many identifiers [`ArchiveSet::segment_identifiers`] yields.
@@ -805,42 +836,10 @@ fn is_java_property_whitespace(character: char) -> bool {
 /// Parsed segment structures, strings, and templates are all cheap to
 /// re-create from the memory-mapped archives, so simple eviction beats
 /// the bookkeeping cost of recency tracking here.
-struct BoundedCache<Key, Value> {
-    entries: HashMap<Key, Value>,
-    insertion_order: VecDeque<Key>,
-    capacity: usize,
-}
-
-impl<Key: Eq + Hash + Clone, Value: Clone> BoundedCache<Key, Value> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: HashMap::with_capacity(capacity.min(1024)),
-            insertion_order: VecDeque::with_capacity(capacity.min(1024)),
-            capacity,
-        }
-    }
-
-    fn get(&self, key: &Key) -> Option<Value> {
-        self.entries.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: Key, value: Value) {
-        if self.entries.insert(key.clone(), value).is_none() {
-            self.insertion_order.push_back(key);
-            while self.insertion_order.len() > self.capacity {
-                if let Some(oldest) = self.insertion_order.pop_front() {
-                    self.entries.remove(&oldest);
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, MAXIMUM_STORE_VERSION, parse_java_i32, parse_java_properties,
-        parse_manifest_store_version,
+        MAXIMUM_STORE_VERSION, parse_java_i32, parse_java_properties, parse_manifest_store_version,
     };
 
     fn java_units(value: &str) -> Vec<u16> {
@@ -973,29 +972,5 @@ mod tests {
     fn manifest_properties_reject_malformed_unicode_escapes() {
         assert!(parse_manifest_store_version(r"store.version=\u12x4").is_err());
         assert!(parse_manifest_store_version(r"unrelated=\u123").is_err());
-    }
-
-    #[test]
-    fn bounded_cache_evicts_oldest_entries() {
-        let mut cache: BoundedCache<u32, u32> = BoundedCache::new(2);
-        cache.insert(1, 10);
-        cache.insert(2, 20);
-        assert_eq!(cache.get(&1), Some(10));
-        cache.insert(3, 30);
-        assert_eq!(cache.get(&1), None, "the oldest entry is evicted");
-        assert_eq!(cache.get(&2), Some(20));
-        assert_eq!(cache.get(&3), Some(30));
-    }
-
-    #[test]
-    fn bounded_cache_reinsertion_does_not_duplicate() {
-        let mut cache: BoundedCache<u32, u32> = BoundedCache::new(2);
-        cache.insert(1, 10);
-        cache.insert(1, 11);
-        cache.insert(2, 20);
-        assert_eq!(cache.get(&1), Some(11), "reinsertion updates the value");
-        cache.insert(3, 30);
-        assert_eq!(cache.get(&1), None);
-        assert_eq!(cache.get(&2), Some(20));
     }
 }

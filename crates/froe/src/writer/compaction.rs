@@ -20,9 +20,9 @@
 //! compacted head — matching Oak's offline `compact` tool — so a
 //! subsequent AEM start resolves the compacted state directly.
 
-use std::collections::HashMap;
 use std::io::Write;
 
+use crate::cache::BoundedCache;
 use crate::content::node::{NodeState, PropertyState, PropertyValues};
 use crate::content::property::{PropertyType, PropertyValue};
 use crate::content::provider::SegmentProvider;
@@ -78,10 +78,32 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
     source_root: RecordIdentifier,
     observer: &mut dyn ProgressObserver,
 ) -> Result<(RecordIdentifier, u64)> {
+    deep_copy_tree_with_memo_budget(
+        source,
+        writer,
+        source_root,
+        COMPACTION_MEMO_BUDGET_BYTES,
+        observer,
+    )
+}
+
+/// Deep-copies exactly like [`deep_copy_tree_with_progress`], with an
+/// explicit sharing-memo budget.
+///
+/// The budget changes how much of the source DAG's sharing survives into the
+/// copy, and nothing else: any budget, zero included, must produce a complete
+/// and correct tree. Tests use that to prove the memo is an optimization.
+fn deep_copy_tree_with_memo_budget<Sink: SegmentSink>(
+    source: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    source_root: RecordIdentifier,
+    memo_budget_bytes: usize,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(RecordIdentifier, u64)> {
     let mut copier = Compactor {
         source,
         writer,
-        rewritten_nodes: HashMap::new(),
+        rewritten_nodes: BoundedCache::new(memo_budget_bytes),
         compacted_nodes: 0,
         reported_nodes: 0,
         observer,
@@ -102,12 +124,30 @@ const COPIED_NODE_REPORT_STRIDE: u64 = 512;
 /// well below the point where recursion would overflow the stack.
 const MAXIMUM_COMPACTION_DEPTH: usize = 4000;
 
+/// Byte budget for the compaction sharing memo.
+///
+/// Sized to hold a few million entries, matching the order of Oak's own
+/// fixed-capacity compaction caches. Beyond it, a shared subtree met again
+/// is copied a second time: the compacted store stays correct and complete,
+/// and the cost lands on output size rather than on resident memory.
+const COMPACTION_MEMO_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
 /// Deep-copies nodes into a fresh generation, sharing rewritten records
 /// through a source-record cache.
 struct Compactor<'writer, Sink: SegmentSink> {
     source: &'writer dyn SegmentProvider,
     writer: &'writer mut RecordWriter<Sink>,
-    rewritten_nodes: HashMap<RecordIdentifier, RecordIdentifier>,
+    /// Source record to its rewritten copy, under a byte budget.
+    ///
+    /// The memo preserves DAG sharing: a subtree the live root and a
+    /// checkpoint both reference is copied once and referenced twice. It is
+    /// not, however, a correctness property — Oak's own compactor caps the
+    /// equivalent cache and accepts duplicated output on a miss, and
+    /// `WriterCacheManager.Empty` shows the empty cache produces a correct
+    /// store. Unbounded it held one entry per distinct source node, which on
+    /// a large repository is tens of gigabytes; a miss now costs a duplicated
+    /// subtree in the output instead of the process.
+    rewritten_nodes: BoundedCache<RecordIdentifier, RecordIdentifier>,
     compacted_nodes: u64,
     /// The count at the last progress report, so the observer is called
     /// once per stride rather than once per node.
@@ -121,7 +161,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         source_node: RecordIdentifier,
         depth: usize,
     ) -> Result<RecordIdentifier> {
-        if let Some(&rewritten) = self.rewritten_nodes.get(&source_node) {
+        if let Some(rewritten) = self.rewritten_nodes.get(&source_node) {
             return Ok(rewritten);
         }
         // The cache is only populated once a node is fully written, so a
@@ -389,7 +429,7 @@ pub(crate) fn fsync_directory(directory: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactionKind, compact};
+    use super::{CompactionKind, compact, deep_copy_tree_with_memo_budget};
     use crate::content::node::PropertyValues;
     use crate::content::property::PropertyValue;
     use crate::content::provider::SegmentProvider;
@@ -573,6 +613,38 @@ mod tests {
         let gc_log = std::fs::read_to_string(directory.path.join("gc.log")).expect("gc.log");
         assert_eq!(gc_log.lines().count(), 1);
         assert_eq!(gc_log.split(',').count(), 7, "seven gc.log fields");
+    }
+
+    #[test]
+    fn a_deep_copy_with_no_sharing_memo_still_produces_the_whole_tree() {
+        let directory = TestDirectory::new("memo-evicts");
+        build_populated_store(&directory);
+
+        // A zero-budget memo is the worst case the bound can produce: every
+        // shared subtree is copied again instead of being referenced. The
+        // copy must still be complete and correct — the memo trades output
+        // size for resident memory, never correctness.
+        let copied = {
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let head = store.head();
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let (root, copied) = deep_copy_tree_with_memo_budget(
+                &store,
+                &mut writer,
+                head,
+                0,
+                &mut crate::progress::DiscardedProgress,
+            )
+            .expect("deep copy without a memo");
+            writer.finish().expect("finish");
+            assert!(store.set_head(head, root));
+            store.close().expect("close");
+            copied
+        };
+        assert!(copied > 0);
+
+        assert_content_intact(&directory);
     }
 
     #[test]

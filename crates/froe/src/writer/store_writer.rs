@@ -28,6 +28,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::cache::BoundedCache;
 use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
 use crate::content::template::{Template, read_template};
@@ -48,8 +49,40 @@ use crate::writer::tar_writer::TarArchiveWriter;
 /// The default archive rotation threshold (Oak: 256 MB).
 const DEFAULT_MAXIMUM_ARCHIVE_SIZE: u64 = 256 * 1024 * 1024;
 
+/// Byte budget for the session read-back cache, given the archive size the
+/// session rotates at.
+///
+/// Sized so the archive currently being written always fits. Eviction is in
+/// write order, so the newest archive's worth of segments is exactly what
+/// survives — which makes "a segment in the open archive is always cached" an
+/// invariant the read path can rely on rather than a hope. Rotated archives
+/// need no residency at all: they are reopened and served from their mapping.
+/// The doubling is headroom for the entry overhead the budget also charges.
+fn session_cache_budget_bytes(maximum_archive_size: u64) -> usize {
+    usize::try_from(maximum_archive_size.saturating_mul(2)).unwrap_or(usize::MAX)
+}
+
 /// A parsed segment paired with its shared bytes.
 type SharedSegment = (Arc<ParsedSegment>, Arc<Vec<u8>>);
+
+/// What the session remembers about a segment it wrote.
+///
+/// Deliberately not the segment: this used to be the parsed structure *and*
+/// an owned copy of every byte, retained for the whole session with no
+/// eviction, which made a compaction hold its entire output in memory. The
+/// bytes are already on disk in the archive the session just wrote them to,
+/// so what has to survive here is only what cannot be recovered from the
+/// archive alone plus what proves the archive still holds the right bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionSegment {
+    /// The generation triple, answering `segment_generation` without a read.
+    generation: GarbageCollectionGeneration,
+    /// The payload CRC the writer computed. Certification compares it with
+    /// the CRC in the archive's own tar entry name, which the archive
+    /// separately proves against the payload — together exactly the
+    /// guarantee the retained byte copy used to give.
+    payload_crc: u32,
+}
 
 /// Returns the next unused archive number. `None` is the explicit exhausted
 /// state after an active `u32::MAX` archive; wrapping to zero is never valid.
@@ -212,31 +245,41 @@ impl FinalizedSessionFileFingerprint {
     }
 }
 
+/// A certificate that one finalized session archive is still the file it was
+/// when certified.
+///
+/// It records the file's identity and metadata rather than holding it open.
+/// Holding an open descriptor per archive was one file descriptor for every
+/// 256 MiB of output, so a large compaction exhausted the process limit with
+/// `EMFILE` after all of its work was already done — a failure mode that
+/// scaled with the repository. The fingerprint carries device and inode
+/// alongside length, mtime and ctime, so a replaced file is caught by its
+/// identity and a rewritten one by its metadata. Reusing an inode number
+/// *and* reproducing a nanosecond ctime would be needed to defeat it, and
+/// this whole path runs under the exclusive repository lock, which excludes
+/// every cooperating writer.
 struct FinalizedSessionArchiveCertificate {
     path: PathBuf,
-    held: File,
     fingerprint: FinalizedSessionFileFingerprint,
 }
 
 impl FinalizedSessionArchiveCertificate {
     fn capture(path: PathBuf) -> Result<Self> {
-        let held = open_regular_file_no_follow(&path, false)?;
-        let fingerprint = FinalizedSessionFileFingerprint::from_metadata(&held.metadata()?)?;
-        let certificate = Self {
-            path,
-            held,
-            fingerprint,
-        };
+        // Opened only to prove it is a regular file, not a symlink or a
+        // device, then closed immediately.
+        let opened = open_regular_file_no_follow(&path, false)?;
+        let fingerprint = FinalizedSessionFileFingerprint::from_metadata(&opened.metadata()?)?;
+        drop(opened);
+        let certificate = Self { path, fingerprint };
         certificate.recertify()?;
         Ok(certificate)
     }
 
     fn recertify(&self) -> Result<()> {
-        let held = FinalizedSessionFileFingerprint::from_metadata(&self.held.metadata()?)?;
         let named = FinalizedSessionFileFingerprint::from_metadata(&std::fs::symlink_metadata(
             &self.path,
         )?)?;
-        if held != self.fingerprint || named != self.fingerprint {
+        if named != self.fingerprint {
             return Err(Error::InvalidFormat {
                 details: format!(
                     "finalized session archive {} changed inode or metadata after certification",
@@ -294,12 +337,31 @@ pub struct WritableRepository {
     /// Archives that existed before this session, newest first.
     base_archives: Vec<TarArchiveReader>,
     /// Segments written in this session, servable without a mapping.
-    session_segments: RwLock<HashMap<SegmentIdentifier, SharedSegment>>,
+    /// Locators for segments written in this session — metadata only. The
+    /// payloads live in the archives on disk; see [`SessionSegment`].
+    session_segments: RwLock<HashMap<SegmentIdentifier, SessionSegment>>,
+    /// Recently written segments, kept for read-back under a byte budget.
+    ///
+    /// The budget is at least one archive's worth, so every segment in the
+    /// archive still being written is resident and read-back never has to
+    /// reach into the open writer. Rotated archives are served from their
+    /// mappings in [`Self::session_archives`] instead.
+    session_segment_cache: RwLock<BoundedCache<SegmentIdentifier, SharedSegment>>,
+    /// Archives this session finished and reopened, so their segments stay
+    /// readable through a mapping rather than through retained buffers.
+    session_archives: RwLock<Vec<TarArchiveReader>>,
     /// Exact physical write order, including the archive rotation boundary
     /// for every session segment. Cleanup certification must preserve this
     /// order because later reverse-order marking is semantically significant.
     session_segment_writes: RwLock<Vec<SessionSegmentWrite>>,
-    parsed_segment_cache: RwLock<HashMap<SegmentIdentifier, Arc<ParsedSegment>>>,
+    /// Base segments parsed while this session reads them, under the same
+    /// byte budget the read path uses.
+    ///
+    /// It was an unbounded `HashMap`, which made every base segment a
+    /// compaction touched resident for the whole run: a deep copy reads
+    /// every reachable segment, so the cache grew to a fraction of the live
+    /// store. A miss re-parses from the archive mapping and touches no I/O.
+    parsed_segment_cache: RwLock<BoundedCache<SegmentIdentifier, Arc<ParsedSegment>>>,
     write_state: Mutex<WriteState>,
     /// Cleanup checkpoint commits seal and validate their archive on disk
     /// before making the new head durable in the journal.
@@ -356,8 +418,14 @@ impl WritableRepository {
             maximum_archive_size: DEFAULT_MAXIMUM_ARCHIVE_SIZE,
             base_archives,
             session_segments: RwLock::new(HashMap::new()),
+            session_segment_cache: RwLock::new(BoundedCache::new(session_cache_budget_bytes(
+                DEFAULT_MAXIMUM_ARCHIVE_SIZE,
+            ))),
+            session_archives: RwLock::new(Vec::new()),
             session_segment_writes: RwLock::new(Vec::new()),
-            parsed_segment_cache: RwLock::new(HashMap::new()),
+            parsed_segment_cache: RwLock::new(BoundedCache::new(
+                crate::store::SEGMENT_CACHE_BUDGET_BYTES,
+            )),
             seal_archive_before_head: false,
             cleanup_archive_metadata: None,
             #[cfg(test)]
@@ -493,8 +561,14 @@ impl WritableRepository {
             maximum_archive_size: DEFAULT_MAXIMUM_ARCHIVE_SIZE,
             base_archives,
             session_segments: RwLock::new(HashMap::new()),
+            session_segment_cache: RwLock::new(BoundedCache::new(session_cache_budget_bytes(
+                DEFAULT_MAXIMUM_ARCHIVE_SIZE,
+            ))),
+            session_archives: RwLock::new(Vec::new()),
             session_segment_writes: RwLock::new(Vec::new()),
-            parsed_segment_cache: RwLock::new(HashMap::new()),
+            parsed_segment_cache: RwLock::new(BoundedCache::new(
+                crate::store::SEGMENT_CACHE_BUDGET_BYTES,
+            )),
             seal_archive_before_head: true,
             cleanup_archive_metadata: Some(cleanup_archive_metadata),
             #[cfg(test)]
@@ -691,8 +765,12 @@ impl WritableRepository {
         // causing sweep/trailer filtering to remove the authoritative copy.
         // Refuse before closing the current writer or taking base readers so
         // the caller observes a true fail-closed, non-mutating preflight.
-        let base_locations = unique_active_segment_locations(&self.base_archives)?;
+        // Scoped, not held: this is a store-wide identifier map built for a
+        // preflight that ends in milliseconds, and leaving it bound for the
+        // rest of the reclaim pinned hundreds of megabytes across the
+        // expensive phase for no reader.
         {
+            let base_locations = unique_active_segment_locations(&self.base_archives)?;
             let session_segments = self
                 .session_segments
                 .read()
@@ -885,7 +963,7 @@ impl WritableRepository {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
-            != parsed_cache_entries_before_reclaim
+            > parsed_cache_entries_before_reclaim
         {
             return Err(Error::InvalidFormat {
                 details: "post-compaction certification and sweeping grew the writable base-segment cache"
@@ -903,6 +981,51 @@ impl WritableRepository {
         // before the caller proceeds to the journal rewrite.
         sync_directory_strict(&self.directory)?;
         Ok(())
+    }
+
+    /// Re-reads a session segment from the archive it was written to.
+    ///
+    /// Rotated archives are reopened mappings and answer directly. The
+    /// archive still being written answers through the writer's positional
+    /// read-back; the cache budget keeps that archive resident, so this is
+    /// the path a smaller-than-default budget would take rather than the
+    /// ordinary one. Nothing here holds the write-state lock across a
+    /// provider call, and no caller reaches a provider read while holding it.
+    fn reread_session_segment(
+        &self,
+        segment_identifier: SegmentIdentifier,
+    ) -> Result<SegmentView<'_>> {
+        let bytes = {
+            let session_archives = self
+                .session_archives
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rotated = session_archives
+                .iter()
+                .find_map(|archive| archive.segment_data(segment_identifier))
+                .map(<[u8]>::to_vec);
+            if let Some(bytes) = rotated {
+                bytes
+            } else {
+                let state = self.lock_write_state();
+                let open = state
+                    .tar_writer
+                    .as_ref()
+                    .and_then(|writer| writer.read_segment(segment_identifier).transpose())
+                    .transpose()?;
+                open.ok_or(Error::SegmentNotFound { segment_identifier })?
+            }
+        };
+        let structure = Arc::new(ParsedSegment::parse(segment_identifier, &bytes)?);
+        let shared = (structure, Arc::new(bytes));
+        self.session_segment_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(segment_identifier, shared.clone());
+        Ok(SegmentView {
+            structure: shared.0,
+            bytes: crate::segment::view::SegmentBytes::Shared(shared.1),
+        })
     }
 
     /// Whether any source of this store holds the segment.
@@ -925,17 +1048,13 @@ impl WritableRepository {
         &self,
         segment_identifier: SegmentIdentifier,
     ) -> Option<GarbageCollectionGeneration> {
-        if let Some((structure, _)) = self
+        if let Some(session) = self
             .session_segments
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&segment_identifier)
         {
-            return Some(GarbageCollectionGeneration {
-                generation: structure.generation,
-                full_generation: structure.full_generation,
-                is_compacted: structure.is_compacted,
-            });
+            return Some(session.generation);
         }
         for archive in &self.base_archives {
             if let Some(entry) = archive.index_entry(segment_identifier) {
@@ -1054,6 +1173,19 @@ impl WritableRepository {
         self.session_segments
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                segment.identifier,
+                SessionSegment {
+                    generation: stored_segment_generation(segment.identifier, &structure),
+                    payload_crc: crate::checksum::crc32(&segment.bytes),
+                },
+            );
+        // The payload goes to the read-back cache, not to permanent session
+        // state: it is already durable in the archive this call just appended
+        // it to, and the cache is sized to keep the open archive resident.
+        self.session_segment_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(segment.identifier, (structure, Arc::new(segment.bytes)));
         self.session_segment_writes
             .write()
@@ -1166,15 +1298,11 @@ impl WritableRepository {
         #[cfg(test)]
         self.finalized_session_semantic_validations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let expected_segments: HashMap<SegmentIdentifier, SharedSegment> = self
+        let expected_segments: HashMap<SegmentIdentifier, SessionSegment> = self
             .session_segments
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .map(|(identifier, (structure, bytes))| {
-                (*identifier, (Arc::clone(structure), Arc::clone(bytes)))
-            })
-            .collect();
+            .clone();
         let expected_writes = self
             .session_segment_writes
             .read()
@@ -1286,7 +1414,7 @@ impl WritableRepository {
             let mut expected_graph = ExpectedGraph::new();
             let mut expected_binary_references = ExpectedBinaryReferences::new();
             for identifier in archive.segment_identifiers() {
-                let Some((_, expected_bytes)) = expected_segments.get(&identifier) else {
+                let Some(expected_session) = expected_segments.get(&identifier) else {
                     return Err(Error::InvalidFormat {
                         details: format!(
                             "finalized session archive {} contains non-session segment {identifier}",
@@ -1301,14 +1429,20 @@ impl WritableRepository {
                         ),
                     });
                 }
+                // Proves the archive's payload against the CRC in its own
+                // tar entry name.
                 archive.validate_indexed_segment_entry(identifier)?;
-                let actual_bytes =
+                // And this closes the loop to what the session actually
+                // wrote. Together the two are what comparing against a
+                // retained copy of every byte used to establish, without the
+                // session holding its whole output to say it.
+                let actual_crc =
                     archive
-                        .segment_data(identifier)
+                        .segment_entry_checksum(identifier)
                         .ok_or(Error::SegmentNotFound {
                             segment_identifier: identifier,
                         })?;
-                if actual_bytes != expected_bytes.as_slice() {
+                if actual_crc != expected_session.payload_crc {
                     return Err(Error::InvalidFormat {
                         details: format!(
                             "finalized session archive {} changed the payload of segment {identifier}",
@@ -1434,9 +1568,19 @@ impl WritableRepository {
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(path)?;
+                .open(&path)?;
             preserve_file_metadata(&file, source_metadata)?;
         }
+        // Reopen what was just finished. A rotated archive's segments must
+        // stay readable for the rest of the session — a later record can
+        // reference one — and a mapping is how they stay readable without
+        // the session holding their bytes. Reopening also drops the file
+        // descriptor: `TarArchiveReader` keeps only the mapping.
+        let reopened = TarArchiveReader::open(&path)?;
+        self.session_archives
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(reopened);
         Ok(())
     }
 
@@ -1529,15 +1673,26 @@ fn journal_needs_separator(path: &Path) -> Result<bool> {
 impl SegmentProvider for WritableRepository {
     fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
         if let Some((structure, bytes)) = self
-            .session_segments
+            .session_segment_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&segment_identifier)
         {
             return Ok(SegmentView {
-                structure: Arc::clone(structure),
-                bytes: crate::segment::view::SegmentBytes::Shared(Arc::clone(bytes)),
+                structure,
+                bytes: crate::segment::view::SegmentBytes::Shared(bytes),
             });
+        }
+        // A session segment the cache no longer holds. It is on disk in one
+        // of this session's archives, so re-read it there rather than keeping
+        // every written byte resident against the chance of this lookup.
+        if self
+            .session_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&segment_identifier)
+        {
+            return self.reread_session_segment(segment_identifier);
         }
         for archive in &self.base_archives {
             if let Some(bytes) = archive.segment_data(segment_identifier) {
@@ -1545,8 +1700,7 @@ impl SegmentProvider for WritableRepository {
                     .parsed_segment_cache
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&segment_identifier)
-                    .cloned();
+                    .get(&segment_identifier);
                 let structure = if let Some(structure) = cached {
                     structure
                 } else {
@@ -4615,7 +4769,9 @@ impl SegmentProvider for ArchiveSegmentsProvider<'_> {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::io::Write as _;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
+
+    use crate::cache::BoundedCache;
 
     #[cfg(unix)]
     use super::certify_active_archive;
@@ -4847,13 +5003,11 @@ mod tests {
                     .is_ok_and(|archive| archive.contains_segment(target))
             })
             .expect("archive containing target session segment");
-        let (structure, bytes) = store
-            .session_segments
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&target)
-            .map(|(structure, bytes)| (Arc::clone(structure), Arc::clone(bytes)))
-            .expect("target belongs to session");
+        // Read through the provider: the session keeps locators, not
+        // payloads, so the bytes come from the archive that holds them.
+        let view = store.segment(target).expect("target belongs to session");
+        let structure = Arc::clone(&view.structure);
+        let bytes = view.bytes.to_vec();
         let generation = stored_segment_generation(target, &structure);
         let mut references = structure.referenced_segments.clone();
         let mut binary_references =
@@ -4880,13 +5034,11 @@ mod tests {
         std::fs::remove_file(store.directory.join(file_name)).expect("remove complete session TAR");
         let mut writer = TarArchiveWriter::new(&store.directory, file_name);
         for identifier in order {
-            let (structure, bytes) = store
-                .session_segments
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(identifier)
-                .map(|(structure, bytes)| (Arc::clone(structure), Arc::clone(bytes)))
+            let view = store
+                .segment(*identifier)
                 .expect("ordered segment belongs to session");
+            let structure = Arc::clone(&view.structure);
+            let bytes = view.bytes.to_vec();
             let binary_references =
                 read_blob_identifiers(store, &structure).expect("reconstruct fixture BRF");
             writer
@@ -6530,6 +6682,51 @@ mod tests {
     #[test]
     fn reclaim_marks_session_archives_so_referenced_base_bulk_survives() {
         assert_session_reference_keeps_base_bulk_alive("session-mark", 2);
+    }
+
+    #[test]
+    fn a_session_serves_its_own_segments_from_disk_when_nothing_is_cached() {
+        let directory = TestDirectory::new("session-reread");
+        let mut store = WritableRepository::open(&directory.path).expect("open");
+        // Rotate on every segment, and cache nothing at all. Between them
+        // these force the two read-back paths the session now depends on:
+        // rotated archives through their mappings, and the archive still
+        // open through the writer's positional read. The session retains no
+        // payload, so if either path were wrong these reads would fail.
+        store.maximum_archive_size = 1;
+        store.session_segment_cache = RwLock::new(BoundedCache::new(0));
+
+        let generation = store.writing_generation().expect("generation");
+        let mut written = Vec::new();
+        for _ in 0..4 {
+            let mut writer = store.record_writer(generation);
+            let node = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("node");
+            writer.finish().expect("finish");
+            written.push(node.segment);
+        }
+
+        assert!(
+            store
+                .session_segment_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a zero-budget cache retains no payload"
+        );
+        for identifier in &written {
+            let view = store.segment(*identifier).expect("session segment rereads");
+            assert_eq!(view.structure.identifier, *identifier);
+            assert!(!view.bytes.is_empty());
+            assert!(
+                store.segment_generation(*identifier).is_some(),
+                "the locator answers the generation without a read"
+            );
+            assert!(store.contains_segment(*identifier));
+        }
+        store.close().expect("close");
+        Repository::open(&directory.path).expect("store is healthy");
     }
 
     #[test]

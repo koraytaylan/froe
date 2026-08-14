@@ -28,7 +28,12 @@ pub use check::{
     ConsistencyReport, NodeTreeVerifier, PathVerdict, check_consistency,
     check_consistency_with_progress, verify_node_tree,
 };
-pub use diff::{NodeDifference, PropertyChange, diff_revisions, diff_revisions_with_progress};
+pub use diff::{
+    NodeDifference, PropertyChange, diff_revisions, diff_revisions_visiting,
+    diff_revisions_with_progress,
+};
 pub use history::{NodeHistoryEntry, node_history, node_history_with_progress};
-pub use search::{NodeMatch, SearchQuery, search_nodes, search_nodes_with_progress};
+pub use search::{
+    NodeMatch, SearchQuery, search_nodes, search_nodes_visiting, search_nodes_with_progress,
+};
 pub use segment_dump::{dump_segment, dump_segment_bytes};

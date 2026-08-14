@@ -174,6 +174,11 @@ pub(crate) fn run_cleanup(
             return Ok(false);
         }
     }
+    // The preview has served its only purpose — the comparison above — and
+    // holds a second copy of every store-wide set the plan carries. Release
+    // it before the apply rather than pinning both plans through the phase
+    // that needs the memory.
+    drop(preview);
     // Captured from the authoritative plan before it is consumed: the
     // preview's figures can be stale, and the operator reads the summary
     // after minutes of progress output has scrolled the warnings away.

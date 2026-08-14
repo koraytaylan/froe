@@ -10,8 +10,9 @@
 //! succeeds when *any* path found a good revision (Java's default,
 //! fail-fast off).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
+use crate::cache::BoundedCache;
 use crate::content::node::NodeState;
 use crate::content::provider::SegmentProvider;
 use crate::error::{Error, Result};
@@ -536,7 +537,7 @@ pub fn verify_node_tree(provider: &dyn SegmentProvider, root: RecordIdentifier) 
 /// a real walk, preserving both the limit and the original path diagnostic.
 pub struct NodeTreeVerifier<'provider> {
     provider: &'provider dyn SegmentProvider,
-    verified_subtree_heights: HashMap<RecordIdentifier, usize>,
+    verified_subtree_heights: BoundedCache<RecordIdentifier, usize>,
     /// Nodes resolved across every `verify_with_progress` call, so a
     /// caller verifying several roots inside one reported step sees one
     /// running total rather than a count that restarts per root.
@@ -547,9 +548,19 @@ impl<'provider> NodeTreeVerifier<'provider> {
     /// Binds a reusable verifier to one immutable segment provider.
     #[must_use]
     pub fn new(provider: &'provider dyn SegmentProvider) -> Self {
+        Self::with_memo_budget(provider, VERIFIED_SUBTREE_CACHE_BUDGET_BYTES)
+    }
+
+    /// Binds a verifier whose subtree memo holds at most `budget_bytes`.
+    ///
+    /// The memo is an optimization, never a correctness property, so any
+    /// budget — including zero — must produce the same verdict. Tests use
+    /// this to prove that; production uses the default.
+    #[must_use]
+    pub fn with_memo_budget(provider: &'provider dyn SegmentProvider, budget_bytes: usize) -> Self {
         Self {
             provider,
-            verified_subtree_heights: HashMap::new(),
+            verified_subtree_heights: BoundedCache::new(budget_bytes),
             verified_nodes: 0,
         }
     }
@@ -612,7 +623,14 @@ fn verify_subtree(
     checks: SubtreeChecks,
     progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<(), CorruptLocation> {
-    verify_subtree_with_cache(provider, root, checks, &mut HashMap::new(), progress).map(|_| ())
+    verify_subtree_with_cache(
+        provider,
+        root,
+        checks,
+        &mut BoundedCache::new(VERIFIED_SUBTREE_CACHE_BUDGET_BYTES),
+        progress,
+    )
+    .map(|_| ())
 }
 
 /// Counts verified nodes for a [`ProgressObserver`], reporting on a stride
@@ -658,13 +676,23 @@ impl<'observer> VerifiedNodeCount<'observer> {
 /// How many nodes a verification walk resolves between progress reports.
 const VERIFIED_NODE_REPORT_STRIDE: u64 = 512;
 
+/// Byte budget for the verified-subtree memo.
+///
+/// The memo exists only to skip re-walking a shared subtree; a miss costs
+/// time and nothing else. Cycle detection is the separate `ancestors` set,
+/// which stays exact and is bounded by `MAXIMUM_CHECK_DEPTH`. Unbounded, this
+/// map held one entry per distinct node record in the tree — on a large store
+/// that is tens of gigabytes, and it is reached from `check`, both `cleanup`
+/// modes, and the post-compaction certification.
+const VERIFIED_SUBTREE_CACHE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+
 /// Returns the verified subtree height. A record enters `verified` only
 /// after every descendant completed successfully.
 fn verify_subtree_with_cache(
     provider: &dyn SegmentProvider,
     root: RecordIdentifier,
     checks: SubtreeChecks,
-    verified: &mut HashMap<RecordIdentifier, usize>,
+    verified: &mut BoundedCache<RecordIdentifier, usize>,
     progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<usize, CorruptLocation> {
     #[allow(
@@ -675,7 +703,7 @@ fn verify_subtree_with_cache(
         provider: &dyn SegmentProvider,
         record: RecordIdentifier,
         checks: SubtreeChecks,
-        verified: &mut HashMap<RecordIdentifier, usize>,
+        verified: &mut BoundedCache<RecordIdentifier, usize>,
         ancestors: &mut HashSet<RecordIdentifier>,
         depth: usize,
         path: &mut String,
@@ -702,7 +730,7 @@ fn verify_subtree_with_cache(
                 "node record {record} is contained in its own subtree"
             )));
         }
-        if let Some(&subtree_height) = verified.get(&record)
+        if let Some(subtree_height) = verified.get(&record)
             && depth
                 .checked_add(subtree_height)
                 .is_some_and(|deepest| deepest <= MAXIMUM_CHECK_DEPTH)
@@ -1142,7 +1170,7 @@ mod tests {
         let shared_reads = provider.reads_of(shared.segment);
         assert!(shared_reads > 0, "the first root traverses the shared node");
         assert!(
-            verifier.verified_subtree_heights.contains_key(&shared),
+            verifier.verified_subtree_heights.get(&shared).is_some(),
             "only a completed shared subtree receives a certificate"
         );
 
@@ -1151,6 +1179,56 @@ mod tests {
             provider.reads_of(shared.segment),
             shared_reads,
             "the second root reuses the provider-bound subtree certificate"
+        );
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn an_evicting_memo_costs_reads_but_never_changes_the_verdict() {
+        let directory = TestDirectory::new("verify-memo-evicts");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+
+        let mut shared_writer = store.record_writer(generation);
+        let shared = shared_writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("shared node");
+        shared_writer.finish().expect("finish shared");
+        let mut root_writer = store.record_writer(generation);
+        let root = root_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "shared".to_owned(),
+                    node: shared,
+                },
+                &[],
+            )
+            .expect("root");
+        root_writer.finish().expect("finish root");
+
+        // A zero budget makes every lookup miss, which is the worst case the
+        // bound can produce. The memo is not a safety property — cycle
+        // detection is the separate `ancestors` set — so the verdict must be
+        // identical to the memoized run.
+        let provider = CountingProvider::new(&store);
+        let mut starved = NodeTreeVerifier::with_memo_budget(&provider, 0);
+        starved.verify(root).expect("verifies without any memo");
+        starved.verify(root).expect("and again");
+        assert!(
+            starved.verified_subtree_heights.is_empty(),
+            "a zero budget retains nothing"
+        );
+
+        let memoized_provider = CountingProvider::new(&store);
+        let mut memoized = NodeTreeVerifier::new(&memoized_provider);
+        memoized.verify(root).expect("verifies with a memo");
+        memoized.verify(root).expect("and again");
+
+        assert!(
+            provider.reads_of(shared.segment) > memoized_provider.reads_of(shared.segment),
+            "the starved verifier re-reads what the memoized one reuses"
         );
         store.close().expect("close");
     }

@@ -75,6 +75,7 @@
 //! Custom backends (in-memory fixtures, remote stores) implement
 //! [`SegmentProvider`] and reuse the whole content layer unchanged.
 
+pub(crate) mod cache;
 pub mod checksum;
 pub mod content;
 pub mod error;

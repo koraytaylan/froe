@@ -72,7 +72,7 @@
 //! names it — so a failed or abandoned export leaves neither a partial
 //! database nor anyone else's file behind.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use froe::content::value::BinaryValue;
@@ -143,7 +143,7 @@ const EMPTY_MULTI_POSITION: i64 = -1;
 const SCHEMA: &str = "
     CREATE TABLE strings(
         id INTEGER PRIMARY KEY,
-        value TEXT NOT NULL
+        value TEXT NOT NULL UNIQUE
     );
     CREATE TABLE nodes(
         id INTEGER PRIMARY KEY,
@@ -212,11 +212,66 @@ pub struct SqliteExportOptions {
     pub create_indexes: bool,
 }
 
+/// Byte budget for the in-memory half of the string dictionary.
+const STRING_DICTIONARY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// A byte-budgeted string-to-id cache in front of the `strings` table.
+///
+/// Deliberately small and local: the table is the authority, so this only
+/// has to make the repeated vocabulary — primary types, property names —
+/// cheap. Eviction in insertion order costs a round-trip to `SQLite`, never a
+/// wrong id, because a miss re-reads the row the first insert created.
+struct BoundedStringCache {
+    entries: HashMap<String, i64>,
+    insertion_order: VecDeque<String>,
+    used_bytes: usize,
+    budget_bytes: usize,
+}
+
+impl BoundedStringCache {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            used_bytes: 0,
+            budget_bytes,
+        }
+    }
+
+    fn get(&self, text: &str) -> Option<i64> {
+        self.entries.get(text).copied()
+    }
+
+    fn insert(&mut self, text: String, id: i64) {
+        let weight = text.len() + 64;
+        if self.entries.insert(text.clone(), id).is_none() {
+            self.insertion_order.push_back(text);
+            self.used_bytes = self.used_bytes.saturating_add(weight);
+        }
+        while self.used_bytes > self.budget_bytes {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            let oldest_weight = oldest.len() + 64;
+            self.entries.remove(&oldest);
+            self.used_bytes = self.used_bytes.saturating_sub(oldest_weight);
+        }
+    }
+}
+
 /// An [`ExportSink`] writing the interned `SQLite` schema described in the
 /// [module documentation](self).
 pub struct SqliteSink {
     connection: Option<Connection>,
-    strings: HashMap<String, i64>,
+    /// Recently interned strings, so the common repeats — primary types,
+    /// property names — do not round-trip to `SQLite` on every row.
+    ///
+    /// The authoritative dictionary is the `strings` table itself, which is
+    /// why this may evict. Holding every distinct string of the export in
+    /// memory was the one thing keeping this sink from streaming: names and
+    /// primary types repeat, but textual property values do not, so the map
+    /// grew with the content rather than with the vocabulary.
+    strings: BoundedStringCache,
     /// The depth-indexed stack of ancestor node ids: after processing a
     /// node, `ancestry[depth]` is its id, so its children's `parent_id`
     /// is one lookup away.
@@ -284,7 +339,7 @@ impl SqliteSink {
         match Self::initialize(path, &guard) {
             Ok(connection) => Ok(Self {
                 connection: Some(connection),
-                strings: HashMap::new(),
+                strings: BoundedStringCache::new(STRING_DICTIONARY_BUDGET_BYTES),
                 ancestry: Vec::new(),
                 node_count: 0,
                 create_indexes: options.create_indexes,
@@ -360,13 +415,21 @@ impl SqliteSink {
     /// row referencing them, so the foreign keys stay valid even under
     /// `PRAGMA foreign_key_check`.
     fn intern(&mut self, text: &str) -> froe::Result<i64> {
-        if let Some(&id) = self.strings.get(text) {
+        if let Some(id) = self.strings.get(text) {
             return Ok(id);
         }
-        let id = self.strings.len() as i64 + 1;
-        self.connection()
-            .prepare_cached("INSERT INTO strings (id, value) VALUES (?, ?)")
-            .and_then(|mut statement| statement.execute(params![id, text]))
+        // A miss asks the table, which is the authority. `INSERT OR IGNORE`
+        // then `SELECT` is two statements rather than one, but both are
+        // cached and served from SQLite's own bounded page cache, so the
+        // dictionary can outgrow memory without the process doing so.
+        let connection = self.connection();
+        connection
+            .prepare_cached("INSERT OR IGNORE INTO strings (value) VALUES (?)")
+            .and_then(|mut statement| statement.execute(params![text]))
+            .map_err(sqlite_error)?;
+        let id: i64 = connection
+            .prepare_cached("SELECT id FROM strings WHERE value = ?")
+            .and_then(|mut statement| statement.query_row(params![text], |row| row.get(0)))
             .map_err(sqlite_error)?;
         self.strings.insert(text.to_owned(), id);
         Ok(id)
@@ -607,8 +670,30 @@ mod tests {
     use froe::writer::store_writer::WritableRepository;
     use rusqlite::Connection;
 
-    use super::{SqliteExportOptions, SqliteSink};
+    use super::{BoundedStringCache, SqliteExportOptions, SqliteSink};
     use crate::export::export_subtree;
+
+    #[test]
+    fn an_evicted_string_reinterns_to_the_same_identifier() {
+        // The table is the dictionary's authority and the in-memory map is
+        // only a shortcut, so a string evicted between two sightings must
+        // come back with the id the first sighting created. Getting this
+        // wrong would silently split one string across two dictionary rows
+        // and corrupt every foreign key pointing at it.
+        let mut cache = BoundedStringCache::new(0);
+        cache.insert("jcr:primaryType".to_owned(), 7);
+        assert_eq!(cache.get("jcr:primaryType"), None, "a zero budget evicts");
+
+        let mut cache = BoundedStringCache::new(1024);
+        cache.insert("nt:unstructured".to_owned(), 3);
+        assert_eq!(cache.get("nt:unstructured"), Some(3));
+        cache.insert("nt:unstructured".to_owned(), 3);
+        assert_eq!(
+            cache.get("nt:unstructured"),
+            Some(3),
+            "reinsertion is idempotent"
+        );
+    }
 
     struct TestDirectory {
         path: std::path::PathBuf,

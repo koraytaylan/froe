@@ -371,6 +371,28 @@ impl TarArchiveReader {
         Ok(())
     }
 
+    /// The CRC32 recorded in a segment's tar entry name.
+    ///
+    /// Read from the name rather than recomputed: a caller that has already
+    /// run [`Self::validate_indexed_segment_entry`] knows the payload hashes
+    /// to this value, so comparing it against an independently recorded
+    /// checksum identifies the payload without hashing it a second time.
+    #[must_use]
+    pub(crate) fn segment_entry_checksum(
+        &self,
+        segment_identifier: SegmentIdentifier,
+    ) -> Option<u32> {
+        let entry = self.index_entry(segment_identifier)?;
+        let payload_start = entry.position as usize;
+        let header_start = payload_start.checked_sub(512)?;
+        let header_block = self.bytes.get(header_start..payload_start)?;
+        let header = TarEntryHeader::parse(header_block)?;
+        let (header_identifier, checksum) = parse_segment_entry_name(&header.name)?;
+        (header_identifier == segment_identifier)
+            .then_some(checksum)
+            .flatten()
+    }
+
     /// Parses the archive's segment graph, when present and valid.
     #[must_use]
     pub fn segment_graph(&self) -> Option<SegmentGraph> {

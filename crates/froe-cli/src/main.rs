@@ -219,8 +219,9 @@ enum Command {
         /// Require a property NAME=VALUE (repeatable).
         #[arg(long = "value")]
         values: Vec<String>,
-        /// Stop after this many matches (0 = no limit).
-        #[arg(long, default_value_t = 0)]
+        /// Stop after this many matches (0 = no limit, which buffers every
+        /// match in memory and is unbounded on a large store).
+        #[arg(long, default_value_t = 10_000)]
         limit: usize,
     },
     /// Compact the repository offline (modifies the store).
