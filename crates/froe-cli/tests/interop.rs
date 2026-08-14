@@ -909,7 +909,76 @@ fn store_into_volume(src: &Path, volume: &str) {
 /// Without this, a fixture step that silently failed to build its condition
 /// would leave the post-cleanup assertions vacuously satisfied — the condition
 /// would be absent afterwards because it was never there.
-fn assert_cleanup_fixture_built(store: &Path, stale: &StaleArchive, checkpoint_name: &str) {
+/// Writes nodes at generation zero that no head ever reaches, and returns the
+/// archive they landed in.
+///
+/// The orphans a segment sweep is supposed to reclaim. This used to be made by
+/// restoring the pre-compaction gen-0 archive at a spare archive number, which
+/// stopped working once compaction began sharing bulk segments the way Oak
+/// does: the compacted head then still references gen-0's binary blocks, so
+/// re-introducing that archive is a genuine duplicate-segment condition and
+/// cleanup rightly refuses it. Fresh unreferenced segments are unreachable by
+/// construction rather than by an assumption about what compaction leaves.
+fn write_orphan_nodes(store_path: &Path) -> PathBuf {
+    let archives_before: std::collections::BTreeSet<String> = std::fs::read_dir(store_path)
+        .expect("list archives before orphans")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    let written = {
+        let store = WritableRepository::open(store_path).expect("open for orphan nodes");
+        let mut writer =
+            store.record_writer(froe::writer::segment_builder::GarbageCollectionGeneration {
+                generation: 0,
+                full_generation: 0,
+                is_compacted: false,
+            });
+        let mut written = 0usize;
+        for index in 0..2000 {
+            let title = writer
+                .write_string(&format!("orphan node {index}"))
+                .expect("orphan title");
+            writer
+                .write_node(
+                    Some("nt:unstructured"),
+                    &[],
+                    &ChildNodesToWrite::Zero,
+                    &[PropertyToWrite {
+                        name: "jcr:title".to_owned(),
+                        property_type: PropertyType::String,
+                        values: PropertyValuesToWrite::Single(title),
+                    }],
+                )
+                .expect("orphan node");
+            written += 1;
+        }
+        writer.finish().expect("finish orphan segments");
+        // Deliberately no set_head: nothing reaches these records.
+        store.close().expect("close orphan writer");
+        written
+    };
+
+    let orphan_archive = std::fs::read_dir(store_path)
+        .expect("list archives after orphans")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("data") && !archives_before.contains(name))
+        .map(|name| store_path.join(name))
+        .expect("the orphan writer created a new archive");
+    eprintln!(
+        "  wrote {written} orphan nodes reachable from nothing, in {}",
+        orphan_archive.display()
+    );
+    orphan_archive
+}
+
+fn assert_cleanup_fixture_built(
+    store: &Path,
+    stale: &StaleArchive,
+    checkpoint_name: &str,
+    orphan_archive: &Path,
+) {
     let checkpoints = froe(&["checkpoints", store.to_str().unwrap()]);
     assert!(
         checkpoints.contains(checkpoint_name),
@@ -928,14 +997,20 @@ fn assert_cleanup_fixture_built(store: &Path, stale: &StaleArchive, checkpoint_n
         stale.winner.display()
     );
     assert!(
-        store.join("data00004a.tar").exists(),
-        "the orphan-bearing gen-0 archive is present before cleanup"
+        orphan_archive.exists(),
+        "the orphan-bearing archive {} is present before cleanup",
+        orphan_archive.display()
     );
 }
 
 /// Confirm each condition is gone from disk and from froe's own listings,
 /// independently of the counts cleanup reported.
-fn assert_cleanup_conditions_removed(store: &Path, stale: &StaleArchive, checkpoint_name: &str) {
+fn assert_cleanup_conditions_removed(
+    store: &Path,
+    stale: &StaleArchive,
+    checkpoint_name: &str,
+    orphan_archive: &Path,
+) {
     assert!(
         !stale.superseded.exists(),
         "the superseded archive letter {} is gone from disk after cleanup",
@@ -948,12 +1023,13 @@ fn assert_cleanup_conditions_removed(store: &Path, stale: &StaleArchive, checkpo
         "the winning archive letter {} survived cleanup",
         stale.winner.display()
     );
-    // The orphan-bearing gen-0 archive is the 727-segment condition; if it is
-    // still here, the segments task reclaimed nothing regardless of the count
-    // it printed.
+    // The orphan-bearing archive is the reclaimable-segment condition; if it
+    // is still here, the segments task reclaimed nothing regardless of the
+    // count it printed.
     assert!(
-        !store.join("data00004a.tar").exists(),
-        "the orphan-bearing gen-0 archive was reclaimed"
+        !orphan_archive.exists(),
+        "the orphan-bearing archive {} was reclaimed",
+        orphan_archive.display()
     );
     let journal = std::fs::read_to_string(store.join("journal.log")).expect("read journal after");
     assert!(
@@ -1725,10 +1801,6 @@ fn cleanup() {
     eprintln!("  copying store to {}", clean_store.display());
     copy_store(&store, &clean_store);
 
-    // Save the original gen-0 archive before compaction.
-    let gen0_archive = work_root().join("gen0-archive-backup.tar");
-    std::fs::copy(clean_store.join("data00000a.tar"), &gen0_archive).expect("backup gen-0 archive");
-
     // Build a multi-generational store: compact twice to advance the head
     // to full_generation=2.
     eprintln!("  step 1: froe compact (gen 0 -> 1)");
@@ -1737,12 +1809,19 @@ fn cleanup() {
     eprintln!("  step 2: froe compact again (gen 1 -> 2)");
     froe(&["compact", clean_store.to_str().unwrap(), "--yes"]);
 
-    // Restore the gen-0 archive at a higher archive number so the segments
-    // task finds it as a separate archive with orphan segments, not as a
-    // stale letter of the active archive.
-    eprintln!("  step 3: restore gen-0 archive at data00004a.tar");
-    std::fs::copy(&gen0_archive, clean_store.join("data00004a.tar"))
-        .expect("restore gen-0 archive");
+    // Orphan nodes, written directly at generation zero and never linked to
+    // any head. Two full generations behind the compacted head, so the FULL
+    // predicate with two retained generations reclaims them.
+    //
+    // This used to restore the pre-compaction gen-0 archive at a spare
+    // archive number, which stopped working once compaction began sharing
+    // bulk segments the way Oak does: the compacted head then still
+    // references gen-0's binary blocks, so re-introducing that archive is a
+    // genuine duplicate-segment condition and cleanup rightly refuses it.
+    // Writing fresh unreferenced segments produces the orphans the phase
+    // actually wants, and cannot collide with anything the head holds.
+    eprintln!("  step 3: writing orphan nodes at generation zero");
+    let orphan_archive = write_orphan_nodes(&clean_store);
 
     // Wait for the checkpoint from phase 3 to expire.
     eprintln!("  waiting 2s for the checkpoint to expire");
@@ -1775,7 +1854,12 @@ fn cleanup() {
     // printed even when the count is zero.
     let expiring_checkpoint = std::fs::read_to_string(work_root().join("expiring-checkpoint.txt"))
         .expect("the checkpoint phase records the name of the checkpoint that will expire");
-    assert_cleanup_fixture_built(&clean_store, &stale, expiring_checkpoint.trim());
+    assert_cleanup_fixture_built(
+        &clean_store,
+        &stale,
+        expiring_checkpoint.trim(),
+        &orphan_archive,
+    );
 
     eprintln!("  froe cleanup --yes");
     let cleanup_output = froe(&["cleanup", clean_store.to_str().unwrap(), "--yes"]);
@@ -1809,7 +1893,12 @@ fn cleanup() {
 
     // Then confirm the same effects on disk, independently of what was
     // reported.
-    assert_cleanup_conditions_removed(&clean_store, &stale, expiring_checkpoint.trim());
+    assert_cleanup_conditions_removed(
+        &clean_store,
+        &stale,
+        expiring_checkpoint.trim(),
+        &orphan_archive,
+    );
 
     eprintln!("  froe summary after cleanup");
     froe(&["summary", clean_store.to_str().unwrap()]);

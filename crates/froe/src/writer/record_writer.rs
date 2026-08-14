@@ -401,12 +401,29 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
         let mut remaining = length;
         for source_block in source_blocks {
             let block_length = remaining.min(BLOCK_SIZE as u64) as usize;
+            remaining -= block_length as u64;
+            // Value sharing, as Oak does it: a block already living in a
+            // bulk segment is referenced where it lies instead of being
+            // copied. Bulk segments are reclaimed by reachability rather
+            // than by the generation predicate, so a reference from the new
+            // generation is exactly what keeps one alive — which is why the
+            // rule is the segment kind and not the generation.
+            //
+            // A block in a *data* segment must still be copied. Those are
+            // reclaimed by generation no matter who points at them, so
+            // sharing one across a compaction would leave the new head
+            // referencing bytes the same run then deletes. froe's own writer
+            // puts blocks in data segments, so this is the path a
+            // froe-authored store takes; an Oak-authored one shares.
+            if source_block.segment.is_bulk_segment() {
+                block_identifiers.push(source_block);
+                continue;
+            }
             let block_view = source.segment(source_block.segment)?;
             let block_bytes = block_view.read_bytes(source_block.record_number, 0, block_length)?;
             let record = self.allocate(RecordType::Block, block_length, &[])?;
             self.current.record_bytes_mut(record)[..block_length].copy_from_slice(block_bytes);
             block_identifiers.push(self.identifier_of(record));
-            remaining -= block_length as u64;
         }
 
         let body =
