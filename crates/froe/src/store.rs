@@ -172,11 +172,29 @@ impl Repository {
         self.segment_locations.contains_key(&segment_identifier)
     }
 
-    /// All segment identifiers, in archive probe order.
+    /// All segment identifiers, in archive probe order. A segment served by
+    /// two archives is yielded once per archive.
     pub fn segment_identifiers(&self) -> impl Iterator<Item = SegmentIdentifier> + '_ {
         self.archives
             .iter()
             .flat_map(TarArchiveReader::segment_identifiers)
+    }
+
+    /// Every segment identifier exactly once, in archive probe order.
+    ///
+    /// A store-wide scan that must not process a segment twice uses this
+    /// rather than accumulating its own seen-set: the location map that
+    /// settles duplicates is already built, so the deduplication is free
+    /// where the caller's would have been one entry per segment.
+    pub fn distinct_segment_identifiers(&self) -> impl Iterator<Item = SegmentIdentifier> + '_ {
+        self.archives
+            .iter()
+            .enumerate()
+            .flat_map(move |(position, archive)| {
+                archive.segment_identifiers().filter(move |identifier| {
+                    self.segment_locations.get(identifier) == Some(&position)
+                })
+            })
     }
 
     /// Returns the exact stored bytes of a segment from the active archive

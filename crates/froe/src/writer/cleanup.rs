@@ -3119,11 +3119,20 @@ fn validate_prospective_segment_plan(
             })?;
     }
 
-    let mut checked = HashSet::new();
-    for identifier in repository.segment_identifiers() {
+    // Live survivors only. A segment the mark phase already proved
+    // reclaimable is garbage that merely outlived the sweep, because the
+    // archive holding it did not repay a rewrite; nothing reachable reads it,
+    // and a dangling reference out of garbage is the ordinary state Oak
+    // leaves behind every partial sweep. Refusing on those made the whole
+    // plan fail on exactly the stores this reclamation exists for — ones
+    // with dead segments scattered through archives the 25% gate defers.
+    // What must not dangle is anything still reachable, and that is proved
+    // above against every retained root.
+    let reclaimable = plan.reclaimable_segments();
+    for identifier in repository.distinct_segment_identifiers() {
         if !identifier.is_data_segment()
             || unavailable.contains(&identifier)
-            || !checked.insert(identifier)
+            || reclaimable.contains(&identifier)
         {
             continue;
         }
@@ -7768,6 +7777,113 @@ mod tests {
             head
         };
         (directory, old_head, new_head)
+    }
+
+    /// The shape a real store has once reclamation actually starts removing
+    /// things: dead segments that survive only because their archive failed
+    /// the rewrite gate, still pointing at dead segments in an archive that
+    /// goes away entirely.
+    #[test]
+    fn a_dead_survivor_pointing_at_a_removed_segment_is_handled() {
+        let directory = TestDirectory::repository("dead-survivor-reference");
+        let dead_generation = GarbageCollectionGeneration {
+            generation: 0,
+            full_generation: 0,
+            is_compacted: false,
+        };
+        let live_generation = GarbageCollectionGeneration {
+            generation: 2,
+            full_generation: 2,
+            is_compacted: false,
+        };
+
+        // An archive of nothing but dead segments: fully reclaimable, so the
+        // sweep unlinks it whole.
+        let target = {
+            let store = WritableRepository::open(&directory.path).expect("open target writer");
+            let mut writer = store.record_writer(dead_generation);
+            let node = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("dead target node");
+            writer.finish().expect("finish target");
+            store.close().expect("close target writer");
+            node
+        };
+
+        // An archive that keeps one dead segment referencing that target,
+        // beside enough live segments that removing the dead one cannot
+        // repay a rewrite — so the dead segment stays on disk.
+        let new_head = {
+            let store = WritableRepository::open(&directory.path).expect("open mixed writer");
+            let mut referencing = store.record_writer(dead_generation);
+            referencing
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "target".to_owned(),
+                        node: target,
+                    },
+                    &[],
+                )
+                .expect("dead referencing node");
+            referencing.finish().expect("finish referencing");
+            for _ in 0..8 {
+                let mut filler = store.record_writer(live_generation);
+                filler
+                    .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                    .expect("live filler");
+                filler.finish().expect("finish filler");
+            }
+            let mut writer = store.record_writer(live_generation);
+            let root = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("content root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("super root");
+            writer.finish().expect("finish head");
+            assert!(store.set_head(store.head(), head));
+            store.close().expect("close mixed writer");
+            head
+        };
+
+        let options = CleanupOptions::default()
+            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"));
+        let planned = plan_cleanup(&directory.path, &options);
+
+        match planned {
+            Ok(plan) => {
+                // Whatever it decides to remove, the store must still open
+                // and the head must still verify afterwards.
+                let outcome = cleanup(&directory.path, options).expect("apply the plan");
+                assert_eq!(outcome.head_after, new_head);
+                let repository = Repository::open(&directory.path).expect("healthy store");
+                assert_eq!(repository.head_record_identifier(), new_head);
+                crate::tooling::verify_node_tree(&repository, new_head).expect("head verifies");
+                let _ = plan;
+            }
+            Err(error) => {
+                // Fail-closed is acceptable — nothing was mutated — but the
+                // operator has to be able to act on it, so the message must
+                // name the surviving reference rather than blame the store.
+                let text = error.to_string();
+                assert!(
+                    text.contains("references segment"),
+                    "unexpected refusal: {text}"
+                );
+                Repository::open(&directory.path).expect("refusal mutates nothing");
+            }
+        }
     }
 
     #[test]

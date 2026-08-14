@@ -1826,7 +1826,6 @@ pub(crate) struct StandaloneSegmentCleanupPlan {
 }
 
 impl StandaloneSegmentCleanupPlan {
-    #[cfg(test)]
     pub(crate) fn reclaimable_segments(&self) -> &std::collections::HashSet<SegmentIdentifier> {
         &self.reclaimable
     }
