@@ -137,8 +137,14 @@ This is the evidence the session rewrite rests on: the certificate now proves
 payload identity by recorded CRC rather than by retained bytes, and Oak read
 back byte-identical trees.
 
-`--retain-journal-revisions` is **not** exercised by the interop suite. See
-gaps.
+`--retain-journal-revisions` is exercised too, by a phase added for it. Oak's
+own fixture carried three journal revisions; froe bounded the journal to one
+and swept the segments behind the other two; Sling then booted the result and
+served the exact baseline tree from the single revision froe kept, with one
+line and its numbered backup on disk. This is the operation that most needed
+Oak evidence — it is the only one that destroys *reachable* history by policy
+rather than by Oak's generation predicate, so froe agreeing with its own
+reachability rules would have proved nothing about it.
 
 ## Verification report
 
@@ -153,7 +159,7 @@ x86-64 host; MSRV `1.89.0` from `Cargo.toml`.
 | `RUSTDOCFLAGS="-D warnings" cargo +1.89.0 doc --workspace --all-features --no-deps` | 0 (failed first run on a dangling intra-doc link; fixed in `83a3ad0`) |
 | `RUSTFLAGS="-D warnings" cargo +1.89.0 check -p froe --all-targets --all-features --target i686-unknown-linux-gnu` | 0 |
 | `cargo test --workspace --all-features` (stable) | 0, 672 tests |
-| `cargo test -p froe-cli --features interop -- --ignored --test-threads=1 interop_full` | 0 |
+| `cargo test -p froe-cli --features interop -- --ignored --test-threads=1 interop_full` | 0 (chain including the `journal_retention` phase) |
 
 Separations the guide asks for explicitly: everything above is **execution**,
 not cross-compilation, except the i686 row, which is a **compile-only width
@@ -164,30 +170,27 @@ interoperability**, not a froe-to-froe round trip.
 
 ## Known gaps
 
-1. **`--retain-journal-revisions` has no interoperability evidence.** No
-   interop phase bounds the journal and then asks Oak to boot the result. It
-   is the one new destructive operation with no Oak-verified post-state.
-2. **The loosened survivor check reaches the default path.** `--task segments`
+1. **The loosened survivor check reaches the default path.** `--task segments`
    can now proceed where it previously refused. One synthetic fixture on the
    default task set covers it and fails when the stricter check is restored;
    no real store has exercised it.
-3. **No RSS measurement.** Budgets are asserted against `cache_weight`, which
+2. **No RSS measurement.** Budgets are asserted against `cache_weight`, which
    is an approximation. A leak outside the budgeted structures would not be
    caught.
-4. **macOS untested.** Only CI covers it.
-5. **The reopen boundary has no armed fault cutpoint.** It is argued
+3. **macOS untested.** Only CI covers it.
+4. **The reopen boundary has no armed fault cutpoint.** It is argued
    prefix-safe above rather than tested by injection.
-6. **The source-shape guard has known blind spots.** It matches literal type
+5. **The source-shape guard has known blind spots.** It matches literal type
    substrings against single-line field text of three named structs, so it
    does not see `VecDeque`, a field whose type rustfmt wrapped across lines, a
    collection behind a type alias, or state inside a nested struct such as
    `write_state: Mutex<WriteState>`. It also cannot see accumulators held in
    function locals, which is the class the `recover-journal` defect belonged
    to. It raises the cost of reintroducing the defect; it does not prevent it.
-7. **`CleanupAction::PruneJournal` gained a required field.** The enum is
+6. **`CleanupAction::PruneJournal` gained a required field.** The enum is
    `#[non_exhaustive]`, which does not make its variants so; a downstream
    struct-pattern match on that variant is source-breaking. Record it in the
    version bump rationale.
-8. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
+7. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
    returns an owned `Vec`. Bounded by the widest single node, not by the
    store; fixing it needs an additive streaming API.
