@@ -4,12 +4,12 @@
 //! the content root and every checkpoint — into new segments stamped with
 //! an advanced garbage collection generation, then swaps the head to the
 //! rewritten super-root and reclaims the now-unreferenced old generations.
-//! A bounded source-record-keyed cache preserves the sharing of the
-//! content graph where it fits: a checkpoint whose `root` shares records
-//! with the live root stays shared after compaction. Past the cache's byte
-//! budget a shared subtree met again is copied a second time, so the output
-//! can exceed the source on a store with many checkpoints — correctness is
-//! unaffected, size is not. The walk terminates by the depth bound.
+//! An exact source-record-keyed memo preserves the sharing of the content
+//! graph: a checkpoint whose `root` shares records with the live root stays
+//! shared after compaction, and each distinct node is copied exactly once,
+//! so the compacted output never exceeds the source through duplication.
+//! The walk terminates on a corrupt self-referential graph by refusing the
+//! record that closes the cycle.
 //!
 //! This is the *classic* deep-copy compaction — the checkpoint-aware and
 //! parallel compactors in Oak are throughput optimizations that produce
@@ -25,13 +25,13 @@
 
 use std::io::Write;
 
-use crate::cache::BoundedCache;
 use crate::content::node::{NodeState, PropertyState, PropertyValues};
 use crate::content::property::{PropertyType, PropertyValue};
 use crate::content::provider::SegmentProvider;
 use crate::content::value::BinaryValue;
 use crate::error::{Error, Result};
 use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
+use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::RecordIdentifier;
 use crate::writer::record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
@@ -61,11 +61,12 @@ pub struct CompactionOutcome {
 }
 
 /// Deep-copies a node tree from a source provider into a record writer,
-/// rewriting every reachable record and sharing results through a bounded
-/// source-record cache, so the content DAG's sharing is preserved as far as
-/// that cache reaches; beyond it a shared subtree is copied again and the
-/// output grows. Returns the rewritten root and the number of nodes copied.
-/// Used by compaction, backup, and restore.
+/// rewriting every reachable record exactly once, so the content DAG's
+/// sharing is preserved exactly: a subtree the live root and a checkpoint
+/// both reference is copied once and referenced twice. Returns the rewritten
+/// root and the number of nodes copied, which equals the number of distinct
+/// node records reachable from `source_root`. Used by compaction, backup,
+/// and restore.
 pub fn deep_copy_tree<Sink: SegmentSink>(
     source: &dyn SegmentProvider,
     writer: &mut RecordWriter<Sink>,
@@ -82,32 +83,12 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
     source_root: RecordIdentifier,
     observer: &mut dyn ProgressObserver,
 ) -> Result<(RecordIdentifier, u64)> {
-    deep_copy_tree_with_memo_budget(
-        source,
-        writer,
-        source_root,
-        COMPACTION_MEMO_BUDGET_BYTES,
-        observer,
-    )
-}
-
-/// Deep-copies exactly like [`deep_copy_tree_with_progress`], with an
-/// explicit sharing-memo budget.
-///
-/// The budget changes how much of the source DAG's sharing survives into the
-/// copy, and nothing else: any budget, zero included, must produce a complete
-/// and correct tree. Tests use that to prove the memo is an optimization.
-fn deep_copy_tree_with_memo_budget<Sink: SegmentSink>(
-    source: &dyn SegmentProvider,
-    writer: &mut RecordWriter<Sink>,
-    source_root: RecordIdentifier,
-    memo_budget_bytes: usize,
-    observer: &mut dyn ProgressObserver,
-) -> Result<(RecordIdentifier, u64)> {
     let mut copier = Compactor {
         source,
         writer,
-        rewritten_nodes: BoundedCache::new(memo_budget_bytes),
+        segments: SegmentInterner::new(),
+        rewritten_nodes: RewrittenNodes::new(),
+        nodes_on_path: std::collections::HashSet::new(),
         compacted_nodes: 0,
         reported_nodes: 0,
         observer,
@@ -122,41 +103,160 @@ fn deep_copy_tree_with_memo_budget<Sink: SegmentSink>(
 /// How many nodes a deep copy rewrites between progress reports.
 const COPIED_NODE_REPORT_STRIDE: u64 = 512;
 
-/// A content tree is never this deep — JCR paths in even the largest AEM
-/// repositories stay under a few hundred levels. A greater depth means the
-/// source node records form a cycle in a corrupt store. The bound is set
-/// well below the point where recursion would overflow the stack.
+/// How deep this walk can descend within the stack it has. It is a stack
+/// bound and nothing else: a cycle in a corrupt store is refused exactly,
+/// by `nodes_on_path`, at the record that closes it. The value matches
+/// [`crate::tooling::MAXIMUM_CHECK_DEPTH`], which the post-write health
+/// traversal applies to the same tree — exceeding it here refuses before
+/// any work, where exceeding it there refuses after the head is durable.
 const MAXIMUM_COMPACTION_DEPTH: usize = 4000;
 
-/// Byte budget for the compaction sharing memo.
+/// Maps each segment identifier met during one compaction to a small index,
+/// so the memo can hold four bytes where a `SegmentIdentifier` holds sixteen.
 ///
-/// Sized to hold a few million entries, matching the order of Oak's own
-/// fixed-capacity compaction caches. Beyond it, a shared subtree met again
-/// is copied a second time: the compacted store stays correct and complete,
-/// and the cost lands on output size rather than on resident memory.
-pub(crate) const COMPACTION_MEMO_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// The cost is per *segment*, not per node — a 25 GB store names on the order
+/// of 250k of them — which is why this is affordable where storing the UUID
+/// in every entry is not. Index 0 is never issued, so a packed key of zero is
+/// unambiguously an empty slot.
+struct SegmentInterner {
+    indices: std::collections::HashMap<SegmentIdentifier, u32>,
+    identifiers: Vec<SegmentIdentifier>,
+}
 
-/// Roughly what one sharing-memo entry charges against the budget: two
-/// record identifiers plus the cache's per-entry overhead. Used only to turn
-/// a budget into an intelligible node count for operators.
-pub const COMPACTION_MEMO_BYTES_PER_NODE: usize = 112;
+impl SegmentInterner {
+    fn new() -> Self {
+        Self {
+            indices: std::collections::HashMap::new(),
+            // Index 0 is the never-issued sentinel; this placeholder keeps
+            // `identifiers[index]` addressable without an offset everywhere.
+            identifiers: vec![SegmentIdentifier {
+                most_significant_bits: 0,
+                least_significant_bits: 0,
+            }],
+        }
+    }
+
+    fn index_of(&mut self, segment: SegmentIdentifier) -> u32 {
+        if let Some(index) = self.indices.get(&segment) {
+            return *index;
+        }
+        let index = u32::try_from(self.identifiers.len()).expect("segments per compaction fit u32");
+        self.identifiers.push(segment);
+        self.indices.insert(segment, index);
+        index
+    }
+
+    fn identifier(&self, index: u32) -> SegmentIdentifier {
+        self.identifiers[index as usize]
+    }
+
+    /// Packs an interned record into the eight bytes the memo stores.
+    fn pack(&mut self, record: RecordIdentifier) -> u64 {
+        u64::from(self.index_of(record.segment)) << 32 | u64::from(record.record_number)
+    }
+
+    fn unpack(&self, packed: u64) -> RecordIdentifier {
+        RecordIdentifier {
+            segment: self.identifier((packed >> 32) as u32),
+            record_number: packed as u32,
+        }
+    }
+}
+
+/// Source node to its rewritten copy, exactly and without eviction.
+///
+/// Copying each distinct node once is an invariant, not an optimization: a
+/// miss does not cost one extra copy, it re-walks the whole subtree, and
+/// misses nest. So this is an open-addressed table over two `Vec<u64>` —
+/// no per-entry overhead, no eviction queue, and sixteen bytes a slot
+/// against the ~110 a `HashMap<RecordIdentifier, RecordIdentifier>` measures.
+/// A packed key of zero marks an empty slot, which [`SegmentInterner`]
+/// guarantees no real record can collide with.
+struct RewrittenNodes {
+    keys: Vec<u64>,
+    values: Vec<u64>,
+    len: usize,
+}
+
+/// Slots in a fresh table. Grown geometrically, so this only sets the floor.
+const INITIAL_MEMO_SLOTS: usize = 1024;
+
+impl RewrittenNodes {
+    fn new() -> Self {
+        Self {
+            keys: vec![0; INITIAL_MEMO_SLOTS],
+            values: vec![0; INITIAL_MEMO_SLOTS],
+            len: 0,
+        }
+    }
+
+    /// Fibonacci hashing over the packed key, which is dense in the low bits
+    /// (record numbers count up) and in the high bits (segment indices count
+    /// up), so the multiply is what spreads both across the probe sequence.
+    fn slot_of(&self, key: u64) -> usize {
+        let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed >> 32) as usize & (self.keys.len() - 1)
+    }
+
+    fn get(&self, key: u64) -> Option<u64> {
+        let mut slot = self.slot_of(key);
+        loop {
+            match self.keys[slot] {
+                0 => return None,
+                found if found == key => return Some(self.values[slot]),
+                _ => slot = (slot + 1) & (self.keys.len() - 1),
+            }
+        }
+    }
+
+    fn insert(&mut self, key: u64, value: u64) {
+        // Grow at ~70% load, before probe sequences get long.
+        if (self.len + 1) * 10 >= self.keys.len() * 7 {
+            self.grow();
+        }
+        self.insert_without_growing(key, value);
+        self.len += 1;
+    }
+
+    fn insert_without_growing(&mut self, key: u64, value: u64) {
+        let mut slot = self.slot_of(key);
+        while self.keys[slot] != 0 {
+            slot = (slot + 1) & (self.keys.len() - 1);
+        }
+        self.keys[slot] = key;
+        self.values[slot] = value;
+    }
+
+    fn grow(&mut self) {
+        let occupied: Vec<(u64, u64)> = self
+            .keys
+            .iter()
+            .zip(&self.values)
+            .filter(|(key, _)| **key != 0)
+            .map(|(key, value)| (*key, *value))
+            .collect();
+        self.keys = vec![0; self.keys.len() * 2];
+        self.values = vec![0; self.values.len() * 2];
+        for (key, value) in occupied {
+            self.insert_without_growing(key, value);
+        }
+    }
+}
 
 /// Deep-copies nodes into a fresh generation, sharing rewritten records
-/// through a source-record cache.
+/// through an exact source-record memo.
 struct Compactor<'writer, Sink: SegmentSink> {
     source: &'writer dyn SegmentProvider,
     writer: &'writer mut RecordWriter<Sink>,
-    /// Source record to its rewritten copy, under a byte budget.
-    ///
-    /// The memo preserves DAG sharing: a subtree the live root and a
-    /// checkpoint both reference is copied once and referenced twice. It is
-    /// not, however, a correctness property — Oak's own compactor caps the
-    /// equivalent cache and accepts duplicated output on a miss, and
-    /// `WriterCacheManager.Empty` shows the empty cache produces a correct
-    /// store. Unbounded it held one entry per distinct source node, which on
-    /// a large repository is tens of gigabytes; a miss now costs a duplicated
-    /// subtree in the output instead of the process.
-    rewritten_nodes: BoundedCache<RecordIdentifier, RecordIdentifier>,
+    /// Interns the segments both the memo and the path set name.
+    segments: SegmentInterner,
+    /// Source record to its rewritten copy — exact, so each distinct node is
+    /// copied once and `compacted_nodes` equals the distinct reachable count.
+    rewritten_nodes: RewrittenNodes,
+    /// The records currently being expanded — the ancestor path, packed the
+    /// same way the memo packs. Exact and unbounded: it carries termination,
+    /// so it is never budgeted. One entry per live level, not per node.
+    nodes_on_path: std::collections::HashSet<u64>,
     compacted_nodes: u64,
     /// The count at the last progress report, so the observer is called
     /// once per stride rather than once per node.
@@ -170,17 +270,28 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         source_node: RecordIdentifier,
         depth: usize,
     ) -> Result<RecordIdentifier> {
-        if let Some(rewritten) = self.rewritten_nodes.get(&source_node) {
-            return Ok(rewritten);
+        let packed_source = self.segments.pack(source_node);
+        if let Some(rewritten) = self.rewritten_nodes.get(packed_source) {
+            return Ok(self.segments.unpack(rewritten));
         }
-        // The cache is only populated once a node is fully written, so a
-        // cycle in a corrupt source would otherwise recurse forever before
-        // any entry exists; the depth bound stops it.
+        // A node reachable from itself is corruption — valid records only
+        // reference already-written records — and is refused exactly, at the
+        // record that closes the cycle. The memo cannot mask it: a memo hit
+        // returns above, so a memoized node is never on the path.
+        if !self.nodes_on_path.insert(packed_source) {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "node record {source_node} is contained in its own subtree; \
+                     the source records form a cycle"
+                ),
+            });
+        }
+        // Depth is a stack bound and nothing else: cycles are refused above.
         if depth > MAXIMUM_COMPACTION_DEPTH {
             return Err(Error::InvalidFormat {
                 details: format!(
-                    "node tree exceeds depth {MAXIMUM_COMPACTION_DEPTH}; \
-                     the source records probably form a cycle"
+                    "node tree exceeds depth {MAXIMUM_COMPACTION_DEPTH}, \
+                     which this walk cannot descend within its stack"
                 ),
             });
         }
@@ -222,7 +333,9 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
             &properties,
             Some(stable_identifier),
         )?;
-        self.rewritten_nodes.insert(source_node, rewritten);
+        self.nodes_on_path.remove(&packed_source);
+        let packed_rewritten = self.segments.pack(rewritten);
+        self.rewritten_nodes.insert(packed_source, packed_rewritten);
         self.compacted_nodes += 1;
         if self.compacted_nodes - self.reported_nodes >= COPIED_NODE_REPORT_STRIDE {
             self.reported_nodes = self.compacted_nodes;
@@ -294,28 +407,14 @@ pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<C
 
 /// Compacts exactly like [`compact`], reporting the deep copy, the
 /// reclamation sweep, and the journal rewrite to `observer`.
+///
+/// The memo maps each source node to its rewritten copy and is exact, so a
+/// subtree the live root and a checkpoint both reference is copied once and
+/// `compacted_nodes` equals the number of distinct node records reachable
+/// from the head.
 pub fn compact_with_progress(
     store: &mut WritableRepository,
     kind: CompactionKind,
-    observer: &mut dyn ProgressObserver,
-) -> Result<CompactionOutcome> {
-    compact_with_memo_budget(store, kind, COMPACTION_MEMO_BUDGET_BYTES, observer)
-}
-
-/// Compacts exactly like [`compact_with_progress`], with an explicit budget
-/// for the sharing memo.
-///
-/// The memo maps each source node to its rewritten copy, so a subtree the
-/// live root and a checkpoint both reference is copied once. A miss copies
-/// it again: correct output, duplicated work and bytes. The budget therefore
-/// trades memory against output size and time, and the right value depends
-/// on the tree — roughly [`COMPACTION_MEMO_BYTES_PER_NODE`] per node to hold
-/// all of it. A compaction reporting more copied nodes than the head
-/// contains is the observable symptom of a budget below that.
-pub fn compact_with_memo_budget(
-    store: &mut WritableRepository,
-    kind: CompactionKind,
-    memo_budget_bytes: usize,
     observer: &mut dyn ProgressObserver,
 ) -> Result<CompactionOutcome> {
     let size_before = store.archive_size_on_disk()?;
@@ -349,9 +448,7 @@ pub fn compact_with_memo_budget(
     let (new_head, compacted_nodes) = crate::progress::observe(
         observer,
         &Step::new("copying nodes into a fresh generation", WorkUnit::Nodes),
-        |observer| {
-            deep_copy_tree_with_memo_budget(store, &mut writer, head, memo_budget_bytes, observer)
-        },
+        |observer| deep_copy_tree_with_progress(store, &mut writer, head, observer),
     )?;
     writer.finish()?;
 
@@ -459,7 +556,7 @@ pub(crate) fn fsync_directory(directory: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactionKind, compact, deep_copy_tree_with_memo_budget};
+    use super::{CompactionKind, compact, deep_copy_tree_with_progress};
     use crate::content::node::PropertyValues;
     use crate::content::property::PropertyValue;
     use crate::content::provider::SegmentProvider;
@@ -646,35 +743,338 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_copy_with_no_sharing_memo_still_produces_the_whole_tree() {
-        let directory = TestDirectory::new("memo-evicts");
+    fn a_deep_copy_copies_each_distinct_node_exactly_once() {
+        let directory = TestDirectory::new("memo-exact");
         build_populated_store(&directory);
 
-        // A zero-budget memo is the worst case the bound can produce: every
-        // shared subtree is copied again instead of being referenced. The
-        // copy must still be complete and correct — the memo trades output
-        // size for resident memory, never correctness.
-        let copied = {
+        // The memo is exact, so the copy visits the shared subtree behind the
+        // checkpoint and the live root once. `copied` is therefore the
+        // distinct reachable node count, not merely at least it.
+        let (copied, distinct) = {
             let store = WritableRepository::open(&directory.path).expect("open");
             let head = store.head();
             let generation = store.writing_generation().expect("generation");
             let mut writer = store.record_writer(generation);
-            let (root, copied) = deep_copy_tree_with_memo_budget(
+            let (root, copied) = deep_copy_tree_with_progress(
                 &store,
                 &mut writer,
                 head,
-                0,
                 &mut crate::progress::DiscardedProgress,
             )
-            .expect("deep copy without a memo");
+            .expect("deep copy");
+            let distinct = distinct_reachable_nodes(&store, head);
             writer.finish().expect("finish");
             assert!(store.set_head(head, root));
             store.close().expect("close");
-            copied
+            (copied, distinct)
         };
-        assert!(copied > 0);
+        assert_eq!(
+            copied as usize, distinct,
+            "every distinct node is copied exactly once"
+        );
 
         assert_content_intact(&directory);
+    }
+
+    /// Builds `levels` diamonds under the super-root: every level references
+    /// the *same* next-level node twice, so distinct nodes grow linearly
+    /// while distinct root-to-leaf paths grow as 2^levels.
+    ///
+    /// `ballast` fresh nodes sit between the two references. They are what
+    /// decides whether the memo survives from the first reference to the
+    /// second: with `ballast` below the budget the second lookup hits, and
+    /// with it above, every level re-copies its whole subtree.
+    fn build_diamond_chain(directory: &TestDirectory, levels: usize, ballast: usize) {
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+
+        let mut node = writer
+            .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+            .expect("leaf");
+        for level in 0..levels {
+            let mut children = vec![("a_left".to_owned(), node)];
+            for index in 0..ballast {
+                let value = writer
+                    .write_string(&format!("{level}-{index}"))
+                    .expect("filler value");
+                let filler = writer
+                    .write_node(
+                        Some("nt:unstructured"),
+                        &[],
+                        &ChildNodesToWrite::Zero,
+                        &[PropertyToWrite {
+                            name: "n".to_owned(),
+                            property_type: crate::content::property::PropertyType::String,
+                            values: PropertyValuesToWrite::Single(value),
+                        }],
+                    )
+                    .expect("filler");
+                children.push((format!("b_fill{index:04}"), filler));
+            }
+            children.push(("c_right".to_owned(), node));
+            node = writer
+                .write_node(
+                    Some("nt:unstructured"),
+                    &[],
+                    &ChildNodesToWrite::Many(children),
+                    &[],
+                )
+                .expect("diamond");
+        }
+        let head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node,
+                },
+                &[],
+            )
+            .expect("super root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, head));
+        store.close().expect("close");
+    }
+
+    /// The exact number of distinct node records reachable from `root` — the
+    /// figure `compacted_nodes` is supposed to equal.
+    fn distinct_reachable_nodes(
+        provider: &dyn SegmentProvider,
+        root: crate::segment::record::RecordIdentifier,
+    ) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![root];
+        while let Some(record) = pending.pop() {
+            if !seen.insert(record) {
+                continue;
+            }
+            let node = crate::content::node::NodeState::new(provider, record);
+            for (_, child) in node.child_node_entries().expect("children") {
+                pending.push(child.record_identifier());
+            }
+        }
+        seen.len()
+    }
+
+    #[test]
+    fn a_shared_subtree_is_copied_once_however_deep_the_sharing_nests() {
+        // Every level references the same next-level node twice, so the
+        // distinct root-to-leaf paths grow as 2^levels while the distinct
+        // nodes grow linearly. A memo that can be starved turns those paths
+        // into copies: at 14 levels this shape measured 557,024 copies
+        // against 464 distinct nodes. An exact memo cannot, at any depth.
+        for (levels, ballast) in [(4usize, 0usize), (14, 0), (14, 32), (24, 4)] {
+            let directory = TestDirectory::new(&format!("diamond-{levels}-{ballast}"));
+            build_diamond_chain(&directory, levels, ballast);
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let head = store.head();
+            let distinct = distinct_reachable_nodes(&store, head);
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let (_root, copied) = deep_copy_tree_with_progress(
+                &store,
+                &mut writer,
+                head,
+                &mut crate::progress::DiscardedProgress,
+            )
+            .expect("deep copy");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+            assert_eq!(
+                copied as usize, distinct,
+                "levels={levels} ballast={ballast}: copied must equal the distinct node count"
+            );
+        }
+    }
+
+    /// A wide, shallow tree of roughly `fanout * fanout` leaves.
+    fn build_wide_store(directory: &TestDirectory, fanout: usize) {
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+
+        let mut branches = Vec::with_capacity(fanout);
+        for branch in 0..fanout {
+            let mut leaves = Vec::with_capacity(fanout);
+            for leaf in 0..fanout {
+                let value = writer
+                    .write_string(&format!("{branch}-{leaf}"))
+                    .expect("leaf value");
+                let node = writer
+                    .write_node(
+                        Some("nt:unstructured"),
+                        &[],
+                        &ChildNodesToWrite::Zero,
+                        &[PropertyToWrite {
+                            name: "n".to_owned(),
+                            property_type: crate::content::property::PropertyType::String,
+                            values: PropertyValuesToWrite::Single(value),
+                        }],
+                    )
+                    .expect("leaf");
+                leaves.push((format!("leaf{leaf:05}"), node));
+            }
+            let node = writer
+                .write_node(
+                    Some("nt:unstructured"),
+                    &[],
+                    &ChildNodesToWrite::Many(leaves),
+                    &[],
+                )
+                .expect("branch");
+            branches.push((format!("branch{branch:05}"), node));
+        }
+        let root = writer
+            .write_node(None, &[], &ChildNodesToWrite::Many(branches), &[])
+            .expect("root");
+        let head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: root,
+                },
+                &[],
+            )
+            .expect("super root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, head));
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn the_exact_memo_costs_a_bounded_number_of_bytes_a_node() {
+        use super::{RewrittenNodes, SegmentInterner};
+        use crate::segment::identifier::SegmentIdentifier;
+        use crate::segment::record::RecordIdentifier;
+
+        // Exactness is only affordable because an entry is two packed u64s
+        // rather than two `RecordIdentifier`s: the same map keyed on the
+        // 24-byte identifier measures ~110 bytes a node, which is the figure
+        // that made an exact memo look impossible. One segment holds many
+        // records, so the interner stays small while the memo grows.
+        for count in [1_000_000usize, 4_000_000] {
+            let mut interner = SegmentInterner::new();
+            let mut memo = RewrittenNodes::new();
+            for index in 0..count {
+                let record = RecordIdentifier {
+                    segment: SegmentIdentifier {
+                        most_significant_bits: (index / 8192) as u64,
+                        least_significant_bits: 0x5eed,
+                    },
+                    record_number: index as u32,
+                };
+                let packed = interner.pack(record);
+                memo.insert(packed, packed);
+                assert_eq!(interner.unpack(packed), record, "packing round-trips");
+            }
+            // Resident bytes vary with allocator reuse, so the pinned figure
+            // is the table's own occupancy: two `u64` vectors over its slots.
+            // Resident size tracked it within a few bytes a node when measured
+            // in isolation (44 at a million entries, 35 at four million).
+            let bytes_per_node = memo.keys.len() * 2 * std::mem::size_of::<u64>() / count;
+            assert_eq!(memo.len, count);
+            assert!(
+                bytes_per_node <= 48,
+                "{count} entries cost {bytes_per_node} bytes a node; the packed \
+                 table must stay far below the ~110 an identifier-keyed map costs"
+            );
+            assert!(
+                memo.len * 10 <= memo.keys.len() * 7,
+                "the table stays under its load factor"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exact_memo_holds_only_what_the_tree_reaches() {
+        for fanout in [100usize, 320] {
+            let directory = TestDirectory::new(&format!("footprint-{fanout}"));
+            build_wide_store(&directory, fanout);
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let head = store.head();
+            let distinct = distinct_reachable_nodes(&store, head);
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let (_root, copied) = deep_copy_tree_with_progress(
+                &store,
+                &mut writer,
+                head,
+                &mut crate::progress::DiscardedProgress,
+            )
+            .expect("deep copy");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+            assert_eq!(copied as usize, distinct, "the copy is exact at {fanout}");
+        }
+    }
+
+    #[test]
+    fn a_cyclic_source_is_refused_at_the_record_that_closes_the_cycle() {
+        use crate::content::provider::tests::MemorySegmentProvider;
+        use crate::error::Error;
+        use crate::writer::segment_builder::SegmentBufferBuilder;
+
+        let directory = TestDirectory::new("compaction-cycle");
+        let store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let original_child = writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("original child");
+        let root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "loop".to_owned(),
+                    node: original_child,
+                },
+                &[],
+            )
+            .expect("root");
+        writer.finish().expect("finish segment");
+
+        // Point the root's only child slot back at the root itself.
+        let view = store.segment(root.segment).expect("root segment");
+        let root_position = view
+            .record_position(root.record_number)
+            .expect("root position");
+        let mut cyclic_bytes = view.bytes.to_vec();
+        let child_slot: &mut [u8; 6] = (&mut cyclic_bytes[root_position + 12..root_position + 18])
+            .try_into()
+            .expect("one child identifier slot");
+        SegmentBufferBuilder::write_record_identifier_bytes(0, root.record_number, child_slot);
+        let mut memory = MemorySegmentProvider::default();
+        memory.insert(root.segment, cyclic_bytes);
+
+        let mut sink_writer = store.record_writer(generation);
+        let error = deep_copy_tree_with_progress(
+            &memory,
+            &mut sink_writer,
+            root,
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect_err("a cyclic source is refused");
+        let Error::InvalidFormat { details } = &error else {
+            panic!("a cycle is a format error, got {error:?}");
+        };
+        // Exactly, at the closing record — not "probably a cycle" after 4000
+        // wasted levels, and naming the record so the store can be repaired.
+        assert!(
+            details.contains("contained in its own subtree"),
+            "unexpected detail: {details}"
+        );
+        assert!(
+            details.contains(&root.to_string()),
+            "the error names the offending record: {details}"
+        );
+        store.close().expect("close");
     }
 
     #[test]

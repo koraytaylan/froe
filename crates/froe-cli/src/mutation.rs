@@ -48,7 +48,6 @@ fn confirm(action: &str, assume_yes: bool, reporter: &Reporter) -> bool {
 pub(crate) fn run_compact(
     repository: &Path,
     tail: bool,
-    memo_budget_mb: usize,
     assume_yes: bool,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
@@ -73,13 +72,7 @@ pub(crate) fn run_compact(
         return Ok(false);
     }
     let mut store = WritableRepository::open_with_progress(repository, &mut reporter.clone())?;
-    let memo_budget_bytes = memo_budget_mb.saturating_mul(1024 * 1024);
-    let outcome = froe::writer::compaction::compact_with_memo_budget(
-        &mut store,
-        kind,
-        memo_budget_bytes,
-        &mut reporter.clone(),
-    )?;
+    let outcome = froe::writer::compact_with_progress(&mut store, kind, &mut reporter.clone())?;
     store.close()?;
     reporter.finish();
     println!(

@@ -2,8 +2,8 @@
 
 The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for the
 range `bdcbe55..HEAD`, extended after `v0.8.0` by three further write-path
-changes: record reuse in the writer, binary value sharing in compaction, and a
-configurable sharing-memo budget. In scope on three counts: it adds a task that makes
+changes: record reuse in the writer, binary value sharing in compaction, and an
+exact compaction sharing memo replacing the evicting one. In scope on three counts: it adds a task that makes
 repository bytes unreachable by design (`--retain-journal-revisions`), it
 rewrites how a write session holds and certifies what it wrote, and it
 *loosens* a refusal on the destructive path — the last reaching the default
@@ -90,16 +90,18 @@ followed by restoring the pristine source and rerunning the original test.
 
 ## Resources
 
-The point of the range. Worst-case residency is now a function of
-configuration, not of repository size:
+The point of the range. Every cache below is a function of configuration
+rather than of repository size — with one deliberate exception, the compaction
+sharing memo, which is now proportional to the tree by design. That exception
+is stated as such rather than hidden: see "The one store-proportional cache".
 
 * Read caches: 192 MiB parsed segments, 48 MiB strings, 48 MiB templates.
 * Writer base-segment cache: 192 MiB. Session read-back cache: twice the
   archive rotation threshold (512 MiB by default), sized so the archive being
   written is always resident.
-* Compaction sharing memo 256 MiB by default and settable per run with
-  `froe compact --memo-budget-mb`, at roughly 112 bytes per node in the head; verified-subtree memo 192 MiB; recovery
-  visited memo 128 MiB; SQLite string dictionary 64 MiB.
+* Verified-subtree memo 192 MiB; recovery visited memo 128 MiB; SQLite string
+  dictionary 64 MiB. The compaction sharing memo is no longer among these: it
+  is exact and unbudgeted, and is treated separately below.
 
 Planning is *not* bounded by configuration. On the default `--task segments`
 path, under the lock, peak store-scale sets are `head_data_segments`,
@@ -115,12 +117,44 @@ records. Compaction no longer copies binary content at all when the source
 blocks live in bulk segments, which on a store written by Oak is most of the
 bytes.
 
-What remains is the sharing memo. It is an evicting FIFO, and a miss re-copies
-a shared subtree, so a budget below the tree inflates the output; the
-observable symptom is a copied-node count climbing past the number of nodes
-the head contains, which is what a 256 MiB budget did on an 18.8M-node
-repository. The budget is now a per-run flag so it can be matched to the tree.
-No test measures the amplification at a given budget.
+### The one store-proportional cache
+
+The compaction sharing memo used to be an evicting FIFO under a 256 MiB
+budget. A miss did not cost one duplicated subtree; it re-walked the subtree,
+and misses nested, so the copied-node count could climb past the number of
+nodes the head contains — which is what the default budget did on an 18.8M-node
+repository. Copying each distinct node once is an invariant, and it was being
+enforced by a byte budget an operator had to guess.
+
+It is now exact: `RewrittenNodes`, an open-addressed table that never evicts,
+keyed on records interned to a `u32` segment index and packed into a `u64`, so
+an entry is two `u64`s rather than two 24-byte `RecordIdentifier`s.
+`compacted_nodes` therefore equals the number of distinct node records
+reachable from the head, pinned by
+`a_shared_subtree_is_copied_once_however_deep_the_sharing_nests` and
+`a_deep_copy_copies_each_distinct_node_exactly_once`.
+
+The cost of that guarantee is residency proportional to the tree: 16 bytes a
+slot, between 35 and 46 bytes a node depending where the table sits between
+growths (measured 44 at a million entries and 35 at four million; pinned as
+table occupancy, not RSS, by
+`the_exact_memo_costs_a_bounded_number_of_bytes_a_node`). An 18.8M-node head
+needs 2^25 slots, or 512 MiB. The rejected alternative — the same map keyed on
+`RecordIdentifier` — measured 104 to 115 bytes a node, or roughly 2.1 GB on the
+same head, which is why interning and packing are load-bearing rather than an
+optimization.
+
+`--memo-budget-mb`, `compact_with_memo_budget` and
+`COMPACTION_MEMO_BYTES_PER_NODE` are gone with it. No knob replaces them: the
+figure an operator would have needed is a distinct-set cardinality unavailable
+before the walk, and a ceiling could only fire mid-copy, after segments had
+already streamed to the sink. If a tree is ever found that does not fit, the
+answer is a measurement first.
+
+Termination no longer rests on the depth bound either. A self-referential
+record graph is refused exactly, by an ancestor set, at the record that closes
+the cycle (`a_cyclic_source_is_refused_at_the_record_that_closes_the_cycle`);
+`MAXIMUM_COMPACTION_DEPTH` is now a stack bound and nothing else.
 
 Still proportional to the store, and unavoidable without an on-disk index:
 one decoded index entry per segment (~40 B), one `segment_locations` entry per
@@ -135,7 +169,10 @@ which previously reached `EMFILE` on a large compaction after its work was
 done.
 
 **Proxy, not a measurement.** `cache_weight` is an approximation of resident
-bytes; it decides eviction, not correctness. No test measures process RSS.
+bytes; it decides eviction, not correctness. No test measures process RSS. The
+compaction memo's per-node figure is pinned as table occupancy for that reason:
+resident size tracked it within a few bytes a node when measured in isolation,
+but varies with allocator reuse when measured alongside other tests.
 
 ## Interoperability
 
