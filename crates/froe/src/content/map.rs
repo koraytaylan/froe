@@ -281,7 +281,7 @@ fn map_entries_internal(
 
     let mut entries = Vec::new();
     let mut visited = std::collections::HashSet::new();
-    collect_map_entries(provider, base, &mut entries, 0, &mut visited, &mut budget)?;
+    collect_map_entries(provider, base, &mut entries, &mut visited, &mut budget)?;
     if !overlays.is_empty() {
         for entry in &mut entries {
             if let Some((_, value)) = overlays
@@ -375,77 +375,82 @@ fn collect_map_entries(
     provider: &dyn SegmentProvider,
     map_identifier: RecordIdentifier,
     entries: &mut Vec<CollectedEntry>,
-    depth: u32,
     visited: &mut std::collections::HashSet<RecordIdentifier>,
     budget: &mut Option<MapEnumerationBudget>,
 ) -> Result<()> {
-    // Valid tries are at most seven levels deep (plus stray diffs); a much
-    // larger depth means the records form a cycle.
-    if depth >= 64 {
-        return Err(walk_too_long(map_identifier));
-    }
-    // In a valid trie every record is reachable exactly once — a key's
-    // hash fixes its unique bucket path, so two buckets can never share a
-    // subtree. A revisit therefore means corrupt records shaped as a DAG,
-    // on which a depth bound alone would allow exponential work (Java
-    // enumerates such maps forever; returning an error is the documented
-    // safer deviation).
-    if !visited.insert(map_identifier) {
-        return Err(walk_too_long(map_identifier));
-    }
-    charge_map_record(budget)?;
-    let view = provider.segment(map_identifier.segment)?;
-    let head = view.read_u32(map_identifier.record_number, 0)?;
-    if head == DIFF_HEAD {
-        // A nested diff below a branch never occurs in well-formed data,
-        // but the Java reader recurses, so we do too.
-        let base = view.read_record_identifier(map_identifier.record_number, 8, 2)?;
-        return collect_map_entries(provider, base, entries, depth + 1, visited, budget);
-    }
-    let size = head & SIZE_MASK;
-    let level = head >> LEVEL_SHIFT;
-    if size == 0 {
-        return Ok(());
-    }
-    if size > BUCKETS_PER_LEVEL && level < MAXIMUM_LEVEL {
-        let bitmap = view.read_u32(map_identifier.record_number, 4)?;
-        let bucket_count = bitmap.count_ones() as usize;
-        for bucket_position in 0..bucket_count {
-            let bucket =
-                view.read_record_identifier(map_identifier.record_number, 8, bucket_position)?;
-            collect_map_entries(provider, bucket, entries, depth + 1, visited, budget)?;
+    // The walk carries its own stack, so it imposes no depth limit: how deep
+    // a trie is belongs to the records, not to this code. In a valid trie
+    // every record is reachable exactly once — a key's hash fixes its unique
+    // bucket path, so two buckets can never share a subtree — so `visited`
+    // decides corruption exactly, and it is what stops a walk that a depth
+    // bound alone could not (Java enumerates a DAG-shaped map forever;
+    // returning an error is the documented safer deviation).
+    let mut pending = vec![map_identifier];
+    while let Some(map_identifier) = pending.pop() {
+        if !visited.insert(map_identifier) {
+            return Err(walk_too_long(map_identifier));
         }
-        return Ok(());
-    }
-    let size = size as usize;
-    let identifiers_base = 4 + size * 4;
-    for position in 0..size {
-        if let Some(budget) = budget {
-            let attempted_entries = u64::try_from(entries.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
-            if attempted_entries > budget.maximum_entries {
-                return Err(Error::MapEntryBudgetExceeded {
-                    maximum_entries: budget.maximum_entries,
-                    attempted_entries,
-                });
+        charge_map_record(budget)?;
+        let view = provider.segment(map_identifier.segment)?;
+        let head = view.read_u32(map_identifier.record_number, 0)?;
+        if head == DIFF_HEAD {
+            // A nested diff below a branch never occurs in well-formed data,
+            // but the Java reader recurses, so we do too.
+            let base = view.read_record_identifier(map_identifier.record_number, 8, 2)?;
+            pending.push(base);
+            continue;
+        }
+        let size = head & SIZE_MASK;
+        let level = head >> LEVEL_SHIFT;
+        if size == 0 {
+            continue;
+        }
+        if size > BUCKETS_PER_LEVEL && level < MAXIMUM_LEVEL {
+            let bitmap = view.read_u32(map_identifier.record_number, 4)?;
+            let bucket_count = bitmap.count_ones() as usize;
+            let mut buckets = Vec::with_capacity(bucket_count);
+            for bucket_position in 0..bucket_count {
+                buckets.push(view.read_record_identifier(
+                    map_identifier.record_number,
+                    8,
+                    bucket_position,
+                )?);
             }
+            // Reversed so `pop` yields bucket order, keeping enumeration order
+            // identical to the recursive walk's.
+            pending.extend(buckets.into_iter().rev());
+            continue;
         }
-        let key_identifier = view.read_record_identifier(
-            map_identifier.record_number,
-            identifiers_base,
-            position * 2,
-        )?;
-        let value = view.read_record_identifier(
-            map_identifier.record_number,
-            identifiers_base,
-            position * 2 + 1,
-        )?;
-        entries.push(CollectedEntry {
-            name: read_map_name(provider, key_identifier, budget)?,
-            key_identifier,
-            value,
-        });
+        let size = size as usize;
+        let identifiers_base = 4 + size * 4;
+        for position in 0..size {
+            if let Some(budget) = budget {
+                let attempted_entries = u64::try_from(entries.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                if attempted_entries > budget.maximum_entries {
+                    return Err(Error::MapEntryBudgetExceeded {
+                        maximum_entries: budget.maximum_entries,
+                        attempted_entries,
+                    });
+                }
+            }
+            let key_identifier = view.read_record_identifier(
+                map_identifier.record_number,
+                identifiers_base,
+                position * 2,
+            )?;
+            let value = view.read_record_identifier(
+                map_identifier.record_number,
+                identifiers_base,
+                position * 2 + 1,
+            )?;
+            entries.push(CollectedEntry {
+                name: read_map_name(provider, key_identifier, budget)?,
+                key_identifier,
+                value,
+            });
+        }
     }
     Ok(())
 }

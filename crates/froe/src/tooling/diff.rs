@@ -14,10 +14,6 @@ use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::record::RecordIdentifier;
 use crate::store::{ArchiveSet, open_all_archives_with_progress};
 
-/// A content tree is never this deep; beyond it the node records form a
-/// cycle in a corrupt store, and the diff walk stops.
-const MAXIMUM_DIFF_DEPTH: usize = 4000;
-
 /// The total node pairs one diff may visit. A depth bound alone cannot
 /// stop corrupt records shaped as a wide DAG, whose distinct paths grow
 /// exponentially while staying shallow; real diffs — even a whole-tree
@@ -144,7 +140,6 @@ pub fn diff_revisions_visiting(
                 before_node.as_ref(),
                 after_node.as_ref(),
                 &base_path,
-                0,
                 emit,
                 &mut visits,
                 observer,
@@ -214,69 +209,152 @@ fn normalized_filter_path(path: &str) -> String {
     }
 }
 
+/// One pair of records on the current path, so a self-referential graph is
+/// refused exactly instead of walked until a work budget notices.
+type PairOnPath = (Option<RecordIdentifier>, Option<RecordIdentifier>);
+
+/// One unit of diff work.
+enum DiffWork<'provider> {
+    /// Compare this pair and schedule its children.
+    Visit {
+        before: Option<NodeState<'provider>>,
+        after: Option<NodeState<'provider>>,
+        path: String,
+    },
+    /// The pair's subtree finished; take it off the ancestor set.
+    Leave(PairOnPath),
+}
+
 /// Diffs two node states, handing each difference to `emit`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the walk threads its path, depth, output, and work budget"
-)]
-fn diff_nodes(
-    provider: &dyn SegmentProvider,
-    before: Option<&NodeState<'_>>,
-    after: Option<&NodeState<'_>>,
+///
+/// The walk carries its own stack on the heap and imposes no depth limit:
+/// depth is a property of the repositories being compared, not something
+/// this code may choose. Two mutually recursive frames per level used to
+/// exhaust an ordinary thread stack long before any bound could refuse.
+fn diff_nodes<'provider>(
+    provider: &'provider dyn SegmentProvider,
+    before: Option<&NodeState<'provider>>,
+    after: Option<&NodeState<'provider>>,
     path: &str,
-    depth: usize,
     emit: &mut dyn FnMut(NodeDifference),
     visits: &mut u64,
     observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
-    if depth > MAXIMUM_DIFF_DEPTH {
-        return Err(crate::error::Error::InvalidFormat {
-            details: format!(
-                "node tree exceeds depth {MAXIMUM_DIFF_DEPTH}; the records probably form a cycle"
-            ),
-        });
-    }
-    // Reported before the increment: the pairs behind this one are the
-    // ones actually compared, and this one has not been yet.
-    if (*visits).is_multiple_of(DIFF_VISIT_REPORT_STRIDE) {
-        observer.step_advanced(*visits);
-    }
-    *visits += 1;
-    if *visits > MAXIMUM_DIFF_VISITS {
-        return Err(crate::error::Error::InvalidFormat {
-            details: format!(
-                "diff exceeds {MAXIMUM_DIFF_VISITS} visited nodes; \
-                 the records probably form a pathological graph"
-            ),
-        });
-    }
-    match (before, after) {
-        (None, None) => {}
-        (None, Some(_)) => emit(NodeDifference::NodeAdded {
-            path: display_path(path),
-        }),
-        (Some(_), None) => emit(NodeDifference::NodeRemoved {
-            path: display_path(path),
-        }),
-        (Some(before_node), Some(after_node)) => {
-            // Identical records mean an identical subtree — skip it whole.
-            if before_node.record_identifier() == after_node.record_identifier() {
-                return Ok(());
+    let mut ancestors: std::collections::HashSet<PairOnPath> = std::collections::HashSet::new();
+    let mut stack = vec![DiffWork::Visit {
+        before: before.copied(),
+        after: after.copied(),
+        path: path.to_owned(),
+    }];
+
+    while let Some(work) = stack.pop() {
+        let (before, after, path) = match work {
+            DiffWork::Leave(pair) => {
+                ancestors.remove(&pair);
+                continue;
             }
-            diff_properties(provider, before_node, after_node, path, emit)?;
-            diff_children(
-                provider,
-                before_node,
-                after_node,
+            DiffWork::Visit {
+                before,
+                after,
                 path,
-                depth,
-                emit,
-                visits,
-                observer,
-            )?;
+            } => (before, after, path),
+        };
+        // Reported before the increment: the pairs behind this one are the
+        // ones actually compared, and this one has not been yet.
+        if (*visits).is_multiple_of(DIFF_VISIT_REPORT_STRIDE) {
+            observer.step_advanced(*visits);
+        }
+        *visits += 1;
+        if *visits > MAXIMUM_DIFF_VISITS {
+            return Err(crate::error::Error::InvalidFormat {
+                details: format!(
+                    "diff exceeds {MAXIMUM_DIFF_VISITS} visited nodes; \
+                     the records probably form a pathological graph"
+                ),
+            });
+        }
+        match (before, after) {
+            (None, None) => {}
+            (None, Some(_)) => emit(NodeDifference::NodeAdded {
+                path: display_path(&path),
+            }),
+            (Some(_), None) => emit(NodeDifference::NodeRemoved {
+                path: display_path(&path),
+            }),
+            (Some(before_node), Some(after_node)) => {
+                // Identical records mean an identical subtree — skip it whole.
+                if before_node.record_identifier() == after_node.record_identifier() {
+                    continue;
+                }
+                let pair = (
+                    Some(before_node.record_identifier()),
+                    Some(after_node.record_identifier()),
+                );
+                // A pair reachable from itself is corruption in one of the
+                // two stores, refused at the records that close the cycle.
+                if !ancestors.insert(pair) {
+                    return Err(crate::error::Error::InvalidFormat {
+                        details: format!(
+                            "node records {} and {} are contained in their own subtree; \
+                             the records form a cycle",
+                            pair.0.expect("a matched pair"),
+                            pair.1.expect("a matched pair"),
+                        ),
+                    });
+                }
+                diff_properties(provider, &before_node, &after_node, &path, emit)?;
+                stack.push(DiffWork::Leave(pair));
+                // Pushed in reverse so they pop in the order the recursive
+                // walk visited them, keeping the emitted sequence identical.
+                for child in child_pairs_to_visit(&before_node, &after_node, &path)?
+                    .into_iter()
+                    .rev()
+                {
+                    stack.push(child);
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// The child pairs of one matched node pair, in the order the diff reports
+/// them: every child of `after` (added or possibly changed), then the
+/// children only `before` has (removed).
+fn child_pairs_to_visit<'provider>(
+    before: &NodeState<'provider>,
+    after: &NodeState<'provider>,
+    path: &str,
+) -> Result<Vec<DiffWork<'provider>>> {
+    let before_children = before.child_node_entries()?;
+    let after_children = after.child_node_entries()?;
+    let before_by_name: std::collections::HashMap<&str, &NodeState<'provider>> = before_children
+        .iter()
+        .map(|(name, node)| (name.as_str(), node))
+        .collect();
+
+    let mut pairs = Vec::with_capacity(after_children.len());
+    for (name, after_child) in &after_children {
+        pairs.push(DiffWork::Visit {
+            before: before_by_name.get(name.as_str()).map(|node| **node),
+            after: Some(*after_child),
+            path: format!("{path}/{name}"),
+        });
+    }
+    let after_names: std::collections::HashSet<&str> = after_children
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    for (name, before_child) in &before_children {
+        if !after_names.contains(name.as_str()) {
+            pairs.push(DiffWork::Visit {
+                before: Some(*before_child),
+                after: None,
+                path: format!("{path}/{name}"),
+            });
+        }
+    }
+    Ok(pairs)
 }
 
 /// Diffs the properties of two nodes.
@@ -327,62 +405,6 @@ fn diff_properties(
                 path: display_path(path),
                 change: PropertyChange::Removed(before_property.clone()),
             });
-        }
-    }
-    Ok(())
-}
-
-/// Diffs the children of two nodes.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the walk threads its path, depth, output, and work budget"
-)]
-fn diff_children(
-    provider: &dyn SegmentProvider,
-    before: &NodeState<'_>,
-    after: &NodeState<'_>,
-    path: &str,
-    depth: usize,
-    emit: &mut dyn FnMut(NodeDifference),
-    visits: &mut u64,
-    observer: &mut dyn ProgressObserver,
-) -> Result<()> {
-    let before_children = before.child_node_entries()?;
-    let after_children = after.child_node_entries()?;
-
-    for (name, after_child) in &after_children {
-        let before_child = before_children
-            .iter()
-            .find(|(before_name, _)| before_name == name)
-            .map(|(_, node)| node);
-        let child_path = format!("{path}/{name}");
-        diff_nodes(
-            provider,
-            before_child,
-            Some(after_child),
-            &child_path,
-            depth + 1,
-            emit,
-            visits,
-            observer,
-        )?;
-    }
-    for (name, before_child) in &before_children {
-        if !after_children
-            .iter()
-            .any(|(after_name, _)| after_name == name)
-        {
-            let child_path = format!("{path}/{name}");
-            diff_nodes(
-                provider,
-                Some(before_child),
-                None,
-                &child_path,
-                depth + 1,
-                emit,
-                visits,
-                observer,
-            )?;
         }
     }
     Ok(())
