@@ -335,15 +335,12 @@ fn signed_uuid_key(record: RecordIdentifier) -> (i64, i64) {
     )
 }
 
-/// A candidate tree is never this deep; a greater depth means a cycle in
-/// corrupt data. Bounded below the stack-overflow threshold.
-const MAXIMUM_RECOVERY_DEPTH: usize = 4000;
-
 /// Byte budget for the recovery walk's shared visited memo.
 ///
 /// One candidate probe walks the head and every checkpoint; the memo exists
 /// so a subtree those trees share is verified once. A miss re-walks, which
-/// is time rather than a different answer.
+/// is time rather than a different answer: entries go in only once a subtree
+/// has verified, and nothing else consults them.
 const RECOVERY_VISITED_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// Whether a candidate super-root passes Oak's consistency gate: the
@@ -490,59 +487,99 @@ fn check_node_shallow(provider: &dyn SegmentProvider, record: RecordIdentifier) 
 /// records the checkpoints share with the live content verify once. On
 /// failure returns the relative path of the corrupt node (empty for the
 /// tree root itself).
+///
+/// The walk carries its own stack on the heap and imposes no depth limit:
+/// depth is a property of the candidate store, not something this code may
+/// choose. Termination on a self-referential record graph is the exact
+/// `ancestors` set.
 fn verify_tree(
     provider: &dyn SegmentProvider,
     record: RecordIdentifier,
     visited: &mut BoundedCache<RecordIdentifier, ()>,
 ) -> std::result::Result<(), String> {
-    fn walk(
+    /// One suspended node: children still to descend into, and the path
+    /// length to restore when it completes.
+    struct Frame {
+        record: RecordIdentifier,
+        pending_children: Vec<(String, RecordIdentifier)>,
+        parent_path_length: usize,
+    }
+
+    /// Checks one node and enumerates its children. `None` means the memo
+    /// already holds it, so the subtree needs no walking.
+    fn open(
         provider: &dyn SegmentProvider,
         record: RecordIdentifier,
-        visited: &mut BoundedCache<RecordIdentifier, ()>,
+        visited: &BoundedCache<RecordIdentifier, ()>,
         ancestors: &mut HashSet<RecordIdentifier>,
-        depth: usize,
-        path: &mut String,
-    ) -> std::result::Result<(), String> {
-        // A tree deeper than the cap cannot be verified within bounded
-        // stack; treating it as consistent would let recovery install a
-        // head with an unchecked subtree, so it fails the gate instead.
-        if depth > MAXIMUM_RECOVERY_DEPTH {
-            return Err(path.clone());
-        }
+        path: &str,
+    ) -> std::result::Result<Option<Vec<(String, RecordIdentifier)>>, String> {
         // A node inside its own subtree is corruption and fails the gate;
         // meeting an already-completed node again is ordinary shared-
-        // subtree deduplication and verifies for free.
+        // subtree deduplication and verifies for free. Tested before the
+        // memo so a cycle can never be served from it.
         if ancestors.contains(&record) {
-            return Err(path.clone());
+            return Err(path.to_owned());
         }
         if visited.get(&record).is_some() {
-            return Ok(());
+            return Ok(None);
         }
-        visited.insert(record, ());
         ancestors.insert(record);
-        check_node_shallow(provider, record).map_err(|_| path.clone())?;
+        check_node_shallow(provider, record).map_err(|_| path.to_owned())?;
         let node = NodeState::new(provider, record);
-        let children = node.child_node_entries().map_err(|_| path.clone())?;
-        for (name, child) in children {
-            let parent_length = path.len();
-            path.push('/');
-            path.push_str(&name);
-            walk(
-                provider,
-                child.record_identifier(),
-                visited,
-                ancestors,
-                depth + 1,
-                path,
-            )?;
-            path.truncate(parent_length);
-        }
-        ancestors.remove(&record);
-        Ok(())
+        let children = node.child_node_entries().map_err(|_| path.to_owned())?;
+        let mut children: Vec<(String, RecordIdentifier)> = children
+            .into_iter()
+            .map(|(name, child)| (name, child.record_identifier()))
+            .collect();
+        // Reversed so `pop` yields enumeration order.
+        children.reverse();
+        Ok(Some(children))
     }
+
     let mut ancestors = HashSet::new();
     let mut path = String::new();
-    walk(provider, record, visited, &mut ancestors, 0, &mut path)
+    let Some(children) = open(provider, record, visited, &mut ancestors, &path)? else {
+        return Ok(());
+    };
+    let mut stack = vec![Frame {
+        record,
+        pending_children: children,
+        parent_path_length: 0,
+    }];
+
+    loop {
+        let next = stack
+            .last_mut()
+            .expect("the loop returns before the stack empties")
+            .pending_children
+            .pop();
+        if let Some((name, child)) = next {
+            let parent_path_length = path.len();
+            path.push('/');
+            path.push_str(&name);
+            match open(provider, child, visited, &mut ancestors, &path)? {
+                Some(children) => stack.push(Frame {
+                    record: child,
+                    pending_children: children,
+                    parent_path_length,
+                }),
+                None => path.truncate(parent_path_length),
+            }
+            continue;
+        }
+        let finished = stack.pop().expect("a frame was just inspected");
+        ancestors.remove(&finished.record);
+        // On completion, never on entry. Entering a node into the memo before
+        // its subtree is verified caches failed and cyclic subtrees, and makes
+        // a shared root the *oldest* entry of its own subtree, so any subtree
+        // larger than the budget guarantees the sibling misses.
+        visited.insert(finished.record, ());
+        if stack.is_empty() {
+            return Ok(());
+        }
+        path.truncate(finished.parent_path_length);
+    }
 }
 
 /// Resolves and reads every block of an inline binary without holding the
