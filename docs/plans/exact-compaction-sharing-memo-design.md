@@ -1,8 +1,8 @@
 # Exact sharing and exact termination in compaction
 
-Landed for `crates/froe/src/writer/compaction.rs`. The rule below is
-repository-wide and three walks still do not follow it; those are listed at the
-end as open work.
+Landed. The rule below is repository-wide, and every walk over records now
+follows it: the compaction memo is exact, and no walk imposes a depth limit.
+What that traded away is listed at the end as open work.
 
 ## The rule
 
@@ -12,9 +12,15 @@ is how a walk loses an invariant.
 
 | guarantee | instrument | who does it |
 |---|---|---|
-| terminate on a self-referential graph | exact unbounded set of records on the current path | `compaction.rs`, `check.rs:707`, `backup.rs:502`, `map.rs:283` |
-| bound work on a corrupt but acyclic graph | a budget charged against work actually done | `traversal.rs:42` |
-| do not exhaust the stack | a depth cap, on recursive walks only | — |
+| terminate on a self-referential graph | exact unbounded set of records on the current path | every walk |
+| bound work on a corrupt but acyclic graph | a budget charged against the resource actually consumed | `traversal.rs`, `diff.rs` |
+| do not exhaust the stack | an explicit stack on the heap — never a depth cap | every walk |
+
+A depth cap is not an instrument for any of the three. It cannot decide the
+first, it charges the wrong resource for the second, and for the third it
+substitutes a guess for a bound the walk can simply not need: depth belongs to
+the repository, so capping it refuses valid stores while doing none of the
+jobs it appears to do.
 
 A memo may be evicted under a byte budget only when a miss changes running
 time and nothing else. That requires all three of: insert on **completion**,
@@ -53,8 +59,6 @@ brutal: a 20-level chain of 22 distinct nodes copied 2,097,152.
 **An exact set of records on the path.** `nodes_on_path`, tested before the
 memo probe, cleared before the memo insert. A repeat is refused as
 `node record {…} is contained in its own subtree`, at the closing record.
-`MAXIMUM_COMPACTION_DEPTH` keeps only its stack job and its message says so —
-though it does not currently perform that job either; see "Still open".
 
 **Interning.** `SegmentInterner` maps each segment identifier met during one
 compaction to a `u32`. The cost is per *segment*, not per node. Index 0 is
@@ -103,13 +107,14 @@ substituted:
    raise-and-retry appends another partial generation — exactly what the
    preflight at `:342-346` exists to prevent.
 
-The depth bound also cannot be raised or deleted on its own:
-`compaction.rs:356-363` runs `writer.finish()`, `set_head` and `flush`, and
-only then does `:371` reach `store_writer.rs:815` → `:1568` `verify_node_tree`
-→ `check.rs`'s own `MAXIMUM_CHECK_DEPTH`, by which point
+The depth bounds had the same coupling, which is why they were removed
+together rather than one at a time: `compaction.rs:356-363` runs
+`writer.finish()`, `set_head` and `flush`, and only then does `:371` reach
+`store_writer.rs:815` → `:1568` `verify_node_tree`, by which point
 `store_writer.rs:804-805` records that the compacted head is already
-journal-visible. Removing compaction's bound alone converts a free pre-flight
-refusal into a full duplicate write, a durable head move, and the same refusal.
+journal-visible. Lifting compaction's bound alone would have converted a free
+pre-flight refusal into a full duplicate write, a durable head move, and then
+the same refusal from the verifier.
 
 ## Tests
 
@@ -168,50 +173,75 @@ Three findings from that exercise are worth keeping:
   uses. A defect there would make the walk, the oracle, and any re-read agree
   on the same wrong number. Nothing here is independent of that function.
 
+## No depth limits anywhere
+
+Every walk over records now carries its own stack on the heap and imposes no
+depth limit. Depth is a property of the repository, not something this code
+may choose, and a bound on it refuses valid stores by fiat.
+
+| walk | was | now |
+|---|---|---|
+| `compaction.rs` | `MAXIMUM_COMPACTION_DEPTH = 4000` | iterative; exact `nodes_on_path` |
+| `check.rs` | `MAXIMUM_CHECK_DEPTH = 4000` | iterative; exact `ancestors` |
+| `backup.rs` | `MAXIMUM_RECOVERY_DEPTH = 4000` | iterative; exact `ancestors` |
+| `traversal.rs` | `MAXIMUM_TRAVERSAL_DEPTH = 16_384` | was already iterative; gained an exact path set |
+| `diff.rs` | `MAXIMUM_DIFF_DEPTH = 4000` | iterative; exact set over the record *pair* |
+| `map.rs` | `depth >= 64` | iterative; `visited` already decided it |
+
+Three of the six were not bounding the stack at all — they were standing in
+for cycle detection that did not exist, `diff.rs` having none in 718 lines.
+Each now refuses a self-referential graph exactly, at the record that closes
+it. And the caps could not do the stack job they claimed either: at ~740 bytes
+a frame in release, 4000 levels needed ~2.8 MiB against the 2 MiB a spawned
+thread gets, so a legitimate 3000-deep tree aborted the process with SIGABRT
+rather than being refused — through public API, where SIGABRT cannot unwind
+and the caller gets no report. `a_tree_deeper_than_any_call_stack_copies_whole`
+now copies *and* verifies a 100,000-level tree on a 2 MiB stack.
+
+Two fixes fell out of opening the walks. `backup.rs` inserted into its visited
+memo on entry, before the node was checked, which cached failed and cyclic
+subtrees and made a shared subtree root the oldest entry of its own subtree —
+so any subtree over budget guaranteed a sibling miss. It inserts on completion
+now, which is what makes its "time rather than a different answer" true. And
+`check.rs`'s subtree height existed only to gate a memo hit against the cap;
+with no cap there is no guard to re-evaluate, both callers already discarded
+it, and the memo is now `BoundedCache<RecordIdentifier, ()>`.
+
+Two budgets deliberately stay: `MAXIMUM_DIFF_VISITS` and
+`MAXIMUM_TRAVERSAL_NODES`. They charge against work actually done, which is
+what a wide corrupt DAG exhausts while staying shallow, and unlike a depth cap
+they cannot refuse a valid store. `descent_limit` and the CLI's `--depth` stay
+too: those are asked for by the caller, not invented.
+
 ## Still open
 
-- **`backup.rs`'s own memo** breaks two clauses of the rule independently:
-  `visited.insert` at `:521` happens on entry, before `check_node_shallow`, and
-  the hit at `:518` returns without re-checking `depth`. A cached subtree can be
-  accepted where a fresh walk would have been refused, so eviction changes the
-  verdict and `:344-346`'s "time rather than a different answer" is false. The
-  direction is recovery falling back to an older head than it needed to, never
-  blessing unverified data. Its deep copy already inherits the exact memo
-  through `deep_copy_tree_with_progress`.
-- **`backup.rs:338-339` and `check.rs:24-25`** document their depth cap as a
-  cycle detector when each has an exact ancestor set doing that job. The
-  `check.rs` one is the more dangerous: it is the single sentence that could
-  get a sound walk's `ancestors` set deleted.
-- **The depth bound cannot fire on an ordinary stack, so the walk aborts the
-  process instead of refusing.** `compact_node` costs ~740 B a frame in
-  release and ~3.8 KiB in debug, so 4000 levels needs ~2.8 MiB / ~14.5 MiB,
-  against the 2 MiB that `std::thread::spawn`, libtest and blocking pools hand
-  out. Measured: debug/2 MiB fine at 500 and aborting at 600; release/2 MiB
-  fine at 2800 and aborting at 2900; release/8 MiB reaches the bound and
-  correctly returns `Err`. A legitimate, uncorrupted 3000-deep tree SIGABRTs —
-  reproduced here directly. `deep_copy_tree`, `compact`, `backup` and
-  `restore` are all public, and SIGABRT cannot unwind, so a consumer calling
-  from a spawned thread gets a killed process and no report. `verify_node_tree`
-  has the identical defect against `MAXIMUM_CHECK_DEPTH`, overflowing around
-  1300 in debug/2 MiB, so a fix that covers only compaction just moves the
-  abort to post-write certification. Making both walks iterative is the fix;
-  `traversal.rs` is the in-repo precedent, iterative precisely "so tree depth
-  is bounded by memory rather than stack size".
-- **The depth verdict depends on child enumeration order.** The memo hit
-  returns before the depth check and stores no subtree height, so the same
-  deep shared-tail graph returns `Ok` under one set of child names and
-  `exceeds depth 4000` under another. `check.rs:733-738` shows the correct
-  shape: gate the hit on `depth + subtree_height`, else fall back to a real
-  walk. Through the public `compact()` the consequence is worse than a wrong
-  answer — the copy slips past the pre-check, `set_head` and `flush` make the
-  new head durable, and only the pre-journal health traversal refuses, which
-  is exactly the outcome the pre-check exists to prevent.
-- **`diff.rs`** has no cycle-detection state at all, its error at `:235` claims
-  the records "probably form a cycle" on evidence that cannot support it, and
-  two mutually recursive frames per level mean it exhausts the stack before the
-  cap can fire on anything under roughly 15 MiB in debug.
-- **`traversal.rs:34-35`** overclaims in the same way, though that walk loses no
-  invariant: it is iterative and pairs its depth bound with a node budget.
+- **The depth-proportional term has no ceiling.** Removing the caps replaced a
+  constant-bounded amount of walk state with one proportional to depth.
+  Measured on `verify_node_tree`: ~175 bytes a level — the ancestor set, the
+  explicit frame stack, and the path buffer — so 17 MiB at 100,000 levels and
+  65 MiB at 400,000. `MAXIMUM_CHECK_DEPTH` used to cap that at ~700 KB. It is
+  now bounded only by how many distinct records the store holds, since a
+  repeat is refused as a cycle.
+
+  This is not the node-count-proportional map that motivated `BoundedCache`:
+  that charged per distinct node on every ordinary run, where this needs a
+  store shaped as a long chain (a real content tree runs a few hundred levels,
+  about 70 KB). But `check.rs` and `backup.rs` have no work budget at all, so
+  nothing bounds it there, and `traversal.rs`'s and `diff.rs`'s budgets charge
+  against node counts rather than residency — at 1e9 they would let the term
+  reach tens of gigabytes before firing.
+
+  The rule already names the right instrument: a budget charged against the
+  resource actually consumed. For this the resource is the walk's own state,
+  not a node count, and a ceiling on it refuses when the host cannot supply
+  what the walk needs — a figure that can be read from the host rather than
+  guessed, which is what separates it from the caps just removed.
+  `measure_deep_chain_walk_footprint` is the harness.
+
+- **The oracles share a primitive.** Every "distinct reachable nodes" count —
+  in the committed tests and in the adversarial attacks — is built on
+  `NodeState::child_node_entries()`, the same call the walks use. A defect
+  there would make walk, oracle and re-read agree on the same wrong number.
 
 ## Divergence from Oak
 

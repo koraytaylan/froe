@@ -91,9 +91,11 @@ followed by restoring the pristine source and rerunning the original test.
 ## Resources
 
 The point of the range. Every cache below is a function of configuration
-rather than of repository size — with one deliberate exception, the compaction
-sharing memo, which is now proportional to the tree by design. That exception
-is stated as such rather than hidden: see "The one store-proportional cache".
+rather than of repository size — with two deliberate exceptions, both stated
+as such rather than hidden: the compaction sharing memo, now proportional to
+the tree by design, and the walk state that replaced the depth caps, now
+proportional to depth. See "The one store-proportional cache" and "What
+removing the depth caps costs".
 
 * Read caches: 192 MiB parsed segments, 48 MiB strings, 48 MiB templates.
 * Writer base-segment cache: 192 MiB. Session read-back cache: twice the
@@ -153,8 +155,44 @@ answer is a measurement first.
 
 Termination no longer rests on the depth bound either. A self-referential
 record graph is refused exactly, by an ancestor set, at the record that closes
-the cycle (`a_cyclic_source_is_refused_at_the_record_that_closes_the_cycle`);
-`MAXIMUM_COMPACTION_DEPTH` is now a stack bound and nothing else.
+the cycle (`a_cyclic_source_is_refused_at_the_record_that_closes_the_cycle`).
+
+### What removing the depth caps costs
+
+Every walk over records — compaction, the verifier, the recovery gate, the
+content traversal, the diff, and the map enumerator — now carries its own
+stack on the heap and imposes no depth limit. The caps were not bounding what
+they claimed: three of the six stood in for cycle detection that did not
+exist, and none could bound the stack, since 4000 levels of the compaction
+walk needs ~2.8 MiB in release against the 2 MiB a spawned thread receives.
+A legitimate 3000-deep tree aborted the process with SIGABRT instead of being
+refused, through public API, where SIGABRT cannot unwind and the caller gets
+no report.
+
+The trade is that a constant-bounded amount of walk state became a
+depth-proportional one. Measured on `verify_node_tree`
+(`measure_deep_chain_walk_footprint`): **~175 bytes a level** — the ancestor
+set, the frame stack, and the path buffer — so 17 MiB at 100,000 levels and
+65 MiB at 400,000, where `MAXIMUM_CHECK_DEPTH` previously capped it at about
+700 KB. It is bounded now only by how many distinct records the store holds,
+because a repeat is refused as a cycle.
+
+For an ordinary repository this is negligible: content trees run a few hundred
+levels, about 70 KB. It takes a store shaped as a long chain — corrupt or
+adversarial — to make it large. But the gap should be named precisely rather
+than waved at:
+
+* `check.rs` and `backup.rs` have **no work budget at all**, so nothing bounds
+  the term there.
+* `traversal.rs` and `diff.rs` do have budgets, but they charge against node
+  counts (1e9), not residency, so they would allow tens of gigabytes of walk
+  state before firing.
+
+The instrument that would close this is the one this document's own rule
+already names — a budget charged against the resource actually consumed. Here
+that resource is the walk's own state, and a ceiling on it can be read from
+the host rather than guessed, which is what separates it from the depth caps
+just removed. Not implemented.
 
 Still proportional to the store, and unavoidable without an on-disk index:
 one decoded index entry per segment (~40 B), one `segment_locations` entry per
@@ -260,3 +298,18 @@ interoperability**, not a froe-to-froe round trip.
 8. **Per-node fan-out is unbounded** by content shape — `child_node_entries`
    returns an owned `Vec`. Bounded by the widest single node, not by the
    store; fixing it needs an additive streaming API.
+9. **Walk state is depth-proportional and has no ceiling.** Removing the depth
+   caps was right — they refused valid stores while doing none of the jobs
+   they appeared to do, and aborted the process rather than refusing — but it
+   left ~175 bytes a level of walk state bounded only by how many distinct
+   records the store holds. `check.rs` and `backup.rs` have no work budget at
+   all; `traversal.rs` and `diff.rs` charge theirs against node counts rather
+   than residency. Negligible on any real content tree (a few hundred levels,
+   ~70 KB), material only on a store shaped as a long chain. Measured by
+   `measure_deep_chain_walk_footprint`; see "What removing the depth caps
+   costs".
+10. **The exactness oracles share a primitive.** Every distinct-reachable-node
+    count that cross-checks `compacted_nodes` is built on
+    `NodeState::child_node_entries()`, the same call the walks use, so a
+    defect there would make walk, oracle and re-read agree on one wrong
+    number.
