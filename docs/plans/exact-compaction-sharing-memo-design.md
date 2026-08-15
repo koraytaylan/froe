@@ -53,7 +53,8 @@ brutal: a 20-level chain of 22 distinct nodes copied 2,097,152.
 **An exact set of records on the path.** `nodes_on_path`, tested before the
 memo probe, cleared before the memo insert. A repeat is refused as
 `node record {…} is contained in its own subtree`, at the closing record.
-`MAXIMUM_COMPACTION_DEPTH` keeps only its stack job and its message says so.
+`MAXIMUM_COMPACTION_DEPTH` keeps only its stack job and its message says so —
+though it does not currently perform that job either; see "Still open".
 
 **Interning.** `SegmentInterner` maps each segment identifier met during one
 compaction to a `u32`. The cost is per *segment*, not per node. Index 0 is
@@ -123,6 +124,49 @@ refusal into a full duplicate write, a durable head move, and the same refusal.
 - `a_cyclic_source_is_refused_at_the_record_that_closes_the_cycle` — built by
   splicing a record identifier in place, the technique already used at
   `check.rs:1356` and `traversal.rs:510`.
+- `every_random_shape_copies_each_distinct_node_exactly_once` — 200 generated
+  DAGs, every twentieth large enough to cross a memo growth, each cross-checked
+  against a `HashSet<RecordIdentifier>` walk.
+- `the_memo_and_the_interner_hold_their_own_invariants` — 60k operations
+  asserting the sentinel is never issued, packing round-trips and is injective,
+  and every entry survives every growth.
+
+Two guards run outside the tests, on every real copy: a duplicate-key
+assertion in `insert_without_growing`, and a postcondition comparing
+`compacted_nodes` against the table's *recounted* occupancy. The postcondition
+originally compared against `len`, which is incremented alongside
+`compacted_nodes` and so could only compare a counter with itself; recounting
+is what lets it catch a growth that loses entries. Both were verified by
+mutation — dropping one entry on rehash and making the memo miss one key in
+three each fail the suite, the duplicate-key assertion firing first.
+
+## The invariant, adversarially tested
+
+Five agents attacked `compacted_nodes == distinct reachable node records`
+along separate angles — packing collisions, table mechanics, tree shapes,
+corrupt input, and callers plus scale — with three claimed breaks, all three
+independently reproduced and all three reclassified as not exactness breaks.
+Every run that returned at all was exact, up to 4,020,101 distinct nodes and
+13 memo doublings, including a graph with 2^40 distinct root-to-leaf paths
+over 480,043 nodes, and backup → restore → compact → compact on one graph.
+
+Three findings from that exercise are worth keeping:
+
+- **`pack` is injective and the sentinel is unreachable.** Forcing a freshly
+  written sink record to pack to the same `u64` as an unvisited source record
+  produced real collisions, and they are harmless: keys and values live in
+  separate arrays, only source-packed values are ever keys, and `get` reads
+  `values[slot]` only after a key match.
+- **A duplicate insert is unreachable from any input**, because `insert` grows
+  before placing so an empty slot always exists, and `grow` rebuilds the probe
+  invariant from an empty table, so `get` can never miss a present key. The
+  duplicate-key assertion stays anyway: it is the one guard that fires at the
+  point of corruption rather than downstream.
+- **The oracles are less independent than they look.** Every "distinct
+  reachable nodes" count — in these attacks and in the committed tests — is
+  built on `NodeState::child_node_entries()`, the same call the walk itself
+  uses. A defect there would make the walk, the oracle, and any re-read agree
+  on the same wrong number. Nothing here is independent of that function.
 
 ## Still open
 
@@ -138,6 +182,30 @@ refusal into a full duplicate write, a durable head move, and the same refusal.
   cycle detector when each has an exact ancestor set doing that job. The
   `check.rs` one is the more dangerous: it is the single sentence that could
   get a sound walk's `ancestors` set deleted.
+- **The depth bound cannot fire on an ordinary stack, so the walk aborts the
+  process instead of refusing.** `compact_node` costs ~740 B a frame in
+  release and ~3.8 KiB in debug, so 4000 levels needs ~2.8 MiB / ~14.5 MiB,
+  against the 2 MiB that `std::thread::spawn`, libtest and blocking pools hand
+  out. Measured: debug/2 MiB fine at 500 and aborting at 600; release/2 MiB
+  fine at 2800 and aborting at 2900; release/8 MiB reaches the bound and
+  correctly returns `Err`. A legitimate, uncorrupted 3000-deep tree SIGABRTs —
+  reproduced here directly. `deep_copy_tree`, `compact`, `backup` and
+  `restore` are all public, and SIGABRT cannot unwind, so a consumer calling
+  from a spawned thread gets a killed process and no report. `verify_node_tree`
+  has the identical defect against `MAXIMUM_CHECK_DEPTH`, overflowing around
+  1300 in debug/2 MiB, so a fix that covers only compaction just moves the
+  abort to post-write certification. Making both walks iterative is the fix;
+  `traversal.rs` is the in-repo precedent, iterative precisely "so tree depth
+  is bounded by memory rather than stack size".
+- **The depth verdict depends on child enumeration order.** The memo hit
+  returns before the depth check and stores no subtree height, so the same
+  deep shared-tail graph returns `Ok` under one set of child names and
+  `exceeds depth 4000` under another. `check.rs:733-738` shows the correct
+  shape: gate the hit on `depth + subtree_height`, else fall back to a real
+  walk. Through the public `compact()` the consequence is worse than a wrong
+  answer — the copy slips past the pre-check, `set_head` and `flush` make the
+  new head durable, and only the pre-journal health traversal refuses, which
+  is exactly the outcome the pre-check exists to prevent.
 - **`diff.rs`** has no cycle-detection state at all, its error at `:235` claims
   the records "probably form a cycle" on evidence that cannot support it, and
   two mutually recursive frames per level mean it exhausts the stack before the

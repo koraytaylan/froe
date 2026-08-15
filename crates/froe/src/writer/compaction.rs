@@ -110,14 +110,20 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
         observer,
     };
     let root = copier.compact_node(source_root, 0)?;
-    // Every memo insert is paired with exactly one increment, and the memo
-    // never evicts, so the counter and the memo's occupancy must agree. This
-    // is the copy-once invariant stated as a postcondition rather than as an
-    // argument about the code: it is O(1), so it runs on every real copy and
-    // not only under test.
+    // The copy-once invariant as a postcondition rather than an argument
+    // about the code. Occupancy is recounted from the table rather than read
+    // from `len`: the two are incremented together, so comparing against
+    // `len` would be comparing a counter with itself and could not see a
+    // growth that lost entries. One pass over the slots at the end of a copy
+    // that took minutes.
+    let memoized = copier.rewritten_nodes.occupied_slots();
     assert_eq!(
-        copier.compacted_nodes, copier.rewritten_nodes.len as u64,
+        copier.compacted_nodes, memoized as u64,
         "copied node count diverged from the number of memoized nodes"
+    );
+    assert_eq!(
+        copier.rewritten_nodes.len, memoized,
+        "the memo's entry count diverged from its occupancy"
     );
     // The stride suppressed the last partial batch; report the exact
     // total so the copy does not end short of what it wrote.
@@ -128,12 +134,21 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
 /// How many nodes a deep copy rewrites between progress reports.
 const COPIED_NODE_REPORT_STRIDE: u64 = 512;
 
-/// How deep this walk can descend within the stack it has. It is a stack
-/// bound and nothing else: a cycle in a corrupt store is refused exactly,
-/// by `nodes_on_path`, at the record that closes it. The value matches
-/// [`crate::tooling::MAXIMUM_CHECK_DEPTH`], which the post-write health
-/// traversal applies to the same tree — exceeding it here refuses before
-/// any work, where exceeding it there refuses after the head is durable.
+/// Intended as a stack bound and nothing else — a cycle in a corrupt store is
+/// refused exactly, by `nodes_on_path`, at the record that closes it — and it
+/// matches [`crate::tooling::MAXIMUM_CHECK_DEPTH`], which the post-write
+/// health traversal applies to the same tree.
+///
+/// It does not currently do that job. `compact_node` costs roughly 740 bytes
+/// a frame in release and 3.8 KiB in debug, so reaching 4000 needs about
+/// 2.8 MiB of stack in release and 14.5 MiB in debug. A thread from
+/// `std::thread::spawn`, from libtest, or from a blocking pool gets 2 MiB by
+/// default, and there the walk aborts the process before this bound can
+/// refuse anything: measured, a legitimate 3000-deep tree SIGABRTs on a 2 MiB
+/// stack in release. The bound only works on a main thread. Making the walk
+/// iterative is the fix, and it has to cover `verify_node_tree` too or the
+/// abort simply moves to post-write certification — see
+/// `docs/plans/exact-compaction-sharing-memo-design.md`.
 const MAXIMUM_COMPACTION_DEPTH: usize = 4000;
 
 /// Maps each segment identifier met during one compaction to a small index,
@@ -204,7 +219,10 @@ struct RewrittenNodes {
 }
 
 /// Slots in a fresh table. Grown geometrically, so this only sets the floor.
+/// Probing masks with `slots - 1`, so a non-power-of-two would silently make
+/// part of the table unreachable; nothing else holds that property.
 const INITIAL_MEMO_SLOTS: usize = 1024;
+const _: () = assert!(INITIAL_MEMO_SLOTS.is_power_of_two());
 
 impl RewrittenNodes {
     fn new() -> Self {
@@ -221,6 +239,11 @@ impl RewrittenNodes {
     fn slot_of(&self, key: u64) -> usize {
         let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (mixed >> 32) as usize & (self.keys.len() - 1)
+    }
+
+    /// Counts the slots actually holding an entry, independently of `len`.
+    fn occupied_slots(&self) -> usize {
+        self.keys.iter().filter(|key| **key != 0).count()
     }
 
     fn get(&self, key: u64) -> Option<u64> {
