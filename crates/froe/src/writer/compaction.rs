@@ -8,8 +8,10 @@
 //! graph: a checkpoint whose `root` shares records with the live root stays
 //! shared after compaction, and each distinct node is copied exactly once,
 //! so the compacted output never exceeds the source through duplication.
-//! The walk terminates on a corrupt self-referential graph by refusing the
-//! record that closes the cycle.
+//! The walk carries its own stack on the heap and imposes no depth limit —
+//! tree depth is a property of the repository, not something this code may
+//! choose — and terminates on a corrupt self-referential graph by refusing
+//! the record that closes the cycle.
 //!
 //! This is the *classic* deep-copy compaction — the checkpoint-aware and
 //! parallel compactors in Oak are throughput optimizations that produce
@@ -109,7 +111,7 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
         reported_nodes: 0,
         observer,
     };
-    let root = copier.compact_node(source_root, 0)?;
+    let root = copier.compact_tree(source_root)?;
     // The copy-once invariant as a postcondition rather than an argument
     // about the code. Occupancy is recounted from the table rather than read
     // from `len`: the two are incremented together, so comparing against
@@ -133,23 +135,6 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
 
 /// How many nodes a deep copy rewrites between progress reports.
 const COPIED_NODE_REPORT_STRIDE: u64 = 512;
-
-/// Intended as a stack bound and nothing else — a cycle in a corrupt store is
-/// refused exactly, by `nodes_on_path`, at the record that closes it — and it
-/// matches [`crate::tooling::MAXIMUM_CHECK_DEPTH`], which the post-write
-/// health traversal applies to the same tree.
-///
-/// It does not currently do that job. `compact_node` costs roughly 740 bytes
-/// a frame in release and 3.8 KiB in debug, so reaching 4000 needs about
-/// 2.8 MiB of stack in release and 14.5 MiB in debug. A thread from
-/// `std::thread::spawn`, from libtest, or from a blocking pool gets 2 MiB by
-/// default, and there the walk aborts the process before this bound can
-/// refuse anything: measured, a legitimate 3000-deep tree SIGABRTs on a 2 MiB
-/// stack in release. The bound only works on a main thread. Making the walk
-/// iterative is the fix, and it has to cover `verify_node_tree` too or the
-/// abort simply moves to post-write certification — see
-/// `docs/plans/exact-compaction-sharing-memo-design.md`.
-const MAXIMUM_COMPACTION_DEPTH: usize = 4000;
 
 /// Maps each segment identifier met during one compaction to a small index,
 /// so the memo can hold four bytes where a `SegmentIdentifier` holds sixteen.
@@ -324,21 +309,95 @@ struct Compactor<'writer, Sink: SegmentSink> {
     observer: &'writer mut dyn ProgressObserver,
 }
 
+/// The outcome of resolving one node reference.
+enum Entered {
+    /// Not yet copied; descend into this frame.
+    Fresh(CompactionFrame),
+    /// Already copied; the memo holds the rewritten record.
+    Memoized(RecordIdentifier),
+}
+
+/// One suspended node in the deep copy: its children have to be rewritten
+/// before it can be written itself, so a node is visited twice — once to
+/// enumerate its children, once to emit it after they are all rewritten.
+struct CompactionFrame {
+    source: RecordIdentifier,
+    packed: u64,
+    /// The name this node has in its parent, so the rewritten record can be
+    /// attached when the frame pops. `None` for the root.
+    name_in_parent: Option<String>,
+    /// Remaining children to descend into, in reverse order so the next one
+    /// is a `pop`.
+    pending_children: Vec<(String, RecordIdentifier)>,
+    /// Children already rewritten, in enumeration order.
+    rewritten_children: Vec<(String, RecordIdentifier)>,
+}
+
 impl<Sink: SegmentSink> Compactor<'_, Sink> {
-    fn compact_node(
-        &mut self,
-        source_node: RecordIdentifier,
-        depth: usize,
-    ) -> Result<RecordIdentifier> {
-        let packed_source = self.segments.pack(source_node);
-        if let Some(rewritten) = self.rewritten_nodes.get(packed_source) {
-            return Ok(self.segments.unpack(rewritten));
+    /// Rewrites `source_root` and everything it reaches.
+    ///
+    /// The walk carries its own stack on the heap, so how deep a tree it can
+    /// copy is bounded by memory rather than by the thread it happens to run
+    /// on. There is no depth limit: depth is a property of the repository,
+    /// not something this code can choose, and a bound on it would refuse
+    /// valid stores. Termination on a corrupt self-referential graph is
+    /// `nodes_on_path`, which decides it exactly.
+    fn compact_tree(&mut self, source_root: RecordIdentifier) -> Result<RecordIdentifier> {
+        let mut stack = match self.enter(source_root)? {
+            Entered::Fresh(root) => vec![root],
+            Entered::Memoized(rewritten) => return Ok(rewritten),
+        };
+
+        loop {
+            let next = stack
+                .last_mut()
+                .expect("the loop returns before the stack empties")
+                .pending_children
+                .pop();
+            if let Some((name, child)) = next {
+                match self.enter(child)? {
+                    Entered::Fresh(mut frame) => {
+                        frame.name_in_parent = Some(name);
+                        stack.push(frame);
+                    }
+                    Entered::Memoized(rewritten) => stack
+                        .last_mut()
+                        .expect("the parent frame is still on the stack")
+                        .rewritten_children
+                        .push((name, rewritten)),
+                }
+                continue;
+            }
+            let finished = stack.pop().expect("a frame was just inspected");
+            let rewritten = self.emit(
+                finished.source,
+                finished.packed,
+                finished.rewritten_children,
+            )?;
+            match stack.last_mut() {
+                Some(parent) => parent.rewritten_children.push((
+                    finished
+                        .name_in_parent
+                        .expect("only the root frame has no name"),
+                    rewritten,
+                )),
+                None => return Ok(rewritten),
+            }
+        }
+    }
+
+    /// Resolves one node: either the memo already holds its rewritten copy,
+    /// or a frame to descend into.
+    fn enter(&mut self, source_node: RecordIdentifier) -> Result<Entered> {
+        let packed = self.segments.pack(source_node);
+        if let Some(rewritten) = self.rewritten_nodes.get(packed) {
+            return Ok(Entered::Memoized(self.segments.unpack(rewritten)));
         }
         // A node reachable from itself is corruption — valid records only
         // reference already-written records — and is refused exactly, at the
         // record that closes the cycle. The memo cannot mask it: a memo hit
         // returns above, so a memoized node is never on the path.
-        if !self.nodes_on_path.insert(packed_source) {
+        if !self.nodes_on_path.insert(packed) {
             return Err(Error::InvalidFormat {
                 details: format!(
                     "node record {source_node} is contained in its own subtree; \
@@ -346,31 +405,38 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
                 ),
             });
         }
-        // Depth is a stack bound and nothing else: cycles are refused above.
-        if depth > MAXIMUM_COMPACTION_DEPTH {
-            return Err(Error::InvalidFormat {
-                details: format!(
-                    "node tree exceeds depth {MAXIMUM_COMPACTION_DEPTH}, \
-                     which this walk cannot descend within its stack"
-                ),
-            });
-        }
+        let node = NodeState::new(self.source, source_node);
+        let mut pending_children: Vec<(String, RecordIdentifier)> = node
+            .child_node_entries()?
+            .into_iter()
+            .map(|(name, child)| (name, child.record_identifier()))
+            .collect();
+        // Reversed so `pop` yields enumeration order.
+        pending_children.reverse();
+        Ok(Entered::Fresh(CompactionFrame {
+            source: source_node,
+            packed,
+            name_in_parent: None,
+            pending_children,
+            rewritten_children: Vec::new(),
+        }))
+    }
+
+    /// Writes one node whose children have all been rewritten.
+    fn emit(
+        &mut self,
+        source_node: RecordIdentifier,
+        packed_source: u64,
+        mut child_entries: Vec<(String, RecordIdentifier)>,
+    ) -> Result<RecordIdentifier> {
         let node = NodeState::new(self.source, source_node);
         let template = node.template()?;
         let stable_identifier = node.stable_identifier_bytes()?;
 
-        // Rewrite children first so the node record can reference them.
-        let mut child_entries = Vec::new();
-        for (name, child) in node.child_node_entries()? {
-            child_entries.push((
-                name,
-                self.compact_node(child.record_identifier(), depth + 1)?,
-            ));
-        }
         let children = match child_entries.len() {
             0 => ChildNodesToWrite::Zero,
             1 => {
-                let (name, node) = child_entries.into_iter().next().expect("one child");
+                let (name, node) = child_entries.pop().expect("one child");
                 ChildNodesToWrite::One { name, node }
             }
             _ => ChildNodesToWrite::Many(child_entries),
@@ -1095,6 +1161,38 @@ mod tests {
 
     /// Throughput of the exact copy, for extrapolating to a field-scale head.
     /// Ignored by default: it writes about a million nodes.
+    #[test]
+    fn a_tree_deeper_than_any_call_stack_copies_whole() {
+        // 100k levels on the 2 MiB stack a spawned thread gets by default.
+        // The recursive walk aborted the process at 2900 levels here; there
+        // is no depth this can refuse, because depth is the repository's
+        // property and not this code's to bound.
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let directory = TestDirectory::new("deep-chain");
+                build_diamond_chain(&directory, 100_000, 0);
+                let store = WritableRepository::open(&directory.path).expect("open");
+                let head = store.head();
+                let distinct = distinct_reachable_nodes(&store, head);
+                let generation = store.writing_generation().expect("generation");
+                let mut writer = store.record_writer(generation);
+                let (_root, copied) = deep_copy_tree_with_progress(
+                    &store,
+                    &mut writer,
+                    head,
+                    &mut crate::progress::DiscardedProgress,
+                )
+                .expect("a deep tree copies rather than aborting");
+                writer.finish().expect("finish");
+                store.close().expect("close");
+                assert_eq!(copied as usize, distinct);
+                assert!(distinct > 100_000, "the chain really is that deep");
+            })
+            .expect("spawn");
+        handle.join().expect("the walk stays off the call stack");
+    }
+
     #[test]
     #[ignore = "measurement, not an assertion"]
     fn measure_copy_throughput() {
