@@ -21,10 +21,6 @@ use crate::progress::{DiscardedProgress, ProgressObserver, Step, StrideCounter, 
 use crate::segment::record::RecordIdentifier;
 use crate::store::{ArchiveSet, open_all_archives_with_progress};
 
-/// The maximum content tree depth checked before assuming a cycle; set
-/// well below the stack-overflow threshold. Real trees are far shallower.
-const MAXIMUM_CHECK_DEPTH: usize = 4000;
-
 /// One checked path's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathVerdict {
@@ -537,7 +533,7 @@ pub fn verify_node_tree(provider: &dyn SegmentProvider, root: RecordIdentifier) 
 /// a real walk, preserving both the limit and the original path diagnostic.
 pub struct NodeTreeVerifier<'provider> {
     provider: &'provider dyn SegmentProvider,
-    verified_subtree_heights: BoundedCache<RecordIdentifier, usize>,
+    verified_subtrees: BoundedCache<RecordIdentifier, ()>,
     /// Nodes resolved across every `verify_with_progress` call, so a
     /// caller verifying several roots inside one reported step sees one
     /// running total rather than a count that restarts per root.
@@ -560,7 +556,7 @@ impl<'provider> NodeTreeVerifier<'provider> {
     pub fn with_memo_budget(provider: &'provider dyn SegmentProvider, budget_bytes: usize) -> Self {
         Self {
             provider,
-            verified_subtree_heights: BoundedCache::new(budget_bytes),
+            verified_subtrees: BoundedCache::new(budget_bytes),
             verified_nodes: 0,
         }
     }
@@ -587,14 +583,12 @@ impl<'provider> NodeTreeVerifier<'provider> {
                 binaries: true,
                 stable_identifiers: true,
             },
-            &mut self.verified_subtree_heights,
+            &mut self.verified_subtrees,
             &mut progress,
         );
         progress.finish();
         self.verified_nodes = progress.completed();
-        verified
-            .map(|_| ())
-            .map_err(|corrupt| node_tree_error(&corrupt))
+        verified.map_err(|corrupt| node_tree_error(&corrupt))
     }
 }
 
@@ -630,7 +624,6 @@ fn verify_subtree(
         &mut BoundedCache::new(VERIFIED_SUBTREE_CACHE_BUDGET_BYTES),
         progress,
     )
-    .map(|_| ())
 }
 
 /// Counts verified nodes for a [`ProgressObserver`], reporting on a stride
@@ -680,120 +673,149 @@ const VERIFIED_NODE_REPORT_STRIDE: u64 = 512;
 ///
 /// The memo exists only to skip re-walking a shared subtree; a miss costs
 /// time and nothing else. Cycle detection is the separate `ancestors` set,
-/// which stays exact and is bounded by `MAXIMUM_CHECK_DEPTH`. Unbounded, this
+/// which stays exact and costs one entry per live level. Unbounded, this
 /// map held one entry per distinct node record in the tree — on a large store
 /// that is tens of gigabytes, and it is reached from `check`, both `cleanup`
 /// modes, and the post-compaction certification.
 const VERIFIED_SUBTREE_CACHE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
-/// Returns the verified subtree height. A record enters `verified` only
-/// after every descendant completed successfully.
+/// One suspended node: the children it has still to descend into, and
+/// the path length to restore when it completes.
+struct VerificationFrame {
+    record: RecordIdentifier,
+    pending_children: Vec<(String, RecordIdentifier)>,
+    parent_path_length: usize,
+}
+
+/// Checks one node and enumerates its children. `None` means the memo
+/// already holds it, so the subtree needs no walking.
+fn open(
+    provider: &dyn SegmentProvider,
+    record: RecordIdentifier,
+    checks: SubtreeChecks,
+    verified: &BoundedCache<RecordIdentifier, ()>,
+    ancestors: &mut HashSet<RecordIdentifier>,
+    path: &str,
+    progress: &mut VerifiedNodeCount<'_>,
+) -> std::result::Result<Option<Vec<(String, RecordIdentifier)>>, CorruptLocation> {
+    let corrupt_here = |reason: String| CorruptLocation {
+        path: path.to_owned(),
+        reason,
+    };
+    // A node reachable from itself is corruption (valid records only
+    // reference already-written records), and must fail the check —
+    // whereas meeting an already-*completed* node again is ordinary
+    // shared-subtree deduplication and verifies for free. Tested before
+    // the memo so a cycle can never be served from it.
+    if ancestors.contains(&record) {
+        return Err(corrupt_here(format!(
+            "node record {record} is contained in its own subtree"
+        )));
+    }
+    if verified.get(&record).is_some() {
+        return Ok(None);
+    }
+    ancestors.insert(record);
+    progress.advance();
+    // Not `map_err(corrupt_here)`: different clippy versions disagree
+    // about the borrow there, and an explicit struct keeps both quiet.
+    if let Err(reason) = check_node_shallow(provider, record, checks.binaries) {
+        return Err(CorruptLocation {
+            path: path.to_owned(),
+            reason,
+        });
+    }
+    let node = NodeState::new(provider, record);
+    if checks.stable_identifiers
+        && let Err(error) = node.stable_identifier_bytes()
+    {
+        return Err(CorruptLocation {
+            path: path.to_owned(),
+            reason: error.to_string(),
+        });
+    }
+    let mut children: Vec<(String, RecordIdentifier)> = node
+        .child_node_entries()
+        .map_err(|error| corrupt_here(error.to_string()))?
+        .into_iter()
+        .map(|(name, child)| (name, child.record_identifier()))
+        .collect();
+    // Reversed so `pop` yields enumeration order.
+    children.reverse();
+    Ok(Some(children))
+}
+
+/// Verifies a subtree. A record enters `verified` only after every
+/// descendant completed successfully.
+///
+/// The walk carries its own stack on the heap, so how deep a tree it can
+/// verify is bounded by memory rather than by the thread it runs on. There is
+/// no depth limit: depth is a property of the repository, not something this
+/// code may choose. Termination on a self-referential record graph is the
+/// exact `ancestors` set.
 fn verify_subtree_with_cache(
     provider: &dyn SegmentProvider,
     root: RecordIdentifier,
     checks: SubtreeChecks,
-    verified: &mut BoundedCache<RecordIdentifier, usize>,
+    verified: &mut BoundedCache<RecordIdentifier, ()>,
     progress: &mut VerifiedNodeCount<'_>,
-) -> std::result::Result<usize, CorruptLocation> {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the recursive walk threads its provider, checks, caches, path, depth, and progress; bundling them would only rename the same state"
-    )]
-    fn walk(
-        provider: &dyn SegmentProvider,
-        record: RecordIdentifier,
-        checks: SubtreeChecks,
-        verified: &mut BoundedCache<RecordIdentifier, usize>,
-        ancestors: &mut HashSet<RecordIdentifier>,
-        depth: usize,
-        path: &mut String,
-        progress: &mut VerifiedNodeCount<'_>,
-    ) -> std::result::Result<usize, CorruptLocation> {
-        let corrupt_here = |reason: String| CorruptLocation {
-            path: path.clone(),
-            reason,
-        };
-        // A subtree deeper than the cap cannot be verified within bounded
-        // stack; calling it consistent would bless corruption below the
-        // cap, so it fails the check instead.
-        if depth > MAXIMUM_CHECK_DEPTH {
-            return Err(corrupt_here(format!(
-                "tree exceeds depth {MAXIMUM_CHECK_DEPTH}"
-            )));
-        }
-        // A node reachable from itself is corruption (valid records only
-        // reference already-written records), and must fail the check —
-        // whereas meeting an already-*completed* node again is ordinary
-        // shared-subtree deduplication and verifies for free.
-        if ancestors.contains(&record) {
-            return Err(corrupt_here(format!(
-                "node record {record} is contained in its own subtree"
-            )));
-        }
-        if let Some(subtree_height) = verified.get(&record)
-            && depth
-                .checked_add(subtree_height)
-                .is_some_and(|deepest| deepest <= MAXIMUM_CHECK_DEPTH)
-        {
-            return Ok(subtree_height);
-        }
-        ancestors.insert(record);
-        progress.advance();
-        // Not `map_err(corrupt_here)`: different clippy versions disagree
-        // about the borrow there, and an explicit struct keeps both quiet.
-        if let Err(reason) = check_node_shallow(provider, record, checks.binaries) {
-            return Err(CorruptLocation {
-                path: path.clone(),
-                reason,
-            });
-        }
-        let node = NodeState::new(provider, record);
-        if checks.stable_identifiers
-            && let Err(error) = node.stable_identifier_bytes()
-        {
-            return Err(CorruptLocation {
-                path: path.clone(),
-                reason: error.to_string(),
-            });
-        }
-        let children = node
-            .child_node_entries()
-            .map_err(|error| corrupt_here(error.to_string()))?;
-        let mut subtree_height = 0usize;
-        for (name, child) in children {
-            let parent_length = path.len();
-            path.push('/');
-            path.push_str(&name);
-            let child_height = walk(
-                provider,
-                child.record_identifier(),
-                checks,
-                verified,
-                ancestors,
-                depth + 1,
-                path,
-                progress,
-            )?;
-            path.truncate(parent_length);
-            subtree_height = subtree_height.max(child_height + 1);
-        }
-        ancestors.remove(&record);
-        verified.insert(record, subtree_height);
-        Ok(subtree_height)
-    }
-
+) -> std::result::Result<(), CorruptLocation> {
     let mut ancestors = HashSet::new();
     let mut path = String::new();
-    walk(
+    let Some(children) = open(
         provider,
         root,
         checks,
         verified,
         &mut ancestors,
-        0,
-        &mut path,
+        &path,
         progress,
-    )
+    )?
+    else {
+        return Ok(());
+    };
+    let mut stack = vec![VerificationFrame {
+        record: root,
+        pending_children: children,
+        parent_path_length: 0,
+    }];
+
+    loop {
+        let next = stack
+            .last_mut()
+            .expect("the loop returns before the stack empties")
+            .pending_children
+            .pop();
+        if let Some((name, child)) = next {
+            let parent_path_length = path.len();
+            path.push('/');
+            path.push_str(&name);
+            match open(
+                provider,
+                child,
+                checks,
+                verified,
+                &mut ancestors,
+                &path,
+                progress,
+            )? {
+                Some(children) => stack.push(VerificationFrame {
+                    record: child,
+                    pending_children: children,
+                    parent_path_length,
+                }),
+                None => path.truncate(parent_path_length),
+            }
+            continue;
+        }
+        let finished = stack.pop().expect("a frame was just inspected");
+        ancestors.remove(&finished.record);
+        verified.insert(finished.record, ());
+        if stack.is_empty() {
+            return Ok(());
+        }
+        path.truncate(finished.parent_path_length);
+    }
 }
 
 /// Resolves and reads every block of an inline binary without holding the
@@ -1170,7 +1192,7 @@ mod tests {
         let shared_reads = provider.reads_of(shared.segment);
         assert!(shared_reads > 0, "the first root traverses the shared node");
         assert!(
-            verifier.verified_subtree_heights.get(&shared).is_some(),
+            verifier.verified_subtrees.get(&shared).is_some(),
             "only a completed shared subtree receives a certificate"
         );
 
@@ -1223,9 +1245,9 @@ mod tests {
         verifier.verify(root).expect("verifies");
 
         assert!(
-            verifier.verified_subtree_heights.used_bytes() <= TEST_BUDGET_BYTES,
+            verifier.verified_subtrees.used_bytes() <= TEST_BUDGET_BYTES,
             "the verified-subtree memo held {} bytes against a {TEST_BUDGET_BYTES}-byte budget",
-            verifier.verified_subtree_heights.used_bytes()
+            verifier.verified_subtrees.used_bytes()
         );
         store.close().expect("close");
     }
@@ -1264,7 +1286,7 @@ mod tests {
         starved.verify(root).expect("verifies without any memo");
         starved.verify(root).expect("and again");
         assert!(
-            starved.verified_subtree_heights.is_empty(),
+            starved.verified_subtrees.is_empty(),
             "a zero budget retains nothing"
         );
 
@@ -1311,7 +1333,7 @@ mod tests {
         let first_reads = provider.reads_of(child.segment);
         assert!(first_reads > 0);
         assert!(
-            verifier.verified_subtree_heights.is_empty(),
+            verifier.verified_subtrees.is_empty(),
             "neither the corrupt child nor its incomplete ancestor is cached"
         );
         let second = verifier
@@ -1319,7 +1341,7 @@ mod tests {
             .expect_err("the same hidden child must be re-read and fail again");
         assert!(provider.reads_of(child.segment) > first_reads);
         assert_eq!(first.to_string(), second.to_string());
-        assert!(verifier.verified_subtree_heights.is_empty());
+        assert!(verifier.verified_subtrees.is_empty());
         store.close().expect("close");
     }
 
@@ -1366,12 +1388,12 @@ mod tests {
         };
         assert!(details.contains("at /loop:"));
         assert!(details.contains("contained in its own subtree"));
-        assert!(verifier.verified_subtree_heights.is_empty());
+        assert!(verifier.verified_subtrees.is_empty());
 
         let second = verifier.verify(root).expect_err("cycle is never cached");
         assert!(provider.reads_of(root.segment) > first_reads);
         assert_eq!(first.to_string(), second.to_string());
-        assert!(verifier.verified_subtree_heights.is_empty());
+        assert!(verifier.verified_subtrees.is_empty());
         store.close().expect("close");
     }
 

@@ -1185,9 +1185,13 @@ mod tests {
                 )
                 .expect("a deep tree copies rather than aborting");
                 writer.finish().expect("finish");
-                store.close().expect("close");
                 assert_eq!(copied as usize, distinct);
                 assert!(distinct > 100_000, "the chain really is that deep");
+                // The post-write health traversal walks the same tree, so a
+                // depth limit there would only move the failure.
+                crate::tooling::verify_node_tree(&store, head)
+                    .expect("the verifier has no depth limit either");
+                store.close().expect("close");
             })
             .expect("spawn");
         handle.join().expect("the walk stays off the call stack");
