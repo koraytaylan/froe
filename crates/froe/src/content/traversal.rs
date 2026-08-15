@@ -30,10 +30,7 @@
 use crate::content::node::NodeState;
 use crate::content::path::normalized_path;
 use crate::error::{Error, Result};
-
-/// Nodes deeper than this indicate a cycle in a corrupt repository;
-/// real content trees are nowhere near this deep.
-const MAXIMUM_TRAVERSAL_DEPTH: usize = 16_384;
+use crate::segment::record::RecordIdentifier;
 
 /// The total nodes one traversal may visit. A depth bound alone cannot
 /// stop corrupt records shaped as a wide DAG, whose distinct paths grow
@@ -49,8 +46,16 @@ enum WorkItem<'provider> {
         name: String,
         depth: usize,
     },
-    /// Restore the path buffer after a subtree completes.
-    RestorePathLength(usize),
+    /// A subtree completed: leave the node's path, and take it off the
+    /// ancestor set. Pushed for every visited node, including ones whose
+    /// name is empty, so the ancestor set can never leak an entry and
+    /// report a false cycle on a later sibling.
+    Complete {
+        record: RecordIdentifier,
+        /// The length to restore, or `None` for a node that added nothing
+        /// to the path.
+        path_length: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +101,10 @@ pub struct BoundedVisitedNode<'traversal, 'provider> {
 pub struct DepthFirstTraversal<'provider> {
     stack: Vec<WorkItem<'provider>>,
     path_buffer: String,
+    /// The records on the current root-to-node path. Exact and unbounded:
+    /// it carries termination, so it is never budgeted, and it costs one
+    /// entry per live level rather than one per node.
+    nodes_on_path: std::collections::HashSet<RecordIdentifier>,
     descent_limit: Option<usize>,
     visited_nodes: u64,
     pending_nodes: u64,
@@ -119,6 +128,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
                 depth: 0,
             }],
             path_buffer,
+            nodes_on_path: std::collections::HashSet::new(),
             descent_limit,
             visited_nodes: 0,
             pending_nodes: 1,
@@ -170,8 +180,14 @@ impl<'provider> DepthFirstTraversal<'provider> {
                 return Ok(None);
             };
             let (node, name, depth) = match item {
-                WorkItem::RestorePathLength(length) => {
-                    self.path_buffer.truncate(length);
+                WorkItem::Complete {
+                    record,
+                    path_length,
+                } => {
+                    self.nodes_on_path.remove(&record);
+                    if let Some(length) = path_length {
+                        self.path_buffer.truncate(length);
+                    }
                     continue;
                 }
                 WorkItem::Visit { node, name, depth } => {
@@ -179,11 +195,17 @@ impl<'provider> DepthFirstTraversal<'provider> {
                     (node, name, depth)
                 }
             };
-            if depth >= MAXIMUM_TRAVERSAL_DEPTH {
+            // A node reachable from itself is corruption, and is refused
+            // exactly, at the record that closes the cycle. Shared subtrees
+            // are not cycles: this set holds only the current root-to-node
+            // path, so the same record may legitimately be visited again
+            // under a different path.
+            let record = node.record_identifier();
+            if !self.nodes_on_path.insert(record) {
                 return Err(Error::InvalidFormat {
                     details: format!(
-                        "content tree exceeds depth {MAXIMUM_TRAVERSAL_DEPTH}; \
-                         the node records probably form a cycle"
+                        "node record {record} is contained in its own subtree; \
+                         the node records form a cycle"
                     ),
                 });
             }
@@ -197,9 +219,11 @@ impl<'provider> DepthFirstTraversal<'provider> {
                 });
             }
 
+            self.stack.push(WorkItem::Complete {
+                record,
+                path_length: (!name.is_empty()).then_some(self.path_buffer.len()),
+            });
             if !name.is_empty() {
-                self.stack
-                    .push(WorkItem::RestorePathLength(self.path_buffer.len()));
                 self.path_buffer.push('/');
                 self.path_buffer.push_str(&name);
             }
