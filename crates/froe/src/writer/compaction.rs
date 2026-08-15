@@ -67,6 +67,14 @@ pub struct CompactionOutcome {
 /// root and the number of nodes copied, which equals the number of distinct
 /// node records reachable from `source_root`. Used by compaction, backup,
 /// and restore.
+///
+/// # Panics
+///
+/// Panics if the copy-once invariant is violated — if the number of nodes
+/// copied disagrees with the number memoized, or if a source record is
+/// memoized twice. Neither is reachable from any input, valid or corrupt:
+/// they mean a logic error in the walk, and failing loudly beats writing a
+/// store whose node count cannot be trusted.
 pub fn deep_copy_tree<Sink: SegmentSink>(
     source: &dyn SegmentProvider,
     writer: &mut RecordWriter<Sink>,
@@ -77,6 +85,14 @@ pub fn deep_copy_tree<Sink: SegmentSink>(
 
 /// Deep-copies exactly like [`deep_copy_tree`], reporting the number of
 /// nodes rewritten so far to `observer`.
+///
+/// # Panics
+///
+/// Panics if the copy-once invariant is violated — if the number of nodes
+/// copied disagrees with the number memoized, or if a source record is
+/// memoized twice. Neither is reachable from any input, valid or corrupt:
+/// they mean a logic error in the walk, and failing loudly beats writing a
+/// store whose node count cannot be trusted.
 pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
     source: &dyn SegmentProvider,
     writer: &mut RecordWriter<Sink>,
@@ -94,6 +110,15 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
         observer,
     };
     let root = copier.compact_node(source_root, 0)?;
+    // Every memo insert is paired with exactly one increment, and the memo
+    // never evicts, so the counter and the memo's occupancy must agree. This
+    // is the copy-once invariant stated as a postcondition rather than as an
+    // argument about the code: it is O(1), so it runs on every real copy and
+    // not only under test.
+    assert_eq!(
+        copier.compacted_nodes, copier.rewritten_nodes.len as u64,
+        "copied node count diverged from the number of memoized nodes"
+    );
     // The stride suppressed the last partial batch; report the exact
     // total so the copy does not end short of what it wrote.
     copier.observer.step_advanced(copier.compacted_nodes);
@@ -218,9 +243,21 @@ impl RewrittenNodes {
         self.len += 1;
     }
 
+    /// Places a key known to be absent. Open addressing has no natural
+    /// duplicate check — a second insert of the same key would occupy a
+    /// second slot, leaving `len` counting one node twice while `get` still
+    /// answered correctly, so the drift would be silent. The walk cannot
+    /// produce one (it probes before inserting, and only inserts on the
+    /// single path out of a miss), which is exactly why a violation here
+    /// means a logic error rather than bad input, and must be loud.
     fn insert_without_growing(&mut self, key: u64, value: u64) {
         let mut slot = self.slot_of(key);
         while self.keys[slot] != 0 {
+            assert_ne!(
+                self.keys[slot], key,
+                "a source record was memoized twice; the memo probe or the \
+                 path set is broken"
+            );
             slot = (slot + 1) & (self.keys.len() - 1);
         }
         self.keys[slot] = key;
@@ -1066,6 +1103,181 @@ mod tests {
             elapsed.as_secs_f64(),
             18_800_000.0 / per_second / 60.0,
         );
+    }
+
+    /// A deterministic generator, so a failure names a seed that reproduces
+    /// it. Nothing in the crate needs randomness, so this stays local.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                return 0;
+            }
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Builds a random acyclic content graph. Every node draws its children
+    /// from the nodes already written, which is what the segment format
+    /// guarantees anyway (a record only references earlier records), so the
+    /// result is a legal DAG with arbitrary sharing.
+    fn build_random_dag(directory: &TestDirectory, seed: u64) {
+        let mut rng = Rng(seed | 1);
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+
+        // Most shapes stay small so many of them run; every twentieth is big
+        // enough that `RewrittenNodes` crosses at least one growth (its first
+        // is at 717 entries), so rehashing is exercised end to end and not
+        // only by the table's own test.
+        let node_count = if seed.is_multiple_of(20) {
+            800 + rng.below(1700)
+        } else {
+            8 + rng.below(60)
+        };
+        let mut written = Vec::with_capacity(node_count);
+        for index in 0..node_count {
+            let child_count = if written.is_empty() { 0 } else { rng.below(5) };
+            let mut children = Vec::with_capacity(child_count);
+            for child in 0..child_count {
+                // Draw with replacement, so the same record can be referenced
+                // several times from one parent and from many parents.
+                let picked = written[rng.below(written.len())];
+                children.push((format!("c{child:03}"), picked));
+            }
+            let value = writer
+                .write_string(&format!("seed{seed}-node{index}"))
+                .expect("value");
+            let node = writer
+                .write_node(
+                    Some("nt:unstructured"),
+                    &[],
+                    &match children.len() {
+                        0 => ChildNodesToWrite::Zero,
+                        1 => {
+                            let (name, node) = children.into_iter().next().expect("one child");
+                            ChildNodesToWrite::One { name, node }
+                        }
+                        _ => ChildNodesToWrite::Many(children),
+                    },
+                    &[PropertyToWrite {
+                        name: "n".to_owned(),
+                        property_type: crate::content::property::PropertyType::String,
+                        values: PropertyValuesToWrite::Single(value),
+                    }],
+                )
+                .expect("node");
+            written.push(node);
+        }
+        let root = *written.last().expect("at least one node");
+        let head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: root,
+                },
+                &[],
+            )
+            .expect("super root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, head));
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn every_random_shape_copies_each_distinct_node_exactly_once() {
+        // The count is cross-checked against `distinct_reachable_nodes`, which
+        // walks with a `HashSet<RecordIdentifier>` and shares no code with the
+        // interner or the memo — so agreement is two independent answers
+        // matching, not one implementation agreeing with itself.
+        for seed in 1..=200u64 {
+            let directory = TestDirectory::new(&format!("random-dag-{seed}"));
+            build_random_dag(&directory, seed);
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let head = store.head();
+            let distinct = distinct_reachable_nodes(&store, head);
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let (_root, copied) = deep_copy_tree_with_progress(
+                &store,
+                &mut writer,
+                head,
+                &mut crate::progress::DiscardedProgress,
+            )
+            .expect("deep copy");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+            assert_eq!(
+                copied as usize, distinct,
+                "seed {seed}: copied {copied} but {distinct} distinct nodes are reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_memo_and_the_interner_hold_their_own_invariants() {
+        use super::{RewrittenNodes, SegmentInterner};
+        use crate::segment::identifier::SegmentIdentifier;
+        use crate::segment::record::RecordIdentifier;
+
+        let mut rng = Rng(0x5EED_1234_9ABC_DEF1);
+        let mut interner = SegmentInterner::new();
+        let mut memo = RewrittenNodes::new();
+        let mut expected = std::collections::HashMap::new();
+        let mut packed_seen = std::collections::HashMap::new();
+
+        for _ in 0..60_000 {
+            let record = RecordIdentifier {
+                segment: SegmentIdentifier {
+                    most_significant_bits: rng.next() % 400,
+                    least_significant_bits: rng.next() % 7,
+                },
+                record_number: (rng.next() % 5000) as u32,
+            };
+            let packed = interner.pack(record);
+
+            // The sentinel is never a real key, so an occupied slot is never
+            // mistaken for an empty one.
+            assert_ne!(packed, 0, "no real record packs to the empty-slot key");
+            // Packing is injective: two distinct records never share a key,
+            // and a key always unpacks to the record it came from.
+            assert_eq!(interner.unpack(packed), record, "packing round-trips");
+            if let Some(previous) = packed_seen.insert(packed, record) {
+                assert_eq!(previous, record, "two distinct records packed alike");
+            }
+
+            if let std::collections::hash_map::Entry::Vacant(slot) = expected.entry(packed) {
+                let value = interner.pack(RecordIdentifier {
+                    segment: record.segment,
+                    record_number: record.record_number ^ 0x00FF_00FF,
+                });
+                slot.insert(value);
+                memo.insert(packed, value);
+            }
+
+            // Everything ever inserted is still retrievable, across every
+            // growth the table has performed by now.
+            assert_eq!(memo.len, expected.len());
+            for (key, value) in &expected {
+                assert_eq!(memo.get(*key), Some(*value));
+            }
+            if expected.len() > 40 {
+                expected.clear();
+                memo = RewrittenNodes::new();
+            }
+        }
     }
 
     #[test]
