@@ -1197,6 +1197,37 @@ mod tests {
         handle.join().expect("the walk stays off the call stack");
     }
 
+    fn resident_bytes() -> usize {
+        let statm = std::fs::read_to_string("/proc/self/statm").expect("statm");
+        let pages: usize = statm
+            .split_whitespace()
+            .nth(1)
+            .expect("resident field")
+            .parse()
+            .expect("page count");
+        pages * 4096
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_deep_chain_walk_footprint() {
+        for levels in [100_000usize, 400_000] {
+            let directory = TestDirectory::new(&format!("deep-footprint-{levels}"));
+            build_diamond_chain(&directory, levels, 0);
+            let store = WritableRepository::open(&directory.path).expect("open");
+            let head = store.head();
+            let before = resident_bytes();
+            crate::tooling::verify_node_tree(&store, head).expect("verifies");
+            let after_verify = resident_bytes();
+            store.close().expect("close");
+            println!(
+                "levels={levels:>7} verify_rss_delta={:>6} MiB = {:>4} B/level",
+                after_verify.saturating_sub(before) / 1024 / 1024,
+                after_verify.saturating_sub(before) / levels,
+            );
+        }
+    }
+
     #[test]
     #[ignore = "measurement, not an assertion"]
     fn measure_copy_throughput() {
