@@ -36,9 +36,14 @@ shortest form than Java's; see `double_to_text`.)
 > froe commits content, creates and removes checkpoints, compacts (full and
 > tail), cleans up orphan segments, stale archives, expired checkpoints and
 > corrupt journal lines, backs up, restores, and rebuilds a deleted journal.
-> After each operation Oak boots against the result, serves a byte-identical
-> content tree, and logs none of its own repair messages — so Oak consumed
-> what froe wrote rather than reconstructing it.
+> After each operation Oak boots against the result, serves the same content
+> tree it served before, and logs none of its own repair messages — so Oak
+> consumed what froe wrote rather than reconstructing it. Each operation is
+> also held to a canonical content digest taken before and after it: every
+> node, property name, type, arity, value and binary checksum, across the head
+> and every checkpoint, must be unchanged except where the phase declares
+> otherwise. The uploaded binary is fetched back from Oak and compared byte for
+> byte.
 >
 > Still unverified against a live instance: `store.version=1` stores (see
 > [Repository format versions](#repository-format-versions)), external blob

@@ -35,8 +35,10 @@ to a numbered `.bak` first.
 > applies it to a store written by Apache Jackrabbit Oak `oak-segment-tar`
 > 1.90.0 — reclaiming orphan segments, a stale archive, an expired checkpoint
 > and corrupt journal lines — and then boots Oak against the result, which
-> serves a byte-identical content tree and logs none of its own repair
-> messages. Not yet verified against a live instance: `store.version=1`
+> serves the same content tree it served before and logs none of its own repair
+> messages. The run is also held to a canonical content digest taken before and
+> after it: every node, property name, type, arity, value and binary checksum
+> must be unchanged outside the checkpoints the run is meant to retire. Not yet verified against a live instance: `store.version=1`
 > stores, external blob stores, and Adobe AEM itself, which ships its own Oak
 > build.
 

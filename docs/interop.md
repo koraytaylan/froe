@@ -44,17 +44,24 @@ than disabling the check. The command's exit status is asserted before its
 duration, so a command that fails *and* is slow reports its own output rather
 than being relabelled a timeout.
 
-Phases share their fixture through an in-process `OnceLock`, so a subset must
-be named in one `cargo test` invocation — `generate` first, since everything
-later reads what it produced.
+Phases share their fixture through an in-process `OnceLock`, and — when that
+is empty, which is the case in any process that did not itself run
+`generate` — through the path `generate` records in `work_root()/fixture-path`.
+The pointer is what makes a single phase re-runnable on its own, which
+matters more than it sounds: a failure that cannot be reproduced in isolation
+cannot be attributed to the operation that caused it, and attribution is the
+whole point of the digest comparisons below.
 
-That sharing is also why the whole suite must never be run by selecting every
-ignored test. `interop_full` runs the chain itself and claims the same
-`OnceLock` `generate` does, and the harness orders tests by name rather than
-by dependency, so an unfiltered run starts `compact` before any store exists
-and then has `interop_full` collide with `generate`. The result is a wall of
-failures that look like real interoperability breakage and are nothing of the
-kind — always name `interop_full`, or one phase.
+`generate` deletes the pointer before it starts. Within one run, a phase
+scheduled ahead of `generate` therefore still fails loudly instead of quietly
+picking up the previous run's store and reporting a pass about bytes nobody
+produced today.
+
+The whole suite must still never be run by selecting every ignored test.
+`interop_full` runs the chain itself and claims the same `OnceLock` `generate`
+does, and the harness orders tests by name rather than by dependency, so an
+unfiltered run has `interop_full` collide with `generate` — always name
+`interop_full`, or one phase.
 
 ## Running
 
@@ -62,8 +69,12 @@ kind — always name `interop_full`, or one phase.
 # All phases in dependency order:
 $ scripts/interop-fixture.sh
 
-# A single phase (generate runs first automatically):
+# A single phase (generate runs first, in its own cargo process):
 $ scripts/interop-fixture.sh compact
+
+# Re-run one phase against a fixture an earlier run already built, without
+# regenerating it — this is the debugging loop after a failure:
+$ cargo test -p froe-cli --features interop -- --ignored --nocapture interop::compact
 
 # Direct cargo invocation — `interop_full` is the whole chain, and naming it
 # is required: an unfiltered `--ignored` run collides with itself as above.
@@ -137,6 +148,70 @@ recover
    │  Last because it is the most destructive (deletes the journal).
 ```
 
+## The content digest, and why attribution matters more than detection
+
+Booting Sling is a liveness gate, not an integrity claim. A store can be
+subtly wrong — a property decoded at the wrong arity, a value re-rendered, a
+node dropped from a subtree nobody inspects — and Oak will still start, still
+serve, and still log nothing. The damage surfaces later, and by then several
+maintenance runs have happened and there is no way to tell which one caused
+it.
+
+So every mutating phase renders its store with `froe digest` before and after
+its operation and asserts the difference is exactly what the phase
+**declared** — `ExpectedDigestDelta::None` for operations that must preserve
+everything, `CheckpointsOnly` where retiring checkpoints is the point. The
+operation named in a failing difference *is* the operation that changed
+something. That is the whole mechanism: no ledger, no replay, no bisection.
+
+It is affordable because it is offline. On the interop fixture — 51,352
+nodes, 107,592 properties, 5,698 binaries totalling ~124 MB — a digest takes
+about 0.3 s and is byte-identical across runs.
+
+What each line covers, and why:
+
+- **Scope is the super-root**: `root`'s subtree, the super-root's own
+  properties, and every checkpoint, including each checkpoint node's own
+  properties. A checkpoint's expiry timestamp drives froe's own retirement
+  logic, so a corrupted one is self-fulfilling corruption.
+- **Sorted by name**, never by storage order. Two encodings of the same
+  content — a map that split into a branch where the other stayed a leaf — are
+  both legal, and ordering by storage would report a difference where there is
+  none.
+- **No identity**: record, segment and stable identifiers are all absent,
+  because compaction legitimately changes every one of them. What survives
+  compaction is exactly what this renders.
+- **Type and arity are explicit.** `tags=String[]:a` and `tags=String:a` are
+  different lines. Arity is invisible to a check that only resolves records.
+- **Binaries are content**: `<declared>/<read>@<crc32>` over the streamed
+  bytes, so a changed, truncated or reordered binary is a changed line.
+- **Lookup probes.** Oak reaches a child or property two ways — enumeration,
+  and lookup by name through `MapRecord.getEntry`'s unsigned-hash descent and
+  `Template.getPropertyTemplate`'s signed-hash binary search. Those read
+  different bytes. A mis-sorted map leaf leaves every entry *present under
+  enumeration*, so a digest, an export and a consistency check all pass, while
+  `getChildNode("page3")` returns nothing in production. Sorting by name — which
+  the digest does for comparability — actively erases that evidence, so every
+  enumerated child and property is looked up by name as well.
+- **`/:async` closure**: checkpoints an index lane still resumes from must
+  still exist. Properties ending `-temp` are excluded: that list holds
+  checkpoints the indexer intends to *release*, and it routinely names ones
+  already gone, so checking it would fail on every pristine Oak store.
+
+`froe digest --baseline <file>` does the same comparison outside the suite and
+exits non-zero on a difference, which is how an operator answers "did this
+maintenance change my content?".
+
+### What the digest does not prove
+
+It is froe reading froe. A misconception shared by froe's writer *and* its
+reader — a map-leaf ordering rule wrong in both — is invisible to it, and only
+an independent Oak-side rendering would catch that. It says nothing about the
+`.gph` and `.brf` trailers, which Oak checks against their own CRC and then
+trusts; those are consumed by Oak's own compaction and blob GC long after any
+assertion here has passed. And two values whose stored bytes differ but decode
+identically (`"TRUE"` and `"true"`) render the same line.
+
 ## What each phase proves
 
 ### generate
@@ -147,11 +222,40 @@ churns content (create + delete 20 subtrees × 5 children × 3 rounds) to
 produce orphaned segments, and stops cleanly. The resulting store is the
 shared fixture for all later phases.
 
+### The log gate, and its positive control
+
+Every phase that boots Oak against a froe-written store asserts Oak logged
+none of its own repair messages — `Unable to access revision`, `Could not
+find a valid tar index`, `Recovering segments from tar file`, `Could not
+read tar file`, `Regenerating tar file`. A content assertion made after a
+repair proves nothing about froe's output, and this is the signal a
+froe-to-froe round trip cannot produce at all.
+
+A scan for *absent* markers passes trivially on an empty string, so the gate
+first requires the captured log to contain `Apache Sling Application
+Launcher` — the launcher's own banner, present in any container that came up
+at all. Without that control, a mistyped container name or a `podman logs`
+that failed for any reason would report "Oak consumed the store as froe
+wrote it" while having read nothing.
+
 ### read
 
 froe reads the Oak-written store: `summary`, `tree`, `check`,
 `search-nodes`, and `export` (json-lines). All must succeed. This is the
 foundation — every later phase uses froe's reader to verify results.
+
+`check` runs as `--path / --binaries` and the phase asserts the reported
+revision **is the head froe wrote**, read from `journal.log`. Exit status
+alone would prove far less than it appears to:
+`ConsistencyReport::has_good_revision` is an `any` over the head paths
+chained with every checkpoint's paths, so a store whose head is broken still
+exits zero as long as one checkpoint resolves somewhere. `--binaries` matters
+for the same reason — without it binary records are resolved but never read.
+
+The phase also re-derives the content digest `generate` recorded and requires
+it to match, which proves the rendering is reproducible across processes.
+Without that, every later comparison would report differences that mean
+nothing.
 
 ### commit
 
@@ -161,6 +265,14 @@ content tree via the library's commit API
 `/content/interop/froe-written/node`. Then Sling boots against the
 modified store and verifies Oak reads the froe-written nodes back
 correctly — the same JSON Sling would serve for any other node.
+
+Two assertions bound what else the commit may have done. Oak must log none
+of its own repair messages, so reading the node back cannot be satisfied by a
+store Oak reconstructed on the way to serving it. And the content digest
+before and after the commit must differ **only by added paths under
+`/content/interop/froe-written`**: a node record rewritten on the path from
+the root that lost a property, or a value re-rendered in passing, is
+invisible to every other assertion in this phase.
 
 This is the core interop claim: froe writes content that Oak reads.
 If this fails, there is no point testing checkpoint, compact,
@@ -183,8 +295,20 @@ Depends on `commit` (the writer can already produce content Oak reads).
 froe compacts a copy of the store. The journal is truncated to the head
 first, so the churned subtrees' segments are true orphans (no journal
 history protects them). Compaction deep-copies only reachable records,
-dropping the orphans. Sling boots against the compacted store and the
-binary round-trips byte-for-byte.
+dropping the orphans. Sling boots against the compacted store.
+
+Two assertions carry the "content preserved" claim, and both are byte-level:
+
+- The **content digest** taken before the run must equal the one taken after,
+  outside the checkpoint subtrees compaction is allowed to retire. That covers
+  every node, property name, type, arity, value and binary in the head and in
+  every surviving checkpoint.
+- The uploaded **binary is fetched back from Oak and compared byte for byte**
+  against the file that was uploaded. A substring check could not carry this:
+  the fixture's binary is one sentence repeated 16384 times, so matching
+  `Lorem ipsum` passes on a stream truncated after the first block, missing
+  blocks in the middle, or with blocks reordered — exactly what a block-list
+  bug produces.
 
 Depends on `read` (to verify the compacted store) and `commit` (to trust
 the writer).
@@ -268,6 +392,37 @@ froe backup copies the store head into a fresh target directory. froe
 restore copies that backup into another store. Sling boots against the
 restored store and content is preserved.
 
+Both are held to the strongest statement the digest makes available: the
+backup must render **identically to its source**, and the restored store
+identically to the backup. Identity — record, segment and stable
+identifiers — is excluded from the rendering, so everything else has to
+agree exactly.
+
+That assertion exists because of what it caught. Copying a binary shares
+bulk-segment blocks by reference rather than copying them, which is correct
+for compaction — within one store, a reference from the new generation is
+exactly what keeps a bulk segment alive — and wrong for a backup, where the
+target is a different directory and the reference resolves to nothing.
+`froe backup` used the same copy, so it produced a target holding the whole
+content tree and none of the binary content: **9.8 MB from a 67 MB store**.
+
+Nothing caught it for a long time, and the reasons are worth recording,
+because they are the general case:
+
+- the backup **booted in Oak** and served its content tree;
+- it matched the **Sling-side fingerprint**, which reads two string
+  properties over one subtree and no binaries at all;
+- it passed **`froe check`**, which resolved the binary records without
+  reading them — `--binaries` is what fails, and the phase did not pass it;
+- and no unit test reached it, because the shape requires blocks in a *bulk*
+  segment, which only appears for binaries over 256 KiB.
+
+The regression is
+`a_backup_carries_binary_content_that_lived_in_a_bulk_segment`, which reads
+the binary back out of the target alone — opening the source anywhere in the
+assertion would let the missing blocks resolve through it and hide the
+defect.
+
 Depends on `read` and `commit`.
 
 ### recover
@@ -293,13 +448,23 @@ was never exercised against Oak:
   new archive. *Every* entry is reclaimable, so `plan_archive_sweep` takes the
   whole-file removal branch. This proves reclamation happens; it cannot prove
   anything about rewriting, because the rewrite machinery is never reached.
-- `write_partially_dead_archive` writes 64 unreferenced generation-zero nodes
-  *beside* the live rewritten super-root, in one archive. Survivors remain, so
-  the sweep copies them into the next generation letter, filters the graph and
-  binary-reference trailers, and publishes the replacement. Oak boots against
-  the result, serves the byte-identical baseline tree, and logs none of its own
-  repair messages — so it consumed froe's rebuilt archive rather than
-  reconstructing one.
+- The **partially dead archive** needs no fixture function at all, and there is
+  none: the Oak store already carries a binary large enough to live in bulk
+  segments, and compaction references bulk segments where they lie rather than
+  copying them. So the archive holding them survives the first compaction while
+  its data segments die — some entries reclaimable, some not, which is exactly
+  the disposition that forces a rewrite to the next generation letter with a
+  survivor subset and reconstructed `.gph`, `.brf` and `.idx` trailers.
+  `assert_first_compaction_rewrites_a_partial_archive` asserts the source
+  archive is gone and its successor letter holds the survivors. Oak then boots
+  against the result, serves the baseline tree, and logs none of its own repair
+  messages — so it consumed froe's rebuilt archive rather than reconstructing
+  one.
+
+  The assertion sits on the *first* compaction deliberately. By the second, the
+  surviving archives hold nothing but referenced bulk, which is wholly live and
+  has nothing left to reclaim — so a rewrite is unreachable there, and asserting
+  it would be asserting something the format cannot produce.
 
 An earlier version of this phase built its orphans by restoring the
 pre-compaction gen-0 archive at a spare archive number. That stopped working

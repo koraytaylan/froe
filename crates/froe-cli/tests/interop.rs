@@ -245,13 +245,24 @@ const EXPECTED_OAK_SEGMENT_TAR_VERSION: &str = "1.90.0";
 static OAK_STORE: OnceLock<PathBuf> = OnceLock::new();
 
 /// The work root for all interop artifacts.
+///
+/// Deliberately **not** process-scoped. A per-process default would put
+/// every `cargo test` invocation in its own directory, and the suite's own
+/// wrapper runs `generate` in one process and the named phase in another —
+/// so a single phase could never find the fixture the previous process
+/// built. Concurrent runs are already impossible for a different reason:
+/// the podman container and volume names are fixed strings, so two suites
+/// on one host collide long before their work roots would.
 fn work_root() -> PathBuf {
-    let root = std::env::var("FROE_INTEROP_WORK_ROOT").map_or_else(
-        |_| std::env::temp_dir().join(format!("froe-interop-{}", std::process::id())),
-        PathBuf::from,
-    );
+    let root = std::env::var("FROE_INTEROP_WORK_ROOT")
+        .map_or_else(|_| std::env::temp_dir().join("froe-interop"), PathBuf::from);
     std::fs::create_dir_all(&root).expect("create work root");
     root
+}
+
+/// Where `generate` records the fixture path for later processes.
+fn fixture_pointer_path() -> PathBuf {
+    work_root().join("fixture-path")
 }
 
 /// The froe binary path, resolved from the cargo build.
@@ -708,9 +719,30 @@ fn container_logs(container: &str) -> String {
     logs
 }
 
+/// A line every Sling boot writes, used as the log gate's positive
+/// control. Captured from a real container log rather than written from
+/// memory: it is the launcher's own banner, printed before any bundle
+/// starts, so it is present in the log of any container that came up at
+/// all.
+const SLING_BOOT_MARKER: &str = "Apache Sling Application Launcher";
+
 /// Fail unless Oak consumed the store exactly as froe wrote it.
 fn assert_oak_consumed_store_as_written(container: &str, phase: &str) {
     let logs = container_logs(container);
+    // The positive control. A scan for absent markers passes trivially on
+    // an empty string, so without this a mistyped container name, a
+    // container removed early, or a `podman logs` that failed for any
+    // reason would report "Oak consumed the store as froe wrote it" while
+    // having read nothing at all. Asserting a line that must be there
+    // makes the absence of the repair markers evidence rather than an
+    // artifact of having no log.
+    assert!(
+        logs.contains(SLING_BOOT_MARKER),
+        "{phase}: the log of {container} does not contain {SLING_BOOT_MARKER:?}, so the \
+         repair-marker scan below would be looking at nothing and would pass no matter \
+         what Oak did. {} bytes were captured.",
+        logs.len()
+    );
     let repairs: Vec<&str> = OAK_REPAIR_MARKERS
         .iter()
         .filter(|marker| logs.contains(**marker))
@@ -771,6 +803,57 @@ fn content_fingerprint(port: u16) -> Vec<String> {
     );
     entries.sort();
     entries
+}
+
+/// Fetch the uploaded binary back from Oak and require every byte to match
+/// what was uploaded.
+///
+/// A substring check cannot carry this claim: the fixture's binary is the
+/// same 122-byte sentence repeated 16384 times, so `contains("Lorem
+/// ipsum")` passes on a stream that lost all but the first block, was
+/// truncated at any point, or had whole blocks reordered — precisely the
+/// damage a block-list bug produces. Comparing the bytes is what makes
+/// "round-trips byte-for-byte" a statement about the run rather than about
+/// the first fifty characters of it.
+fn assert_binary_round_trips_byte_for_byte(port: u16, phase: &str) {
+    let expected = std::fs::read(work_root().join("binary.txt")).expect("read the uploaded binary");
+    let served_path = work_root().join(format!("served-binary-{port}.bin"));
+    let status = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            served_path.to_str().unwrap(),
+            "-u",
+            "admin:admin",
+            &format!("http://localhost:{port}/content/interop/files/file/jcr:content"),
+        ])
+        .status()
+        .expect("curl the binary");
+    assert!(status.success(), "{phase}: curl failed fetching the binary");
+    let served = std::fs::read(&served_path).expect("read the served binary");
+    assert_eq!(
+        served.len(),
+        expected.len(),
+        "{phase}: Oak served {} bytes of the binary, not the {} that were uploaded",
+        served.len(),
+        expected.len()
+    );
+    if served != expected {
+        let first_difference = served
+            .iter()
+            .zip(&expected)
+            .position(|(left, right)| left != right)
+            .unwrap_or(0);
+        panic!(
+            "{phase}: the binary Oak serves is the right length but differs from what was \
+             uploaded, first at byte {first_difference}"
+        );
+    }
+    let _ = std::fs::remove_file(&served_path);
+    eprintln!(
+        "  binary round-tripped byte-for-byte ({} bytes)",
+        served.len()
+    );
 }
 
 fn content_baseline_path() -> PathBuf {
@@ -844,6 +927,162 @@ fn froe_head(store: &Path) -> String {
         .unwrap_or_else(|| panic!("summary reports a head line: {summary}"))
         .trim()
         .to_owned()
+}
+
+/// The revision on the last line of `journal.log` — the head froe actually
+/// wrote, read from the file rather than from froe's own reporting.
+fn journal_head_revision(store: &Path) -> String {
+    let journal = std::fs::read_to_string(store.join("journal.log")).expect("read journal.log");
+    journal
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("journal.log has no revision line:\n{journal}"))
+        .to_owned()
+}
+
+/// `froe check` over the whole tree *including binary content*, asserting
+/// it found a good revision **at the head froe wrote**.
+///
+/// Asserting the exit status alone proves almost nothing:
+/// `ConsistencyReport::has_good_revision` is an `any` over the head paths
+/// chained with every checkpoint's paths, so a store whose head is broken
+/// still exits zero as long as one checkpoint resolves somewhere. The
+/// revision is what carries the claim, and froe already prints it.
+///
+/// `--binaries` matters for the same reason: without it binary records are
+/// resolved but never read, so a store whose blocks are unreachable passes.
+fn assert_check_passes_at_head(store: &Path, phase: &str) {
+    let report = froe(&[
+        "check",
+        store.to_str().unwrap(),
+        "--path",
+        "/",
+        "--binaries",
+    ]);
+    let head = journal_head_revision(store);
+    let expected = format!("latest good revision for path / is {head}");
+    assert!(
+        report.contains(&expected),
+        "{phase}: froe check found a good revision, but not at the head froe wrote.\n\
+         expected to find: {expected}\n\
+         has_good_revision() is an `any` over head *and* checkpoint paths, so a zero exit \
+         status alone would not have caught this.\nreport:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Content digest: the attribution mechanism
+// ---------------------------------------------------------------------------
+
+/// The canonical content rendering of a store.
+///
+/// This is what makes damage attributable rather than merely detectable.
+/// Every mutating phase digests its store and compares against the
+/// baseline, so the operation named in the difference *is* the operation
+/// that changed something — instead of a fatal error three phases later
+/// with no way to tell which run introduced it.
+fn digest_store(store: &Path) -> String {
+    froe(&["digest", store.to_str().unwrap()])
+}
+
+/// What an operation is expected to change in the content digest.
+///
+/// Every phase declares one. `None` is by far the strongest and is what
+/// most maintenance should be able to claim: the store was rewritten and
+/// not one node, property, type, arity, value or binary moved.
+#[derive(Clone, Copy, PartialEq)]
+enum ExpectedDigestDelta {
+    /// Nothing changed anywhere, checkpoints included.
+    None,
+    /// Only checkpoint subtrees may change; the content tree must be
+    /// byte-identical. Used where the operation retires checkpoints by
+    /// design.
+    CheckpointsOnly,
+}
+
+/// Splits a digest into `path -> properties`.
+fn digest_nodes(digest: &str) -> std::collections::BTreeMap<&str, &str> {
+    digest
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split_once('\t').unwrap_or((line, "")))
+        .collect()
+}
+
+/// Assert the digest changed exactly as much as the phase declared.
+fn assert_digest_delta(baseline: &str, current: &str, expected: ExpectedDigestDelta, phase: &str) {
+    let before = digest_nodes(baseline);
+    let after = digest_nodes(current);
+    assert!(
+        !before.is_empty() && !after.is_empty(),
+        "{phase}: a digest is empty, so comparing them would be vacuous"
+    );
+
+    let mut differences: Vec<String> = Vec::new();
+    for (path, properties) in &before {
+        match after.get(path) {
+            None => differences.push(format!("removed {path}")),
+            Some(current_properties) if current_properties != properties => {
+                differences.push(format!(
+                    "changed {path}\n    before: {properties}\n    after:  {current_properties}"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for path in after.keys() {
+        if !before.contains_key(path) {
+            differences.push(format!("added {path}"));
+        }
+    }
+
+    let offending: Vec<&String> = match expected {
+        ExpectedDigestDelta::None => differences.iter().collect(),
+        // The super-root's own line names its children, and retiring a
+        // checkpoint rewrites the checkpoints container, so both move
+        // legitimately when checkpoints do.
+        ExpectedDigestDelta::CheckpointsOnly => differences
+            .iter()
+            .filter(|difference| {
+                let path = difference
+                    .split_once(' ')
+                    .map_or("", |(_, rest)| rest.lines().next().unwrap_or(""));
+                !path.starts_with("#checkpoint") && !path.starts_with("#super-root")
+            })
+            .collect(),
+    };
+
+    assert!(
+        offending.is_empty(),
+        "{phase}: the content digest changed in ways the phase did not declare.\n\
+         This is the attribution signal: the operation this phase ran is the one that \
+         changed content it was supposed to preserve.\n{} unexpected difference(s):\n{}",
+        offending.len(),
+        offending
+            .iter()
+            .take(20)
+            .map(|difference| format!("  {difference}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // Reported precisely rather than as "matches": a run that legitimately
+    // retires a checkpoint moves tens of thousands of lines, and calling
+    // that "matches the baseline" is the kind of claim-stronger-than-the-
+    // evidence this whole comparison exists to eliminate.
+    let declared = differences.len();
+    if declared == 0 {
+        eprintln!(
+            "  content digest identical to the baseline ({} nodes, nothing changed)",
+            after.len()
+        );
+    } else {
+        eprintln!(
+            "  content digest holds: {} nodes after, {declared} line(s) differ and every one \
+             is within the declared scope",
+            after.len()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1224,98 @@ fn write_orphan_nodes(store_path: &Path) -> PathBuf {
         orphan_archive.display()
     );
     orphan_archive
+}
+
+/// Compacts once to advance the store off generation zero, asserting the
+/// partial-archive rewrite that only this first pass can produce.
+///
+/// This is the one place the rewrite is reachable: the Oak store carries a
+/// binary large enough to live in bulk segments, so the first compaction
+/// keeps those where they lie while the data segments beside them die — an
+/// archive that must be rewritten to its next generation letter rather
+/// than unlinked. By the second pass the surviving archives hold nothing
+/// but referenced bulk, which is wholly live, so asserting a rewrite there
+/// would be asserting something the format cannot produce.
+fn assert_first_compaction_rewrites_a_partial_archive(clean_store: &Path) {
+    eprintln!("  step 1: froe compact (gen 0 -> 1)");
+    let archives_before_first = archive_names(clean_store);
+    let first_compaction = froe(&[
+        "compact",
+        clean_store.to_str().unwrap(),
+        "--keep-expired-checkpoints",
+        "--yes",
+    ]);
+    let archives_after_first = archive_names(clean_store);
+    assert!(
+        parse_count(&first_compaction, " rewritten") >= 1,
+        "the first compaction rewrote at least one partially dead archive: {first_compaction}"
+    );
+    let rewritten_pairs: Vec<String> = archives_before_first
+        .iter()
+        .filter(|name| !archives_after_first.contains(*name))
+        .filter_map(|name| {
+            let letter = name.as_bytes()[name.len() - 5];
+            let successor = format!(
+                "data{}{}.tar",
+                &name[4..name.len() - 5],
+                (letter + 1) as char
+            );
+            archives_after_first
+                .contains(&successor)
+                .then(|| format!("{name} -> {successor}"))
+        })
+        .collect();
+    assert!(
+        !rewritten_pairs.is_empty(),
+        "a source archive is gone and its successor letter holds the survivors; \
+         before {archives_before_first:?} after {archives_after_first:?}"
+    );
+    eprintln!("  archives rewritten in place: {rewritten_pairs:?}");
+}
+
+/// Every reported effect of a cleanup run, plus the journal's end state.
+///
+/// Extracted from the phase so each condition is named in one place. The
+/// obvious check — that the output contains "orphan segments removed" — is
+/// worthless, because that phrase comes from an unconditional format
+/// template and is printed even when the count is zero. Parsing the number
+/// is what makes a zero-count run fail.
+fn assert_cleanup_counts_and_journal(cleanup_output: &str, clean_store: &Path) {
+    let removed_segments = parse_count(cleanup_output, " orphan segments removed");
+    let removed_stale = parse_count(cleanup_output, " stale removed");
+    let removed_checkpoints = parse_count(cleanup_output, " checkpoints and");
+    let removed_journal_lines = parse_count(cleanup_output, " journal lines removed");
+    assert!(
+        removed_segments > 0,
+        "the run reclaimed orphan segments, not zero: {cleanup_output}"
+    );
+    assert!(
+        removed_stale >= 1,
+        "the run removed the stale archive: {cleanup_output}"
+    );
+    assert_eq!(
+        removed_checkpoints, 1,
+        "the run dropped the one expired checkpoint: {cleanup_output}"
+    );
+    // Every earlier revision goes, not only the two corrupt lines: a run
+    // retires history to the head it just compacted. Asserting the end state
+    // is both stronger and stable against the fixture's line count.
+    assert!(
+        removed_journal_lines >= 2,
+        "the run retired at least the two corrupt journal lines: {cleanup_output}"
+    );
+    let journal_after = std::fs::read_to_string(clean_store.join("journal.log"))
+        .expect("read the journal after the run");
+    assert_eq!(
+        journal_after.lines().count(),
+        1,
+        "the run leaves exactly one journal line: {journal_after}"
+    );
+    assert!(
+        !journal_after.contains("this_line_has_no_space")
+            && !journal_after.contains("not-a-uuid:bad"),
+        "and neither corrupt line survives: {journal_after}"
+    );
 }
 
 /// The `data*.tar` names currently in a store, sorted.
@@ -1160,6 +1491,13 @@ fn append_corrupt_journal_lines(store: &Path) {
 #[ignore = "requires podman and the apache/sling:14 image"]
 fn generate() {
     let root = work_root();
+    // Retire any pointer left by an earlier run before building the new
+    // fixture. The pointer exists so a *separate* `cargo test` process can
+    // find the fixture this one produced; it must never let a phase that
+    // ran before `generate` in the same run silently pick up the previous
+    // run's store and report a pass about bytes nobody produced today.
+    let _ = std::fs::remove_file(fixture_pointer_path());
+    let _ = std::fs::remove_file(digest_baseline_path());
     let volume = PodmanVolume::new("froe-interop-generate");
     eprintln!("  starting Sling on :8080");
     let sling = PodmanContainer::run_detached("froe-interop-gen", 8080, &volume.name);
@@ -1215,18 +1553,60 @@ fn generate() {
     OAK_STORE
         .set(store.clone())
         .expect("store the Oak store path");
+    std::fs::write(fixture_pointer_path(), store.to_string_lossy().as_bytes())
+        .expect("record the fixture path for later processes");
+
+    // The baseline every later phase compares its digest against: the
+    // content exactly as Oak itself wrote it, before froe has touched
+    // anything. Taken here rather than per phase so that a difference
+    // names the operation that introduced it.
+    let baseline = digest_store(&store);
+    assert!(
+        baseline.lines().count() > 100,
+        "the digest baseline is implausibly small, so later comparisons would be vacuous:\n\
+         {baseline}"
+    );
+    std::fs::write(digest_baseline_path(), &baseline).expect("write the digest baseline");
+    eprintln!(
+        "  recorded content digest baseline: {} nodes",
+        baseline.lines().count()
+    );
 
     eprintln!("  Oak store generated at {}", store.display());
 }
 
 /// Get the shared Oak store, or panic with a clear message.
+///
+/// Falls back to the path `generate` recorded on disk, because the suite's
+/// own wrapper script runs `generate` and the named phase in two separate
+/// `cargo test` processes and a `OnceLock` does not survive that. Without
+/// the fallback no phase can be re-run on its own — and a failure that
+/// cannot be reproduced in isolation cannot be attributed to anything.
 fn oak_store() -> PathBuf {
-    OAK_STORE.get().cloned().unwrap_or_else(|| {
-        panic!(
-            "Oak store not generated. Run the `generate` test first:\n\
-                 cargo test -p froe-cli --features interop -- --ignored interop::generate"
-        )
-    })
+    if let Some(store) = OAK_STORE.get() {
+        return store.clone();
+    }
+    let recorded = std::fs::read_to_string(fixture_pointer_path()).unwrap_or_default();
+    let store = PathBuf::from(recorded.trim());
+    assert!(
+        !recorded.trim().is_empty() && store.join("journal.log").exists(),
+        "Oak store not generated. Run the `generate` phase first:\n\
+             cargo test -p froe-cli --features interop -- --ignored interop::generate"
+    );
+    store
+}
+
+/// The recorded digest of the pristine Oak-written store.
+fn digest_baseline_path() -> PathBuf {
+    work_root().join("content-digest-baseline.txt")
+}
+
+/// The baseline digest, or a clear message about which phase records it.
+fn digest_baseline() -> String {
+    std::fs::read_to_string(digest_baseline_path()).expect(
+        "read the content digest baseline; the generate phase records it and every later \
+         phase compares against it",
+    )
 }
 
 /// Phase 2: froe reads the Oak-written store.
@@ -1260,7 +1640,19 @@ fn read() {
     assert!(tree.contains("nt:file"), "tree shows nt:file");
 
     eprintln!("  froe check (expect exit 0)");
-    froe(&["check", store.to_str().unwrap()]);
+    assert_check_passes_at_head(&store, "read");
+
+    // The digest `generate` recorded, re-derived in this process. It
+    // proves the rendering is reproducible across runs — without which
+    // every later comparison would report differences that mean nothing —
+    // and that reading the pristine store is itself stable.
+    eprintln!("  content digest reproduces the baseline recorded at generate");
+    assert_digest_delta(
+        &digest_baseline(),
+        &digest_store(&store),
+        ExpectedDigestDelta::None,
+        "read",
+    );
 
     eprintln!("  froe search-nodes");
     let search = froe(&[
@@ -1362,6 +1754,7 @@ fn commit() {
     let commit_store = work_root().join("commit-store");
     eprintln!("  copying store to {}", commit_store.display());
     copy_store(&store, &commit_store);
+    let digest_before = digest_store(&commit_store);
 
     eprintln!("  opening store for writing");
     let writable = WritableRepository::open(&commit_store).expect("open writable");
@@ -1525,6 +1918,52 @@ fn commit() {
         "froe reads the boolean property: {node}"
     );
 
+    // A commit is the one operation that is *supposed* to change content,
+    // which makes "did it change anything else?" the question worth
+    // asking. A node record rewritten on the path from the root to the new
+    // subtree that lost a property, or a re-rendered value, would be
+    // invisible to every other assertion in this phase.
+    //
+    // Only added paths are expected: a digest line carries a node's own
+    // properties, so an ancestor gaining a child does not change its line.
+    eprintln!("  content digest after the commit");
+    let before_nodes = digest_nodes(&digest_before);
+    let after_digest = digest_store(&commit_store);
+    let after_nodes = digest_nodes(&after_digest);
+    let unexpected: Vec<&str> = before_nodes
+        .iter()
+        .filter(|(path, properties)| after_nodes.get(*path) != Some(properties))
+        .map(|(path, _)| *path)
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "commit: {} node(s) that existed before the commit changed or disappeared, and a \
+         commit must only add:\n{}",
+        unexpected.len(),
+        unexpected
+            .iter()
+            .take(20)
+            .map(|path| format!("  {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let added: Vec<&str> = after_nodes
+        .keys()
+        .filter(|path| !before_nodes.contains_key(*path))
+        .copied()
+        .collect();
+    assert!(
+        !added.is_empty()
+            && added
+                .iter()
+                .all(|path| path.starts_with("/content/interop/froe-written")),
+        "commit: the added nodes are exactly the froe-written subtree, nothing else: {added:?}"
+    );
+    eprintln!(
+        "  commit added {} nodes and changed nothing else",
+        added.len()
+    );
+
     // Boot Sling against the froe-written store and verify Oak reads the
     // froe-written nodes.
     eprintln!("  booting Sling against the froe-written store");
@@ -1535,6 +1974,15 @@ fn commit() {
     store_into_volume(&commit_store, &volume.name);
     let sling = PodmanContainer::run_detached("froe-commit-verify", 8084, &volume.name);
     wait_for_sling(8084, "froe-commit-verify");
+
+    // The phase that carries the core interop claim had no repair-marker
+    // scan at all, so a run where Oak rebuilt an index or skipped an
+    // archive on its way to serving the node would have passed. Reading
+    // the node back proves nothing if Oak had to reconstruct the store to
+    // do it. The baseline comparison is deliberately absent instead: this
+    // phase *adds* content, so the pristine fingerprint would rightly
+    // differ, and the digest assertion below is what covers it.
+    assert_oak_consumed_store_as_written("froe-commit-verify", "commit");
 
     eprintln!("  fetching froe-written node from Sling");
     let sling_node = Command::new("curl")
@@ -1573,8 +2021,8 @@ fn compact() {
     eprintln!("  truncating journal to head");
     truncate_journal_to_head(&compact_store);
 
-    eprintln!("  froe summary before compaction");
-    let _before = froe(&["summary", compact_store.to_str().unwrap()]);
+    eprintln!("  content digest before compaction");
+    let digest_before = digest_store(&compact_store);
 
     eprintln!("  froe compact --yes");
     let compact_output = froe(&["compact", compact_store.to_str().unwrap(), "--yes"]);
@@ -1591,7 +2039,19 @@ fn compact() {
     );
 
     eprintln!("  froe check after compaction");
-    froe(&["check", compact_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&compact_store, "compact");
+
+    // The claim compaction actually makes: every node, property, type,
+    // arity, value and binary survived the rewrite unchanged. Checkpoints
+    // are exempt because compaction retires expired ones by design — the
+    // content tree is not.
+    eprintln!("  content digest after compaction");
+    assert_digest_delta(
+        &digest_before,
+        &digest_store(&compact_store),
+        ExpectedDigestDelta::CheckpointsOnly,
+        "compact",
+    );
 
     eprintln!("  froe tree /content/interop after compaction (content preserved)");
     let tree = froe(&[
@@ -1619,21 +2079,7 @@ fn compact() {
     let snapshot = content_snapshot(8083);
     assert!(snapshot.contains("Page 1"), "page 1 preserved: {snapshot}");
 
-    // Verify the binary round-tripped.
-    let binary = Command::new("curl")
-        .args([
-            "-s",
-            "-u",
-            "admin:admin",
-            "http://localhost:8083/content/interop/files/file/jcr:content",
-        ])
-        .output()
-        .expect("curl binary");
-    let binary_text = String::from_utf8_lossy(&binary.stdout);
-    assert!(
-        binary_text.contains("Lorem ipsum"),
-        "binary content round-tripped: {binary_text}"
-    );
+    assert_binary_round_trips_byte_for_byte(8083, "compact");
 
     drop(sling);
     eprintln!("  compact phase passed");
@@ -1656,11 +2102,21 @@ fn compact_tail() {
     eprintln!("  truncating journal to head");
     truncate_journal_to_head(&tail_store);
 
+    let digest_before = digest_store(&tail_store);
+
     eprintln!("  froe compact --tail --yes");
     froe(&["compact", tail_store.to_str().unwrap(), "--tail", "--yes"]);
 
     eprintln!("  froe check after tail compaction");
-    froe(&["check", tail_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&tail_store, "compact --tail");
+
+    eprintln!("  content digest after tail compaction");
+    assert_digest_delta(
+        &digest_before,
+        &digest_store(&tail_store),
+        ExpectedDigestDelta::CheckpointsOnly,
+        "compact --tail",
+    );
 
     eprintln!("  booting Sling against the tail-compacted store");
     let volume = PodmanVolume::new("froe-interop-compact-tail");
@@ -1774,7 +2230,7 @@ fn checkpoint_removal() {
     );
 
     eprintln!("  froe check after checkpoint removal");
-    froe(&["check", removal_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&removal_store, "checkpoint removal");
 
     eprintln!("  booting Sling against the store with a rewritten checkpoints subtree");
     let volume = PodmanVolume::new("froe-interop-checkpoint-removal");
@@ -1803,7 +2259,7 @@ fn checkpoint_removal() {
         after_all.contains("no checkpoints"),
         "remove-all emptied the checkpoints subtree: {after_all}"
     );
-    froe(&["check", removal_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&removal_store, "checkpoint removal (remove-all)");
 
     eprintln!("  checkpoint removal phase passed");
 }
@@ -1843,40 +2299,7 @@ fn cleanup() {
     // next generation letter rather than unlinked. By step 2 the surviving
     // archives hold nothing but referenced bulk, which is wholly live and has
     // nothing left to reclaim.
-    eprintln!("  step 1: froe compact (gen 0 -> 1)");
-    let archives_before_first = archive_names(&clean_store);
-    let first_compaction = froe(&[
-        "compact",
-        clean_store.to_str().unwrap(),
-        "--keep-expired-checkpoints",
-        "--yes",
-    ]);
-    let archives_after_first = archive_names(&clean_store);
-    assert!(
-        parse_count(&first_compaction, " rewritten") >= 1,
-        "the first compaction rewrote at least one partially dead archive: {first_compaction}"
-    );
-    let rewritten_pairs: Vec<String> = archives_before_first
-        .iter()
-        .filter(|name| !archives_after_first.contains(*name))
-        .filter_map(|name| {
-            let letter = name.as_bytes()[name.len() - 5];
-            let successor = format!(
-                "data{}{}.tar",
-                &name[4..name.len() - 5],
-                (letter + 1) as char
-            );
-            archives_after_first
-                .contains(&successor)
-                .then(|| format!("{name} -> {successor}"))
-        })
-        .collect();
-    assert!(
-        !rewritten_pairs.is_empty(),
-        "a source archive is gone and its successor letter holds the survivors; \
-         before {archives_before_first:?} after {archives_after_first:?}"
-    );
-    eprintln!("  archives rewritten in place: {rewritten_pairs:?}");
+    assert_first_compaction_rewrites_a_partial_archive(&clean_store);
 
     eprintln!("  step 2: froe compact again (gen 1 -> 2)");
     froe(&[
@@ -1945,46 +2368,12 @@ fn cleanup() {
         &orphan_archive,
     );
 
+    let digest_before = digest_store(&clean_store);
+
     eprintln!("  froe compact --yes");
     let cleanup_output = froe(&["compact", clean_store.to_str().unwrap(), "--yes"]);
 
-    // Parse the reported counts and require each condition to have been acted
-    // on, so a run that removed nothing cannot pass.
-    let removed_segments = parse_count(&cleanup_output, " orphan segments removed");
-    let removed_stale = parse_count(&cleanup_output, " stale removed");
-    let removed_checkpoints = parse_count(&cleanup_output, " checkpoints and");
-    let removed_journal_lines = parse_count(&cleanup_output, " journal lines removed");
-    assert!(
-        removed_segments > 0,
-        "the run reclaimed orphan segments, not zero: {cleanup_output}"
-    );
-    assert!(
-        removed_stale >= 1,
-        "the run removed the stale archive: {cleanup_output}"
-    );
-    assert_eq!(
-        removed_checkpoints, 1,
-        "the run dropped the one expired checkpoint: {cleanup_output}"
-    );
-    // Every earlier revision goes, not only the two corrupt lines: a run
-    // retires history to the head it just compacted. Asserting the end state
-    // is both stronger and stable against the fixture's line count.
-    assert!(
-        removed_journal_lines >= 2,
-        "the run retired at least the two corrupt journal lines: {cleanup_output}"
-    );
-    let journal_after = std::fs::read_to_string(clean_store.join("journal.log"))
-        .expect("read the journal after the run");
-    assert_eq!(
-        journal_after.lines().count(),
-        1,
-        "the run leaves exactly one journal line: {journal_after}"
-    );
-    assert!(
-        !journal_after.contains("this_line_has_no_space")
-            && !journal_after.contains("not-a-uuid:bad"),
-        "and neither corrupt line survives: {journal_after}"
-    );
+    assert_cleanup_counts_and_journal(&cleanup_output, &clean_store);
     assert!(
         cleanup_output.contains("compaction complete"),
         "the run completed without deferred or failed deletions: {cleanup_output}"
@@ -2015,7 +2404,18 @@ fn cleanup() {
     froe(&["summary", clean_store.to_str().unwrap()]);
 
     eprintln!("  froe check after cleanup");
-    froe(&["check", clean_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&clean_store, "cleanup");
+
+    // The run removed an orphan archive, a stale archive, an expired
+    // checkpoint and two corrupt journal lines in one pass. None of that
+    // is allowed to have cost a single content node.
+    eprintln!("  content digest after cleanup");
+    assert_digest_delta(
+        &digest_before,
+        &digest_store(&clean_store),
+        ExpectedDigestDelta::CheckpointsOnly,
+        "cleanup",
+    );
 
     // Boot Sling against the cleaned store.
     eprintln!("  booting Sling against the froe-cleaned store");
@@ -2111,7 +2511,7 @@ fn journal_retention() {
     );
 
     eprintln!("  froe check after retiring history");
-    froe(&["check", retention_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&retention_store, "journal-retention");
 
     // Boot Sling against the store whose history froe destroyed.
     eprintln!("  booting Sling against the history-retired store");
@@ -2214,6 +2614,12 @@ fn repair() {
         "the refusal points at the flag that repairs it: {refusal}"
     );
 
+    // Read-only, so it does not heal the fixture the way a write command
+    // would: froe's reader reconstructs a missing index in memory, which
+    // is exactly what makes a digest of the damaged store meaningful as a
+    // before-image.
+    let digest_before = digest_store(&repair_store);
+
     eprintln!("  froe compact --repair-archive-indexes");
     let output = froe(&[
         "compact",
@@ -2237,7 +2643,18 @@ fn repair() {
         !after.contains("recovered (no valid index"),
         "no archive is served through the recovery scan any more:\n{after}"
     );
-    froe(&["check", repair_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&repair_store, "repair");
+
+    // Rebuilding an index must recover the content the crash left behind,
+    // not a subset of it. A rebuilt index that silently omits entries
+    // still parses, still boots, and still loses nodes.
+    eprintln!("  content digest after the index rebuild");
+    assert_digest_delta(
+        &digest_before,
+        &digest_store(&repair_store),
+        ExpectedDigestDelta::CheckpointsOnly,
+        "repair",
+    );
 
     // The claim this phase exists for: Oak opens what froe rebuilt.
     eprintln!("  booting Sling against the froe-repaired store");
@@ -2281,7 +2698,26 @@ fn backup() {
     );
 
     eprintln!("  froe check of the backup");
-    froe(&["check", backup_dir.to_str().unwrap()]);
+    assert_check_passes_at_head(&backup_dir, "backup");
+
+    // The strongest statement a backup can make, and the one the digest
+    // makes available: it renders *identically* to its source. Identity —
+    // record, segment and stable identifiers — is excluded from the
+    // rendering, and everything else must agree exactly.
+    //
+    // This is the assertion that would have caught the backup writing a
+    // target which referenced bulk segments living only in the source. That
+    // backup opened, served its whole content tree, matched the Sling-side
+    // fingerprint and passed a consistency check that did not read
+    // binaries, while holding none of the binary content: 9.8 MB copied
+    // from a 67 MB store.
+    eprintln!("  content digest of the backup against its source");
+    assert_digest_delta(
+        &digest_store(&store),
+        &digest_store(&backup_dir),
+        ExpectedDigestDelta::None,
+        "backup",
+    );
 
     // Restore into a target whose *content* differs from the backup's, not a
     // byte copy of the store the backup came from. Restoring into a copy of its
@@ -2320,7 +2756,19 @@ fn backup() {
     );
 
     eprintln!("  froe check after restore");
-    froe(&["check", restore_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&restore_store, "restore");
+
+    // The restored head must render exactly as the backup does. The target
+    // began as the commit store, whose content differs, so this also fails
+    // on a restore that wrote nothing — and unlike the head comparison
+    // above, it fails on a restore that wrote *something else*.
+    eprintln!("  content digest after restore against the backup");
+    assert_digest_delta(
+        &digest_store(&backup_dir),
+        &digest_store(&restore_store),
+        ExpectedDigestDelta::None,
+        "restore",
+    );
 
     eprintln!("  froe tree /content/interop after restore");
     let tree = froe(&[
@@ -2371,6 +2819,11 @@ fn recover() {
     // satisfied by resolving to an older revision — which would silently lose
     // every commit after it.
     let head_before = froe_head(&recover_store);
+    // Taken before the journal is destroyed, because after that there is
+    // no head to render from. Recovery restoring the same *revision* and
+    // recovery restoring the same *content* are different claims, and only
+    // the second one is what an operator actually needs.
+    let digest_before = digest_store(&recover_store);
 
     eprintln!("  deleting journal.log");
     std::fs::remove_file(recover_store.join("journal.log")).expect("remove journal");
@@ -2390,7 +2843,15 @@ fn recover() {
     );
 
     eprintln!("  froe check after recovery");
-    froe(&["check", recover_store.to_str().unwrap()]);
+    assert_check_passes_at_head(&recover_store, "recover");
+
+    eprintln!("  content digest after recovery");
+    assert_digest_delta(
+        &digest_before,
+        &digest_store(&recover_store),
+        ExpectedDigestDelta::None,
+        "recover",
+    );
 
     eprintln!("  froe tree /content/interop after recovery");
     let tree = froe(&[
