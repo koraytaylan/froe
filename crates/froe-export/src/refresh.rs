@@ -273,8 +273,10 @@ fn apply_ranges(
         revision,
         provenance.root_path(),
         ranges,
-        &delta_nodes,
-        &delta_properties,
+        TablePaths {
+            nodes: &delta_nodes,
+            properties: &delta_properties,
+        },
         options,
         on_node,
     )?;
@@ -283,12 +285,16 @@ fn apply_ranges(
         ExportProvenance::new(revision_text.to_owned(), provenance.root_path(), depth);
     match merge_tables(
         repository,
-        base_nodes,
-        &delta_nodes,
-        &merged_nodes,
-        base_properties,
-        &delta_properties,
-        &merged_properties,
+        TableMerge {
+            previous: base_nodes,
+            delta: &delta_nodes,
+            merged: &merged_nodes,
+        },
+        TableMerge {
+            previous: base_properties,
+            delta: &delta_properties,
+            merged: &merged_properties,
+        },
         ranges,
         &new_provenance,
         options,
@@ -774,22 +780,25 @@ impl<'ranges> RangeIndex<'ranges> {
 /// Exports every dirty range's replacement — at the pinned revision —
 /// into the delta files, returning the number of nodes written.
 /// `on_node` reports the running count per node.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the delta export threads its source, ranges, destinations, and progress"
-)]
+/// The pair of files one export writes, kept together so the two
+/// same-typed paths cannot be transposed.
+#[derive(Clone, Copy)]
+struct TablePaths<'paths> {
+    nodes: &'paths Path,
+    properties: &'paths Path,
+}
+
 fn export_delta(
     repository: &Repository,
     revision: RecordIdentifier,
     root_path: &str,
     ranges: &[DirtyRange],
-    delta_nodes: &Path,
-    delta_properties: &Path,
+    delta: TablePaths<'_>,
     options: &ParquetExportOptions,
     on_node: &mut dyn FnMut(u64),
 ) -> froe::Result<u64> {
-    let nodes_file = create_export_output(repository.directory(), delta_nodes)?;
-    let properties_file = create_export_output(repository.directory(), delta_properties)?;
+    let nodes_file = create_export_output(repository.directory(), delta.nodes)?;
+    let properties_file = create_export_output(repository.directory(), delta.properties)?;
     let mut sink = ParquetSink::new(
         std::io::BufWriter::with_capacity(1 << 20, nodes_file),
         std::io::BufWriter::with_capacity(1 << 20, properties_file),
@@ -886,18 +895,23 @@ enum MergeVerdict {
 /// open handle keeps its bytes even if its pathname is replaced, so a
 /// base swapped by a writer outside the lock can never be merged and
 /// stamped under the new head.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "two tables times three paths, plus ranges, provenance, and options"
-)]
+///
+/// Each table carries its own three files together, so the nodes and
+/// properties sides cannot be interleaved by a transposed argument.
+#[derive(Clone, Copy)]
+struct TableMerge<'merge> {
+    /// The table already on disk, opened by the caller and validated.
+    previous: &'merge ::parquet::file::reader::SerializedFileReader<std::fs::File>,
+    /// The delta this run wrote for the dirty ranges.
+    delta: &'merge Path,
+    /// Where the merged table is written before the atomic swap.
+    merged: &'merge Path,
+}
+
 fn merge_tables(
     repository: &Repository,
-    old_nodes_reader: &::parquet::file::reader::SerializedFileReader<std::fs::File>,
-    delta_nodes: &Path,
-    merged_nodes: &Path,
-    old_properties_reader: &::parquet::file::reader::SerializedFileReader<std::fs::File>,
-    delta_properties: &Path,
-    merged_properties: &Path,
+    nodes: TableMerge<'_>,
+    properties: TableMerge<'_>,
     ranges: &[DirtyRange],
     provenance: &ExportProvenance,
     options: &ParquetExportOptions,
@@ -907,8 +921,8 @@ fn merge_tables(
     let open_delta = |path: &Path| -> froe::Result<SerializedFileReader<std::fs::File>> {
         SerializedFileReader::new(std::fs::File::open(path)?).map_err(parquet_read_error)
     };
-    let delta_nodes_reader = open_delta(delta_nodes)?;
-    let delta_properties_reader = open_delta(delta_properties)?;
+    let delta_nodes_reader = open_delta(nodes.delta)?;
+    let delta_properties_reader = open_delta(properties.delta)?;
 
     // A decode or read failure inside an old stream does not abort the
     // merge; it ends the affected stream, and the flag turns the
@@ -916,8 +930,8 @@ fn merge_tables(
     // then discarded and a full export replaces the unparseable base.
     let failure = RefCell::new(None::<String>);
 
-    let nodes_out = create_export_output(repository.directory(), merged_nodes)?;
-    let properties_out = create_export_output(repository.directory(), merged_properties)?;
+    let nodes_out = create_export_output(repository.directory(), nodes.merged)?;
+    let properties_out = create_export_output(repository.directory(), properties.merged)?;
     let mut sink = ParquetSink::new_with_provenance(
         std::io::BufWriter::with_capacity(1 << 20, nodes_out),
         std::io::BufWriter::with_capacity(1 << 20, properties_out),
@@ -926,7 +940,7 @@ fn merge_tables(
     )?;
     let index = RangeIndex::new(ranges);
     merge_row_streams(
-        NodeRows::new(old_nodes_reader, &failure, RowSource::PreviousExport)?,
+        NodeRows::new(nodes.previous, &failure, RowSource::PreviousExport)?,
         NodeRows::new(&delta_nodes_reader, &failure, RowSource::FreshDelta)?,
         ranges,
         &index,
@@ -941,7 +955,7 @@ fn merge_tables(
         },
     )?;
     merge_row_streams(
-        PropertyRows::new(old_properties_reader, &failure, RowSource::PreviousExport)?,
+        PropertyRows::new(properties.previous, &failure, RowSource::PreviousExport)?,
         PropertyRows::new(&delta_properties_reader, &failure, RowSource::FreshDelta)?,
         ranges,
         &index,
