@@ -197,8 +197,26 @@ impl TemplateKey {
 
 /// The per-slot type byte a template records: the property type, negated
 /// when the slot is multi-valued, exactly as the serialized form encodes it.
+///
+/// This is the single source of truth for that byte. Both
+/// [`TemplateKey::of`], which decides whether two nodes may share a
+/// template record, and `write_template_record`, which serializes the
+/// byte, go through it — because if they disagree, two nodes whose slots
+/// differ *only* in arity hash to the same key, the second silently
+/// inherits the first one's template, and its values are then decoded at
+/// the wrong arity: a single value record read as a counted list, or a
+/// counted list read as one value. Nothing rejects the result. The store
+/// parses, Oak boots, and the property is quietly wrong.
+///
+/// The match is exhaustive rather than a `matches!` against one variant so
+/// that a new [`PropertyValuesToWrite`] variant is a compile error here
+/// instead of defaulting to single-valued.
 fn property_slot_tag(property_type: PropertyType, values: &PropertyValuesToWrite) -> u8 {
-    let multiple = matches!(values, PropertyValuesToWrite::Multiple(_));
+    let multiple = match values {
+        PropertyValuesToWrite::Single(_) => false,
+        PropertyValuesToWrite::Multiple(_) => true,
+        PropertyValuesToWrite::PreservedSlot { is_multiple, .. } => *is_multiple,
+    };
     let tag = property_type as i8;
     (if multiple { -tag } else { tag }) as u8
 }
@@ -818,19 +836,8 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
             cursor += 6;
         }
         for property in properties {
-            let tag = property.property_type as u8 as i8;
-            let type_byte = match property.values {
-                PropertyValuesToWrite::Single(_) => tag,
-                PropertyValuesToWrite::Multiple(_) => -tag,
-                PropertyValuesToWrite::PreservedSlot { is_multiple, .. } => {
-                    if is_multiple {
-                        -tag
-                    } else {
-                        tag
-                    }
-                }
-            };
-            self.current.record_bytes_mut(record)[cursor] = type_byte as u8;
+            self.current.record_bytes_mut(record)[cursor] =
+                property_slot_tag(property.property_type, &property.values);
             cursor += 1;
         }
         Ok(self.identifier_of(record))
@@ -1301,6 +1308,100 @@ mod tests {
         assert_eq!(
             node.stable_identifier().expect("stable"),
             format!("{}:{}", parent.segment, parent.record_number as i32)
+        );
+    }
+
+    #[test]
+    fn a_preserved_multi_valued_slot_never_shares_a_template_with_a_single_valued_one() {
+        // The template cache keys on TemplateKey, and the per-slot type
+        // byte carries the arity in its sign. When the key and the
+        // serialized byte disagree about a preserved slot's arity, these
+        // two nodes — identical in primary type, mixins, child arity and
+        // property name and type, differing *only* in arity — collide.
+        // The second then inherits the first's template record and its
+        // values are decoded at the wrong arity: the counted list read as
+        // one value, or the single value read as a counted list. Nothing
+        // rejects that. It is the shape of damage a store still boots on.
+        //
+        // Both directions are exercised, because whichever node is written
+        // first is the one that wins the cache and the other is the one
+        // that gets corrupted.
+        let mut writer = new_writer();
+
+        let first_tag = writer.write_string("alpha").expect("value");
+        let second_tag = writer.write_string("beta").expect("value");
+        let preserved_list = writer
+            .write_counted_list(&[first_tag, second_tag])
+            .expect("counted list");
+        let lone_value = writer.write_string("solo").expect("value");
+
+        let multi_valued = writer
+            .write_node(
+                Some("nt:unstructured"),
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[PropertyToWrite {
+                    name: "tags".to_owned(),
+                    property_type: PropertyType::String,
+                    values: PropertyValuesToWrite::PreservedSlot {
+                        value_slot: preserved_list,
+                        is_multiple: true,
+                    },
+                }],
+            )
+            .expect("multi-valued node");
+
+        let single_valued = writer
+            .write_node(
+                Some("nt:unstructured"),
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[PropertyToWrite {
+                    name: "tags".to_owned(),
+                    property_type: PropertyType::String,
+                    values: PropertyValuesToWrite::Single(lone_value),
+                }],
+            )
+            .expect("single-valued node");
+
+        let store = writer.finish().expect("finish");
+
+        let multi_template = NodeState::new(&store, multi_valued)
+            .template()
+            .expect("multi template");
+        let single_template = NodeState::new(&store, single_valued)
+            .template()
+            .expect("single template");
+        assert!(
+            multi_template.properties[0].is_multiple,
+            "the preserved slot must serialize as multi-valued"
+        );
+        assert!(
+            !single_template.properties[0].is_multiple,
+            "the single-valued slot must not inherit the multi-valued template"
+        );
+
+        // The decoded values are what an Oak reader would actually see, so
+        // assert those too: a template mix-up shows up here as an arity
+        // flip, not as a parse failure.
+        let multi_tags = NodeState::new(&store, multi_valued)
+            .property("tags")
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            multi_tags.values,
+            PropertyValues::Multiple(vec![
+                PropertyValue::String("alpha".to_owned()),
+                PropertyValue::String("beta".to_owned()),
+            ])
+        );
+        let single_tags = NodeState::new(&store, single_valued)
+            .property("tags")
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            single_tags.values,
+            PropertyValues::Single(PropertyValue::String("solo".to_owned()))
         );
     }
 
