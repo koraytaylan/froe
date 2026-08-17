@@ -226,7 +226,7 @@ impl CompactionOptions {
     /// A bound of one leaves the current head as the only root, which is the
     /// closest standalone cleanup comes to Oak's own retention.
     ///
-    /// This implies [`MaintenanceTask::Journal`]: the bounded lines must actually
+    /// This implies the journal task: the bounded lines must actually
     /// leave the journal in the same run. A line that stopped being a root
     /// while remaining in the file would still be verified as retained
     /// history when the plan is validated, and the run would refuse itself.
@@ -726,7 +726,7 @@ impl CompactionPlan {
     }
 
     /// Exact physical journal lines selected for removal. This is empty unless
-    /// [`MaintenanceTask::Journal`] was selected; internal journal analysis still
+    /// the journal task was selected; internal journal analysis still
     /// runs for the safety of other tasks.
     #[must_use]
     pub fn journal_line_removals(&self) -> &[JournalLineRemoval] {
@@ -777,7 +777,7 @@ impl CompactionPlan {
     }
 
     /// Data segments kept alive only because a historical journal revision
-    /// still reaches them. Zero unless [`MaintenanceTask::Segments`] ran.
+    /// still reaches them. Zero unless the segment task ran.
     #[must_use]
     pub fn history_protected_segments(&self) -> usize {
         self.history_protection.history_only_segments
