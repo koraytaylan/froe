@@ -408,17 +408,37 @@ pub(crate) mod tests {
         referenced_segments: &[SegmentIdentifier],
         records: &[(u32, u8, Vec<u8>)],
     ) -> Vec<u8> {
-        synthetic_data_segment_with_generations(referenced_segments, records, 13, 1, 1, true)
+        synthetic_data_segment_with_generations(
+            referenced_segments,
+            records,
+            13,
+            SyntheticGenerations {
+                generation: 1,
+                full_generation: 1,
+                is_compacted: true,
+            },
+        )
+    }
+
+    /// The generation triple a synthetic segment header carries.
+    #[derive(Clone, Copy)]
+    pub(crate) struct SyntheticGenerations {
+        pub(crate) generation: i32,
+        pub(crate) full_generation: i32,
+        pub(crate) is_compacted: bool,
     }
 
     pub(crate) fn synthetic_data_segment_with_generations(
         referenced_segments: &[SegmentIdentifier],
         records: &[(u32, u8, Vec<u8>)],
         version: u8,
-        generation: i32,
-        full_generation: i32,
-        is_compacted: bool,
+        generations: SyntheticGenerations,
     ) -> Vec<u8> {
+        let SyntheticGenerations {
+            generation,
+            full_generation,
+            is_compacted,
+        } = generations;
         let table_end = 32 + referenced_segments.len() * 16 + records.len() * 9;
         let record_bytes: usize = records
             .iter()
@@ -473,9 +493,11 @@ pub(crate) mod tests {
             &[referenced],
             &[(0, 4, vec![3, b'a', b'b', b'c'])],
             13,
-            5,
-            4,
-            true,
+            SyntheticGenerations {
+                generation: 5,
+                full_generation: 4,
+                is_compacted: true,
+            },
         );
         let segment = ParsedSegment::parse(identifier, &bytes).expect("valid segment");
         assert_eq!(segment.kind, SegmentKind::Data);
@@ -494,7 +516,16 @@ pub(crate) mod tests {
     #[test]
     fn version_12_repeats_generation_and_is_compacted() {
         let identifier = data_segment_identifier(1);
-        let bytes = synthetic_data_segment_with_generations(&[], &[], 12, 7, 0, false);
+        let bytes = synthetic_data_segment_with_generations(
+            &[],
+            &[],
+            12,
+            SyntheticGenerations {
+                generation: 7,
+                full_generation: 0,
+                is_compacted: false,
+            },
+        );
         let segment = ParsedSegment::parse(identifier, &bytes).expect("valid segment");
         assert_eq!(segment.version, Some(12));
         assert_eq!(segment.full_generation, 7);
@@ -507,7 +538,16 @@ pub(crate) mod tests {
     #[test]
     fn version_13_uncompacted_flag_round_trips() {
         let identifier = data_segment_identifier(1);
-        let bytes = synthetic_data_segment_with_generations(&[], &[], 13, 3, 2, false);
+        let bytes = synthetic_data_segment_with_generations(
+            &[],
+            &[],
+            13,
+            SyntheticGenerations {
+                generation: 3,
+                full_generation: 2,
+                is_compacted: false,
+            },
+        );
         let segment = ParsedSegment::parse(identifier, &bytes).expect("valid segment");
         assert_eq!(segment.full_generation, 2);
         assert!(!segment.is_compacted);

@@ -925,7 +925,7 @@ impl PreparedCompaction {
         // without it here froe would rewrite the archives of a store it then
         // declares itself unable to read — and a caller using the library API
         // directly never gets the lockless preview that would have refused.
-        crate::store::check_manifest(&directory, true)?;
+        crate::store::check_manifest(&directory, crate::store::ArchivePresence::Present)?;
         validate_apply_environment(&directory)?;
         validate_apply_identity(&directory)?;
         let repository_lock = Arc::new(RepositoryLock::acquire(&directory)?);
@@ -933,7 +933,7 @@ impl PreparedCompaction {
         // acquisition. Revalidate every managed type while the cooperative
         // repository lock is held before reading the authoritative plan.
         validate_repository_shape(&directory)?;
-        crate::store::check_manifest(&directory, true)?;
+        crate::store::check_manifest(&directory, crate::store::ArchivePresence::Present)?;
         validate_apply_environment(&directory)?;
         validate_apply_identity(&directory)?;
         repository_lock.validate_path_identity(&directory)?;
@@ -1204,16 +1204,30 @@ fn current_apply_credentials() -> Result<ApplyCredentials> {
     })
 }
 
+/// What a planned run will rewrite, which is what decides the files it may
+/// take ownership and permission metadata from.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct PlannedRewrites<'plan> {
+    upgrades_manifest: bool,
+    segment_plan: Option<&'plan StandaloneSegmentCompactionPlan>,
+    moves_checkpoint_head: bool,
+    rewrites_journal: bool,
+}
+
 #[cfg(unix)]
 fn planned_metadata_sources(
     directory: &Path,
-    manifest_upgrade: bool,
-    segment_plan: Option<&StandaloneSegmentCompactionPlan>,
-    moves_checkpoint_head: bool,
-    rewrites_journal: bool,
+    rewrites: PlannedRewrites<'_>,
 ) -> Result<BTreeSet<String>> {
+    let PlannedRewrites {
+        upgrades_manifest,
+        segment_plan,
+        moves_checkpoint_head,
+        rewrites_journal,
+    } = rewrites;
     let mut metadata_sources = BTreeSet::new();
-    if manifest_upgrade {
+    if upgrades_manifest {
         metadata_sources.insert("manifest".to_owned());
     }
     if rewrites_journal {
@@ -1273,10 +1287,13 @@ fn planned_apply_identity_issue(
 
     for name in planned_metadata_sources(
         directory,
-        plan.manifest_upgrade,
-        plan.segment_plan.as_ref(),
-        !plan.checkpoints.names.is_empty(),
-        plan.tasks.contains(&MaintenanceTask::Journal) && plan.journal.removed_lines != 0,
+        PlannedRewrites {
+            upgrades_manifest: plan.manifest_upgrade,
+            segment_plan: plan.segment_plan.as_ref(),
+            moves_checkpoint_head: !plan.checkpoints.names.is_empty(),
+            rewrites_journal: plan.tasks.contains(&MaintenanceTask::Journal)
+                && plan.journal.removed_lines != 0,
+        },
     )? {
         let path = directory.join(&name);
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -3071,14 +3088,31 @@ fn reject_duplicate_active_segments_across(
 /// it, so counting readers would report one damaged number as two or three
 /// damaged archives — and the warning carried alongside this refusal already
 /// speaks in archive numbers.
-fn indexless_archive_refusal(
+/// The census of index-less active archives a refusal is written from.
+#[derive(Clone, Copy)]
+struct IndexlessCensus<'census> {
+    /// Active archive numbers in the store.
     total_numbers: usize,
+    /// How many of those numbers carry no valid index.
     indexless_numbers: usize,
-    indexless: &[(&str, &str)],
+    /// Each offending archive's file name with the reason its index was
+    /// rejected.
+    offenders: &'census [(&'census str, &'census str)],
     newest_is_indexless: bool,
+    /// Whether any offender's recovery scan read no segment at all, which
+    /// is residue no repair can rebuild.
     any_scan_is_empty: bool,
-) -> String {
+}
+
+fn indexless_archive_refusal(census: IndexlessCensus<'_>) -> String {
     const NAMES_SHOWN: usize = 5;
+    let IndexlessCensus {
+        total_numbers,
+        indexless_numbers,
+        offenders: indexless,
+        newest_is_indexless,
+        any_scan_is_empty,
+    } = census;
     let mut names = indexless
         .iter()
         .take(NAMES_SHOWN)
@@ -3511,13 +3545,13 @@ fn active_index_generations(
         }
         let any_scan_is_empty = scanned_segments.values().any(|count| *count == 0);
         return Err(Error::InvalidFormat {
-            details: indexless_archive_refusal(
-                total_numbers.len(),
-                indexless_numbers.len(),
-                &indexless,
+            details: indexless_archive_refusal(IndexlessCensus {
+                total_numbers: total_numbers.len(),
+                indexless_numbers: indexless_numbers.len(),
+                offenders: &indexless,
                 newest_is_indexless,
                 any_scan_is_empty,
-            ),
+            }),
         });
     }
     let mut generations = HashMap::new();
@@ -5328,7 +5362,7 @@ mod tests {
 
     #[cfg(unix)]
     use super::{
-        ApplyCredentials, ManifestFileAccess, SETGID_MODE,
+        ApplyCredentials, ManifestFileAccess, PlannedRewrites, SETGID_MODE,
         append_apply_identity_preview_warning_for_credentials, certify_manifest_file,
         journal_service_user_issue, metadata_source_apply_identity_issue,
         planned_apply_identity_issue, planned_metadata_sources, possible_created_group_ids,
@@ -5337,11 +5371,11 @@ mod tests {
         validate_plan_apply_identity_for_credentials,
     };
     use super::{
-        CompactionAction, CompactionOptions, JOURNAL_LINE_PREVIEW_LIMIT, JournalRemovalReason,
-        MaintenanceTask, PlannedFileRemoval, PlannedFileRemovalFailureMode, PreparedCompaction,
-        RecoveryBackupPolicy, attach_planning_warnings, compact, compact_with_progress,
-        file_fingerprint, indexless_archive_refusal, manifest_upgrade_bytes, plan_compaction,
-        recovery_backup_target, remove_planned_files, remove_planned_files_with,
+        CompactionAction, CompactionOptions, IndexlessCensus, JOURNAL_LINE_PREVIEW_LIMIT,
+        JournalRemovalReason, MaintenanceTask, PlannedFileRemoval, PlannedFileRemovalFailureMode,
+        PreparedCompaction, RecoveryBackupPolicy, attach_planning_warnings, compact,
+        compact_with_progress, file_fingerprint, indexless_archive_refusal, manifest_upgrade_bytes,
+        plan_compaction, recovery_backup_target, remove_planned_files, remove_planned_files_with,
     };
     use crate::checksum::crc32;
     use crate::content::provider::SegmentProvider as _;
@@ -6278,8 +6312,16 @@ mod tests {
         )
         .expect("create a second readable archive number");
 
-        let sources = planned_metadata_sources(&directory.path, false, None, true, false)
-            .expect("derive checkpoint metadata sources");
+        let sources = planned_metadata_sources(
+            &directory.path,
+            PlannedRewrites {
+                upgrades_manifest: false,
+                segment_plan: None,
+                moves_checkpoint_head: true,
+                rewrites_journal: false,
+            },
+        )
+        .expect("derive checkpoint metadata sources");
 
         assert_eq!(sources, BTreeSet::from(["data00001a.tar".to_owned()]));
     }
@@ -6355,10 +6397,12 @@ mod tests {
 
         let sources = planned_metadata_sources(
             &directory.path,
-            false,
-            plan.segment_plan.as_ref(),
-            true,
-            false,
+            PlannedRewrites {
+                upgrades_manifest: false,
+                segment_plan: plan.segment_plan.as_ref(),
+                moves_checkpoint_head: true,
+                rewrites_journal: false,
+            },
         )
         .expect("derive possible checkpoint templates");
 
@@ -6412,7 +6456,13 @@ mod tests {
     fn indexless_archive_refusal_counts_every_offender_and_states_ordinality() {
         const MAGIC: &str = "unrecognized index magic number 0x000115a9";
         const CRC: &str = "index checksum mismatch";
-        let one = indexless_archive_refusal(43, 1, &[("data00042a.tar", MAGIC)], true, false);
+        let one = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 43,
+            indexless_numbers: 1,
+            offenders: &[("data00042a.tar", MAGIC)],
+            newest_is_indexless: true,
+            any_scan_is_empty: false,
+        });
         assert!(
             one.contains("1 of 43 active archive numbers has no index metadata (data00042a.tar)"),
             "singular subject names the archive and the total: {one}"
@@ -6434,13 +6484,13 @@ mod tests {
             "the refusal states what to run next and what repair costs: {one}"
         );
 
-        let two = indexless_archive_refusal(
-            3,
-            2,
-            &[("data00001a.tar", CRC), ("data00000a.tar", CRC)],
-            false,
-            false,
-        );
+        let two = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 3,
+            indexless_numbers: 2,
+            offenders: &[("data00001a.tar", CRC), ("data00000a.tar", CRC)],
+            newest_is_indexless: false,
+            any_scan_is_empty: false,
+        });
         assert!(
             two.contains("2 of 3 active archive numbers have no index metadata"),
             "plural subject agrees: {two}"
@@ -6465,8 +6515,13 @@ mod tests {
 
         // An archive whose scan read nothing cannot be rebuilt, and the
         // write open refuses it. Advising a write command would be circular.
-        let unrecoverable =
-            indexless_archive_refusal(2, 1, &[("data00009a.tar", MAGIC)], true, true);
+        let unrecoverable = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 2,
+            indexless_numbers: 1,
+            offenders: &[("data00009a.tar", MAGIC)],
+            newest_is_indexless: true,
+            any_scan_is_empty: true,
+        });
         assert!(
             !unrecoverable.contains("--repair-archive-indexes"),
             "an unrecoverable archive must not be sent to a command that will refuse it: \
@@ -6481,7 +6536,13 @@ mod tests {
             .map(|index| format!("data0000{index}a.tar"))
             .collect();
         let borrowed: Vec<(&str, &str)> = many.iter().map(|n| (n.as_str(), MAGIC)).collect();
-        let truncated = indexless_archive_refusal(40, 8, &borrowed, true, false);
+        let truncated = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 40,
+            indexless_numbers: 8,
+            offenders: &borrowed,
+            newest_is_indexless: true,
+            any_scan_is_empty: false,
+        });
         assert!(
             truncated.contains("8 of 40 active archive numbers"),
             "the count is the whole census, not the shown names: {truncated}"

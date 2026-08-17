@@ -324,6 +324,16 @@ struct ActiveStep {
     announced: bool,
 }
 
+/// Whether ending a step also writes its completion line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionLine {
+    /// Write it, for any step that had announced itself.
+    Write,
+    /// Erase the live line only, because the caller reports the outcome
+    /// itself and the completion line would say the same thing twice.
+    Suppress,
+}
+
 impl Reporter {
     /// The reporter for a command line: `silent` wins over `when`.
     pub(crate) fn new(when: ProgressWhen, silent: bool) -> Self {
@@ -445,7 +455,7 @@ impl Reporter {
     /// Ends any active step and erases the live line, so whatever the
     /// command prints next — a result, an error — starts on a clean line.
     pub(crate) fn finish(&self) {
-        self.step_ended_locked(true);
+        self.step_ended_locked(CompletionLine::Write);
     }
 
     /// Ends the active step and erases its line without the completion
@@ -453,10 +463,10 @@ impl Reporter {
     /// export names its destination, which the step cannot — the
     /// completion line would only say the same thing twice.
     pub(crate) fn end_step_without_completion_line(&self) {
-        self.step_ended_locked(false);
+        self.step_ended_locked(CompletionLine::Suppress);
     }
 
-    fn step_ended_locked(&self, report_completion: bool) {
+    fn step_ended_locked(&self, completion_line: CompletionLine) {
         let mut state = self.inner.state.lock().unwrap_or_else(|error| {
             self.inner.state.clear_poison();
             error.into_inner()
@@ -465,7 +475,7 @@ impl Reporter {
         let Some(step) = state.active.take() else {
             return;
         };
-        if step.announced && report_completion {
+        if step.announced && completion_line == CompletionLine::Write {
             let line = format!("{}\n", ReporterInner::completion_line(&step));
             state.write_line(&line);
             state.last_line_at = Some(Instant::now());
@@ -477,7 +487,7 @@ impl ProgressObserver for Reporter {
     fn step_began(&mut self, step: &Step<'_>) {
         // A step beginning while another is active ends it first: the
         // trait promises callers never have to pair the edges themselves.
-        self.step_ended_locked(true);
+        self.step_ended_locked(CompletionLine::Write);
         if self.inner.style == Style::Silent {
             return;
         }
@@ -532,7 +542,7 @@ impl ProgressObserver for Reporter {
     }
 
     fn step_ended(&mut self) {
-        self.step_ended_locked(true);
+        self.step_ended_locked(CompletionLine::Write);
     }
 }
 

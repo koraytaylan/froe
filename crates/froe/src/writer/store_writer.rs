@@ -273,7 +273,7 @@ impl FinalizedSessionArchiveCertificate {
     fn capture(path: PathBuf) -> Result<Self> {
         // Opened only to prove it is a regular file, not a symlink or a
         // device, then closed immediately.
-        let opened = open_regular_file_no_follow(&path, false)?;
+        let opened = open_regular_file_no_follow(&path, FileAccess::ReadOnly)?;
         let fingerprint = FinalizedSessionFileFingerprint::from_metadata(&opened.metadata()?)?;
         drop(opened);
         let certificate = Self { path, fingerprint };
@@ -509,7 +509,10 @@ impl WritableRepository {
 
         validate_cleanup_archive_number(directory, certified_next_archive_number)?;
         let archive_file_names = crate::store::list_archive_file_names(directory)?;
-        crate::store::check_manifest(directory, !archive_file_names.is_empty())?;
+        crate::store::check_manifest(
+            directory,
+            crate::store::ArchivePresence::of(&archive_file_names),
+        )?;
         crate::writer::identifier_generator::verify_entropy_source()?;
 
         let journal_path = directory.join("journal.log");
@@ -2467,9 +2470,18 @@ fn filesystem_object_identity(metadata: &std::fs::Metadata) -> Result<RegularFil
     }
 }
 
-fn open_regular_file_no_follow(path: &Path, write: bool) -> Result<File> {
+/// Whether an opened handle may write through to the file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileAccess {
+    /// Read only, so the handle cannot modify what it inspects.
+    ReadOnly,
+    /// Read and write.
+    ReadWrite,
+}
+
+fn open_regular_file_no_follow(path: &Path, access: FileAccess) -> Result<File> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(write);
+    options.read(true).write(access == FileAccess::ReadWrite);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -3562,7 +3574,7 @@ fn sweep_one_archive<'archives>(
     // prevents a semantically different but still well-formed source from
     // silently proceeding after the locked plan.
     let reopened_source = if planned.changes_disk() {
-        let source_file = open_regular_file_no_follow(&path, false)?;
+        let source_file = open_regular_file_no_follow(&path, FileAccess::ReadOnly)?;
         let source_identity = held_file_identity(&source_file)?;
         let reopened = TarArchiveReader::open_file(&path, &source_file)?;
         if let Some(provider) = source_certificate_provider {
@@ -3790,7 +3802,7 @@ fn sweep_one_archive<'archives>(
     crate::writer::maintenance_fault_injection::fail_if_armed(
         "sweep.staging-before-validation-open",
     )?;
-    let staging_file = open_regular_file_no_follow(&staging_path, true)?;
+    let staging_file = open_regular_file_no_follow(&staging_path, FileAccess::ReadWrite)?;
     preserve_file_metadata(&staging_file, &source_metadata)?;
     let staging_identity = held_file_identity(&staging_file)?;
     let staged_reader = TarArchiveReader::open_file(&staging_path, &staging_file)?;
@@ -3857,13 +3869,18 @@ fn sweep_one_archive<'archives>(
         });
     }
 
-    let replacement_file = match open_regular_file_no_follow(&replacement_path, false) {
-        Ok(file) => file,
-        Err(error) => {
-            remove_published_link_if_same(directory, &replacement_path, Some(staging_identity))?;
-            return Err(error);
-        }
-    };
+    let replacement_file =
+        match open_regular_file_no_follow(&replacement_path, FileAccess::ReadOnly) {
+            Ok(file) => file,
+            Err(error) => {
+                remove_published_link_if_same(
+                    directory,
+                    &replacement_path,
+                    Some(staging_identity),
+                )?;
+                return Err(error);
+            }
+        };
     let replacement_validation = (|| {
         require_held_file_identity(
             &replacement_file,
@@ -4145,7 +4162,12 @@ fn check_and_update_manifest(directory: &Path) -> Result<()> {
             .and_then(|entry| entry.file_name().into_string().ok())
             .is_some_and(|name| name.ends_with(".tar"))
     });
-    crate::store::check_manifest(directory, archives_exist)?;
+    let archives = if archives_exist {
+        crate::store::ArchivePresence::Present
+    } else {
+        crate::store::ArchivePresence::Absent
+    };
+    crate::store::check_manifest(directory, archives)?;
     std::fs::write(
         directory.join("manifest"),
         "#written by froe\nstore.version=2\n",

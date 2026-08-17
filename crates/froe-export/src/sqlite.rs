@@ -827,14 +827,36 @@ mod tests {
 
     /// Exports `path` from the store into the test database and returns
     /// a fresh read connection to it.
-    fn export(directory: &TestDirectory, path: &str, create_indexes: bool) -> Connection {
-        let repository = Repository::open(&directory.store()).expect("open");
-        let mut sink = SqliteSink::create(
-            &directory.store(),
-            &directory.database(),
-            SqliteExportOptions { create_indexes },
+    fn export(directory: &TestDirectory, path: &str) -> Connection {
+        export_with_options(
+            directory,
+            path,
+            SqliteExportOptions {
+                create_indexes: false,
+            },
         )
-        .expect("sink");
+    }
+
+    /// Exports exactly like [`export`], additionally creating the lookup
+    /// indexes.
+    fn export_with_indexes(directory: &TestDirectory, path: &str) -> Connection {
+        export_with_options(
+            directory,
+            path,
+            SqliteExportOptions {
+                create_indexes: true,
+            },
+        )
+    }
+
+    fn export_with_options(
+        directory: &TestDirectory,
+        path: &str,
+        options: SqliteExportOptions,
+    ) -> Connection {
+        let repository = Repository::open(&directory.store()).expect("open");
+        let mut sink =
+            SqliteSink::create(&directory.store(), &directory.database(), options).expect("sink");
         export_subtree(&repository, path, None, &mut sink)
             .expect("export")
             .expect("root present");
@@ -846,7 +868,7 @@ mod tests {
     fn the_node_paths_view_reconstructs_full_paths() {
         let directory = TestDirectory::new("node-paths");
         populate(&directory.store());
-        let connection = export(&directory, "/", false);
+        let connection = export(&directory, "/");
 
         let rows: Vec<(i64, String, i64, Option<String>)> = connection
             .prepare("SELECT id, path, depth, primary_type FROM node_paths ORDER BY id")
@@ -894,7 +916,7 @@ mod tests {
     fn the_properties_tables_carry_every_value_shape() {
         let directory = TestDirectory::new("properties");
         populate(&directory.store());
-        let connection = export(&directory, "/", false);
+        let connection = export(&directory, "/");
 
         let value: String = connection
             .query_row(
@@ -987,7 +1009,7 @@ mod tests {
     fn strings_are_stored_once() {
         let directory = TestDirectory::new("strings");
         populate(&directory.store());
-        let connection = export(&directory, "/", false);
+        let connection = export(&directory, "/");
 
         let occurrences: i64 = connection
             .query_row(
@@ -1013,7 +1035,7 @@ mod tests {
     fn a_subtree_export_anchors_paths_at_the_export_root() {
         let directory = TestDirectory::new("subtree");
         populate(&directory.store());
-        let connection = export(&directory, "/content", false);
+        let connection = export(&directory, "/content");
 
         let paths: Vec<String> = connection
             .prepare("SELECT path FROM node_paths ORDER BY id")
@@ -1034,7 +1056,7 @@ mod tests {
     fn the_schema_is_without_rowid_and_analyzed() {
         let directory = TestDirectory::new("schema");
         populate(&directory.store());
-        let connection = export(&directory, "/", false);
+        let connection = export(&directory, "/");
 
         let sql: String = connection
             .query_row(
@@ -1071,7 +1093,7 @@ mod tests {
     fn indexes_are_created_on_request() {
         let directory = TestDirectory::new("indexes");
         populate(&directory.store());
-        let connection = export(&directory, "/", true);
+        let connection = export_with_indexes(&directory, "/");
 
         for index in ["nodes_by_parent", "properties_by_name"] {
             let present: bool = connection

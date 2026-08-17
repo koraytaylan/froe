@@ -186,7 +186,7 @@ pub(crate) fn run_compact(
     let outcome = prepared.apply_with_progress(&mut reporter.clone())?;
     reporter.finish();
     let complete = outcome.is_complete();
-    print_cleanup_summary(&outcome, retention, complete);
+    print_cleanup_summary(&outcome, retention);
     for failure in outcome.deletion_failures() {
         eprintln!("{}", cleanup_deletion_warning(failure));
     }
@@ -225,12 +225,8 @@ impl RetentionSummary {
     }
 }
 
-fn print_cleanup_summary(
-    outcome: &froe::CompactionOutcome,
-    retention: RetentionSummary,
-    complete: bool,
-) {
-    let status = if complete {
+fn print_cleanup_summary(outcome: &froe::CompactionOutcome, retention: RetentionSummary) {
+    let status = if outcome.is_complete() {
         "compaction complete"
     } else {
         "compaction partially completed"
@@ -300,18 +296,31 @@ fn cleanup_deletion_warning(failure: &FileDeletionFailure) -> String {
     cleanup_deletion_warning_fields(
         failure.file_name(),
         failure.error(),
-        failure.target_was_already_absent(),
+        if failure.target_was_already_absent() {
+            DeletionTarget::AlreadyAbsent
+        } else {
+            DeletionTarget::Retained
+        },
     )
+}
+
+/// What a failed planned deletion left behind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeletionTarget {
+    /// Something else had already removed it, so the plan's intent holds.
+    AlreadyAbsent,
+    /// It is still on disk, and a later cleanup can retry.
+    Retained,
 }
 
 fn cleanup_deletion_warning_fields(
     file_name: &str,
     detail: &str,
-    target_was_already_absent: bool,
+    target: DeletionTarget,
 ) -> String {
     let file_name = crate::output::sanitize_terminal_text(file_name);
     let detail = crate::output::sanitize_terminal_text(detail);
-    if target_was_already_absent {
+    if target == DeletionTarget::AlreadyAbsent {
         format!(
             "froe: warning: deletion of {file_name} was already satisfied outside this cleanup ({detail}); no deletion retry is needed"
         )
@@ -757,21 +766,24 @@ pub(crate) enum CheckpointRemoval {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_deletion_warning_fields, cleanup_partial_summary_counts};
+    use super::{DeletionTarget, cleanup_deletion_warning_fields, cleanup_partial_summary_counts};
 
     #[test]
     fn partial_cleanup_diagnostics_distinguish_absent_targets_from_retained_ones() {
         let absent = cleanup_deletion_warning_fields(
             "journal.log.compacting",
             "file was already absent when deletion was attempted",
-            true,
+            DeletionTarget::AlreadyAbsent,
         );
         assert!(absent.contains("was already satisfied outside this cleanup"));
         assert!(absent.contains("no deletion retry is needed"));
         assert!(!absent.contains("target was retained"));
 
-        let retained =
-            cleanup_deletion_warning_fields("journal.log.compacting", "permission denied", false);
+        let retained = cleanup_deletion_warning_fields(
+            "journal.log.compacting",
+            "permission denied",
+            DeletionTarget::Retained,
+        );
         assert!(retained.contains("could not delete journal.log.compacting"));
         assert!(retained.contains("target was retained"));
         assert!(retained.contains("a later cleanup can retry"));

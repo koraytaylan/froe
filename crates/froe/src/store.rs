@@ -92,7 +92,7 @@ impl Repository {
         }
 
         let archive_file_names = list_archive_file_names(directory)?;
-        check_manifest(directory, !archive_file_names.is_empty())?;
+        check_manifest(directory, ArchivePresence::of(&archive_file_names))?;
 
         let archives = open_archives_newest_valid_first(directory, &archive_file_names, observer)?;
 
@@ -457,7 +457,7 @@ pub fn open_all_archives_with_progress(
     observer: &mut dyn ProgressObserver,
 ) -> Result<Vec<TarArchiveReader>> {
     let file_names = list_archive_file_names(directory)?;
-    check_manifest(directory, !file_names.is_empty())?;
+    check_manifest(directory, ArchivePresence::of(&file_names))?;
     open_archives_newest_valid_first(directory, &file_names, observer)
 }
 
@@ -553,13 +553,35 @@ pub(crate) fn list_archive_file_names(directory: &Path) -> Result<Vec<String>> {
     Ok(file_names)
 }
 
+/// Whether the store directory holds any segment archive, which decides
+/// whether a missing manifest is the legacy pre-tar format or an empty
+/// store that has yet to be written to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchivePresence {
+    /// At least one `.tar` archive is present.
+    Present,
+    /// None, so a missing manifest is not evidence of the legacy format.
+    Absent,
+}
+
+impl ArchivePresence {
+    /// Classifies a store from the archive file names it was opened with.
+    pub(crate) fn of(archive_file_names: &[String]) -> Self {
+        if archive_file_names.is_empty() {
+            Self::Absent
+        } else {
+            Self::Present
+        }
+    }
+}
+
 /// Validates the `manifest` file with read-only semantics: never writes,
 /// accepts store versions 1 and 2, and rejects a store that has archives
 /// but no manifest (that is the legacy pre-tar format).
-pub(crate) fn check_manifest(directory: &Path, archives_exist: bool) -> Result<()> {
+pub(crate) fn check_manifest(directory: &Path, archives: ArchivePresence) -> Result<()> {
     let manifest_path = directory.join("manifest");
     if !manifest_path.exists() {
-        if archives_exist {
+        if archives == ArchivePresence::Present {
             return Err(Error::InvalidFormat {
                 details: format!(
                     "{} has segment archives but no manifest; this is the legacy \

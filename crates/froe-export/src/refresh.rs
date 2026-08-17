@@ -926,8 +926,8 @@ fn merge_tables(
     )?;
     let index = RangeIndex::new(ranges);
     merge_row_streams(
-        NodeRows::new(old_nodes_reader, &failure, true)?,
-        NodeRows::new(&delta_nodes_reader, &failure, false)?,
+        NodeRows::new(old_nodes_reader, &failure, RowSource::PreviousExport)?,
+        NodeRows::new(&delta_nodes_reader, &failure, RowSource::FreshDelta)?,
         ranges,
         &index,
         |row| {
@@ -941,8 +941,8 @@ fn merge_tables(
         },
     )?;
     merge_row_streams(
-        PropertyRows::new(old_properties_reader, &failure, true)?,
-        PropertyRows::new(&delta_properties_reader, &failure, false)?,
+        PropertyRows::new(old_properties_reader, &failure, RowSource::PreviousExport)?,
+        PropertyRows::new(&delta_properties_reader, &failure, RowSource::FreshDelta)?,
         ranges,
         &index,
         |row| {
@@ -1053,13 +1053,24 @@ fn take_error<R, I: Iterator<Item = froe::Result<R>>>(
     }
 }
 
+/// Where a row stream came from, which decides whether a read error is
+/// fatal or merely recorded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowSource {
+    /// The export already on disk, which may legitimately be corrupt: a
+    /// read error is recorded and ends the stream.
+    PreviousExport,
+    /// A delta this run just wrote, where a read error is a hard failure.
+    FreshDelta,
+}
+
 /// An iterator decoding nodes-table rows. A decode failure records in
-/// `failure` and ends the stream. A read error is hard, except on a
-/// lenient (old, maybe-corrupt) stream, where it records instead.
+/// `failure` and ends the stream. A read error is hard, except on the
+/// previous export's stream, where it records instead.
 struct NodeRows<'a> {
     inner: ::parquet::record::reader::RowIter<'a>,
     failure: &'a RefCell<Option<String>>,
-    lenient: bool,
+    source: RowSource,
 }
 
 impl<'a> NodeRows<'a> {
@@ -1067,13 +1078,13 @@ impl<'a> NodeRows<'a> {
     fn new(
         reader: &'a ::parquet::file::reader::SerializedFileReader<std::fs::File>,
         failure: &'a RefCell<Option<String>>,
-        lenient: bool,
+        source: RowSource,
     ) -> froe::Result<Self> {
         use ::parquet::file::reader::FileReader;
         Ok(Self {
             inner: reader.get_row_iter(None).map_err(parquet_read_error)?,
             failure,
-            lenient,
+            source,
         })
     }
 }
@@ -1097,7 +1108,7 @@ impl Iterator for NodeRows<'_> {
                 }
             }
             Err(error) => {
-                if self.lenient {
+                if self.source == RowSource::PreviousExport {
                     record_read_failure(
                         self.failure,
                         format!("the existing export's rows are not readable: {error}"),
@@ -1116,7 +1127,7 @@ impl Iterator for NodeRows<'_> {
 struct PropertyRows<'a> {
     inner: ::parquet::record::reader::RowIter<'a>,
     failure: &'a RefCell<Option<String>>,
-    lenient: bool,
+    source: RowSource,
 }
 
 impl<'a> PropertyRows<'a> {
@@ -1124,13 +1135,13 @@ impl<'a> PropertyRows<'a> {
     fn new(
         reader: &'a ::parquet::file::reader::SerializedFileReader<std::fs::File>,
         failure: &'a RefCell<Option<String>>,
-        lenient: bool,
+        source: RowSource,
     ) -> froe::Result<Self> {
         use ::parquet::file::reader::FileReader;
         Ok(Self {
             inner: reader.get_row_iter(None).map_err(parquet_read_error)?,
             failure,
-            lenient,
+            source,
         })
     }
 }
@@ -1154,7 +1165,7 @@ impl Iterator for PropertyRows<'_> {
                 }
             }
             Err(error) => {
-                if self.lenient {
+                if self.source == RowSource::PreviousExport {
                     record_read_failure(
                         self.failure,
                         format!("the existing export's rows are not readable: {error}"),

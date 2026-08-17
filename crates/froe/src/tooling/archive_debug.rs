@@ -1525,14 +1525,24 @@ fn decode_value_utf8(
             break;
         }
         pending.extend_from_slice(&buffer[..read_length]);
-        consume_utf8_prefix(&mut pending, false, &mut consume)?;
+        consume_utf8_prefix(&mut pending, ValueRemainder::MoreToCome, &mut consume)?;
     }
-    consume_utf8_prefix(&mut pending, true, &mut consume)
+    consume_utf8_prefix(&mut pending, ValueRemainder::EndOfValue, &mut consume)
+}
+
+/// Whether more bytes of the value can still arrive after this chunk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueRemainder {
+    /// More bytes follow, so a truncated multi-byte sequence at the end is
+    /// held back rather than replaced.
+    MoreToCome,
+    /// The last chunk: a truncated sequence can only be replacement text.
+    EndOfValue,
 }
 
 fn consume_utf8_prefix(
     pending: &mut Vec<u8>,
-    end_of_value: bool,
+    remainder: ValueRemainder,
     consume: &mut impl FnMut(char) -> ArchiveDebugResult<()>,
 ) -> ArchiveDebugResult<()> {
     let mut consumed = 0usize;
@@ -1555,7 +1565,7 @@ fn consume_utf8_prefix(
                 if let Some(error_length) = error.error_len() {
                     consume('\u{fffd}')?;
                     consumed = consumed.saturating_add(error_length);
-                } else if end_of_value {
+                } else if remainder == ValueRemainder::EndOfValue {
                     consume('\u{fffd}')?;
                     consumed = pending.len();
                 } else {

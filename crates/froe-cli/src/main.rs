@@ -607,12 +607,17 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                         );
                         return Ok(ExitCode::FAILURE);
                     };
+                    let mode = if full {
+                        ParquetExportMode::Rebuild
+                    } else {
+                        ParquetExportMode::RefreshInPlace
+                    };
                     run_parquet_export(
                         &repository_path,
                         &path,
                         depth,
                         output_directory,
-                        full,
+                        mode,
                         reporter,
                     )?
                 }
@@ -946,6 +951,26 @@ fn run_json_lines_export(
     }
 }
 
+/// Whether a Parquet export refreshes the existing tables or rebuilds them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParquetExportMode {
+    /// Refresh in place, decoding only what changed since the last export.
+    RefreshInPlace,
+    /// Rebuild every table from scratch, as `--full` requests.
+    Rebuild,
+}
+
+/// Why a from-scratch Parquet export is running, which decides whether an
+/// existing usable export may be replaced without further authorization.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RebuildReason {
+    /// The operator passed `--full`, which authorizes the replacement.
+    OperatorRequested,
+    /// A refresh could not proceed, so replacement needs the directory's
+    /// own state to authorize it.
+    RefreshUnavailable,
+}
+
 /// Brings the Parquet export in `output_directory` up to date: an
 /// existing, usable export is refreshed in place — decoding only what
 /// changed since it was taken — and anything else (a first export, an
@@ -956,16 +981,22 @@ fn run_parquet_export(
     path: &str,
     depth: Option<usize>,
     output_directory: &Path,
-    full: bool,
+    mode: ParquetExportMode,
     reporter: &Reporter,
 ) -> froe::Result<ExportRun> {
     let repository = open_repository(repository_path, reporter)?;
     froe_export::create_export_directory(repository_path, output_directory)?;
-    if full {
-        let FullExport::Completed(run) =
-            run_full_parquet_export(&repository, path, depth, output_directory, true, reporter)?
+    if mode == ParquetExportMode::Rebuild {
+        let FullExport::Completed(run) = run_full_parquet_export(
+            &repository,
+            path,
+            depth,
+            output_directory,
+            RebuildReason::OperatorRequested,
+            reporter,
+        )?
         else {
-            unreachable!("a forced export never defers to a refresh");
+            unreachable!("an operator-requested rebuild never defers to a refresh");
         };
         return Ok(run);
     }
@@ -1043,7 +1074,7 @@ fn run_parquet_export(
                     path,
                     depth,
                     output_directory,
-                    false,
+                    RebuildReason::RefreshUnavailable,
                     reporter,
                 )? {
                     FullExport::Completed(run) => return Ok(run),
@@ -1110,11 +1141,13 @@ fn run_full_parquet_export(
     path: &str,
     depth: Option<usize>,
     output_directory: &Path,
-    forced: bool,
+    reason: RebuildReason,
     reporter: &Reporter,
 ) -> froe::Result<FullExport> {
     let _lock = froe_export::lock_export_directory(output_directory)?;
-    if !forced && !authorize_replacement(repository, output_directory, path, depth)? {
+    if reason == RebuildReason::RefreshUnavailable
+        && !authorize_replacement(repository, output_directory, path, depth)?
+    {
         return Ok(FullExport::RefreshInstead);
     }
     for file_name in [

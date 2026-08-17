@@ -821,12 +821,22 @@ fn stable_identifiers_use_the_journal_record_form() {
     );
 }
 
+/// Whether the fixture includes the segment holding the string record a
+/// cross-segment blob identifier points at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringSegment {
+    /// Included, so the identifier resolves.
+    Present,
+    /// Omitted, so the identifier dangles and recovery must fail closed.
+    Absent,
+}
+
 /// Builds a two-segment archive fixture where a large (`0xF0`-class)
 /// external blob identifier in one segment points at a string record in
 /// the *other* segment — the layout the production writer emits when a
-/// segment boundary falls between the two records. `resolvable` controls
-/// whether the string-bearing segment is actually included.
-fn cross_segment_blob_archive(resolvable: bool) -> Vec<u8> {
+/// segment boundary falls between the two records. `string_segment`
+/// controls whether the string-bearing segment is actually included.
+fn cross_segment_blob_archive(string_segment_presence: StringSegment) -> Vec<u8> {
     let identifier_holder = data_segment_uuid(0x51);
     let string_holder = data_segment_uuid(0x52);
 
@@ -848,7 +858,7 @@ fn cross_segment_blob_archive(resolvable: bool) -> Vec<u8> {
     );
 
     let mut archive = ArchiveBuilder::new().without_index();
-    if resolvable {
+    if string_segment_presence == StringSegment::Present {
         archive.add_segment(string_holder, string_segment.build());
     }
     archive.add_segment(identifier_holder, identifier_segment.build());
@@ -857,7 +867,10 @@ fn cross_segment_blob_archive(resolvable: bool) -> Vec<u8> {
 
 /// Writes the synthetic content repository plus the cross-segment blob
 /// archive (which has no index, so a write open must recover it).
-fn write_repository_with_blob_archive(directory: &TestDirectory, resolvable: bool) {
+fn write_repository_with_blob_archive(
+    directory: &TestDirectory,
+    string_segment_presence: StringSegment,
+) {
     let repository = build_synthetic_repository();
     let mut content_archive = ArchiveBuilder::new();
     content_archive.add_segment(
@@ -874,7 +887,7 @@ fn write_repository_with_blob_archive(directory: &TestDirectory, resolvable: boo
             ),
             (
                 "data00001a.tar".to_owned(),
-                cross_segment_blob_archive(resolvable),
+                cross_segment_blob_archive(string_segment_presence),
             ),
         ],
         std::slice::from_ref(&repository.journal_line),
@@ -884,7 +897,7 @@ fn write_repository_with_blob_archive(directory: &TestDirectory, resolvable: boo
 #[test]
 fn write_open_recovery_resolves_cross_segment_blob_identifiers() {
     let directory = TestDirectory::new("recovery-blob-catalog");
-    write_repository_with_blob_archive(&directory, true);
+    write_repository_with_blob_archive(&directory, StringSegment::Present);
 
     // The write open recovers the index-less archive; the rebuilt binary
     // references catalog must contain the cross-segment identifier —
@@ -923,7 +936,7 @@ fn write_open_recovery_resolves_cross_segment_blob_identifiers() {
 #[test]
 fn write_open_recovery_fails_closed_on_unresolvable_blob_identifiers() {
     let directory = TestDirectory::new("recovery-blob-fail-closed");
-    write_repository_with_blob_archive(&directory, false);
+    write_repository_with_blob_archive(&directory, StringSegment::Absent);
 
     let error = froe::writer::store_writer::WritableRepository::open(&directory.path);
     assert!(

@@ -587,15 +587,27 @@ mod tests {
         )
     }
 
+    /// What a fault at a manifest-replacement cutpoint must leave on disk.
+    #[derive(Clone, Copy)]
+    struct ExpectedManifestResidue {
+        /// The upgraded manifest is in place under its final name.
+        replacement_installed: bool,
+        /// The staging temporary is still present.
+        temporary_exists: bool,
+    }
+
     fn assert_manifest_residue(
         directory: &Path,
         snapshot: &RepositorySnapshot,
         old_manifest: &[u8],
         upgraded_manifest: &[u8],
-        replacement_installed: bool,
-        temporary_exists: bool,
+        residue: ExpectedManifestResidue,
         cutpoint: &str,
     ) {
+        let ExpectedManifestResidue {
+            replacement_installed,
+            temporary_exists,
+        } = residue;
         assert_exact_snapshot_reopens(directory, snapshot);
         assert_eq!(
             std::fs::read(directory.join("manifest")).expect("read canonical manifest"),
@@ -639,8 +651,10 @@ mod tests {
                 &snapshot,
                 &old_manifest,
                 &upgraded_manifest,
-                replacement_installed,
-                temporary_exists,
+                ExpectedManifestResidue {
+                    replacement_installed,
+                    temporary_exists,
+                },
                 cutpoint,
             );
         }
@@ -668,8 +682,10 @@ mod tests {
                 &snapshot,
                 &old_manifest,
                 &upgraded_manifest,
-                replacement_installed,
-                false,
+                ExpectedManifestResidue {
+                    replacement_installed,
+                    temporary_exists: false,
+                },
                 cutpoint,
             );
         }
