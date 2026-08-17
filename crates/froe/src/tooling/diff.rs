@@ -688,7 +688,6 @@ mod tests {
         let differences =
             diff_revisions(&directory.path, &before, &after, "/content").expect("diff");
 
-        // The title changed.
         let title_changed = differences.iter().any(|difference| {
             matches!(
                 difference,

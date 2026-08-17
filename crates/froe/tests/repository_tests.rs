@@ -538,42 +538,31 @@ fn reads_checkpoints_sharing_records_with_the_head() {
 }
 
 #[test]
-fn resolves_paths() {
-    let directory = TestDirectory::new("resolves-paths");
+fn resolves_an_existing_path_however_it_is_spelled() {
+    let directory = TestDirectory::new("resolves-existing-paths");
     write_single_archive_repository(&directory);
     let repository = Repository::open(&directory.path).expect("open repository");
 
-    assert!(repository.node_at_path("/").expect("resolve").is_some());
-    assert!(
-        repository
-            .node_at_path("/content")
-            .expect("resolve")
-            .is_some()
-    );
-    assert!(
-        repository
-            .node_at_path("content/")
-            .expect("resolve")
-            .is_some()
-    );
-    assert!(
-        repository
-            .node_at_path("/content/child-05")
-            .expect("resolve")
-            .is_some()
-    );
-    assert!(
-        repository
-            .node_at_path("/missing")
-            .expect("resolve")
-            .is_none()
-    );
-    assert!(
-        repository
-            .node_at_path("/content/missing")
-            .expect("resolve")
-            .is_none()
-    );
+    for path in ["/", "/content", "content/", "/content/child-05"] {
+        assert!(
+            repository.node_at_path(path).expect("resolve").is_some(),
+            "{path} names a node in the fixture, with or without surrounding slashes"
+        );
+    }
+}
+
+#[test]
+fn resolves_a_path_with_no_node_to_none_rather_than_an_error() {
+    let directory = TestDirectory::new("resolves-missing-paths");
+    write_single_archive_repository(&directory);
+    let repository = Repository::open(&directory.path).expect("open repository");
+
+    for path in ["/missing", "/content/missing"] {
+        assert!(
+            repository.node_at_path(path).expect("resolve").is_none(),
+            "{path} names no node, which is an absence and not a failure"
+        );
+    }
 }
 
 #[test]

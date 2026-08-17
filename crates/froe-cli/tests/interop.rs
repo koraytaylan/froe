@@ -2063,7 +2063,6 @@ fn compact() {
     ]);
     assert!(tree.contains("sling:Folder"), "content tree preserved");
 
-    // Boot Sling against the compacted store.
     eprintln!("  booting Sling against the froe-compacted store");
     let volume = PodmanVolume::new("froe-interop-compact");
     let bootstrap = PodmanContainer::run_detached("froe-compact-bootstrap", 8083, &volume.name);
@@ -2417,7 +2416,6 @@ fn cleanup() {
         "cleanup",
     );
 
-    // Boot Sling against the cleaned store.
     eprintln!("  booting Sling against the froe-cleaned store");
     let volume = PodmanVolume::new("froe-interop-cleanup");
     let bootstrap = PodmanContainer::run_detached("froe-cleanup-bootstrap", 8082, &volume.name);
@@ -2783,7 +2781,6 @@ fn backup() {
         "content tree preserved after restore"
     );
 
-    // Boot Sling against the restored store.
     eprintln!("  booting Sling against the froe-restored store");
     let volume = PodmanVolume::new("froe-interop-restore");
     let bootstrap = PodmanContainer::run_detached("froe-restore-bootstrap", 8085, &volume.name);
@@ -2866,7 +2863,6 @@ fn recover() {
         "content tree preserved after recovery"
     );
 
-    // Boot Sling against the recovered store.
     eprintln!("  booting Sling against the froe-recovered store");
     let volume = PodmanVolume::new("froe-interop-recover");
     let bootstrap = PodmanContainer::run_detached("froe-recover-bootstrap", 8086, &volume.name);

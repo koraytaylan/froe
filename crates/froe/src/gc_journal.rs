@@ -691,31 +691,39 @@ mod tests {
     }
 
     #[test]
-    fn parses_signed_boundaries_and_defaults_each_malformed_field() {
-        let boundaries = parse_gc_journal_entry(&format!(
+    fn parses_every_field_at_its_signed_extreme() {
+        let entry = parse_gc_journal_entry(&format!(
             "{},{},-1,{},{},+7,root",
             i64::MIN,
             i64::MAX,
             i32::MIN,
             i32::MAX
         ));
-        assert_eq!(boundaries.repository_size, i64::MIN);
-        assert_eq!(boundaries.reclaimed_size, i64::MAX);
-        assert_eq!(boundaries.timestamp_milliseconds, -1);
-        assert_eq!(boundaries.generation.generation, i32::MIN);
-        assert_eq!(boundaries.generation.full_generation, i32::MAX);
-        assert_eq!(boundaries.compacted_nodes, 7);
-        assert_eq!(boundaries.root_record_identifier_text, "root");
 
-        let malformed = parse_gc_journal_entry(" 1,2,x,2147483648,5,+,not-a-record");
-        assert_eq!(malformed.repository_size, -1, "Java does not trim fields");
-        assert_eq!(malformed.reclaimed_size, 2);
-        assert_eq!(malformed.timestamp_milliseconds, -1);
-        assert_eq!(malformed.generation.generation, -1);
-        assert_eq!(malformed.generation.full_generation, 5);
-        assert_eq!(malformed.compacted_nodes, -1);
-        assert_eq!(malformed.root_record_identifier_text, "not-a-record");
-        assert!(malformed.root_record_identifier().is_none());
+        assert_eq!(entry.repository_size, i64::MIN);
+        assert_eq!(entry.reclaimed_size, i64::MAX);
+        assert_eq!(entry.timestamp_milliseconds, -1);
+        assert_eq!(entry.generation.generation, i32::MIN);
+        assert_eq!(entry.generation.full_generation, i32::MAX);
+        assert_eq!(entry.compacted_nodes, 7);
+        assert_eq!(entry.root_record_identifier_text, "root");
+    }
+
+    /// One malformed field defaults on its own: a leading space, a
+    /// non-numeric value, an i32 overflow, and a bare sign each fall back
+    /// without disturbing the fields around them.
+    #[test]
+    fn defaults_each_malformed_field_independently() {
+        let entry = parse_gc_journal_entry(" 1,2,x,2147483648,5,+,not-a-record");
+
+        assert_eq!(entry.repository_size, -1, "Java does not trim fields");
+        assert_eq!(entry.reclaimed_size, 2);
+        assert_eq!(entry.timestamp_milliseconds, -1);
+        assert_eq!(entry.generation.generation, -1);
+        assert_eq!(entry.generation.full_generation, 5);
+        assert_eq!(entry.compacted_nodes, -1);
+        assert_eq!(entry.root_record_identifier_text, "not-a-record");
+        assert!(entry.root_record_identifier().is_none());
     }
 
     #[test]
