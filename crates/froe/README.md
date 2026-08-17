@@ -12,11 +12,12 @@ never-modify-in-place file protocol; an external process that truncates or
 rewrites an archive would disturb both froe and a running Oak instance.
 
 The mutating writing API ([`writer`]) covers commits, checkpoints, applying
-`cleanup`, compaction, backup, restore, and journal recovery. It takes the
+compaction and the reclamation it performs, backup, restore, and journal
+recovery. It takes the
 exclusive repository lock and produces stores byte-for-byte compatible with
 Oak (apart from the documented extreme-subnormal `double_to_text` rendering
 residue), so a subsequent AEM start consumes the result cleanly. Planning
-`cleanup` is the read-only exception and never takes the lock. Run mutations
+Planning a compaction is the read-only exception and never takes the lock. Run mutations
 only against a *stopped* repository. The writer currently requires a Unix
 operating-system entropy source and therefore refuses to open on Windows. If
 `repo.lock` is absent, opening any writer also requires same-directory
@@ -35,7 +36,7 @@ Writing still requires a stopped repository, and keeping a copy before a
 destructive operation on irreplaceable data remains ordinary prudence.
 
 See the workspace repository for the complete feature map and storage
-format documentation, including the cleanup safety guide, and the `froe-cli`
+format documentation, including the compaction safety guide, and the `froe-cli`
 crate for the command-line interface.
 
 Large inline binaries can be consumed without materializing their full

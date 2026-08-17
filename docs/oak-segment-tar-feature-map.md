@@ -49,7 +49,7 @@ after which a normal AEM start consumes the result cleanly.
 | Read-only store over tar archives | `ReadOnlyFileStore` + `ReadOnlyRevisions` | `Repository::open` | **Implemented** |
 | Read-write store lifecycle | `FileStore` | `writer::WritableRepository::open` | **Implemented** |
 | Head resolution with journal rewind | `FileStoreUtil.findPersistedRecordId` | journal scan in both stores | **Implemented** |
-| Manifest validation and update | `ManifestChecker` | `store::check_manifest` (read); rewrite on ordinary write open; conditional atomic v1-to-v2 upgrade during cleanup | **Implemented** |
+| Manifest validation and update | `ManifestChecker` | `store::check_manifest` (read); rewrite on ordinary write open; conditional atomic v1-to-v2 upgrade during a maintenance run | **Implemented** |
 | Tar generation selection (destructive on write) | `TarReader.open` / `openRO` | `tar_archive::select_newest_file_generations`; write-mode deletes stale letters | **Implemented** |
 | Recovery of archives without a valid index | `TarReader` recovery (writes `.ro.bak`) | in-memory on read; write-mode backs up to `.bak` and regenerates | **Implemented** |
 | Repository lock | `TarPersistence.lockRepository` (blocking `FileChannel.lock`) | `writer::RepositoryLock` (classic POSIX `fcntl` lock on Unix, fails fast) | **Implemented** |
@@ -80,9 +80,9 @@ after which a normal AEM start consumes the result cleanly.
 | Feature | Java | froe | Status |
 | --- | --- | --- | --- |
 | Journal reading (backwards, tolerant) | `JournalReader` | `journal::read_journal` | **Implemented** |
-| Journal append and rewrite | `TarRevisions.doFlush`, `Compact` rewrite | `WritableRepository::flush`, compaction and byte-preserving cleanup journal rewrites | **Implemented** |
+| Journal append and rewrite | `TarRevisions.doFlush`, `Compact` rewrite | `WritableRepository::flush` and the compaction's byte-preserving journal rewrite | **Implemented** |
 | Record identifier string forms | `RecordId.fromString`/`toString10` | `journal::parse_record_identifier_text` | **Implemented** |
-| `gc.log` writing | `GCJournal.persist` | successful offline compaction appends and syncs Oak's seven-field line | **Implemented** (reduced form: no Oak-style no-op suppression; standalone cleanup does not write it) |
+| `gc.log` writing | `GCJournal.persist` | successful offline compaction appends and syncs Oak's seven-field line | **Implemented** (reduced form: no Oak-style no-op suppression; a run that does not compact leaves the file untouched) |
 | `gc.log` parsing | `GCJournal.read`, `readAll` | `gc_journal::{read_gc_journal, read_all_gc_journal, read_gc_journal_with_options, read_all_gc_journal_with_options}` | **Implemented** (six/seven-field layouts, Java split/numeric fallbacks, line-ending and unreadable-file behavior; streaming readers default to 64 MiB/file, 1 MiB/line, and 250,000 entries, with constructible custom limits and typed errors; default wrappers preserve Oak's I/O/decoding fallback but surface froe-only limit failures) |
 
 ## 2. Garbage collection and compaction
@@ -95,7 +95,7 @@ after which a normal AEM start consumes the result cleanly.
 | Generation arithmetic (full/tail transitions) | `GCGeneration.nextFull/nextTail` | `writer::compaction` | **Implemented** |
 | Offline compaction (deep copy into a fresh generation) | `Compact` + `ClassicCompactor` | `writer::compact` (`CompactionKind::Full` / `Tail`) | **Implemented** |
 | Post-compaction cleanup / reclaim predicate | `Reclaimers`, `DefaultCleanupStrategy`, `FileReaper` | `WritableRepository::reclaim_old_generations` (Oak's `newOldReclaimer` with one retained generation) | **Implemented** |
-| Standalone cleanup and repository hygiene | `FileStore.cleanup`, journal/checkpoint maintenance | `plan_cleanup`, `PreparedCleanup`, and `froe cleanup` (FULL policy with two retained generations, history protection, and opt-in backup retention) | **Implemented** |
+| Reclamation and repository hygiene | `FileStore.cleanup`, journal/checkpoint maintenance | `plan_compaction`, `PreparedCompaction`, and `froe compact` (FULL policy with **one** retained generation — Oak's own offline value — unconditional journal retirement, and opt-in backup retention) | **Implemented** (merged into compaction: there is no separate cleanup command) |
 | Online GC, estimation, parallel/checkpoint compactors, memory barrier | `GarbageCollector`, `ParallelCompactor` | — | **Planned** (throughput optimizations; the offline deep copy produces an equivalent result) |
 
 ## 3. Tooling (oak-run segment commands)
@@ -108,7 +108,7 @@ after which a normal AEM start consumes the result cleanly.
 | `history` | `tool/History` | `froe history` | **Implemented** |
 | `search-nodes` | `tool/SearchNodes` | `froe search-nodes` | **Implemented** |
 | `compact` | `tool/Compact` | `froe compact` | **Implemented** |
-| standalone cleanup | `FileStore.cleanup` plus maintenance tools | `froe cleanup` | **Implemented** |
+| standalone cleanup | `FileStore.cleanup` plus maintenance tools | `froe compact` (merged; no separate command) | **Implemented** |
 | `backup` / `restore` | `tool/Backup`, `tool/Restore` | `froe backup`, `froe restore` (plus content export via `froe export`) | **Implemented** |
 | `recover-journal` | `tool/RecoverJournal` | `froe recover-journal` | **Implemented** |
 | `checkpoints` | `oak-run checkpoints` | `froe checkpoint list/create/remove/remove-all/remove-unreferenced` | **Implemented** |
@@ -155,8 +155,8 @@ safely; archive rewrites have the additional hard-link requirement noted below:
 
 | Command | Purpose |
 | --- | --- |
-| `froe cleanup REPOSITORY [--dry-run] [--task TASK]…` | Strictly read-only plan with `--dry-run`; otherwise safely reclaim orphaned storage and stale metadata; see [`cleanup.md`](cleanup.md). |
-| `froe compact REPOSITORY [--tail]` | Offline full or tail compaction with cleanup and journal rewrite; archive rewrites require same-directory hard-link support. |
+| `froe compact REPOSITORY [--dry-run] [--task TASK]…` | Strictly read-only plan with `--dry-run`; otherwise safely reclaim orphaned storage and stale metadata; see [`compact.md`](compact.md). |
+| `froe compact REPOSITORY [--tail] [--dry-run]` | The one maintenance command: offline full or tail compaction, the reclamation it makes possible, and the journal retirement, in one run. `--dry-run` previews it read-only. Archive rewrites require same-directory hard-link support. |
 | `froe backup SOURCE TARGET` | Copy a repository's head into a target store. |
 | `froe restore BACKUP TARGET` | Copy a backup's head into an existing store. |
 | `froe recover-journal REPOSITORY` | Rebuild `journal.log` from the segments. |

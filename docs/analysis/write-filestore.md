@@ -632,6 +632,12 @@ against the store afterwards:
    retain everything the old-reclaimer predicates (§7) would retain for
    `retainedGenerations = 2`, and must never delete a segment reachable from the
    current journal head or any checkpoint.
+
+   > **froe deviation (retention value).** froe runs at
+   > `retainedGenerations = 1`, the value Oak's own `setOffline()` uses, and
+   > proves the second clause per run rather than inheriting it from the first.
+   > The proof and its reasoning are in `write-cleanup.md` §11 invariant 2 and
+   > in `docs/compact.md`.
 9. **gc.log**: append a well-formed 7-field CSV line only after a compaction that
    actually advanced the head generation; never rewrite history; identical-generation
    repeats must not duplicate lines.

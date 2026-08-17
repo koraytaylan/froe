@@ -81,12 +81,7 @@ impl InteractiveCleanup {
     /// so a test can choose how the run reports.
     fn spawn_with(store: &std::path::Path, extra_arguments: &[&str]) -> Self {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-            .args([
-                "cleanup",
-                store.to_str().expect("path"),
-                "--task",
-                "journal",
-            ])
+            .args(["compact", store.to_str().expect("path")])
             .args(extra_arguments)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -291,7 +286,12 @@ fn clap_help_and_version_remain_successful_stdout_diagnostics() {
 #[test]
 fn clap_errors_escape_bidi_values_and_keep_their_multiline_layout() {
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args(["cleanup", "/not-consulted", "--task", "bad\u{202e}value"])
+        .args([
+            "compact",
+            "/not-consulted",
+            "--archive-rewrite-policy",
+            "bad\u{202e}value",
+        ])
         .output()
         .expect("run invalid clap value");
 
@@ -420,7 +420,7 @@ fn install_unlink_denial_filter() -> std::io::Result<()> {
 }
 
 #[test]
-fn cleanup_dry_run_plans_dangling_journal_without_taking_the_lock_or_writing() {
+fn compact_dry_run_plans_the_whole_pipeline_without_taking_the_lock_or_writing() {
     let directory = TestDirectory::new("cleanup-dry-run");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
@@ -449,13 +449,7 @@ fn cleanup_dry_run_plans_dangling_journal_without_taking_the_lock_or_writing() {
     };
 
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args([
-            "cleanup",
-            store.to_str().expect("path"),
-            "--task",
-            "journal",
-            "--dry-run",
-        ])
+        .args(["compact", store.to_str().expect("path"), "--dry-run"])
         .output()
         .expect("run cleanup dry-run");
 
@@ -465,8 +459,17 @@ fn cleanup_dry_run_plans_dangling_journal_without_taking_the_lock_or_writing() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("selected tasks: journal"), "{stdout}");
-    assert!(stdout.contains("prune 1 journal lines"), "{stdout}");
+    // A compacting run retires every revision by policy rather than pruning
+    // the ones that cannot resolve, and says so — this is the irreversible
+    // half of the run.
+    assert!(
+        stdout.contains("retire all 2 journal lines, keeping only the compacted head"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("not recoverable from the store"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("journal line 2: missing segment"),
         "{stdout}"
@@ -492,7 +495,7 @@ fn cleanup_dry_run_plans_dangling_journal_without_taking_the_lock_or_writing() {
 }
 
 #[test]
-fn cleanup_yes_applies_the_locked_plan_and_reopens_healthy() {
+fn compact_yes_applies_the_locked_plan_and_reopens_healthy() {
     let directory = TestDirectory::new("cleanup-apply");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
@@ -506,13 +509,7 @@ fn cleanup_yes_applies_the_locked_plan_and_reopens_healthy() {
         .expect("append dangling line");
 
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args([
-            "cleanup",
-            store.to_str().expect("path"),
-            "--task",
-            "journal",
-            "--yes",
-        ])
+        .args(["compact", store.to_str().expect("path"), "--yes"])
         .output()
         .expect("run cleanup");
 
@@ -522,8 +519,13 @@ fn cleanup_yes_applies_the_locked_plan_and_reopens_healthy() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("cleanup complete"), "{stdout}");
-    assert!(stdout.contains("0 orphan segments removed"), "{stdout}");
+    assert!(stdout.contains("compaction complete"), "{stdout}");
+    // The merged run compacts, so the superseded generation is reclaimed in
+    // the same pass; a zero here would mean the copy freed nothing.
+    assert!(
+        stdout.contains("orphan segments removed") && !stdout.contains("0 orphan segments removed"),
+        "{stdout}"
+    );
     assert!(stdout.contains("journal recovery backup:"), "{stdout}");
     assert!(stdout.contains("journal.log.bak.000"), "{stdout}");
     assert!(
@@ -536,7 +538,7 @@ fn cleanup_yes_applies_the_locked_plan_and_reopens_healthy() {
 }
 
 #[test]
-fn cleanup_reconfirms_and_accepts_a_changed_authoritative_plan() {
+fn compact_reconfirms_and_accepts_a_changed_authoritative_plan() {
     let directory = TestDirectory::new("cleanup-reconfirmation");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
@@ -551,7 +553,7 @@ fn cleanup_reconfirms_and_accepts_a_changed_authoritative_plan() {
     let mut child = InteractiveCleanup::spawn(&store);
     child.expect_prompt(
         "initial confirmation prompt",
-        &["about to apply this cleanup plan"],
+        &["about to apply this compaction plan"],
     );
 
     // The first preview is complete and the command is blocked on confirmation,
@@ -570,7 +572,7 @@ fn cleanup_reconfirms_and_accepts_a_changed_authoritative_plan() {
         "changed-plan confirmation prompt",
         &[
             "repository state changed before the lock was acquired",
-            "about to apply the changed authoritative cleanup plan",
+            "about to apply the changed authoritative compaction plan",
         ],
     );
     child.send(b"yes\n", "authoritative-plan affirmative answer");
@@ -587,10 +589,14 @@ fn cleanup_reconfirms_and_accepts_a_changed_authoritative_plan() {
         output.status
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // The preview and the reconfirmed authoritative plan each state the
+    // retirement, and the second sees one more line than the first because the
+    // fixture appends one between them — which is exactly the change the
+    // reconfirmation exists to surface.
     for expected in [
-        "prune 1 journal lines",
-        "prune 2 journal lines",
-        "cleanup complete",
+        "retire all 2 journal lines",
+        "retire all 3 journal lines",
+        "compaction complete",
     ] {
         assert!(
             stdout.contains(expected),
@@ -612,9 +618,25 @@ fn cleanup_reconfirms_and_accepts_a_changed_authoritative_plan() {
     );
     let backup = std::fs::read(store.join("journal.log.bak.000"))
         .unwrap_or_else(|error| panic!("read journal recovery backup: {error}\n{diagnostic}"));
+    // The backup is the journal as it stood immediately before the rewrite.
+    // A merged run appends the compacted head's line first, so the backup is
+    // the pre-run journal plus exactly that one line — which is what makes it
+    // a usable recovery artefact rather than a stale snapshot.
+    assert!(
+        backup.starts_with(&journal_before_rewrite),
+        "journal recovery backup must extend the pre-run journal\n{diagnostic}"
+    );
+    let appended = &backup[journal_before_rewrite.len()..];
     assert_eq!(
-        backup, journal_before_rewrite,
-        "journal recovery backup must equal the exact pre-rewrite journal\n{diagnostic}"
+        appended.split_inclusive(|byte| *byte == b'\n').count(),
+        1,
+        "exactly the compacted head's line was appended before the rewrite\n{diagnostic}"
+    );
+    let retained = String::from_utf8(journal.clone()).expect("the journal stays UTF-8");
+    assert_eq!(
+        retained.lines().count(),
+        1,
+        "a completed compaction retires every earlier revision\n{diagnostic}"
     );
     froe::Repository::open(&store)
         .unwrap_or_else(|error| panic!("repository did not reopen: {error}\n{diagnostic}"));
@@ -622,7 +644,7 @@ fn cleanup_reconfirms_and_accepts_a_changed_authoritative_plan() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn partial_cleanup_deletion_is_reported_and_exits_nonzero() {
+fn partial_compaction_deletion_is_reported_and_exits_nonzero() {
     use std::os::unix::process::CommandExt as _;
 
     let directory = TestDirectory::new("cleanup-partial-deletion");
@@ -634,13 +656,7 @@ fn partial_cleanup_deletion_is_reported_and_exits_nonzero() {
         .expect("create provably redundant journal staging file");
 
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_froe"));
-    command.args([
-        "cleanup",
-        store.to_str().expect("path"),
-        "--task",
-        "stale-temporaries",
-        "--yes",
-    ]);
+    command.args(["compact", store.to_str().expect("path"), "--yes"]);
     // SAFETY: the hook performs only async-signal-safe `prctl` syscalls and
     // returns an `io::Error` to abort exec if the filter cannot be installed.
     unsafe {
@@ -651,70 +667,22 @@ fn partial_cleanup_deletion_is_reported_and_exits_nonzero() {
     assert!(!run.status.success(), "partial cleanup must exit nonzero");
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
-    assert!(stdout.contains("cleanup partially completed"), "{stdout}");
+    assert!(
+        stdout.contains("compaction partially completed"),
+        "{stdout}"
+    );
     assert!(
         stderr.contains("could not delete journal.log.compacting"),
         "{stderr}"
     );
     assert!(stderr.contains("os error 13"), "{stderr}");
-    assert!(stderr.contains("cleanup is partial"), "{stderr}");
+    assert!(stderr.contains("compaction is partial"), "{stderr}");
     assert!(temporary.is_file(), "failed deletion target must remain");
     froe::Repository::open(&store).expect("partial cleanup preserves repository health");
 }
 
 #[test]
-fn recovery_backup_task_without_policy_is_a_cli_configuration_error() {
-    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args([
-            "cleanup",
-            "/not/consulted",
-            "--task",
-            "recovery-backups",
-            "--dry-run",
-        ])
-        .output()
-        .expect("run invalid cleanup configuration");
-
-    assert!(!run.status.success());
-    let stderr = String::from_utf8_lossy(&run.stderr);
-    assert!(
-        stderr.contains("--task recovery-backups requires"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("invalid segment-tar data"), "{stderr}");
-    assert!(!stderr.contains("not a repository"), "{stderr}");
-}
-
-#[test]
-fn a_journal_bound_beside_an_explicit_task_set_without_journal_is_refused() {
-    // Bounding the journal rewrites journal.log. An operator who named an
-    // explicit task set that excludes the journal did not ask for that, and
-    // silently re-adding the task would delete history they never selected.
-    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args([
-            "cleanup",
-            "/not/consulted",
-            "--task",
-            "segments",
-            "--retain-journal-revisions",
-            "1",
-            "--dry-run",
-        ])
-        .output()
-        .expect("run invalid cleanup configuration");
-
-    assert!(!run.status.success());
-    let stderr = String::from_utf8_lossy(&run.stderr);
-    assert!(
-        stderr.contains("--retain-journal-revisions rewrites journal.log"),
-        "{stderr}"
-    );
-    // Refused on the arguments alone: the store is never opened.
-    assert!(!stderr.contains("not a repository"), "{stderr}");
-}
-
-#[test]
-fn cleanup_preview_escapes_invalid_utf8_and_terminal_control_bytes_exactly() {
+fn compact_preview_escapes_invalid_utf8_and_terminal_control_bytes_exactly() {
     let directory = TestDirectory::new("cleanup-byte-preview");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
@@ -727,9 +695,9 @@ fn cleanup_preview_escapes_invalid_utf8_and_terminal_control_bytes_exactly() {
         .expect("append hostile journal line");
 
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .arg("cleanup")
+        .arg("compact")
         .arg(&store)
-        .args(["--task", "journal", "--dry-run"])
+        .args(["--dry-run"])
         .output()
         .expect("run hostile preview");
 
@@ -744,44 +712,13 @@ fn cleanup_preview_escapes_invalid_utf8_and_terminal_control_bytes_exactly() {
 }
 
 #[test]
-fn segment_only_preview_does_not_disclose_journal_removal_candidates() {
-    let directory = TestDirectory::new("cleanup-segments-hide-journal");
-    let store = directory.path.join("segmentstore");
-    std::fs::create_dir_all(&store).expect("create store directory");
-    populate(&store);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(store.join("journal.log"))
-        .expect("open journal")
-        .write_all(b"parser-skipped\n")
-        .expect("append removable journal candidate");
-
-    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .arg("cleanup")
-        .arg(&store)
-        .args(["--task", "segments", "--dry-run"])
-        .output()
-        .expect("run segment-only preview");
-
-    assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-    let stdout = String::from_utf8(run.stdout).expect("preview stays UTF-8");
-    assert!(stdout.contains("selected tasks: segments"), "{stdout}");
-    assert!(!stdout.contains("journal line"), "{stdout}");
-    assert!(!stdout.contains("prune "), "{stdout}");
-}
-
-#[test]
-fn cleanup_errors_escape_hostile_path_controls_and_bidi() {
+fn compact_errors_escape_hostile_path_controls_and_bidi() {
     let hostile = std::env::temp_dir().join(format!(
         "missing-{}-\u{1b}-\u{202e}-store",
         std::process::id()
     ));
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .arg("cleanup")
+        .arg("compact")
         .arg(hostile)
         .arg("--dry-run")
         .output()
@@ -795,7 +732,7 @@ fn cleanup_errors_escape_hostile_path_controls_and_bidi() {
 }
 
 #[test]
-fn cleanup_preview_names_every_checkpoint_before_confirmation() {
+fn compact_preview_names_every_omitted_checkpoint_before_confirmation() {
     let directory = TestDirectory::new("cleanup-checkpoint-preview");
     let store_path = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store_path).expect("create store directory");
@@ -810,14 +747,15 @@ fn cleanup_preview_names_every_checkpoint_before_confirmation() {
 
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
         .args([
-            "cleanup",
+            "compact",
             store_path.to_str().expect("path"),
-            "--task",
-            "unreferenced-checkpoints",
+            // The checkpoint has a minute to live, so only the unreferenced
+            // policy selects it — which is the opt-in this preview is about.
+            "--remove-unreferenced-checkpoints",
             "--dry-run",
         ])
         .output()
-        .expect("run cleanup preview");
+        .expect("run the compaction preview");
 
     assert!(
         run.status.success(),
@@ -825,7 +763,10 @@ fn cleanup_preview_names_every_checkpoint_before_confirmation() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("remove 1 checkpoints"), "{stdout}");
+    assert!(
+        stdout.contains("omit 1 checkpoints from the copy"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains(&format!("checkpoint {checkpoint:?}")),
         "the destructive preview must name the exact checkpoint: {stdout}"
@@ -1010,7 +951,7 @@ fn the_export_reports_progress_and_a_summary_on_stderr() {
 /// reporting mode must produce byte-identical standard output; a report
 /// leaking there would make the three differ.
 #[test]
-fn reporting_never_reaches_the_standard_output_of_a_cleanup_plan() {
+fn reporting_never_reaches_the_standard_output_of_a_compaction_plan() {
     let directory = TestDirectory::new("cleanup-stdout-purity");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
@@ -1024,7 +965,7 @@ fn reporting_never_reaches_the_standard_output_of_a_cleanup_plan() {
 
     let plan_under = |mode: &[&str]| {
         let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-            .args(["cleanup", store.to_str().expect("path"), "--dry-run"])
+            .args(["compact", store.to_str().expect("path"), "--dry-run"])
             .args(mode)
             .output()
             .expect("run the dry-run plan");
@@ -1074,7 +1015,7 @@ fn reporting_never_reaches_the_standard_output_of_a_cleanup_plan() {
 /// a destructive cleanup between its mutations, leaving the journal
 /// rewrite undone.
 #[test]
-fn a_closed_standard_error_cannot_kill_a_destructive_cleanup() {
+fn a_closed_standard_error_cannot_kill_a_destructive_compaction() {
     let directory = TestDirectory::new("cleanup-closed-stderr");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
@@ -1088,10 +1029,8 @@ fn a_closed_standard_error_cannot_kill_a_destructive_cleanup() {
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
         .args([
-            "cleanup",
+            "compact",
             store.to_str().expect("path"),
-            "--task",
-            "journal",
             "--yes",
             "--progress",
             "always",
@@ -1141,7 +1080,7 @@ fn silence_never_hides_the_destructive_confirmation_prompt() {
     child.expect_prompt(
         "the confirmation prompt of a silenced cleanup",
         &[
-            "about to apply this cleanup plan",
+            "about to apply this compaction plan",
             "this modifies the repository",
         ],
     );
@@ -1154,13 +1093,13 @@ fn silence_never_hides_the_destructive_confirmation_prompt() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("cleanup plan for"),
+        stdout.contains("compaction plan for"),
         "the plan must still be printed under --silent: {stdout}"
     );
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
-        stderr.contains("cleanup cancelled"),
-        "a declined cleanup still says so: {stderr}"
+        stderr.contains("compaction cancelled"),
+        "a declined compaction still says so: {stderr}"
     );
     assert!(
         !stderr.contains("froe: opening archives"),
@@ -1173,7 +1112,7 @@ fn silence_never_hides_the_destructive_confirmation_prompt() {
 #[test]
 fn silence_never_hides_an_error() {
     let failed = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args(["cleanup", "/not/a/repository", "--dry-run", "--silent"])
+        .args(["compact", "/not/a/repository", "--dry-run", "--silent"])
         .output()
         .expect("run a silenced failing cleanup");
     assert!(!failed.status.success());

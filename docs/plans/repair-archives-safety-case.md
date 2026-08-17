@@ -1,12 +1,12 @@
-# Safety case: `--task repair-archives`
+# Safety case: `--repair-archive-indexes`
 
 The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for
-the eighth cleanup task, which rebuilds the index of an active archive that
+the opt-in `--repair-archive-indexes` stage, which rebuilds the index of an active archive that
 has none. In scope because it introduces destructive behavior on a path that
 previously refused, and because it unblocks segment reclamation on stores that
 were unreachable to it.
 
-Covers `crates/froe/src/writer/cleanup.rs` and
+Covers `crates/froe/src/writer/maintenance.rs` and
 `crates/froe/src/writer/store_writer.rs` as of the commit introducing this
 file.
 
@@ -46,10 +46,10 @@ pattern; `.bak`, `.recovering`, and unrelated `*.tar` files are not inputs.
 ## Authoritative state
 
 **Lock boundary.** `RepositoryLock::acquire` in
-`PreparedCleanup::prepare_with_progress`. Every mutation in this task happens
+`PreparedCompaction::prepare_with_progress`. Every mutation in this task happens
 after it and before the lock is dropped.
 
-**Where the preview is discarded.** `plan_cleanup` is advisory and strictly
+**Where the preview is discarded.** `plan_compaction` is advisory and strictly
 read-only; `prepare` rebuilds the plan from disk under the lock. Unique to
 this task, the preview is *deliberately partial*: while a repair is pending,
 `index_available` is false and the checkpoint plan, stale-archive scan,
@@ -128,7 +128,7 @@ rebuilt index rather than reconstructing one.
 Producer-to-consumer direction: Oak → froe → Oak. Oak build:
 `oak-segment-tar` 1.90.0, from the digest-pinned Apache Sling image named in
 `crates/froe-cli/tests/interop.rs`. Operation exercised:
-`froe cleanup --task repair-archives` alongside the five default tasks.
+`froe compact --repair-archive-indexes` alongside the five default tasks.
 Verified post-state: every archive indexed, `froe check` passing, Oak serving
 the baseline tree.
 

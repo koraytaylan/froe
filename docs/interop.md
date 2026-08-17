@@ -97,42 +97,40 @@ commit
    │  froe adds nodes with typed properties to the content tree via
    │  the library's commit API, then Sling reads them back
    │  If this fails: froe cannot write content that Oak reads — the
-   │  core interop claim. No point testing checkpoint, compact, cleanup,
+   │  core interop claim. No point testing checkpoint, compact,
    │  backup, or recover if the writer can't produce content Oak reads.
    ▼
 checkpoint
    │  froe writes a checkpoint (metadata-only write-path test)
    │  If this fails: the writer's checkpoint machinery is broken,
-   │  which affects cleanup's expired-checkpoint test and compact's
+   │  which affects compact's expired-checkpoint handling and its
    │  checkpoint preservation.
    ▼
 compact
-   │  froe compacts a copy, Sling boots against the result
-   │  If this fails: cleanup's multi-generational fixture cannot be
-   │  built (it uses two compactions to advance the generation).
-   ▼
-cleanup
-   │  froe cleanup against a gen 0→1→2 store with orphans, stale
-   │  archives, expired checkpoints, and corrupt journal lines
+   │  froe compacts a copy — the one maintenance command, so this is
+   │  also the reclamation test: orphan segments, a partially dead
+   │  archive rewritten to its next generation letter, a stale archive,
+   │  expired checkpoints and corrupt journal lines all go in the same
+   │  run. Sling boots against the result.
    │  If this fails: the write path's plan-and-apply machinery is broken.
    ▼
 journal_retention
-   │  froe cleanup --retain-journal-revisions 1 retires resolvable
-   │  journal history and sweeps the segments behind it; Oak boots the
-   │  result and serves the baseline tree from the one revision kept
-   │  If this fails: froe's only by-policy destruction of reachable
-   │  history leaves a store Oak cannot open.
+   │  a plain froe compact retires every revision but the head it
+   │  wrote and sweeps the segments behind them; Oak boots the result
+   │  and serves the baseline tree from the one revision kept
+   │  If this fails: froe's by-policy destruction of reachable history
+   │  leaves a store Oak cannot open.
    ▼
 repair
    │  Oak's own JVM is killed with SIGKILL while it holds an archive
-   │  open; froe cleanup --task repair-archives rebuilds the index and
+   │  open; froe compact --repair-archive-indexes rebuilds the index and
    │  Oak boots against the result
    │  If this fails: froe cannot repair the state a crashed Oak leaves,
    │  or Oak will not read what froe rebuilt.
    ▼
 backup
    │  froe backup + restore, Sling boots against the result
-   │  Independent of compact/cleanup but later because lower-risk.
+   │  Independent of compact but later because lower-risk.
    ▼
 recover
    │  froe recover-journal after deleting journal.log
@@ -165,7 +163,7 @@ modified store and verifies Oak reads the froe-written nodes back
 correctly — the same JSON Sling would serve for any other node.
 
 This is the core interop claim: froe writes content that Oak reads.
-If this fails, there is no point testing checkpoint, compact, cleanup,
+If this fails, there is no point testing checkpoint, compact,
 backup, or recover — the writer cannot produce content Oak reads.
 
 Depends on `read` (to verify).
@@ -175,7 +173,7 @@ Depends on `read` (to verify).
 froe creates a checkpoint with a 1-second lifetime against the Oak
 store. A metadata-only write-path operation (logical head update) that
 exercises the writer's checkpoint machinery against a store froe didn't
-write. If this fails, cleanup's expired-checkpoint test and compact's
+write. If this fails, compact's expired-checkpoint handling and its
 checkpoint preservation can't be trusted.
 
 Depends on `commit` (the writer can already produce content Oak reads).
@@ -191,26 +189,37 @@ binary round-trips byte-for-byte.
 Depends on `read` (to verify the compacted store) and `commit` (to trust
 the writer).
 
-### cleanup
+### compact — reclamation
 
-froe cleanup against a multi-generational store with:
+froe compact against a multi-generational store with:
 
-- **727 orphan segments** (67 MB): built by compacting twice (gen 0→1→2),
-  then restoring the original gen-0 archive at a higher archive number.
-  Those gen-0 segments are 2 full generations behind the head, not
-  protected by journal history (truncated), and not referenced by
-  surviving gen-2 segments. Compact's built-in cleanup already ran and
-  can't see them; only standalone cleanup finds and reclaims them. This
-  mirrors a real scenario: a crashed online compaction leaving a stale
-  archive behind, or an old backup archive restored to the directory.
+- **A wholly dead archive**: 2000 nodes written directly at generation zero
+  and linked to no head, two full generations behind the compacted head. Every
+  entry in the archive is reclaimable, so the sweep unlinks the whole file.
+- **A partially dead archive**, which needs no fixture at all. The Oak store
+  carries a binary large enough to live in bulk segments, and compaction
+  references bulk segments where they lie rather than copying them. So the
+  archive holding them survives the first compaction while its data segments
+  die — some entries reclaimable, some not, which is exactly the disposition
+  that forces a rewrite to the next generation letter with a survivor subset
+  and reconstructed `.gph`, `.brf` and `.idx` trailers. Oak then reads that
+  archive. This is the shape a production store actually has and the one Oak's
+  25% savings heuristic declines forever; the phase asserts the source archive
+  is gone, its successor letter holds the survivors, and the reported rewrite
+  count is at least one.
+
+  The assertion sits on the *first* compaction deliberately. By the second,
+  the surviving archives hold nothing but referenced bulk, which is wholly
+  live and has nothing left to reclaim — so a rewrite is unreachable there,
+  and asserting it would be asserting something the format cannot produce.
 - **1 stale archive**: a copied newer-letter duplicate of the active
   archive — the on-disk condition Oak's own compaction leaves behind.
 - **1 expired checkpoint**: created by froe with a 1-second lifetime.
 - **2 corrupt journal lines**: a no-space line (ParserSkippedNoSpace)
   and an invalid-record-identifier line (InvalidRecordIdentifier).
 
-froe cleanup removes all four conditions. Sling boots against the
-cleaned store.
+froe compact removes every one of these conditions in a single run — there is
+no second command — and Sling boots against the result.
 
 Depends on `compact` (to build the gen 0→1→2 fixture).
 
@@ -242,9 +251,9 @@ authentic artifact of a crash rather than a simulated one.
 
 Then, read-only until the repair runs, because every froe *write* command
 rebuilds a missing index on open and would heal the fixture: `froe archives`
-confirms the damage, and `froe cleanup --dry-run` without the task confirms
-the refusal names `--task repair-archives`. The repair itself runs through
-`froe cleanup --yes` with that task selected, and the original is asserted
+confirms the damage, and `froe compact --dry-run` without the task confirms
+the refusal names `--repair-archive-indexes`. The repair itself runs through
+`froe compact --yes` with that task selected, and the original is asserted
 present under its `.bak` name.
 
 The assertion that makes this phase worth having is the last one: Oak boots
@@ -269,28 +278,37 @@ and Sling boots against the recovered store.
 
 Depends on `read`.
 
-## How the orphan-segment gap was closed
+## What the two reclamation fixtures prove
 
-A fresh Oak store has only generation 0. froe's `segments` cleanup task
-uses Oak's FULL-generation predicate, which reclaims segments whose
-`full_generation` is 2+ behind the head. A single-generation store has
-nothing old enough to reclaim.
+A fresh Oak store has only generation 0. froe's segment reclamation uses
+Oak's FULL-generation predicate, which reclaims segments whose `full_generation`
+is 2+ behind the head, so a single-generation store has nothing old enough to
+reclaim. The phase therefore compacts twice (gen 0→1→2) before building
+anything.
 
-The natural way to advance generations is `froe compact`, but compact's
-built-in cleanup (with `retained_generations=1`) reclaims old-gen
-segments during compaction itself. So after compacting, old archives are
-already gone.
+The two fixtures exist because the sweep has two dispositions, and one of them
+was never exercised against Oak:
 
-The solution: compact twice (gen 0→1→2), **then** restore the original
-gen-0 archive to the store directory. Those gen-0 segments are 2 full
-generations behind the gen-2 head, not protected by journal history
-(truncated), and not referenced by surviving segments. Compact's
-cleanup already ran and can't see them. Only standalone cleanup finds
-and reclaims them — 727 orphan segments, 67 MB.
+- `write_orphan_nodes` writes 2000 unreferenced generation-zero nodes into a
+  new archive. *Every* entry is reclaimable, so `plan_archive_sweep` takes the
+  whole-file removal branch. This proves reclamation happens; it cannot prove
+  anything about rewriting, because the rewrite machinery is never reached.
+- `write_partially_dead_archive` writes 64 unreferenced generation-zero nodes
+  *beside* the live rewritten super-root, in one archive. Survivors remain, so
+  the sweep copies them into the next generation letter, filters the graph and
+  binary-reference trailers, and publishes the replacement. Oak boots against
+  the result, serves the byte-identical baseline tree, and logs none of its own
+  repair messages — so it consumed froe's rebuilt archive rather than
+  reconstructing one.
 
-This mirrors a real production scenario: Oak runs online compaction
-(gen 0→1→2), but an old backup archive from gen 0 is restored to the
-directory, or a crashed online compaction left a stale archive behind.
+An earlier version of this phase built its orphans by restoring the
+pre-compaction gen-0 archive at a spare archive number. That stopped working
+once compaction began sharing bulk segments the way Oak does: the compacted
+head still references gen-0's binary blocks, so re-introducing that archive is
+a genuine duplicate-segment condition and froe rightly refuses it. Both
+current fixtures write fresh unreferenced segments instead, which are
+unreachable by construction rather than by an assumption about what compaction
+leaves behind.
 
 ## CI
 

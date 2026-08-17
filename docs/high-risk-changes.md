@@ -120,6 +120,34 @@ Benchmarks are supplementary unless they have a stable tracked threshold;
 minor changes to an already-covered traversal may cite the existing
 evidence.
 
+## Changes whose safety argument moved
+
+Four decisions in the maintenance path no longer rest where they used to, and
+a reviewer should check the *new* place rather than the old one.
+
+* **One retained generation.** `RETAINED_GENERATIONS` is 1, the value Oak's own
+  `SegmentGCOptions.setOffline()` uses. Head safety therefore no longer follows
+  from the generation predicate the way `write-cleanup.md` §11 invariant 2
+  states it for the online default of 2. It is proved per run by
+  `validate_reclaim_reference_invariant`, which re-evaluates the run's exact
+  `ReclaimRule` over the head's transitive segment closure and refuses before
+  any mutation. A change that weakens that guard silently re-opens the
+  invariant.
+* **Journal history is retired unconditionally.** Every run leaves `journal.log`
+  holding one line. The removed history survives only as `journal.log.bak.NNN`,
+  and by the time that file exists the segments its revisions named are already
+  unlinked, so it restores the file and not the history. There is no flag that
+  keeps more.
+* **Reclamation requires headroom.** There is no sweep-only mode: a run copies
+  the live content into a fresh generation before it frees anything, so a store
+  with less free space than its live set can no longer be reclaimed by froe at
+  all. This is the largest capability the merge of cleanup into compact cost,
+  and it is deliberate.
+* **Checkpoint expiry drops content from the copy.** An expired checkpoint is
+  not removed from the live head and then compacted; it is simply never carried
+  into the fresh generation. That keeps the head moving exactly once, but it
+  means expiry and compaction can no longer be authorized separately.
+
 ## Verify portability deliberately
 
 The current MSRV comes from `workspace.package.rust-version` in

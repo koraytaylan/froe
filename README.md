@@ -57,7 +57,7 @@ awkward or slow to address against a running Oak/AEM instance.
 corrupt, `froe recover-journal` rebuilds it from the surviving segments.
 `froe check` locates the newest consistent revision for each requested
 path — read-only, safe against a live repo, and a fast way to scope
-damage before touching anything. `froe cleanup` reclaims orphan storage,
+damage before touching anything. `froe compact` reclaims orphan storage,
 prunes dead journal entries, and removes stale archives left by
 interrupted compactions. `froe compact`, `backup`, and `restore` round
 out the offline maintenance set, and `froe checkpoint` manages
@@ -68,15 +68,25 @@ read-only commands write nothing and are safe against a live instance.
 **Reclaim what online GC leaves behind.** Oak's online garbage collector
 runs opportunistically and only sweeps segments — it does not prune the
 journal, remove stale archives from failed compactions, expire
-checkpoints, or clean up staging files. `froe cleanup` does all five in
-one conservative pass. It drops journal lines that point at absent or
-unreadable revisions, runs a store-wide FULL mark/sweep against the
-persisted head generation with two retained generations, reclaims
-segments whose closure is unreachable from every readable journal root,
-removes superseded archives only after reconstructing their full segment
-graph as proof, expires checkpoints past their timestamp, and deletes
-only staging files it can prove redundant. Every readable journal
-revision is retained; the safety gate fails closed rather than guessing.
+checkpoints, or clean up staging files. `froe compact` is froe's one
+maintenance command and does all of it in a single run: it deep-copies the
+head and every retained checkpoint into a fresh garbage-collection
+generation, retires `journal.log` to that one revision, runs a store-wide
+FULL mark/sweep against the generation it just wrote, reclaims every segment
+the new head does not reach, removes superseded archives only after
+reconstructing their full segment graph as proof, drops checkpoints past
+their timestamp, and deletes only staging files it can prove redundant.
+`--dry-run` previews the whole plan without writing a byte or taking the
+lock.
+
+Exactly one generation is retained — the value Oak's own offline tool uses
+(`SegmentGCOptions.setOffline`) — and, unlike Oak, froe rewrites *every*
+archive holding identified garbage rather than only those a rewrite would
+shrink by a quarter. So one run leaves nothing reclaimable behind, where the
+older split of compaction and cleanup could identify hundreds of megabytes it
+was unable to remove. `--archive-rewrite-policy oak-savings-gate` restores
+Oak's heuristic. Journal history is retired rather than retained, and the
+safety gate fails closed rather than guessing.
 
 **Query a repository in minutes, not hours.** Auditing a running Oak/AEM
 repository — finding unused DAM assets, mapping references, inventorying
@@ -129,10 +139,10 @@ Cleanup is the one maintenance path that touches a version-one store, and
 only conditionally: if a run would write version-two state, it first
 upgrades the manifest. That upgrade is one-way, appears as an explicit
 action in the read-only preview before anything is confirmed, and is
-described in [`docs/cleanup.md`](docs/cleanup.md). The journal,
+described in [`docs/compact.md`](docs/compact.md). The journal,
 stale-archive, stale-temporary, and recovery-backup passes never upgrade.
 If you need to keep a version-one store readable by the Oak that created
-it, copy it before running cleanup.
+it, copy it before running a maintenance command.
 
 ## Quick start
 
@@ -149,8 +159,8 @@ $ target/release/froe segment /path/to/segmentstore SEGMENT-UUID --hex
 $ target/release/froe debug /path/to/segmentstore data00000a.tar
 
 # Maintenance — stopped repository only (mutating forms ask for confirmation):
-$ target/release/froe cleanup /path/to/segmentstore --dry-run
-$ target/release/froe cleanup /path/to/segmentstore
+$ target/release/froe compact /path/to/segmentstore --dry-run
+$ target/release/froe compact /path/to/segmentstore
 $ target/release/froe compact /path/to/segmentstore
 $ target/release/froe backup /path/to/segmentstore /path/to/backup
 $ target/release/froe recover-journal /path/to/segmentstore
@@ -166,19 +176,19 @@ pending child visits, 250,000 graph rows, and 1,000,000 graph edges.
 Crossing a bound is a typed refusal rather than partial successful output;
 multiple archive arguments are not yet batched under one global work budget.
 
-`froe cleanup` first prints a strictly read-only plan. When that plan contains
+`froe compact` first prints a strictly read-only plan. When that plan contains
 mutations, it then acquires the repository lock and rebuilds the plan before
 applying it; an empty plan returns without taking the lock. If the locked plan
 changed, it is printed and confirmed again. The conservative defaults preserve
 every readable journal revision while pruning dangling or unreadable journal
 entries, reclaiming eligible segments, removing expired checkpoints, and
-cleaning only proven stale files. See the [cleanup guide](docs/cleanup.md) for
+cleaning only proven stale files. See the [compaction guide](docs/compact.md) for
 task selection, retention rules, resource expectations, and failure behavior.
 When a planned checkpoint removal, segment-archive rewrite, or archive-index
 repair needs to write version-two state, the plan also shows the one-way
 `store.version=1` to `2` manifest upgrade before apply.
 
-The opt-in `--task repair-archives` rebuilds the index of an archive a killed
+The opt-in `--repair-archive-indexes` rebuilds the index of an archive a killed
 Oak left untrailered — the state that otherwise blocks every generation-
 dependent task — retaining each original under a `.bak` name.
 
@@ -189,14 +199,14 @@ require same-directory hard-link and durable directory-fsync support when
 `repo.lock` has not already been created; unsupported filesystems fail without
 falling back to an unsafe lock-creation sequence.
 
-Archive rewrites performed by either `froe cleanup` or the cleanup phase of
+Archive rewrites performed by
 `froe compact` publish validated successors with absent-only, same-directory
 hard links. A filesystem that does not support those links cannot perform such
 a rewrite; the operation fails with the original archive still active.
 
 ### Knowing what a command is doing
 
-Planning a cleanup, compacting, checking consistency, and exporting all
+Planning a compaction, compacting, checking consistency, and exporting all
 run for minutes against a real repository. Every command reports what it
 is doing on **standard error**, so standard output stays pure data and a
 plan or an export can still be piped anywhere:
@@ -210,7 +220,7 @@ A step that cannot count its work in advance reports what it has done so
 far and how long it has been running, without a bar:
 
 ```console
-$ froe cleanup /path/to/segmentstore --dry-run
+$ froe compact /path/to/segmentstore --dry-run
 froe: verifying the current head 29,184 nodes 0:01
 ```
 
@@ -329,9 +339,9 @@ fn main() -> froe::Result<()> {
 * [`docs/storage-format.md`](docs/storage-format.md)
   — the on-disk format as implemented by this workspace: tar archive layout,
   segment headers, and every record encoding.
-* [`docs/cleanup.md`](docs/cleanup.md)
+* [`docs/compact.md`](docs/compact.md)
   — the safety model, default and opt-in tasks, retention rules, and examples
-  for offline repository cleanup.
+  for offline repository maintenance.
 * [`docs/cli-output.md`](docs/cli-output.md)
   — which stream carries what, how progress is reported and silenced, and
   what each command says while it works.

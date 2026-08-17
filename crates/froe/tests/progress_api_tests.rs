@@ -20,7 +20,9 @@ use froe::progress::{ProgressObserver, Step, WorkUnit};
 use froe::store::Repository;
 use froe::writer::record_writer::ChildNodesToWrite;
 use froe::writer::store_writer::WritableRepository;
-use froe::{CleanupOptions, PreparedCleanup, cleanup, cleanup_with_progress, plan_cleanup};
+use froe::{
+    CompactionOptions, PreparedCompaction, compact, compact_with_progress, plan_compaction,
+};
 
 /// A temporary directory removed when the test ends.
 struct TestDirectory(std::path::PathBuf);
@@ -295,11 +297,15 @@ fn an_observed_plan_equals_an_unobserved_one() {
     let directory = TestDirectory::new("plan");
     build_repository(directory.path(), 8);
 
-    let unobserved = plan_cleanup(directory.path(), &CleanupOptions::default()).expect("plan");
+    let unobserved =
+        plan_compaction(directory.path(), &CompactionOptions::default()).expect("plan");
     let mut log = ObservationLog::default();
-    let observed =
-        froe::plan_cleanup_with_progress(directory.path(), &CleanupOptions::default(), &mut log)
-            .expect("plan while observed");
+    let observed = froe::plan_compaction_with_progress(
+        directory.path(),
+        &CompactionOptions::default(),
+        &mut log,
+    )
+    .expect("plan while observed");
 
     assert_eq!(
         observed, unobserved,
@@ -333,11 +339,11 @@ fn an_observed_cleanup_equals_an_unobserved_one() {
     build_repository(observed_directory.path(), 6);
 
     let unobserved =
-        cleanup(unobserved_directory.path(), CleanupOptions::default()).expect("clean up");
+        compact(unobserved_directory.path(), CompactionOptions::default()).expect("clean up");
     let mut log = ObservationLog::default();
-    let observed = cleanup_with_progress(
+    let observed = compact_with_progress(
         observed_directory.path(),
-        CleanupOptions::default(),
+        CompactionOptions::default(),
         &mut log,
     )
     .expect("clean up while observed");
@@ -393,9 +399,9 @@ fn a_prepared_cleanup_reports_both_of_its_phases() {
     build_repository(directory.path(), 4);
 
     let mut log = ObservationLog::default();
-    let prepared = PreparedCleanup::prepare_with_progress(
+    let prepared = PreparedCompaction::prepare_with_progress(
         directory.path(),
-        CleanupOptions::default(),
+        CompactionOptions::default(),
         &mut log,
     )
     .expect("prepare under the lock");
@@ -582,14 +588,37 @@ fn a_verifier_reporting_several_roots_keeps_one_running_total() {
         .expect("verify the sharing root");
     log.step_ended();
 
-    // ObservationLog panics on any decrease, so reaching here is the
-    // assertion; this pins that the total really did carry over.
-    assert!(
-        log.highest_count_of("validating the prospective plan")
-            .is_some_and(|nodes| nodes >= 6),
-        "the step reports a running total across both roots: {:?}",
-        log.highest_count_of("validating the prospective plan")
+    // ObservationLog panics on any decrease, so reaching here already pins
+    // that the total carried over. The count is also exact: a node reached
+    // from both roots is certified — and so reported — once, which is what
+    // an independent walk of the two roots counts below.
+    let distinct = distinct_nodes_below(&repository, &[head, second_head]);
+    assert_eq!(
+        log.highest_count_of("validating the prospective plan"),
+        Some(distinct as u64),
+        "the step reports each distinct node exactly once across both roots"
     );
+}
+
+/// The distinct node records the given roots reach, counted with a plain
+/// `HashSet` walk that shares no code with the verifier's certificate set.
+fn distinct_nodes_below(repository: &Repository, roots: &[froe::RecordIdentifier]) -> usize {
+    let mut seen: std::collections::HashSet<froe::RecordIdentifier> =
+        std::collections::HashSet::new();
+    let mut pending: Vec<froe::RecordIdentifier> = roots.to_vec();
+    while let Some(record) = pending.pop() {
+        if !seen.insert(record) {
+            continue;
+        }
+        let node = repository.node(record);
+        for (_, child) in node
+            .child_node_entries()
+            .expect("enumerate the child nodes")
+        {
+            pending.push(child.record_identifier());
+        }
+    }
+    seen.len()
 }
 
 #[test]

@@ -1,13 +1,36 @@
-# Safe repository cleanup
+# Compaction: froe's one maintenance command
 
-`froe cleanup` is conservative, offline maintenance for an existing
-segment-tar repository. It removes journal entries that cannot name a readable
-revision, reclaims eligible orphan segments, removes safe archive leftovers,
-expires checkpoints, and deletes only staging files it can prove redundant.
-It never creates or bootstraps a repository.
+`froe compact` is offline maintenance for an existing segment-tar repository,
+and it is the only maintenance command froe has. One run deep-copies the head
+and every retained checkpoint into a fresh garbage-collection generation,
+retires `journal.log` to that single revision, and reclaims everything the new
+head does not reach — orphan segments, whole archives, safe archive leftovers,
+expired checkpoints, and staging files it can prove redundant. It never creates
+or bootstraps a repository.
 
-> **Run cleanup only while Oak/AEM is stopped, and keep a recoverable copy of
-> important repositories.** Cleanup is covered by format-level and failure-path
+Compaction and reclamation are one command because they are one decision. A
+sweep alone works at *segment* granularity, so a segment holding one live
+record is wholly live however much dead content sits beside it; only a rewrite
+recovers that. And only a rewrite lets a run retain a single generation, which
+is what makes the sweep that follows it complete rather than incidental.
+Splitting them left froe able to identify garbage it could not remove — see
+[Why froe rewrites archives Oak would leave
+alone](#why-froe-rewrites-archives-oak-would-leave-alone).
+
+Exactly one generation is retained. That is Oak's own offline setting:
+`SegmentGCOptions.setOffline()` sets `retainedGenerations = 1`. At that value
+head safety no longer follows from the generation predicate, so froe proves it
+per run — the reclaim reference invariant re-evaluates the run's exact reclaim
+rule over the head's transitive segment closure and refuses before any
+mutation.
+
+Journal history is retired, not preserved: after a successful run
+`journal.log` holds exactly one line, naming the compacted head. The removed
+history is not recoverable from the store afterwards; `journal.log` is copied
+to a numbered `.bak` first.
+
+> **Run compaction only while Oak/AEM is stopped, and keep a recoverable copy of
+> important repositories.** Compaction is covered by format-level and failure-path
 > tests and by the interoperability suite ([`interop.md`](interop.md)), which
 > applies it to a store written by Apache Jackrabbit Oak `oak-segment-tar`
 > 1.90.0 — reclaiming orphan segments, a stale archive, an expired checkpoint
@@ -20,13 +43,13 @@ It never creates or bootstraps a repository.
 Apply is Unix-only and must run as the operating-system user that owns
 `journal.log`—normally the Oak/AEM service account, not through `sudo`. This is
 checked before `repo.lock` or any replacement file can be created. Rewritten
-files preserve the source uid, gid, and permission bits, and cleanup refuses
+files preserve the source uid, gid, and permission bits, and the run refuses
 before mutation if the repository filesystem cannot strictly fsync a directory.
 Read-only `--dry-run` remains available without those apply preconditions.
 Platform ACLs and extended attributes are not cloned; before publication,
 replacement TARs, the journal, its recovery backup, and an upgraded manifest
 are reopened through their path with the service identity and required access.
-Cleanup fails before the swap if copied POSIX metadata alone would make a
+The run fails before the swap if copied POSIX metadata alone would make a
 replacement unusable.
 
 Owning `journal.log` is necessary but does not make every mixed-ownership plan
@@ -60,12 +83,12 @@ applying a plan.
 Start with a preview:
 
 ```console
-$ froe cleanup /path/to/segmentstore --dry-run
+$ froe compact /path/to/segmentstore --dry-run
 ```
 
 Planning a large store takes minutes: it verifies the whole head tree,
 replays the journal, and traces the reachable segment closure before it can
-say anything. Cleanup reports each of those steps on standard error while it
+say anything. The run reports each of those steps on standard error while it
 works, so a long wait is legible rather than silent; `--silent` turns the
 reports off without hiding the plan, the warnings, or the confirmation
 prompt. See [`cli-output.md`](cli-output.md).
@@ -80,7 +103,7 @@ or sent to the terminal.
 
 ## Applying a plan
 
-Without `--dry-run`, cleanup uses two planning stages:
+Without `--dry-run`, the command uses two planning stages:
 
 1. It builds and prints the same lock-free preview shown by dry-run.
 2. After confirmation, it acquires the exclusive Oak-compatible repository
@@ -93,7 +116,7 @@ Without `--dry-run`, cleanup uses two planning stages:
 
 If the first preview contains no mutations, the CLI reports that result and
 returns without creating or taking `repo.lock`; there is no destructive plan
-to authorize. Use the library's `PreparedCleanup` health-only apply when a
+to authorize. Use the library's `PreparedCompaction` health-only apply when a
 lock-protected final verification is specifically required.
 
 `--yes` answers both possible confirmation questions automatically; it does
@@ -101,15 +124,15 @@ not bypass the lock, replan, fingerprint, validation, or final verification.
 Lock acquisition fails immediately if Oak/AEM or another writer is using the
 repository. As with Oak's own repository lock, safety assumes every other
 writer cooperates with the persistent `repo.lock` inode and does not unlink or
-replace it behind the lock holder; cleanup rechecks that inode between mutation
+replace it behind the lock holder; the run rechecks that inode between mutation
 phases, but cannot make an actively hostile process obey an advisory lock.
 
 ```console
-# Interactive application of the conservative defaults
-$ froe cleanup /path/to/segmentstore
+# Interactive application
+$ froe compact /path/to/segmentstore
 
 # The same checks and application without interactive questions
-$ froe cleanup /path/to/segmentstore --yes
+$ froe compact /path/to/segmentstore --yes
 ```
 
 ## Default tasks
@@ -129,17 +152,15 @@ more than one category:
 
 ```console
 # Journal pruning only
-$ froe cleanup /path/to/segmentstore --task journal
+$ froe compact /path/to/segmentstore --dry-run
 
 # Inspect only archive and temporary-file hygiene
-$ froe cleanup /path/to/segmentstore \
-    --task stale-archives \
-    --task stale-temporaries \
+$ froe compact /path/to/segmentstore \
     --dry-run
 ```
 
 Task selection is isolation, not merely output filtering. For example,
-`--task journal` does not open the normal writable-store lifecycle or repair,
+A dry run does not open the normal writable-store lifecycle or repair,
 rewrite, or delete archives as a side effect.
 
 There is one format-level effect to account for when selecting tasks. If the
@@ -147,7 +168,7 @@ repository still has `store.version=1`, an actual checkpoint removal (from
 either checkpoint task) or a `segments` archive rewrite adds an explicit
 `atomically upgrade manifest to store.version=2` action to the plan.
 Apply installs that upgrade atomically before writing version-two repository
-state. The upgrade is one-way: cleanup does not provide a downgrade back to
+state. The upgrade is one-way: froe does not provide a downgrade back to
 version 1. Merely selecting either task is not enough to change the manifest;
 there must be a checkpoint to remove or an archive to rewrite. Journal-only,
 stale-archive, stale-temporary, and recovery-backup passes do not upgrade it.
@@ -170,7 +191,7 @@ is removable.
 ### Journal history
 
 A syntactically valid journal line is not an orphan merely because it is old.
-Cleanup traverses each revision that still resolves and keeps its original
+The run traverses each revision that still resolves and keeps its original
 physical line bytes and order, including its tag and timestamp text. A
 malformed or missing timestamp alone never makes a line removable. If a
 rewrite is needed, the only normalization is to ensure that the installed
@@ -180,8 +201,8 @@ original is durably copied to a numbered `journal.log.bak.NNN` recovery backup
 first, and successful CLI output names that exact backup.
 
 The current selected head is special: if its record is not a node or its full
-tree cannot be read—including inline binary blocks—cleanup fails instead of
-silently falling back to an older revision. Segment cleanup also checks the
+tree cannot be read—including inline binary blocks—the run fails instead of
+silently falling back to an older revision. Segment reclamation also checks the
 prospective archive set against every retained readable journal root, so the
 default pass does not exchange historical readability for disk space.
 
@@ -198,45 +219,34 @@ if that history were retired. The second figure is measured by replanning with
 the veto lifted rather than estimated beside it, because the veto holds bulk
 segments only through the data segments that reference them—on a store of
 inline binaries the data segments are a rounding error next to the content
-behind them—and because releasing more of an archive can carry it over the
-rewrite gate below. Pricing it costs one extra marking pass over the archives
+behind them. Pricing it costs one extra marking pass over the archives
 whenever the veto protects anything.
 
-Two ways retire it. A full `froe compact` rewrites the reachable head into a
-fresh generation, reclaims the older ones without any history veto, and
-truncates `journal.log` to a single line; it is the reliable option and the
-one to reach for first. Alternatively `--retain-journal-revisions N` keeps only
-the newest `N` resolvable revisions, removes the older lines, and releases
-their closure to the ordinary generation predicate—`N=1` leaves the current
-head as the only root, which is the closest standalone cleanup comes to Oak's
-own retention. The bound selects the journal task, because un-rooting a line
-without removing it would leave the run refusing its own plan; naming an
-explicit task set that excludes `journal` is refused rather than silently
-widened. It is also refused while planning when the same run would remove
-checkpoints: that removal installs a new head and appends its journal line, so
-a bound counted afterwards would retire the head the plan retained and abort
-the apply with the checkpoint removal already committed. Remove the
-checkpoints first, then bound the journal in a second run. The removed history
-is not recoverable afterwards. The segment sweep runs before the journal
-rewrite in the same run, so the numbered `journal.log.bak.NNN` copy restores
-the journal *file* but not the history: by the time it exists it names
-revisions whose segments are already unlinked. Take a repository backup first
-if the history matters. Whether the bound
-actually frees bytes still depends on the store: the released segments must be
-old enough for the generation predicate, and the archives holding them must
-still clear the 25% rewrite gate below.
+Every run retires it. The copy rewrites the reachable head into a fresh
+generation, reclaims the older ones without any history veto, and truncates
+`journal.log` to the single line naming the head it just published. There is no
+bound to set and no opt-in: retiring history is what a maintenance run does,
+because the segments behind the older revisions are exactly what it reclaims.
+
+The removed history is not recoverable from the store afterwards. The copy
+appends its own journal line before the retirement, so the numbered
+`journal.log.bak.NNN` holds the journal as it stood immediately before the
+rewrite — every earlier revision plus the compacted head. That restores the
+journal *file*, not the history: by the time it exists, the segments those
+revisions named are already unlinked. Take a repository backup first if the
+history matters.
 
 Checkpoint removal is a logical head update. The default segment sweep is
 planned and applied first against the pre-removal roots, so it does not claim
 bytes that become unreachable only after that new head is installed. The old
-head remains readable journal history and standalone cleanup deliberately
+head remains readable journal history and a run that did not compact would deliberately
 protects its complete closure, so removing the checkpoint does not by itself
-make those bytes eligible on a later cleanup pass. A subsequent full compaction
+make those bytes eligible on a later run. A subsequent full compaction
 (or another explicit history-retirement workflow) is required to retire that
 history and reclaim eligible storage. The outcome therefore reports the
 logical checkpoint count separately from physical archive bytes.
 
-Before planning a checkpoint head update, cleanup chooses the first archive
+Before planning a head update, the run chooses the first archive
 number above every physical Oak archive name in the directory. This includes
 zero-byte files, invalid or unselected archive letters, and both the lettered
 and letterless spellings of generation `a`; none can be silently reused. A
@@ -246,11 +256,11 @@ while planning, before mutation. If the certified first output number itself is
 256 MiB rotation threshold cannot allocate a second archive. That later failure
 is prefix-safe—the old journal head remains committed and the exclusive writer
 never wraps or overwrites another archive—but may leave finalized, unreferenced
-output for a subsequent cleanup pass.
+output for a subsequent run.
 
 ### Segment and TAR retention
 
-Standalone segment cleanup uses Oak's FULL-generation predicate with the
+Segment reclamation uses Oak's FULL-generation predicate with the
 current persisted committed head as the reference and retains two generations.
 Data segments old enough under that predicate may be marked; unreferenced bulk
 segments are discovered from a single store-wide reference graph. Readable
@@ -266,15 +276,17 @@ place. The plan and the summary report that population as `identified but
 retained` with its byte total, so a reclaimable estimate of zero can be told
 apart from a store that holds no garbage at all.
 
-The safety gate rejects cleanup rather than guessing when, for example, a
+The safety gate rejects the run rather than guessing when, for example, a
 current-head segment appears reclaimable, index and segment-header generations
 disagree, an active segment identifier occurs in more than one archive, an
 active archive has no index metadata at all, or a *live* surviving data segment
 would reference removed data.
 
 Live is the operative word there. A segment the mark phase proved reclaimable
-also survives whenever the rewrite gate declines to rewrite its archive, and
-such a segment may point at other reclaimed data — that is the ordinary state
+also survives whenever its archive cannot be rewritten — it is already at
+generation `z`, its next generation pathname is occupied, or Oak's savings
+heuristic was explicitly selected — and such a segment may point at other
+reclaimed data — that is the ordinary state
 Oak leaves behind every partial sweep, and nothing reachable reads it.
 Rejecting on those would abort reclamation on precisely the stores it exists
 for. What must not dangle is what is still reachable, and that is proved
@@ -288,11 +300,11 @@ one an operator is most likely to meet. Oak writes an archive's `.gph`, `.brf`,
 and index trailers only when it closes the archive, so a JVM killed with
 `SIGKILL`, an out-of-memory kill, or a yanked container leaves its newest
 archive complete but untrailered. froe's reader serves such an archive through
-a recovery scan; the generation decisions cleanup makes are not allowed to rest
+a recovery scan; the generation decisions the run makes are not allowed to rest
 on a scan, because a scan silently drops what it cannot read and generation
-cleanup deletes on the strength of it.
+froe deletes on the strength of it.
 
-Without `--task repair-archives`, cleanup refuses, and the refusal counts
+Without `--repair-archive-indexes`, the run refuses, and the refusal counts
 *every* affected archive number, states why the index was rejected, and says
 whether the newest one is among them — the distinction between a killed
 writer, where the bytes are all still there, and damage in the middle of a
@@ -302,7 +314,7 @@ read-only preview path, and under it when a caller prepares directly, in which
 case `repo.lock` itself may have been created — that file is the only thing a
 refusing run can leave behind.
 
-Selecting [`repair-archives`](#repairing-index-less-archives) makes cleanup
+Selecting [`repair-archives`](#repairing-index-less-archives) makes the run
 rebuild those indexes instead. `froe archives` reports each archive's index
 state read-only, and the tasks that do not consult generations — `journal`,
 `stale-archives`, `stale-temporaries` — still run against an affected store
@@ -315,14 +327,16 @@ leaves nothing but the name. It contributes no archive, blocks nothing, and
 
 If every segment in an archive is reclaimable, the whole archive can be
 removed only when no other letter for that archive number could be promoted by
-the removal. Otherwise it is rewritten to the next generation letter only
-when the surviving TAR-entry bytes pass Oak's exact Java signed-32-bit 25%
-savings calculation; at ordinary archive sizes this means *below* 75% of the
-original entry bytes, and equality is deferred. Rewrites use a non-active
-staging name and exclusively publish and validate the new archive before the
-old file is removed. Partial rewrites are also deferred when the archive is
-already at generation `z` or the next generation pathname is occupied. These
-deferrals are warnings, not repository health failures.
+the removal. Otherwise it is rewritten to the next generation letter, however
+little of the file that frees — see [Why froe rewrites archives Oak would
+leave alone](#why-froe-rewrites-archives-oak-would-leave-alone), and
+`--archive-rewrite-policy oak-savings-gate` to restore Oak's heuristic
+instead. Rewrites use a non-active staging name and exclusively publish and
+validate the new archive before the old file is removed. A partial rewrite is
+still deferred when the archive is already at generation `z` or the next
+generation pathname is occupied. Those deferrals are warnings, not repository
+health failures, and both commands name the archive, its reclaimable segment
+count and its bytes so the residue is never silent.
 
 Publishing a validated staging TAR uses an absent-only hard link in the same
 directory, so it never overwrites a path that appeared after planning. Dry-run
@@ -333,8 +347,49 @@ recognized `.cleaning.NNN` residue. Post-compaction archive rewrites performed
 by ordinary `froe compact` use the same publication protocol and therefore
 share this same-directory hard-link requirement.
 
-Standalone cleanup never appends to or changes `gc.log`; that log is reserved
-for completed compaction cycles.
+A run that compacts appends exactly one `gc.log` line recording the cycle it
+completed, and the final verification proves the file grew by that line and
+nothing else.
+
+## Why froe rewrites archives Oak would leave alone
+
+Apache Oak's `TarReader.sweep` rewrites an archive only when the surviving
+TAR-entry bytes fall below three quarters of the original — Java signed 32-bit
+arithmetic, equality deferred. froe reproduces that arithmetic exactly, and by
+default does not consult it.
+
+The gate protects no invariant. It is evaluated *after* the whole-file removal
+branch, so Oak already drops one hundred per cent of an archive with no gate at
+all while refusing to drop twenty-four per cent of one, and the rewrite itself
+is the same operation whatever volume it drops: the same survivor copy in
+original file-position order, the same graph and binary-reference trailers
+filtered from the existing ones, the same validated publication. What the gate
+buys is input/output economics for an online collector competing with a running
+repository.
+
+froe reclaims offline, under the exclusive repository lock, because an operator
+asked it to. On a store whose archives hold live binary content beside dead
+node segments — the ordinary shape of an AEM repository, because compaction
+re-links bulk segments where they lie instead of copying them — the surviving
+bytes never fall below three quarters, so the gate declines those archives on
+every run, forever. A `froe compact` followed by a `froe compact` could report
+hundreds of megabytes of correctly identified garbage and reclaim none of it.
+
+So the default is `--archive-rewrite-policy every-reclaimable-archive`: any
+archive holding a reclaimable segment is rewritten. `froe compact`'s own
+reclaim pass always behaves this way and has no flag — a compaction that leaves
+garbage no later command can remove defeats its own purpose. Pass
+`--archive-rewrite-policy oak-savings-gate` to `froe compact` to leave behind
+exactly what `oak-run compact` would.
+
+The cost is the generation-letter namespace. An archive number carries the
+letters `a` through `z`, a rewrite spends one, and only `froe compact` retiring
+the number replenishes them. In practice the pressure is mild: after a
+gate-less compaction a base archive holds nothing but referenced bulk segments,
+so it is rewritten again only when binary content is actually deleted from the
+repository, not on every garbage-collection run. An archive that does reach
+`z` is deferred, named in a warning, and counted on the summary line of both
+commands, so the residue a format limit forces is always visible.
 
 ## Opt-in tasks
 
@@ -342,7 +397,7 @@ Three categories are intentionally outside the defaults.
 
 ### Repairing index-less archives
 
-`--task repair-archives` rebuilds the index of an active archive that has
+`--repair-archive-indexes` rebuilds the index of an active archive that has
 none, which is the state described under [the safety
 gate](#an-active-archive-with-no-index-metadata). It is not a default because
 it rewrites an archive, and because a store damaged in the middle rather than
@@ -352,10 +407,8 @@ known gaps — is
 [`plans/repair-archives-safety-case.md`](plans/repair-archives-safety-case.md).
 
 ```console
-$ froe cleanup /path/to/segmentstore \
-    --task repair-archives \
-    --task journal --task segments --task stale-archives \
-    --task expired-checkpoints --task stale-temporaries
+$ froe compact /path/to/segmentstore \
+    --repair-archive-indexes
 ```
 
 Four things about it differ from every other task.
@@ -373,7 +426,7 @@ rebuild and everything the replan then finds.
 to a `<archive>.bak` name — `<archive>.2.bak` and so on if one exists already —
 so a repaired archive costs its own size again on disk, transiently twice.
 The plan states the figure. Retiring the backups is a *separate, later* run of
-`--task recovery-backups`, deliberately: repair and recovery-backups are
+the recovery-backup retention flags, deliberately: repair and those backups are
 refused together, because the run that made the only copy of unrecoverable
 bytes must not be the run that deletes it.
 
@@ -385,14 +438,14 @@ because the task was selected. The upgrade appears in the plan as
 afterwards.
 
 **An archive no scan can read stops the run.** If any index-less number holds
-bytes but yields no segment, cleanup refuses the whole run in the read-only
+bytes but yields no segment, the run refuses the whole run in the read-only
 preview rather than rebuilding the others first — the run cannot complete
 however it is retried, and the refusal names the file to move aside. Keep that
 file: it is the only copy of whatever it holds.
 
 The repair itself is reversible — every original is under a `.bak` — but the
 segment sweep it unblocks is not. Repair, run `froe check`, and only then
-cleanup, if you want those separated.
+runs, if you want those separated.
 
 ### Unreferenced checkpoints
 
@@ -401,8 +454,8 @@ string values under the content tree's `/:async` node. This is more
 application-specific than timestamp expiry, so it requires explicit selection:
 
 ```console
-$ froe cleanup /path/to/segmentstore \
-    --task unreferenced-checkpoints \
+$ froe compact /path/to/segmentstore \
+    --remove-unreferenced-checkpoints \
     --dry-run
 ```
 
@@ -421,9 +474,8 @@ zeroes:
 ```console
 # Backups only: keep the newest 3 per original target and consider only
 # backups at least 30 days old.
-$ froe cleanup /path/to/segmentstore \
-    --task recovery-backups \
-    --backup-min-age-days 30 \
+$ froe compact /path/to/segmentstore \
+    --backup-minimum-age-days 30 \
     --backup-keep-latest 3
 ```
 
@@ -438,12 +490,12 @@ above are grouped under that original archive and compete for the same slots,
 ordered by modification time; the unnumbered forms have no special priority.
 The two policy flags must be supplied together. Supplying them enables
 `recovery-backups` in addition to the selected task set; without any `--task`,
-that means backup cleanup is added to the five defaults. Future-dated backups
+that means recovery-backup retirement is enabled. Future-dated backups
 are never old; if modification times tie at the count boundary, the entire tie
 is retained because numbered suffixes cannot safely establish creation order.
 Any matching recovery-backup name denotes a managed file, so a directory,
 symlink, or other non-regular object at such a name makes planning fail closed,
-including during `--dry-run`; cleanup does not follow or remove it.
+including during `--dry-run`; froe does not follow or remove it.
 
 ## Deliberate exclusions
 
@@ -452,33 +504,33 @@ The default pass has a narrow managed-file allowlist:
 - Existing recovery backups are retained (although a journal rewrite creates
   a new numbered backup).
 - `gc.log` is byte-checked before and after and is never updated by standalone
-  cleanup.
-- Applying cleanup acquires `repo.lock` and may create the empty lock file if
+  a maintenance run.
+- Applying acquires `repo.lock` and may create the empty lock file if
   absent, but never writes, truncates, or deletes its contents. A newly created
   Unix lock is hardened and synced under a non-active
   `.repo.lock.creating.*` name before an absent-only hard link publishes it as
   mode `0600`; an existing lock's mode is left untouched. Interrupted creation
   can leave a harmless staging link or file which repository discovery ignores
-  and cleanup currently treats as an unknown, non-target path. Therefore apply,
+  and froe currently treats as an unknown, non-target path. Therefore apply,
   like every mutating froe command, requires same-directory hard-link and
   durable directory-fsync support when `repo.lock` is absent. It fails instead
   of using an unsafe fallback on an unsupported filesystem. Dry-run does not
   even acquire or create the canonical lock or a staging name.
-- Unknown files and directories are not cleanup targets.
+- Unknown files and directories are never targets.
 - External blob objects are outside the segment store and are never deleted;
   this is not blob garbage collection.
 
-Recognized managed paths must be regular files. Cleanup refuses symlinks and
+Recognized managed paths must be regular files. The run refuses symlinks and
 other unexpected file types rather than following them. The repository
 argument itself may be relative or pass through a symbolic-link alias: at API
 entry it is resolved once to an absolute canonical directory, that target is
 shown in the plan, and all later planning, locking, and mutation use the
 captured path. Retargeting the alias afterward cannot redirect a prepared
-cleanup session.
+maintenance session.
 
 ## Failures, deferrals, and reruns
 
-Cleanup is fail-closed. A missing manifest or journal, an invalid or unreadable
+The run is fail-closed. A missing manifest or journal, an invalid or unreadable
 current head, unsafe generation metadata, duplicate active segment IDs, an
 unexpected managed file type, or a repository change during planning causes an
 error instead of a speculative deletion. In the CLI, a no-action preview
@@ -486,22 +538,23 @@ returns successfully without taking the lock.
 
 Some residue is expected and safe:
 
-- the 25% gate, generation `z`, or an occupied next archive name can defer an
-  otherwise reclaimable archive (rerun after `stale-archives` removes a proven
-  occupied leftover);
+- generation `z` or an occupied next archive name can defer an otherwise
+  reclaimable archive (rerun after `stale-archives` removes a proven occupied
+  leftover); under `--archive-rewrite-policy oak-savings-gate`, so can the 25%
+  gate;
 - malformed checkpoint metadata is not selected by timestamp expiry (although
   the explicitly selected `unreferenced-checkpoints` policy can still remove
   that checkpoint); staging files that cannot be proved redundant are kept;
 - a non-`NotFound` open error or identity/certification mismatch for a planned
   stale archive is fatal before checkpoint or journal head mutation: the
   confirmed proof cannot authorize a different or uninspectable inode. If a
-  planned target is already absent, cleanup reports that externally satisfied
+  planned target is already absent, the run reports that externally satisfied
   but unconfirmed deletion separately and no retry is needed for that name. If
   unlinking a successfully recertified stale archive or other now-redundant old
   file fails, the retained target and operating-system detail are reported for
   a later retry. In both cases the validated repository remains usable, and
   the CLI calls the result partial and exits nonzero so unattended callers do
-  not mistake another actor's deletion or a deferred deletion for cleanup's
+  not mistake another actor's deletion or a deferred deletion for this run's
   own complete success.
 
 The command is designed to be rerun. A second pass can remove deletion residue
@@ -543,14 +596,14 @@ history-protection, reference, and reclaim sets whose size grows with the
 number of active segments and references, not just the number of TAR files.
 As a rough planning figure on a typical 64-bit build, opening the repository
 alone costs on the order of 70 bytes per active segment for index entries and
-the global location map, before allocator overhead, caches, and cleanup's
+the global location map, before allocator overhead, caches, and the run's
 additional sets and graph adjacency. Parsed-content caches are bounded and
 archive payloads are not copied wholesale into the heap, but mapped pages still
 consume address space and page cache as they are visited. Dry-run performs the
 same planning analysis and is a useful baseline under the intended resource
 limits; apply repeats that analysis under the lock and may need additional
 transient writer and verification state, so the dry-run peak is not an upper
-bound. An out-of-memory process kill is not an orderly cleanup error; keep
+bound. An out-of-memory process kill is not an orderly error; keep
 recovery headroom and an independent copy.
 
 The failure suite injects deterministic I/O errors and abrupt `_exit` process
@@ -561,7 +614,7 @@ tears sectors, lies about flushes, or replays a damaged filesystem journal;
 those scenarios require block-layer/VM power-cut testing. Keep an independent
 recoverable copy for important repositories.
 
-If segment cleanup refuses a generation invariant that an explicitly expired
+If segment the run refuses a generation invariant that an explicitly expired
 or unreferenced checkpoint is keeping reachable, run that checkpoint task by
 itself and verify the repository. Its previous head remains protected history;
 use full compaction when the operator is ready to retire that history and
@@ -572,13 +625,13 @@ physically reclaim it.
 The core library exposes the same split between preview and locked apply:
 
 ```rust
-use froe::{CleanupOptions, PreparedCleanup, plan_cleanup};
+use froe::{CompactionKind, CompactionOptions, PreparedCompaction, plan_compaction};
 use std::path::Path;
 
 fn main() -> froe::Result<()> {
     let directory = Path::new("/path/to/segmentstore");
-    let options = CleanupOptions::default();
-    let preview = plan_cleanup(directory, &options)?;
+    let options = CompactionOptions::default().with_compaction(CompactionKind::Full);
+    let preview = plan_compaction(directory, &options)?;
     println!("selected tasks: {:?}", preview.tasks());
     println!("{} planned actions", preview.actions().len());
     for removal in preview.journal_line_removals() {
@@ -587,11 +640,11 @@ fn main() -> froe::Result<()> {
 
     // Reuse the preview's captured target so an alias cannot redirect the
     // lock acquisition between the two API calls.
-    let prepared = PreparedCleanup::prepare(preview.directory(), options)?;
+    let prepared = PreparedCompaction::prepare(preview.directory(), options)?;
     // Interactive applications should compare/display prepared.plan() and
     // reconfirm if it differs from preview before calling apply().
     let outcome = prepared.apply()?;
-    println!("verified head after cleanup: {}", outcome.head_after);
+    println!("verified head after the run: {}", outcome.head_after);
     println!("{} orphan segments removed", outcome.removed_segments());
     if let Some(path) = outcome.journal_backup_path() {
         println!("journal recovery backup: {}", path.display());
@@ -606,13 +659,13 @@ fn main() -> froe::Result<()> {
 ```
 
 Every one of these has a `_with_progress` twin —
-`plan_cleanup_with_progress`, `PreparedCleanup::prepare_with_progress`,
-`PreparedCleanup::apply_with_progress`, `cleanup_with_progress` — taking a
+`plan_compaction_with_progress`, `PreparedCompaction::prepare_with_progress`,
+`PreparedCompaction::apply_with_progress`, `compact_with_progress` — taking a
 `froe::progress::ProgressObserver` that is told which step is running and
 how far it has got. The plain spellings above delegate to them with a
 discarding observer, so observation costs nothing when nobody is watching
 and never changes what an operation returns.
 
 For unattended callers that do not need an external confirmation boundary,
-`froe::cleanup(directory, options)` prepares under lock and applies the
+`froe::compact(directory, options)` prepares under lock and applies the
 authoritative plan directly.

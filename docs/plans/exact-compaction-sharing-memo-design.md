@@ -29,7 +29,19 @@ participates in; and bound the cost of a miss — a miss that re-walks a subtree
 containing further misses compounds, and a memo whose miss compounds is
 carrying an invariant, not an optimization.
 
-`check.rs` satisfies every clause and its rationale is written at `:682-683`.
+`check.rs` did **not** satisfy the third clause, although this document once
+asserted it did. Its memo inserted on completion and its guard was the separate
+`ancestors` set, but a miss re-walked the whole subtree below the missing
+record, and every miss inside that subtree compounded — so the memo was
+carrying an invariant while being evicted under a byte budget. The reported
+node count made the defect visible: the walk counted one node per memo miss, so
+a 58 GB AEM repository whose head held 18,796,598 nodes reported 56,389,743.
+For a super-root walk, which reaches the content root and every checkpoint
+snapshot root as sibling subtrees inside one traversal, *any* budget below the
+tree size gives roughly one full walk per root — not the near-total starvation
+this document describes for compaction. `NodeTreeVerifier` now uses the same
+exact, unbudgeted `PackedRecordSet` and counts at the certificate-issue site,
+so the reported number equals the certificate count by construction.
 
 ## What compaction had, and why it was wrong
 

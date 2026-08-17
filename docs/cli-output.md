@@ -10,14 +10,14 @@ The implementation is `froe::progress` (the observation API) and
 
 ## The streams are not interchangeable
 
-* **Standard output is data.** A cleanup plan, a JSON lines export, a
+* **Standard output is data.** A compaction plan, a JSON lines export, a
   node listing, a segment dump, a consistency report. Nothing else ever
   goes there. Piping any command into a consumer gives exactly what it
   gave before progress reporting existed, byte for byte.
 * **Standard error is everything else**: progress, status, warnings,
   errors, and confirmation prompts.
 
-`reporting_never_reaches_the_standard_output_of_a_cleanup_plan` pins this
+`reporting_never_reaches_the_standard_output_of_a_compaction_plan` pins this
 by running the same plan under `--progress always`, under the default,
 and under `--silent`, and requiring the three standard outputs to be
 byte-identical.
@@ -31,10 +31,10 @@ byte-identical.
 | Silent | `--silent` or `--progress never` | nothing |
 
 Reporting can never change what a command does. Standard error is a pipe
-often enough — `froe cleanup --yes 2>&1 | less`, quit early — and `main`
+often enough — `froe compact --yes 2>&1 | less`, quit early — and `main`
 restores SIGPIPE to its terminating disposition so that piping *data*
 into `head` ends quietly. Those two facts together once let a progress
-line kill a destructive cleanup between its mutations. The reporter's
+line kill a destructive run between its mutations. The reporter's
 writes, and only the reporter's, therefore suppress that signal: a closed
 stream yields `EPIPE` and the reporter falls silent for the rest of the
 run, rather than felling the process.
@@ -63,7 +63,7 @@ kernel behaves as `bsd/sys/fcntl.h` and `bsd/kern/sys_generic.c` say it
 does. CI's `macos-latest` job is that evidence, and it fails loudly
 either way: a wrong `fcntl` constant leaves `F_GETNOSIGPIPE` returning
 -1 so no guard is built, and an ineffective suppression fails
-`a_closed_standard_error_cannot_kill_a_destructive_cleanup` there.
+`a_closed_standard_error_cannot_kill_a_destructive_compaction` there.
 
 Reporting is deliberately conservative about the terminal:
 
@@ -83,6 +83,33 @@ Reporting is deliberately conservative about the terminal:
   characters are used.
 * The terminal width comes from `COLUMNS`, then from `TIOCGWINSZ` on
   Unix, then from an assumed 80 columns.
+
+## Numbers
+
+Counts carry thousands separators on both streams: `18,796,598 nodes`.
+
+Byte counts are scaled to binary (IEC) units with one decimal place, truncated
+toward zero so a figure never claims more than is there: `612.4 MiB`,
+`54.7 GiB`. Counts below one kibibyte keep their exact value and the plain
+noun — `512 bytes` — because at that size the exact number is both shorter and
+more useful. Binary units, not decimal: the format is binary throughout, a
+segment caps at 262144 bytes and an archive rotates at 256 MiB, and an operator
+comparing froe's figure against `du` needs the ambiguity of "GB" gone. The
+implementation is `froe::format_byte_size`, shared by the library warnings and
+the CLI so one rule serves both.
+
+Four renderings deliberately stay unscaled, because their exact integer is the
+thing being reported rather than a size an operator is comparing:
+
+* `froe summary`'s `archive bytes` and `froe segment`'s `size` print the scaled
+  figure *and* the exact count, one labelled value per line;
+* `froe archives` and `froe segments` print tabular rows whose fields are split
+  on whitespace by downstream consumers, so no field may gain a token;
+* `froe segment --debug`'s `Debug file {path}({length})` header reproduces
+  Oak's `oak-run debug` output byte-for-byte;
+* the `{-1 bytes}` / `{N bytes}` binary-size rendering in archive debug output
+  reproduces Oak's `AbstractPropertyState.getBinarySize`, and the
+  segment-size-limit diagnostic names an exact format boundary.
 
 ## Nothing is reported for work that finishes promptly
 
@@ -114,9 +141,9 @@ predates uniform reporting — and means exactly the same thing.
 It never suppresses:
 
 * **errors** — `silence_never_hides_an_error`;
-* **warnings** — a cleanup warning is a fact about the repository, not a
+* **warnings** — a maintenance warning is a fact about the repository, not a
   progress report;
-* **confirmation prompts** — a silenced destructive cleanup still prints
+* **confirmation prompts** — a silenced destructive run still prints
   its plan and still asks, in full:
   `silence_never_hides_the_destructive_confirmation_prompt`;
 * **any command's own output** on standard output.
@@ -132,8 +159,8 @@ Beyond that:
 
 | Command | Steps |
 | --- | --- |
-| `cleanup` (plan and locked replan) | `verifying the current head` (nodes), `analyzing journal revisions` (journal lines), `scanning for stale archives` (archives), `tracing segments reachable from the head` and `…from history` (segments), `planning segment reclamation` (archives), `pricing the journal-history protection` (archives, only when that protection holds something the head does not reach), `validating the prospective plan` (nodes), `scanning for stale temporary files` (files) |
-| `cleanup` (apply) | `checking archive indexes for repair` (archives, only with `--task repair-archives`, and before the plan exists; it counts every archive number examined, of which only the damaged ones are rebuilt), `opening archives`, `certifying source archives` (archives), `replanning segment reclamation`, `sweeping archives` (archives), `removing stale archives` (files), `removing checkpoints`, then the reopen / head verification / journal analysis triple — **twice** when the journal task is selected, once for the rewrite and once for the final proof — and only then `removing stale temporary files` and `removing old recovery backups` (files), which are deliberately the last mutation of all. Each removal step is reported only when its own task is selected |
+| `compact` (plan and locked replan) | `verifying the current head` (nodes), `analyzing journal revisions` (journal lines), `scanning for stale archives` (archives), `tracing segments reachable from the head` and `…from history` (segments), `predicting the shared binary content` (nodes) and `predicting the reclamation` (archives) — the read-only pass that lets the plan name the archives the run will remove or rewrite — `planning residue retirement` (archives, only when an interrupted earlier run left output ahead of the head), `scanning for stale temporary files` (files) |
+| `compact` (apply) | `checking archive indexes for repair` (archives, only with `--repair-archive-indexes`, and before the plan exists; it counts every archive number examined, of which only the damaged ones are rebuilt), `opening archives`, `retiring interrupted-compaction residue` (archives, only when there is any), `removing stale archives` (files), `certifying source archives` (archives), `copying nodes into a fresh generation` (nodes), `reclaiming old generations` (archives), then the reopen / head verification / journal analysis triple — **twice**, once for the journal retirement and once for the final proof — and only then `removing stale temporary files` and `removing old recovery backups` (files), which are deliberately the last mutation of all |
 | `compact` | `opening archives for writing`, `certifying source archives` (archives), `copying nodes into a fresh generation` (nodes), `reclaiming old generations` |
 | `backup`, `restore` | `opening archives for writing` for the target (archives), `copying nodes` (nodes) |
 | `checkpoint create\|remove\|remove-all\|remove-unreferenced` | `opening archives for writing` (archives) |
@@ -199,14 +226,14 @@ Known granularity limits, stated rather than hidden:
 
 | Guard and production callers | Named regression | Neutralization | Observed failing result |
 | --- | --- | --- | --- |
-| Reports never reach standard output. Every command; exercised through `cleanup --dry-run`, the plan an operator confirms a destructive run from. | `reporting_never_reaches_the_standard_output_of_a_cleanup_plan` | `Reporter::new` constructs with `std::io::stdout()` instead of `std::io::stderr()`. | The reported and silent standard outputs differ: every progress line is prepended to the plan. Four unrelated export tests also fail, their data streams contaminated. |
-| Silence never hides a destructive confirmation. `mutation::confirm`, reached by every mutating command; exercised through an interactive `cleanup --silent`. | `silence_never_hides_the_destructive_confirmation_prompt` | `confirm` writes the prompt through `Reporter::status`, which silence suppresses. | The test times out after 15s waiting for a prompt that never arrives, with the plan printed and the process blocked on an invisible question. |
-| The observed twin of an operation returns what the plain spelling returns. `plan_cleanup` / `plan_cleanup_with_progress`, and the same pairing for `cleanup`, `backup`, and the readers. | `an_observed_plan_equals_an_unobserved_one`, `an_observed_cleanup_equals_an_unobserved_one`, `an_observed_backup_equals_an_unobserved_one` | `plan_cleanup` stops delegating to `plan_cleanup_with_progress` and appends a warning of its own. | `assertion left == right failed: observation must not change the plan an operator confirms`, with the drifted warning shown in the diff. |
+| Reports never reach standard output. Every command; exercised through `compact --dry-run`, the plan an operator confirms a destructive run from. | `reporting_never_reaches_the_standard_output_of_a_compaction_plan` | `Reporter::new` constructs with `std::io::stdout()` instead of `std::io::stderr()`. | The reported and silent standard outputs differ: every progress line is prepended to the plan. Four unrelated export tests also fail, their data streams contaminated. |
+| Silence never hides a destructive confirmation. `mutation::confirm`, reached by every mutating command; exercised through an interactive `compact --silent`. | `silence_never_hides_the_destructive_confirmation_prompt` | `confirm` writes the prompt through `Reporter::status`, which silence suppresses. | The test times out after 15s waiting for a prompt that never arrives, with the plan printed and the process blocked on an invisible question. |
+| The observed twin of an operation returns what the plain spelling returns. `plan_compaction` / `plan_compaction_with_progress`, and the same pairing for `compact`, `backup`, and the readers. | `an_observed_plan_equals_an_unobserved_one`, `an_observed_compaction_equals_an_unobserved_one`, `an_observed_backup_equals_an_unobserved_one` | `plan_compaction` stops delegating to `plan_compaction_with_progress` and appends a warning of its own. | `assertion left == right failed: observation must not change the plan an operator confirms`, with the drifted warning shown in the diff. |
 | The reported sequence is well formed: advances inside a begin/end pair, counts never decreasing, never overshooting a declared total. Every observable operation. | `ObservationLog`, asserted on every call of all six `progress_api_tests` | (found a live defect rather than needing one injected) | `rewriting the journal: counts must not run backwards (0 after 8)` — two apply-path phases whose step wrapped inner steps. Fixed by rule 1 above. |
 | An animated line is erased before another writer takes the stream. `Reporter::while_suspended`, used by `mutation::confirm`. | `suspending_erases_the_live_line_before_the_borrower_writes` | (covered by the prompt guard's neutralization) | — |
-| Reporting never changes a command's outcome. `RenderState::write_line`, the reporter's only path onto the stream; reached by every command, exercised through a destructive `cleanup --yes` whose standard error is a pipe with no reader. | `a_closed_standard_error_cannot_kill_a_destructive_cleanup` | `write_line` writes without `without_sigpipe`. | The child dies of signal 13 (`ExitStatus(unix_wait_status(13))`) with the journal rewrite undone and `journal.log.bak.000` absent. |
+| Reporting never changes a command's outcome. `RenderState::write_line`, the reporter's only path onto the stream; reached by every command, exercised through a destructive `compact --yes` whose standard error is a pipe with no reader. | `a_closed_standard_error_cannot_kill_a_destructive_compaction` | `write_line` writes without `without_sigpipe`. | The child dies of signal 13 (`ExitStatus(unix_wait_status(13))`) with the journal rewrite undone and `journal.log.bak.000` absent. |
 | A bounded run never labels a revision past its own bound. `check_consistency_with_progress`, reached by `froe check --revisions N` over a journal containing an unresolvable line. | `a_bounded_check_never_labels_a_revision_past_its_bound` | The label uses `checked_revisions` rather than `checked_revisions.min(examinable)`. | `a bounded run advertised "checking revision 3 of 2", past its own bound`. |
-| A step whose work spans several calls keeps one running total. `NodeTreeVerifier::verify_with_progress`, used once per retained journal root by the cleanup planner's prospective-plan validation. | `a_verifier_reporting_several_roots_keeps_one_running_total` | The verifier resumes from `0` instead of its carried total. | `validating the prospective plan: counts must not run backwards (2 after 10)`. |
+| A step whose work spans several calls keeps one running total. `NodeTreeVerifier::verify_with_progress`, used per root by the planner's projected node count. | `a_verifier_reporting_several_roots_keeps_one_running_total` | The verifier resumes from `0` instead of its carried total. | `verifying the current head: counts must not run backwards (2 after 10)`. |
 | A run of short steps is neither silenced by a per-step deferral nor spammed into a log. `ReporterInner::render`. | `many_short_steps_are_neither_silenced_nor_spammed` | (bounded by the two assertions in the test itself, either side of the behaviour) | — |
 | A long step with no counter of its own still announces itself and completes when standard error is a log. `Ticker`, in the plain style; reached by compaction's reclamation sweep and the checkpoint removal. | `a_plain_step_that_never_advances_still_announces_and_completes` | `Ticker::start` is spawned only for `Style::Animated`, as it originally was. | The captured stream is empty: a ten-minute phase leaves no announcement and no completion line. |
 | `check` reports the nodes a revision resolves, not a revision counter that cannot move. `check_one_path` → `verify_subtree`. | `every_observable_reader_reports_through_the_same_trait` | `check_one_path` is passed a fresh `VerifiedNodeCount::new(&mut DiscardedProgress)` instead of the step's counter. | `the revision step counts the nodes it resolved, not a frozen revision count: None`. |

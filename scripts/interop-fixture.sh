@@ -10,7 +10,7 @@
 #   scripts/interop-fixture.sh             # run all phases in order
 #   scripts/interop-fixture.sh read        # run a single phase
 #   scripts/interop-fixture.sh compact     # (phases: generate, read,
-#   scripts/interop-fixture.sh cleanup     #  commit, checkpoint, compact,
+#   scripts/interop-fixture.sh compact     #  commit, checkpoint, compact,
 #   scripts/interop-fixture.sh backup      #  compact_tail,
 #   scripts/interop-fixture.sh recover     #  checkpoint_removal, cleanup,
 #                                          #  backup, recover)
@@ -56,7 +56,7 @@ else
     # Run a single phase.
     phase="$1"
     case "$phase" in
-        generate|read|checkpoint|commit|compact|compact_tail|checkpoint_removal|cleanup|backup|recover)
+        generate|read|checkpoint|commit|compact|compact_tail|checkpoint_removal|cleanup|journal_retention|repair|backup|recover)
             # generate must run first for all other phases.
             if [[ "$phase" != "generate" ]]; then
                 echo "Running 'generate' first (required by all phases)..."
@@ -67,7 +67,8 @@ else
         *)
             echo "Unknown phase: $phase" >&2
             echo "Phases: generate, read, commit, checkpoint, compact, compact_tail," >&2
-            echo "        checkpoint_removal, cleanup, backup, recover" >&2
+            echo "        checkpoint_removal, cleanup, journal_retention, repair," >&2
+            echo "        backup, recover" >&2
             exit 1
             ;;
     esac

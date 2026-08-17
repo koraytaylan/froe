@@ -14,13 +14,13 @@
 //! never-modify-in-place file protocol; an external process that truncates or
 //! rewrites an archive would disturb both froe and a running Oak instance.
 //!
-//! The mutating writing API ([`writer`]) covers commits, checkpoints, applying
-//! `cleanup`, compaction, backup, restore, and journal recovery. It takes the
-//! exclusive repository lock first, so it cannot race a cooperating running
-//! instance, and produces stores byte-for-byte compatible with Oak (apart from
-//! the documented extreme-subnormal rendering residue; see
-//! [`content::property::double_to_text`]). Planning `cleanup` is the read-only
-//! exception and never takes the lock. Run mutations only against a *stopped*
+//! The mutating writing API ([`writer`]) covers commits, checkpoints,
+//! compaction and the reclamation it performs, backup, restore, and journal
+//! recovery. It takes the exclusive repository lock first, so it cannot race a
+//! cooperating running instance, and produces stores byte-for-byte compatible
+//! with Oak (apart from the documented extreme-subnormal rendering residue;
+//! see [`content::property::double_to_text`]). Planning a compaction is the
+//! read-only exception and never takes the lock. Run mutations only against a *stopped*
 //! repository. The writer requires a Unix operating-system entropy source and
 //! therefore refuses to open on Windows.
 //!
@@ -67,7 +67,7 @@
 //! * [`gc_journal`] — optional garbage-collection history;
 //! * [`store`] — the assembled read-only repository.
 //!
-//! Long-running operations — opening a large store, planning a cleanup,
+//! Long-running operations — opening a large store, planning a compaction,
 //! compacting, checking consistency — have a `_with_progress` twin that
 //! reports what they are doing to a [`progress::ProgressObserver`], so a
 //! caller need not guess whether a silent minute means work or a hang.
@@ -82,11 +82,13 @@ pub mod error;
 pub mod gc_journal;
 pub mod hashing;
 pub mod journal;
+pub(crate) mod packed_records;
 pub mod progress;
 pub mod segment;
 pub mod store;
 pub mod tar_archive;
 pub mod tooling;
+pub mod units;
 pub mod writer;
 
 pub use content::{
@@ -101,11 +103,12 @@ pub use segment::{
     GarbageCollectionGeneration, RecordIdentifier, RecordType, SegmentIdentifier, SegmentKind,
 };
 pub use store::Repository;
+pub use units::format_byte_size;
 pub use writer::{
-    CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupOutcome, CleanupPlan,
-    CleanupTask, CompactionKind, CompactionOutcome, JournalLineRemoval, JournalRemovalReason,
-    PreparedCleanup, RecoveryBackupPolicy, RecoveryOutcome, StaleArchiveReason, WritableRepository,
-    backup, backup_with_progress, cleanup, cleanup_with_progress, compact, compact_with_progress,
-    plan_cleanup, plan_cleanup_with_progress, recover_journal, recover_journal_with_progress,
-    restore, restore_with_progress,
+    ArchiveRewritePolicy, CompactedGeneration, CompactionAction, CompactionKind, CompactionOptions,
+    CompactionOutcome, CompactionPlan, FileDeletionFailure, JournalLineRemoval,
+    JournalRemovalReason, PreparedCompaction, RecoveryBackupPolicy, RecoveryOutcome,
+    StaleArchiveReason, WritableRepository, backup, backup_with_progress, compact,
+    compact_with_progress, plan_compaction, plan_compaction_with_progress, recover_journal,
+    recover_journal_with_progress, restore, restore_with_progress,
 };

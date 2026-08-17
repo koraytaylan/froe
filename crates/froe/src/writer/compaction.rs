@@ -25,22 +25,26 @@
 //! compacted head — matching Oak's offline `compact` tool — so a
 //! subsequent AEM start resolves the compacted state directly.
 
-use std::io::Write;
-
 use crate::content::node::{NodeState, PropertyState, PropertyValues};
 use crate::content::property::{PropertyType, PropertyValue};
 use crate::content::provider::SegmentProvider;
 use crate::content::value::BinaryValue;
 use crate::error::{Error, Result};
-use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
-use crate::segment::identifier::SegmentIdentifier;
+use crate::packed_records::SegmentInterner;
+use crate::progress::{DiscardedProgress, ProgressObserver};
+#[cfg(test)]
+use crate::progress::{Step, WorkUnit};
 use crate::segment::record::RecordIdentifier;
 use crate::writer::record_writer::{
     ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
     sort_properties_for_template,
 };
 use crate::writer::segment_builder::GarbageCollectionGeneration;
-use crate::writer::store_writer::WritableRepository;
+#[cfg(test)]
+use crate::writer::store_writer::{
+    ArchiveRewritePolicy, GenerationReclaimRequest, RETAINED_GENERATIONS, ReclaimRule,
+    WritableRepository,
+};
 
 /// The kind of compaction to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,9 +55,10 @@ pub enum CompactionKind {
     Tail,
 }
 
-/// The outcome of a compaction.
+/// The outcome of the test-only compaction primitive.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompactionOutcome {
+pub(crate) struct CompactionOutcome {
     /// Bytes occupied by archives before compaction.
     pub size_before: u64,
     /// Bytes occupied by archives after compaction and cleanup.
@@ -101,9 +106,45 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
     source_root: RecordIdentifier,
     observer: &mut dyn ProgressObserver,
 ) -> Result<(RecordIdentifier, u64)> {
+    deep_copy_super_root_with_progress(
+        source,
+        writer,
+        source_root,
+        &std::collections::BTreeSet::new(),
+        observer,
+    )
+}
+
+/// Deep-copies a super-root, omitting the named checkpoints.
+///
+/// A checkpoint a maintenance run retires is never entered, so neither its
+/// snapshot root nor any record only it reaches is copied. This is how
+/// expiry happens: not by rewriting the live head first — which would move
+/// the head twice, append a second journal line, and strand records at the
+/// old generation inside an archive the reclaim pass never sweeps — but
+/// simply by declining to carry them into the fresh generation. A subtree a
+/// retired checkpoint shares with the content root, or with a checkpoint
+/// that stays, is still copied through those.
+///
+/// `omitted_checkpoints` names children of the super-root's `checkpoints`
+/// container. Any other name in the set is silently absent from the tree and
+/// therefore has no effect.
+///
+/// # Panics
+///
+/// Panics on the same copy-once violations as [`deep_copy_tree_with_progress`].
+pub fn deep_copy_super_root_with_progress<Sink: SegmentSink>(
+    source: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    super_root: RecordIdentifier,
+    omitted_checkpoints: &std::collections::BTreeSet<String>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(RecordIdentifier, u64)> {
+    let source_root = super_root;
     let mut copier = Compactor {
         source,
         writer,
+        omitted_checkpoints,
         segments: SegmentInterner::new(),
         rewritten_nodes: RewrittenNodes::new(),
         nodes_on_path: std::collections::HashSet::new(),
@@ -135,58 +176,6 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
 
 /// How many nodes a deep copy rewrites between progress reports.
 const COPIED_NODE_REPORT_STRIDE: u64 = 512;
-
-/// Maps each segment identifier met during one compaction to a small index,
-/// so the memo can hold four bytes where a `SegmentIdentifier` holds sixteen.
-///
-/// The cost is per *segment*, not per node — a 25 GB store names on the order
-/// of 250k of them — which is why this is affordable where storing the UUID
-/// in every entry is not. Index 0 is never issued, so a packed key of zero is
-/// unambiguously an empty slot.
-struct SegmentInterner {
-    indices: std::collections::HashMap<SegmentIdentifier, u32>,
-    identifiers: Vec<SegmentIdentifier>,
-}
-
-impl SegmentInterner {
-    fn new() -> Self {
-        Self {
-            indices: std::collections::HashMap::new(),
-            // Index 0 is the never-issued sentinel; this placeholder keeps
-            // `identifiers[index]` addressable without an offset everywhere.
-            identifiers: vec![SegmentIdentifier {
-                most_significant_bits: 0,
-                least_significant_bits: 0,
-            }],
-        }
-    }
-
-    fn index_of(&mut self, segment: SegmentIdentifier) -> u32 {
-        if let Some(index) = self.indices.get(&segment) {
-            return *index;
-        }
-        let index = u32::try_from(self.identifiers.len()).expect("segments per compaction fit u32");
-        self.identifiers.push(segment);
-        self.indices.insert(segment, index);
-        index
-    }
-
-    fn identifier(&self, index: u32) -> SegmentIdentifier {
-        self.identifiers[index as usize]
-    }
-
-    /// Packs an interned record into the eight bytes the memo stores.
-    fn pack(&mut self, record: RecordIdentifier) -> u64 {
-        u64::from(self.index_of(record.segment)) << 32 | u64::from(record.record_number)
-    }
-
-    fn unpack(&self, packed: u64) -> RecordIdentifier {
-        RecordIdentifier {
-            segment: self.identifier((packed >> 32) as u32),
-            record_number: packed as u32,
-        }
-    }
-}
 
 /// Source node to its rewritten copy, exactly and without eviction.
 ///
@@ -293,6 +282,9 @@ impl RewrittenNodes {
 struct Compactor<'writer, Sink: SegmentSink> {
     source: &'writer dyn SegmentProvider,
     writer: &'writer mut RecordWriter<Sink>,
+    /// Children of the super-root's `checkpoints` container this copy never
+    /// enters. Empty for every copy that is not a maintenance run's.
+    omitted_checkpoints: &'writer std::collections::BTreeSet<String>,
     /// Interns the segments both the memo and the path set name.
     segments: SegmentInterner,
     /// Source record to its rewritten copy — exact, so each distinct node is
@@ -357,6 +349,22 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
             if let Some((name, child)) = next {
                 match self.enter(child)? {
                     Entered::Fresh(mut frame) => {
+                        // The `checkpoints` container directly under the
+                        // super-root is the one node whose child *names* this
+                        // copy reads. A retired checkpoint is dropped here,
+                        // before the frame is pushed, so the walk never enters
+                        // it. A memo hit cannot bypass this: the container is
+                        // reached exactly once per copy, and `Memoized` means
+                        // the node was already emitted — which for the
+                        // container can only happen after this filter ran.
+                        if stack.len() == 1
+                            && name == "checkpoints"
+                            && !self.omitted_checkpoints.is_empty()
+                        {
+                            frame.pending_children.retain(|(checkpoint, _)| {
+                                !self.omitted_checkpoints.contains(checkpoint)
+                            });
+                        }
                         frame.name_in_parent = Some(name);
                         stack.push(frame);
                     }
@@ -524,21 +532,35 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
     }
 }
 
-/// Compacts the repository in place: deep-copies the head into a fresh
-/// generation, swaps the head, reclaims the old generations, and
-/// rewrites the journal to a single line.
-pub fn compact(store: &mut WritableRepository, kind: CompactionKind) -> Result<CompactionOutcome> {
+/// Compacts an open session in place: deep-copies the head into a fresh
+/// generation, swaps the head, reclaims the old generations, and rewrites the
+/// journal to a single line.
+///
+/// Not the shipped entry point — `froe compact` plans, confirms and applies
+/// under one lock through `writer::maintenance`, and this performs no
+/// planning, takes no lock and asks nothing. It survives as the focused
+/// primitive the copy-and-reclaim unit tests drive directly, so a failure in
+/// the deep copy is diagnosed where it happens rather than through a whole
+/// maintenance run.
+#[cfg(test)]
+pub(crate) fn compact(
+    store: &mut WritableRepository,
+    kind: CompactionKind,
+) -> Result<CompactionOutcome> {
     compact_with_progress(store, kind, &mut DiscardedProgress)
 }
 
 /// Compacts exactly like [`compact`], reporting the deep copy, the
 /// reclamation sweep, and the journal rewrite to `observer`.
 ///
+/// Test-only for the same reason as [`compact`].
+///
 /// The memo maps each source node to its rewritten copy and is exact, so a
 /// subtree the live root and a checkpoint both reference is copied once and
 /// `compacted_nodes` equals the number of distinct node records reachable
 /// from the head.
-pub fn compact_with_progress(
+#[cfg(test)]
+pub(crate) fn compact_with_progress(
     store: &mut WritableRepository,
     kind: CompactionKind,
     observer: &mut dyn ProgressObserver,
@@ -565,10 +587,16 @@ pub fn compact_with_progress(
     };
 
     // Refuse damaged base payloads or incomplete graph/BRF trailers before
-    // allocating the compacted copy. Reclamation certifies them again at its
-    // mutation boundary, but doing the first pass here prevents every retry
-    // against a pre-existing defect from durably appending another full copy.
-    store.preflight_reclaim_sources_with_progress(observer)?;
+    // allocating the compacted copy: without this pass, every retry against a
+    // pre-existing defect durably appends another full copy before failing.
+    //
+    // The proof travels to reclamation, which would otherwise re-derive the
+    // identical certificate over the identical bytes. Nothing between here and
+    // there writes to a base archive — the deep copy only appends new ones —
+    // and each source is certified again through a fresh no-follow descriptor
+    // immediately before it is mutated, which is the certificate that actually
+    // guards the sweep.
+    let certified_sources = store.preflight_reclaim_sources_with_progress(observer)?;
 
     let mut writer = store.record_writer_with_identifier(target_generation, "c");
     let (new_head, compacted_nodes) = crate::progress::observe(
@@ -591,7 +619,18 @@ pub fn compact_with_progress(
     crate::progress::observe(
         observer,
         &Step::new("reclaiming old generations", WorkUnit::Archives),
-        |_observer| store.reclaim_old_generations(target_generation, kind == CompactionKind::Full),
+        |_observer| {
+            store.reclaim_old_generations_with(GenerationReclaimRequest {
+                rule: ReclaimRule {
+                    reference: target_generation,
+                    full: kind == CompactionKind::Full,
+                    retained_generations: RETAINED_GENERATIONS,
+                },
+                rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
+                certified_sources: Some(&certified_sources),
+                expected: None,
+            })
+        },
     )?;
     rewrite_journal_to_head(store, new_head)?;
 
@@ -616,6 +655,7 @@ pub fn compact_with_progress(
 
 /// Appends one line to `gc.log`:
 /// `repoSize,reclaimedSize,timestamp,generation,fullGeneration,nodes,root`.
+#[cfg(test)]
 fn append_gc_log(
     store: &WritableRepository,
     repository_size: u64,
@@ -624,18 +664,49 @@ fn append_gc_log(
     compacted_nodes: u64,
     root: RecordIdentifier,
 ) -> Result<()> {
-    use std::io::Write;
+    let line = garbage_collection_log_entry(
+        repository_size,
+        reclaimed_size,
+        generation,
+        compacted_nodes,
+        root,
+    );
+    append_garbage_collection_log_entry(store.directory(), &line)
+}
+
+/// Oak's seven-field `gc.log` line for one completed compaction cycle:
+/// `repoSize,reclaimedSize,timestamp,generation,fullGeneration,nodes,root`.
+///
+/// Built separately from the append so a caller can hold the exact bytes it
+/// wrote and prove afterwards that the file grew by those and nothing else.
+/// The timestamp makes the line unreproducible, which is why proving it after
+/// the fact means remembering it rather than recomputing it.
+pub(crate) fn garbage_collection_log_entry(
+    repository_size: u64,
+    reclaimed_size: u64,
+    generation: GarbageCollectionGeneration,
+    compacted_nodes: u64,
+    root: RecordIdentifier,
+) -> String {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
-    let line = format!(
+    format!(
         "{repository_size},{reclaimed_size},{timestamp},{},{},{compacted_nodes},{}:{}\n",
         generation.generation, generation.full_generation, root.segment, root.record_number as i32,
-    );
+    )
+}
+
+/// Appends one already-built entry to `gc.log`, durably.
+pub(crate) fn append_garbage_collection_log_entry(
+    directory: &std::path::Path,
+    line: &str,
+) -> Result<()> {
+    use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(store.directory().join("gc.log"))?;
+        .open(directory.join("gc.log"))?;
     file.write_all(line.as_bytes())?;
     file.sync_data()?;
     Ok(())
@@ -645,7 +716,9 @@ fn append_gc_log(
 /// offline compact tool. The store's own journal handle is bypassed so
 /// the truncation is atomic from the reader's perspective (write to a
 /// temporary file, then rename over the original).
+#[cfg(test)]
 fn rewrite_journal_to_head(store: &WritableRepository, head: RecordIdentifier) -> Result<()> {
+    use std::io::Write as _;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
@@ -682,7 +755,9 @@ pub(crate) fn fsync_directory(directory: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactionKind, compact, deep_copy_tree_with_progress};
+    use super::{
+        CompactionKind, compact, deep_copy_super_root_with_progress, deep_copy_tree_with_progress,
+    };
     use crate::content::node::PropertyValues;
     use crate::content::property::PropertyValue;
     use crate::content::provider::SegmentProvider;
@@ -827,6 +902,234 @@ mod tests {
             .expect("read")
             .expect("snapshot");
         assert!(snapshot.child_node("content").expect("read").is_some());
+    }
+
+    /// Builds a store whose super-root carries a content root and three
+    /// checkpoints, and returns the checkpoint names in creation order.
+    fn build_store_with_checkpoints(directory: &TestDirectory) -> Vec<String> {
+        build_populated_store(directory);
+        let store = WritableRepository::open(&directory.path).expect("open for checkpoints");
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            names.push(
+                create_checkpoint(&store, 60 * 60 * 1000, &[]).expect("create the checkpoint"),
+            );
+        }
+        store.close().expect("close after checkpoints");
+        names
+    }
+
+    /// Every child name a node has, in stored order.
+    fn child_names(node: &crate::content::node::NodeState<'_>) -> Vec<String> {
+        node.child_node_entries()
+            .expect("enumerate the children")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Copies a repository directory, so two mechanisms can be applied to the
+    /// same store. Checkpoint names are randomly generated, so a fixture built
+    /// twice is not the same fixture and the two results cannot be compared.
+    fn copy_repository(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).expect("create the copy directory");
+        for entry in std::fs::read_dir(source).expect("list the source store") {
+            let entry = entry.expect("read the directory entry");
+            if entry.file_type().expect("file type").is_file() {
+                std::fs::copy(entry.path(), target.join(entry.file_name()))
+                    .expect("copy a repository file");
+            }
+        }
+        // `repo.lock` is a live artefact, never part of the copy.
+        let _ = std::fs::remove_file(target.join("repo.lock"));
+    }
+
+    /// A copy that omits a checkpoint must land on the same tree as removing
+    /// that checkpoint from the head first and then copying — two independent
+    /// mechanisms, one of which (`remove_checkpoints`) is the commit path Oak's
+    /// own checkpoint removal mirrors. Both run against copies of one store,
+    /// because checkpoint names are random and a fixture built twice carries
+    /// different ones.
+    #[test]
+    fn a_copy_that_omits_a_checkpoint_reproduces_every_other_child_exactly() {
+        let source = TestDirectory::new("omit-checkpoint-source");
+        let names = build_store_with_checkpoints(&source);
+        let dropped = names[1].clone();
+
+        let omitting = TestDirectory::new("omit-checkpoint-copy");
+        copy_repository(&source.path, &omitting.path);
+        let removing = TestDirectory::new("omit-checkpoint-removal");
+        copy_repository(&source.path, &removing.path);
+
+        let (omitted_head, omitted_nodes) = {
+            let store = WritableRepository::open(&omitting.path).expect("open the omitting store");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let (head, nodes) = deep_copy_super_root_with_progress(
+                &store,
+                &mut writer,
+                store.head(),
+                &std::collections::BTreeSet::from([dropped.clone()]),
+                &mut crate::progress::DiscardedProgress,
+            )
+            .expect("copy while omitting one checkpoint");
+            writer.finish().expect("finish");
+            assert!(store.set_head(store.head(), head));
+            store.flush().expect("flush");
+            store.close().expect("close the omitting store");
+            (head, nodes)
+        };
+
+        let (removed_head, removed_nodes) = {
+            let store = WritableRepository::open(&removing.path).expect("open the removing store");
+            crate::writer::commit::remove_checkpoints(&store, std::slice::from_ref(&dropped))
+                .expect("remove the checkpoint from the live head");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let (head, nodes) = deep_copy_tree_with_progress(
+                &store,
+                &mut writer,
+                store.head(),
+                &mut crate::progress::DiscardedProgress,
+            )
+            .expect("copy the already-reduced head");
+            writer.finish().expect("finish");
+            assert!(store.set_head(store.head(), head));
+            store.flush().expect("flush");
+            store.close().expect("close the removing store");
+            (head, nodes)
+        };
+
+        let omitted = Repository::open(&omitting.path).expect("reopen the omitting store");
+        let removed = Repository::open(&removing.path).expect("reopen the removing store");
+        let omitted_root = omitted.node(omitted_head);
+        let removed_root = removed.node(removed_head);
+        assert_eq!(
+            child_names(&omitted_root),
+            child_names(&removed_root),
+            "the super-root carries the same children either way"
+        );
+
+        let omitted_checkpoints = omitted_root
+            .child_node("checkpoints")
+            .expect("read")
+            .expect("present");
+        let removed_checkpoints = removed_root
+            .child_node("checkpoints")
+            .expect("read")
+            .expect("present");
+        let mut surviving = child_names(&omitted_checkpoints);
+        let mut expected = child_names(&removed_checkpoints);
+        surviving.sort();
+        expected.sort();
+        assert_eq!(
+            surviving, expected,
+            "exactly the same checkpoints survive both mechanisms"
+        );
+        assert!(
+            !surviving.contains(&dropped),
+            "the retired checkpoint is gone: {surviving:?}"
+        );
+        // Record addresses differ between two stores by construction, so the
+        // equivalence that means something is the shape: both mechanisms copy
+        // the same number of distinct nodes, and every surviving checkpoint
+        // still resolves its snapshot.
+        assert_eq!(
+            omitted_nodes, removed_nodes,
+            "both mechanisms copy the same tree, so the same number of distinct nodes"
+        );
+        for name in &surviving {
+            for (label, container) in [
+                ("omitted", &omitted_checkpoints),
+                ("removed", &removed_checkpoints),
+            ] {
+                let checkpoint = container
+                    .child_node(name)
+                    .expect("read the checkpoint")
+                    .unwrap_or_else(|| panic!("{label} store keeps checkpoint {name}"));
+                assert!(
+                    checkpoint
+                        .child_node("root")
+                        .expect("read the snapshot")
+                        .is_some(),
+                    "{label} store resolves the snapshot of checkpoint {name}"
+                );
+            }
+        }
+    }
+
+    /// A checkpoint whose subtree nothing else reaches costs exactly its own
+    /// distinct records, and none of them reaches the output.
+    #[test]
+    fn an_omitted_checkpoint_leaves_its_exclusive_records_uncopied() {
+        let directory = TestDirectory::new("omit-exclusive-records");
+        let names = build_store_with_checkpoints(&directory);
+        let store = WritableRepository::open(&directory.path).expect("open");
+
+        let generation = store.writing_generation().expect("generation");
+        let mut whole_writer = store.record_writer(generation);
+        let (_, whole) = deep_copy_super_root_with_progress(
+            &store,
+            &mut whole_writer,
+            store.head(),
+            &std::collections::BTreeSet::new(),
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect("copy everything");
+        whole_writer.finish().expect("finish");
+
+        let mut reduced_writer = store.record_writer(generation);
+        let (_, reduced) = deep_copy_super_root_with_progress(
+            &store,
+            &mut reduced_writer,
+            store.head(),
+            &std::collections::BTreeSet::from([names[0].clone()]),
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect("copy while omitting one checkpoint");
+        reduced_writer.finish().expect("finish");
+
+        assert!(
+            reduced < whole,
+            "omitting a checkpoint copies strictly fewer nodes: {reduced} against {whole}"
+        );
+        store.close().expect("close");
+    }
+
+    /// A subtree the retired checkpoint shares with the live content root is
+    /// still copied — through the root. Omission drops a name, not a subtree.
+    #[test]
+    fn omitting_a_shared_subtree_still_copies_it_through_the_live_root() {
+        let directory = TestDirectory::new("omit-shared-subtree");
+        let names = build_store_with_checkpoints(&directory);
+        let store = WritableRepository::open(&directory.path).expect("open");
+
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let (head, _) = deep_copy_super_root_with_progress(
+            &store,
+            &mut writer,
+            store.head(),
+            &std::collections::BTreeSet::from([names[0].clone()]),
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect("copy while omitting one checkpoint");
+        writer.finish().expect("finish");
+        assert!(store.set_head(store.head(), head));
+        store.flush().expect("flush");
+        store.close().expect("close");
+
+        // The checkpoints snapshot the same content root, so the content the
+        // retired one pointed at is still fully readable through `root`.
+        let repository = Repository::open(&directory.path).expect("reopen");
+        let content = repository
+            .node_at_path("/content")
+            .expect("resolve the content")
+            .expect("the shared content survives the omission");
+        assert!(
+            content.child_node_count().expect("count") > 0,
+            "the shared subtree is intact"
+        );
     }
 
     #[test]

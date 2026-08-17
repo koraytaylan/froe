@@ -17,7 +17,10 @@ pub(crate) fn print_summary(repository: &Repository) -> froe::Result<()> {
         .iter()
         .map(froe::tar_archive::TarArchiveReader::file_size)
         .sum();
-    println!("archive bytes     {total_size}");
+    println!(
+        "archive bytes     {} ({total_size})",
+        froe::format_byte_size(total_size)
+    );
     let mut data_segments = 0usize;
     let mut bulk_segments = 0usize;
     for identifier in repository.segment_identifiers() {
@@ -123,7 +126,11 @@ pub(crate) fn print_segment(
     let structure = &view.structure;
     println!("segment           {identifier}");
     println!("kind              {:?}", structure.kind);
-    println!("size              {} bytes", structure.size);
+    println!(
+        "size              {} ({} bytes)",
+        froe::format_byte_size(structure.size as u64),
+        structure.size
+    );
     match structure.version {
         Some(version) => println!("format version    {version}"),
         None => println!("format version    none (bulk segments have no header)"),

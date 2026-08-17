@@ -53,7 +53,10 @@ const MAXIMUM_DEDUPLICATED_VALUE_BYTES: usize = 1024;
 const SMALL_VALUE_LIMIT: usize = 128;
 
 /// Lengths below this use the two-byte medium value encoding.
-const MEDIUM_VALUE_LIMIT: usize = (1 << 14) + 128;
+/// The length at or above which a binary is stored as a block list rather
+/// than materialized. Read by the reclamation prediction, which must apply the
+/// same threshold `copy_binary_value` does or its answer is wrong.
+pub(crate) const MEDIUM_VALUE_LIMIT: usize = (1 << 14) + 128;
 
 /// Maximum identifiers per list bucket.
 const LIST_BUCKET_CAPACITY: usize = 255;

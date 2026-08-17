@@ -318,6 +318,18 @@ file lengths. `beforeSize * 3 / 4` is Java `int` arithmetic: multiply first
 file size overflow cannot occur; a port must still not "fix" the expression to
 floating point (use 64-bit or the exact int sequence).
 
+> **froe deviation (predicate only, never arithmetic).** froe reproduces this
+> calculation byte-exactly in `ArchiveRewritePolicy::OakSavingsGate`
+> (`store_writer.rs`, `oak_sweep_threshold`/`oak_sweep_defers`), unit-pinned by
+> `the_oak_savings_gate_defers_at_exactly_twenty_five_percent` and
+> `sweep_gate_reproduces_java_signed_i32_wrap_and_rejects_larger_domains`.
+> froe's *default* policy does not evaluate the predicate at all: an offline,
+> operator-invoked reclamation rewrites every archive holding a reclaimable
+> entry. The reasoning, and the generation-letter cost, are in
+> `docs/compact.md`, "Why froe rewrites archives Oak would leave alone". Every
+> other rule of §4 — the whole-file branch ordering, the `z` cap, file-position
+> order, trailer filtering, validated reopen — is unchanged.
+
 ### 4.2 Rewriting the next generation
 
 ```
@@ -653,6 +665,20 @@ reads, and never cache lookups across the swap.
    the head super-root (which includes all checkpoints) is reclaimable.
    Verify before deleting: the journal head's segment generation must satisfy
    `¬reclaim(headGen)`.
+
+   > **froe deviation (retention value, never the predicate).** froe's one
+   > maintenance command always deep-copies the head into the reference
+   > generation before it sweeps, and always runs at `retainedGenerations = 1`
+   > — the value Oak's own `SegmentGCOptions.setOffline()` uses
+   > (`write-compaction.md` §4, lines 486 and 531). At that value this
+   > invariant no longer follows from the predicate: the predicate decides only
+   > which *older* generations are reclaimable, and whether the head reaches
+   > one is a property of the store. froe proves it per run instead, with
+   > `validate_reclaim_reference_invariant`, which re-evaluates the identical
+   > predicate over the head's transitive segment closure using the same
+   > `ReclaimRule` value the mark phase consumes, and refuses before any
+   > mutation. The predicate arithmetic itself (§5) is unchanged. See
+   > `docs/compact.md`.
 3. **Bulk segments** may be removed only if unreachable through the union of
    (a) graph edges from every *kept* data segment across **all** tar files and
    (b) any externally supplied seed set. Visit tars newest-index→oldest and
@@ -700,7 +726,9 @@ reads, and never cache lookups across the swap.
 12. **All comparisons in 32-bit wrapping int arithmetic**: generation deltas
     (`h.g − s.g >= n`) and the 25% rule (`afterSize >= beforeSize * 3 / 4`)
     follow Java `int` semantics; sizes in the 25% rule count only
-    `512 + len + pad(len)` per segment entry.
+    `512 + len + pad(len)` per segment entry. (froe applies the 25% rule only
+    under `ArchiveRewritePolicy::OakSavingsGate`; see the deviation note in
+    §4.1. The generation-delta arithmetic is unconditional.)
 13. **Invalidate caches across the swap**: any in-process segment or id cache
     keyed on pre-cleanup files must be dropped before serving reads, so a
     reclaimed segment can never be returned from cache after its file is gone.

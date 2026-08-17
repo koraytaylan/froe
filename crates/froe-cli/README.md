@@ -11,7 +11,7 @@ read-only and safe against a live repository (like Oak, archives are
 memory-mapped under the store's never-modify-in-place file protocol; a
 process mutating archives outside that protocol would disturb froe and a
 running Oak instance alike). Mutating maintenance commands (`compact`,
-applying `cleanup`, `backup`, `restore`, `recover-journal`, and checkpoint
+`compact`, `backup`, `restore`, `recover-journal`, and checkpoint
 mutation) take the exclusive repository lock, so they must run against a
 *stopped* repository and ask for confirmation first. These commands require a
 Unix operating-system entropy source and refuse to run on Windows; the
@@ -30,7 +30,7 @@ Still unverified against a live instance: `store.version=1` stores, external
 blob stores, native macOS or Windows execution, and Adobe AEM itself, which
 ships its own Oak build. Maintenance still requires a stopped repository, and
 keeping a copy before a destructive operation on irreplaceable data remains
-ordinary prudence. `froe cleanup --dry-run` is strictly read-only: it neither
+ordinary prudence. `froe compact --dry-run` is strictly read-only: it neither
 creates nor acquires `repo.lock`.
 
 Two low-level interoperability diagnostics mirror Oak's segment tooling:

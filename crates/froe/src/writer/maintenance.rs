@@ -41,6 +41,7 @@ use crate::tar_archive::archive::TarArchiveReader;
 use crate::tar_archive::file_name::{ArchiveFileName, group_file_generations_newest_first};
 use crate::tooling::NodeTreeVerifier;
 use crate::writer::commit::remove_checkpoints;
+use crate::writer::compaction::CompactionKind;
 use crate::writer::journal_maintenance::{
     JournalRewriteOutcome, RawJournal, RawJournalLine, RawJournalLineClassification,
     rewrite_journal_atomically, scan_raw_journal, scan_raw_journal_file,
@@ -48,11 +49,11 @@ use crate::writer::journal_maintenance::{
 use crate::writer::repository_lock::RepositoryLock;
 use crate::writer::segment_builder::GarbageCollectionGeneration;
 use crate::writer::store_writer::{
-    PlannedArchiveSweep, StandaloneSegmentCleanupOutcome, StandaloneSegmentCleanupPlan,
-    WritableRepository, apply_standalone_segment_cleanup, certify_active_archive,
-    certify_active_archives_with_progress, is_reclaimable, next_cleanup_archive_number,
-    plan_standalone_segment_cleanup, planned_unavailable_segments, preserve_file_metadata,
-    sync_directory_strict,
+    ArchiveRewritePolicy, PlannedArchiveSweep, ReclaimRule, StandaloneSegmentCompactionOutcome,
+    StandaloneSegmentCompactionPlan, WritableRepository, apply_standalone_segment_cleanup,
+    certify_active_archive, certify_active_archives_with_progress, is_reclaimable,
+    next_cleanup_archive_number, plan_standalone_segment_cleanup, planned_unavailable_segments,
+    preserve_file_metadata, sync_directory_strict,
 };
 
 /// How many segments a closure trace visits between progress reports.
@@ -63,7 +64,7 @@ const SEGMENT_TRACE_REPORT_STRIDE: u64 = 256;
 /// One independently selectable cleanup category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
-pub enum CleanupTask {
+pub(crate) enum MaintenanceTask {
     /// Remove parser-ignored, missing-segment, and unreadable historical
     /// journal lines while retaining every readable revision byte-for-byte.
     Journal,
@@ -92,7 +93,7 @@ pub enum CleanupTask {
     RepairArchives,
 }
 
-impl std::fmt::Display for CleanupTask {
+impl std::fmt::Display for MaintenanceTask {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
             Self::Journal => "journal",
@@ -149,31 +150,38 @@ impl RecoveryBackupPolicy {
 
 /// Cleanup selection and opt-in retention settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CleanupOptions {
-    tasks: BTreeSet<CleanupTask>,
+pub struct CompactionOptions {
+    tasks: BTreeSet<MaintenanceTask>,
     recovery_backup_policy: Option<RecoveryBackupPolicy>,
     journal_revision_retention: Option<NonZeroUsize>,
+    archive_rewrite_policy: ArchiveRewritePolicy,
+    compaction_kind: Option<CompactionKind>,
 }
 
-impl Default for CleanupOptions {
+impl Default for CompactionOptions {
     fn default() -> Self {
         Self {
             tasks: BTreeSet::from([
-                CleanupTask::Journal,
-                CleanupTask::Segments,
-                CleanupTask::StaleArchives,
-                CleanupTask::ExpiredCheckpoints,
-                CleanupTask::StaleTemporaries,
+                MaintenanceTask::Journal,
+                MaintenanceTask::Segments,
+                MaintenanceTask::StaleArchives,
+                MaintenanceTask::ExpiredCheckpoints,
+                MaintenanceTask::StaleTemporaries,
             ]),
             recovery_backup_policy: None,
             // Unbounded: every readable revision stays a tracing root, which
             // is the conservative default froe has always applied.
             journal_revision_retention: None,
+            // Reclaim everything the mark phase proves dead. An offline,
+            // operator-invoked run that identifies garbage and then declines to
+            // move it is the defect this default fixes.
+            archive_rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
+            compaction_kind: None,
         }
     }
 }
 
-impl CleanupOptions {
+impl CompactionOptions {
     /// Starts with the conservative default task set.
     #[must_use]
     pub fn new() -> Self {
@@ -183,14 +191,18 @@ impl CleanupOptions {
     /// Replaces the selected task set. Supplying an empty iterator performs a
     /// health-only plan/apply.
     #[must_use]
-    pub fn with_tasks(mut self, tasks: impl IntoIterator<Item = CleanupTask>) -> Self {
+    /// Replaces the internal task set. Test-only: the command's own surface
+    /// is the flags above, and a run cannot be restricted to one stage.
+    #[cfg(test)]
+    pub(crate) fn with_tasks(mut self, tasks: impl IntoIterator<Item = MaintenanceTask>) -> Self {
         self.tasks = tasks.into_iter().collect();
         self
     }
 
     /// Enables one task in addition to the current selection.
     #[must_use]
-    pub fn with_task(mut self, task: CleanupTask) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_task(mut self, task: MaintenanceTask) -> Self {
         self.tasks.insert(task);
         self
     }
@@ -198,7 +210,7 @@ impl CleanupOptions {
     /// Enables backup cleanup with its mandatory two-part retention policy.
     #[must_use]
     pub fn with_recovery_backup_policy(mut self, policy: RecoveryBackupPolicy) -> Self {
-        self.tasks.insert(CleanupTask::RecoveryBackups);
+        self.tasks.insert(MaintenanceTask::RecoveryBackups);
         self.recovery_backup_policy = Some(policy);
         self
     }
@@ -214,25 +226,104 @@ impl CleanupOptions {
     /// A bound of one leaves the current head as the only root, which is the
     /// closest standalone cleanup comes to Oak's own retention.
     ///
-    /// This implies [`CleanupTask::Journal`]: the bounded lines must actually
+    /// This implies [`MaintenanceTask::Journal`]: the bounded lines must actually
     /// leave the journal in the same run. A line that stopped being a root
     /// while remaining in the file would still be verified as retained
     /// history when the plan is validated, and the run would refuse itself.
     #[must_use]
     pub fn with_journal_revision_retention(mut self, revisions: NonZeroUsize) -> Self {
-        self.tasks.insert(CleanupTask::Journal);
+        self.tasks.insert(MaintenanceTask::Journal);
         self.journal_revision_retention = Some(revisions);
         self
     }
 
+    /// Applies Oak's 25% savings heuristic instead of rewriting every archive
+    /// that holds reclaimable segments.
+    ///
+    /// froe's default reclaims all identified garbage, which is what an
+    /// offline, operator-invoked cleanup is for. Oak's gate keeps an archive
+    /// untouched unless the rewrite would shrink it by at least a quarter,
+    /// which on a store whose archives hold live binary content alongside
+    /// dead node segments means the garbage is never removed by any number of
+    /// runs. Selecting the gate makes this run leave behind exactly what
+    /// `oak-run compact` would, at the cost of retaining garbage the run has
+    /// already proved removable.
+    #[must_use]
+    pub fn with_oak_savings_gate(mut self) -> Self {
+        self.archive_rewrite_policy = ArchiveRewritePolicy::OakSavingsGate;
+        self
+    }
+
+    /// Which archives a sweep is willing to rewrite.
+    #[must_use]
+    pub fn archive_rewrite_policy(&self) -> ArchiveRewritePolicy {
+        self.archive_rewrite_policy
+    }
+
+    /// Deep-copies the head into a fresh garbage-collection generation as part
+    /// of this run, and reclaims every generation the copy supersedes.
+    ///
+    /// The copy is what makes reclamation complete rather than incidental: a
+    /// sweep alone works at segment granularity, so a segment holding one live
+    /// record is wholly live however much dead content sits beside it. Only a
+    /// rewrite recovers that, and only a rewrite lets the run retain a single
+    /// generation.
+    ///
+    /// Checkpoints this run retires are omitted from the copy rather than
+    /// removed from the live head first, so the head moves exactly once and
+    /// no record is written at a generation the same run then reclaims.
+    #[must_use]
+    pub fn with_compaction(mut self, kind: CompactionKind) -> Self {
+        self.compaction_kind = Some(kind);
+        self
+    }
+
+    /// The compaction this run performs, if any.
+    #[must_use]
+    pub fn compaction_kind(&self) -> Option<CompactionKind> {
+        self.compaction_kind
+    }
+
+    /// Carries checkpoints whose valid timestamp has passed into the fresh
+    /// generation instead of dropping them.
+    ///
+    /// Dropping is the default: an expired checkpoint's content is otherwise
+    /// copied into the new generation, where one retained generation can never
+    /// reclaim it.
+    #[must_use]
+    pub fn keeping_expired_checkpoints(mut self) -> Self {
+        self.tasks.remove(&MaintenanceTask::ExpiredCheckpoints);
+        self
+    }
+
+    /// Also drops checkpoints that no string value under `/:async`
+    /// references. Not a default: an operator-created checkpoint held for a
+    /// backup is unreferenced by that rule.
+    #[must_use]
+    pub fn with_unreferenced_checkpoint_removal(mut self) -> Self {
+        self.tasks.insert(MaintenanceTask::UnreferencedCheckpoints);
+        self
+    }
+
+    /// Rebuilds the index of an active archive that has none — what a killed
+    /// Oak writer leaves behind — keeping the original under a `.bak` name.
+    ///
+    /// Not a default: it rewrites an archive, and a store damaged in the
+    /// middle rather than at the tail is a case to look at before authorizing.
+    #[must_use]
+    pub fn with_archive_index_repair(mut self) -> Self {
+        self.tasks.insert(MaintenanceTask::RepairArchives);
+        self
+    }
+
     /// Selected tasks in deterministic order.
-    pub fn tasks(&self) -> impl Iterator<Item = CleanupTask> + '_ {
+    pub(crate) fn tasks(&self) -> impl Iterator<Item = MaintenanceTask> + '_ {
         self.tasks.iter().copied()
     }
 
     /// Whether a category is selected.
     #[must_use]
-    pub fn contains(&self, task: CleanupTask) -> bool {
+    pub(crate) fn contains(&self, task: MaintenanceTask) -> bool {
         self.tasks.contains(&task)
     }
 }
@@ -338,7 +429,7 @@ impl JournalLineRemoval {
 const ALREADY_ABSENT_DELETION_DETAIL: &str = "file was already absent when deletion was attempted";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CleanupDeletionFailureKind {
+enum FileDeletionFailureKind {
     Retained,
     AlreadyAbsent,
 }
@@ -350,18 +441,18 @@ enum CleanupDeletionFailureKind {
 /// [`Self::target_was_already_absent`] to distinguish that auditable race.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct CleanupDeletionFailure {
+pub struct FileDeletionFailure {
     file_name: String,
     error: String,
-    kind: CleanupDeletionFailureKind,
+    kind: FileDeletionFailureKind,
 }
 
-impl CleanupDeletionFailure {
+impl FileDeletionFailure {
     fn retained(file_name: String, error: impl Into<String>) -> Self {
         Self {
             file_name,
             error: error.into(),
-            kind: CleanupDeletionFailureKind::Retained,
+            kind: FileDeletionFailureKind::Retained,
         }
     }
 
@@ -369,7 +460,7 @@ impl CleanupDeletionFailure {
         Self {
             file_name,
             error: error.into(),
-            kind: CleanupDeletionFailureKind::AlreadyAbsent,
+            kind: FileDeletionFailureKind::AlreadyAbsent,
         }
     }
 
@@ -393,14 +484,14 @@ impl CleanupDeletionFailure {
     /// when cleanup reached its guarded deletion.
     #[must_use]
     pub fn target_was_already_absent(&self) -> bool {
-        self.kind == CleanupDeletionFailureKind::AlreadyAbsent
+        self.kind == FileDeletionFailureKind::AlreadyAbsent
     }
 }
 
 /// One concrete, deterministically ordered cleanup action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum CleanupAction {
+pub enum CompactionAction {
     /// Rebuild the index of an active archive that has none.
     ///
     /// Reported by the read-only preview, which cannot do more than name the
@@ -484,6 +575,40 @@ pub enum CleanupAction {
         /// Current whole-file bytes.
         bytes: u64,
     },
+    /// Retire every journal revision but the one the copy publishes.
+    ///
+    /// Named separately from `PruneJournal`, which describes removing lines
+    /// that cannot resolve. This removes lines that resolve perfectly well,
+    /// by policy, because the segments behind them are what the run reclaims.
+    RetireJournalHistory {
+        /// Physical journal lines present before the run, all of which are
+        /// replaced by the single line naming the compacted head.
+        revisions: usize,
+    },
+    /// Retire the output an interrupted earlier compaction left behind.
+    ///
+    /// Segments stamped ahead of the head are, by construction, the copy of a
+    /// run that died before it committed. No ordinary rule removes them, so a
+    /// killed run would otherwise leave residue that every later run steps
+    /// around while it holds bulk segments alive.
+    RetireInterruptedCompactionResidue {
+        /// Data segments found ahead of the head.
+        segments: usize,
+    },
+    /// Deep-copy the head, and every checkpoint this run retains, into a
+    /// fresh garbage-collection generation.
+    CopyHeadIntoFreshGeneration {
+        /// Distinct node records the current head reaches.
+        ///
+        /// What the copy rewrites is this minus whatever only a retired
+        /// checkpoint reaches, so it is an exact statement about the store
+        /// rather than a prediction about the copy.
+        head_nodes: u64,
+        /// The generation the copy writes into.
+        target_generation: GarbageCollectionGeneration,
+        /// Whether this is a full or a tail compaction.
+        kind: CompactionKind,
+    },
     /// Remove an explicitly authorized old recovery backup.
     RemoveRecoveryBackup {
         /// Exact file name.
@@ -548,11 +673,11 @@ struct HistoryProtection {
 
 /// A strictly read-only cleanup analysis.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CleanupPlan {
+pub struct CompactionPlan {
     directory: PathBuf,
-    tasks: Vec<CleanupTask>,
+    tasks: Vec<MaintenanceTask>,
     current_head: RecordIdentifier,
-    actions: Vec<CleanupAction>,
+    actions: Vec<CompactionAction>,
     warnings: Vec<String>,
     estimated_reclaimable_bytes: u64,
     estimated_archive_rewrite_source_bytes: u64,
@@ -565,13 +690,16 @@ pub struct CleanupPlan {
     stale_archives: Vec<StaleArchive>,
     temporaries: Vec<PlannedFileRemoval>,
     recovery_backups: Vec<PlannedFileRemoval>,
-    segment_plan: Option<StandaloneSegmentCleanupPlan>,
+    segment_plan: Option<StandaloneSegmentCompactionPlan>,
+    /// The sweep that retires an interrupted earlier compaction's output,
+    /// applied before this run's own copy.
+    residue_sweep: Option<StandaloneSegmentCompactionPlan>,
     reference_generation: GarbageCollectionGeneration,
     protected_history_segments: HashSet<SegmentIdentifier>,
     manifest_upgrade: bool,
 }
 
-impl CleanupPlan {
+impl CompactionPlan {
     /// Canonical absolute repository directory this plan describes.
     #[must_use]
     pub fn directory(&self) -> &Path {
@@ -580,7 +708,8 @@ impl CleanupPlan {
 
     /// Selected cleanup categories in deterministic order.
     #[must_use]
-    pub fn tasks(&self) -> &[CleanupTask] {
+    #[cfg(test)]
+    pub(crate) fn tasks(&self) -> &[MaintenanceTask] {
         &self.tasks
     }
 
@@ -592,16 +721,16 @@ impl CleanupPlan {
 
     /// Concrete mutations in deterministic display order.
     #[must_use]
-    pub fn actions(&self) -> &[CleanupAction] {
+    pub fn actions(&self) -> &[CompactionAction] {
         &self.actions
     }
 
     /// Exact physical journal lines selected for removal. This is empty unless
-    /// [`CleanupTask::Journal`] was selected; internal journal analysis still
+    /// [`MaintenanceTask::Journal`] was selected; internal journal analysis still
     /// runs for the safety of other tasks.
     #[must_use]
     pub fn journal_line_removals(&self) -> &[JournalLineRemoval] {
-        if self.tasks.contains(&CleanupTask::Journal) {
+        if self.tasks.contains(&MaintenanceTask::Journal) {
             &self.journal.removals
         } else {
             &[]
@@ -648,7 +777,7 @@ impl CleanupPlan {
     }
 
     /// Data segments kept alive only because a historical journal revision
-    /// still reaches them. Zero unless [`CleanupTask::Segments`] ran.
+    /// still reaches them. Zero unless [`MaintenanceTask::Segments`] ran.
     #[must_use]
     pub fn history_protected_segments(&self) -> usize {
         self.history_protection.history_only_segments
@@ -673,10 +802,21 @@ impl CleanupPlan {
     }
 }
 
-/// Result of a prepared cleanup application and its final fresh verification.
+/// What a run's deep copy produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CompactedGeneration {
+    /// Distinct node records the copy rewrote.
+    pub nodes: u64,
+    /// The garbage-collection generation the copy wrote into.
+    pub generation: GarbageCollectionGeneration,
+}
+
+/// Result of a prepared maintenance application and its final fresh
+/// verification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct CleanupOutcome {
+pub struct CompactionOutcome {
     /// Head before cleanup.
     pub head_before: RecordIdentifier,
     /// Freshly reopened and verified head after cleanup.
@@ -713,12 +853,15 @@ pub struct CleanupOutcome {
     /// original under a `.bak` name, so the directory grows by this much
     /// while the archive figures report no change at all.
     pub retained_recovery_backup_bytes: u64,
+    /// Distinct node records copied into the fresh generation, and the
+    /// generation they were copied into. `None` when the run did not compact.
+    pub compacted: Option<CompactedGeneration>,
     removed_segments: usize,
     journal_backup_path: Option<PathBuf>,
-    deletion_failures: Vec<CleanupDeletionFailure>,
+    deletion_failures: Vec<FileDeletionFailure>,
 }
 
-impl CleanupOutcome {
+impl CompactionOutcome {
     /// Orphan segments removed from the active archive set.
     #[must_use]
     pub fn removed_segments(&self) -> usize {
@@ -734,7 +877,7 @@ impl CleanupOutcome {
     /// Planned deletions this cleanup did not perform itself, making the
     /// result partial even when another actor already removed a target.
     #[must_use]
-    pub fn deletion_failures(&self) -> &[CleanupDeletionFailure] {
+    pub fn deletion_failures(&self) -> &[FileDeletionFailure] {
         &self.deletion_failures
     }
 
@@ -747,10 +890,10 @@ impl CleanupOutcome {
 }
 
 /// An authoritative cleanup plan protected by the held repository lock.
-pub struct PreparedCleanup {
+pub struct PreparedCompaction {
     directory: PathBuf,
-    options: CleanupOptions,
-    plan: CleanupPlan,
+    options: CompactionOptions,
+    plan: CompactionPlan,
     /// Archives whose index this preparation already rebuilt, before the
     /// plan was built. Carried so the outcome can report work that, by
     /// construction, happened before there was a plan to record it in.
@@ -758,20 +901,20 @@ pub struct PreparedCleanup {
     repository_lock: Arc<RepositoryLock>,
 }
 
-impl PreparedCleanup {
+impl PreparedCompaction {
     /// Resolves the repository path once to its canonical absolute target,
     /// validates it without mutation, acquires `repo.lock`, and rebuilds an
     /// authoritative plan while holding that lock.
-    pub fn prepare(directory: &Path, options: CleanupOptions) -> Result<Self> {
+    pub fn prepare(directory: &Path, options: CompactionOptions) -> Result<Self> {
         Self::prepare_with_progress(directory, options, &mut DiscardedProgress)
     }
 
-    /// Prepares exactly like [`PreparedCleanup::prepare`], reporting the
+    /// Prepares exactly like [`PreparedCompaction::prepare`], reporting the
     /// authoritative replan — the slow part, repeated under the lock — to
     /// `observer`.
     pub fn prepare_with_progress(
         directory: &Path,
-        options: CleanupOptions,
+        options: CompactionOptions,
         observer: &mut dyn ProgressObserver,
     ) -> Result<Self> {
         validate_options(&options)?;
@@ -830,10 +973,10 @@ impl PreparedCleanup {
     /// a repair run byte-identical, including its manifest.
     fn repair_before_planning(
         directory: &Path,
-        options: &CleanupOptions,
+        options: &CompactionOptions,
         observer: &mut dyn ProgressObserver,
     ) -> Result<Vec<crate::writer::store_writer::RepairedArchive>> {
-        if !options.contains(CleanupTask::RepairArchives) {
+        if !options.contains(MaintenanceTask::RepairArchives) {
             return Ok(Vec::new());
         }
         // One predicate for the whole decision. `repairable` — not merely
@@ -917,7 +1060,7 @@ impl PreparedCleanup {
 
     /// The lock-protected plan callers should display and confirm.
     #[must_use]
-    pub fn plan(&self) -> &CleanupPlan {
+    pub fn plan(&self) -> &CompactionPlan {
         &self.plan
     }
 
@@ -934,18 +1077,18 @@ impl PreparedCleanup {
 
     /// Applies exactly this authoritative plan, failing before the first
     /// mutation if any directory entry changed after planning.
-    pub fn apply(self) -> Result<CleanupOutcome> {
+    pub fn apply(self) -> Result<CompactionOutcome> {
         apply_prepared(self, &mut DiscardedProgress)
     }
 
-    /// Applies exactly like [`PreparedCleanup::apply`], reporting the
+    /// Applies exactly like [`PreparedCompaction::apply`], reporting the
     /// archive rewrites and file removals to `observer`. Reporting cannot
     /// alter the mutation sequence: the observer is told what has already
     /// been done and never decides anything.
     pub fn apply_with_progress(
         self,
         observer: &mut dyn ProgressObserver,
-    ) -> Result<CleanupOutcome> {
+    ) -> Result<CompactionOutcome> {
         apply_prepared(self, observer)
     }
 }
@@ -1010,7 +1153,7 @@ fn journal_service_user_issue(directory: &Path, effective_uid: u32) -> Result<Op
 }
 
 #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
-fn validate_plan_apply_identity(directory: &Path, plan: &CleanupPlan) -> Result<()> {
+fn validate_plan_apply_identity(directory: &Path, plan: &CompactionPlan) -> Result<()> {
     #[cfg(unix)]
     {
         let credentials = current_apply_credentials()?;
@@ -1065,7 +1208,7 @@ fn current_apply_credentials() -> Result<ApplyCredentials> {
 fn planned_metadata_sources(
     directory: &Path,
     manifest_upgrade: bool,
-    segment_plan: Option<&StandaloneSegmentCleanupPlan>,
+    segment_plan: Option<&StandaloneSegmentCompactionPlan>,
     moves_checkpoint_head: bool,
     rewrites_journal: bool,
 ) -> Result<BTreeSet<String>> {
@@ -1116,7 +1259,7 @@ fn planned_metadata_sources(
 #[cfg(unix)]
 fn planned_apply_identity_issue(
     directory: &Path,
-    plan: &CleanupPlan,
+    plan: &CompactionPlan,
     credentials: &ApplyCredentials,
 ) -> Result<Option<String>> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1133,7 +1276,7 @@ fn planned_apply_identity_issue(
         plan.manifest_upgrade,
         plan.segment_plan.as_ref(),
         !plan.checkpoints.names.is_empty(),
-        plan.tasks.contains(&CleanupTask::Journal) && plan.journal.removed_lines != 0,
+        plan.tasks.contains(&MaintenanceTask::Journal) && plan.journal.removed_lines != 0,
     )? {
         let path = directory.join(&name);
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -1220,7 +1363,7 @@ fn metadata_source_apply_identity_issue(
 #[cfg(unix)]
 fn validate_plan_apply_identity_for_credentials(
     directory: &Path,
-    plan: &CleanupPlan,
+    plan: &CompactionPlan,
     credentials: &ApplyCredentials,
 ) -> Result<()> {
     if let Some(details) = planned_apply_identity_issue(directory, plan, credentials)? {
@@ -1236,7 +1379,7 @@ fn validate_plan_apply_identity_for_credentials(
 #[cfg(unix)]
 fn preview_apply_identity_issue(
     directory: &Path,
-    plan: &CleanupPlan,
+    plan: &CompactionPlan,
     credentials: &ApplyCredentials,
 ) -> Result<Option<String>> {
     if let Some(issue) = journal_service_user_issue(directory, credentials.effective_uid)? {
@@ -1245,7 +1388,7 @@ fn preview_apply_identity_issue(
     planned_apply_identity_issue(directory, plan, credentials)
 }
 
-fn append_apply_identity_preview_warning(directory: &Path, plan: &mut CleanupPlan) {
+fn append_apply_identity_preview_warning(directory: &Path, plan: &mut CompactionPlan) {
     #[cfg(unix)]
     append_apply_identity_preview_warning_for_credentials(
         directory,
@@ -1259,7 +1402,7 @@ fn append_apply_identity_preview_warning(directory: &Path, plan: &mut CleanupPla
 #[cfg(unix)]
 fn append_apply_identity_preview_warning_for_credentials(
     directory: &Path,
-    plan: &mut CleanupPlan,
+    plan: &mut CompactionPlan,
     credentials: Result<ApplyCredentials>,
 ) {
     match credentials
@@ -1277,23 +1420,23 @@ fn append_apply_identity_preview_warning_for_credentials(
 
 /// Resolves `directory` once to its canonical absolute target, then builds a
 /// cleanup plan without acquiring a lock or changing any byte. Interactive
-/// callers should pass [`CleanupPlan::directory`] to
-/// [`PreparedCleanup::prepare`] so an alias cannot redirect lock acquisition
+/// callers should pass [`CompactionPlan::directory`] to
+/// [`PreparedCompaction::prepare`] so an alias cannot redirect lock acquisition
 /// after the preview.
-pub fn plan_cleanup(directory: &Path, options: &CleanupOptions) -> Result<CleanupPlan> {
-    plan_cleanup_with_progress(directory, options, &mut DiscardedProgress)
+pub fn plan_compaction(directory: &Path, options: &CompactionOptions) -> Result<CompactionPlan> {
+    plan_compaction_with_progress(directory, options, &mut DiscardedProgress)
 }
 
-/// Plans exactly like [`plan_cleanup`] — still strictly read-only, still
+/// Plans exactly like [`plan_compaction`] — still strictly read-only, still
 /// without acquiring the lock — reporting each planning step to
 /// `observer`. Planning a large store is the phase that takes minutes:
 /// it verifies the whole head tree, replays the journal, and traces the
 /// reachable segment closure before it can say anything at all.
-pub fn plan_cleanup_with_progress(
+pub fn plan_compaction_with_progress(
     directory: &Path,
-    options: &CleanupOptions,
+    options: &CompactionOptions,
     observer: &mut dyn ProgressObserver,
-) -> Result<CleanupPlan> {
+) -> Result<CompactionPlan> {
     validate_options(options)?;
     let directory = canonical_repository_directory(directory)?;
     validate_repository_shape(&directory)?;
@@ -1302,19 +1445,19 @@ pub fn plan_cleanup_with_progress(
 
 /// Convenience non-interactive API: prepares under lock and immediately
 /// applies the authoritative plan. Interactive callers should use
-/// [`plan_cleanup`] and [`PreparedCleanup`] so they can display/reconfirm.
-pub fn cleanup(directory: &Path, options: CleanupOptions) -> Result<CleanupOutcome> {
-    cleanup_with_progress(directory, options, &mut DiscardedProgress)
+/// [`plan_compaction`] and [`PreparedCompaction`] so they can display/reconfirm.
+pub fn compact(directory: &Path, options: CompactionOptions) -> Result<CompactionOutcome> {
+    compact_with_progress(directory, options, &mut DiscardedProgress)
 }
 
-/// Prepares and applies exactly like [`cleanup`], reporting both phases
+/// Prepares and applies exactly like [`compact`], reporting both phases
 /// to `observer`.
-pub fn cleanup_with_progress(
+pub fn compact_with_progress(
     directory: &Path,
-    options: CleanupOptions,
+    options: CompactionOptions,
     observer: &mut dyn ProgressObserver,
-) -> Result<CleanupOutcome> {
-    PreparedCleanup::prepare_with_progress(directory, options, observer)?
+) -> Result<CompactionOutcome> {
+    PreparedCompaction::prepare_with_progress(directory, options, observer)?
         .apply_with_progress(observer)
 }
 
@@ -1377,8 +1520,10 @@ struct FileFingerprint {
     change_time_nanoseconds: i64,
 }
 
-fn validate_options(options: &CleanupOptions) -> Result<()> {
-    if options.contains(CleanupTask::RecoveryBackups) && options.recovery_backup_policy.is_none() {
+fn validate_options(options: &CompactionOptions) -> Result<()> {
+    if options.contains(MaintenanceTask::RecoveryBackups)
+        && options.recovery_backup_policy.is_none()
+    {
         return Err(Error::InvalidFormat {
             details: "recovery-backups requires an explicit age/count retention policy".to_owned(),
         });
@@ -1389,8 +1534,8 @@ fn validate_options(options: &CleanupOptions) -> Result<()> {
     // is reachable from the command line, and would delete the only copy of
     // whatever the recovery scan could not read, in the same breath that made
     // the copy. The two tasks are coherent in sequence and never together.
-    if options.contains(CleanupTask::RepairArchives)
-        && options.contains(CleanupTask::RecoveryBackups)
+    if options.contains(MaintenanceTask::RepairArchives)
+        && options.contains(MaintenanceTask::RecoveryBackups)
     {
         return Err(Error::InvalidFormat {
             details: "repair-archives and recovery-backups cannot run together: repair retires \
@@ -1406,7 +1551,7 @@ fn validate_options(options: &CleanupOptions) -> Result<()> {
     // still verifies it as retained history and refuses the very plan the
     // bound was set to enable. The builder selects the task, so this only
     // fires for a caller that deselected it afterwards.
-    if options.journal_revision_retention.is_some() && !options.contains(CleanupTask::Journal) {
+    if options.journal_revision_retention.is_some() && !options.contains(MaintenanceTask::Journal) {
         return Err(Error::InvalidFormat {
             details: "a journal revision retention bound requires the journal task: the bounded \
                       lines must leave the journal in the same run, or they remain retained \
@@ -1561,10 +1706,10 @@ fn file_fingerprint(name: OsString, metadata: &Metadata) -> FileFingerprint {
 /// warnings are never suppressed; that promise has to survive an error.
 fn build_plan(
     directory: &Path,
-    options: &CleanupOptions,
+    options: &CompactionOptions,
     now: SystemTime,
     observer: &mut dyn ProgressObserver,
-) -> Result<CleanupPlan> {
+) -> Result<CompactionPlan> {
     let mut warnings = Vec::new();
     build_plan_collecting(directory, options, now, observer, &mut warnings)
         .map_err(|error| attach_planning_warnings(error, &warnings))
@@ -1675,11 +1820,11 @@ fn attach_planning_warnings(error: Error, warnings: &[String]) -> Error {
 )]
 fn build_plan_collecting(
     directory: &Path,
-    options: &CleanupOptions,
+    options: &CompactionOptions,
     now: SystemTime,
     observer: &mut dyn ProgressObserver,
     warnings: &mut Vec<String>,
-) -> Result<CleanupPlan> {
+) -> Result<CompactionPlan> {
     let fingerprint_before = directory_fingerprint(directory)?;
     let repository = Repository::open_with_progress(directory, observer)?;
     let current_head = repository.head_record_identifier();
@@ -1687,7 +1832,7 @@ fn build_plan_collecting(
     // Repository::open deliberately binds by segment existence, matching
     // Oak. Cleanup's gate is stronger: the exact selected record and every
     // descendant (including binary blocks and checkpoints) must traverse.
-    verify_exact_super_root(&repository, current_head, observer)?;
+    let head_nodes = verify_exact_super_root_counting_nodes(&repository, current_head, observer)?;
 
     let raw_journal = scan_raw_journal(directory)?;
     let journal_analysis = analyze_journal(
@@ -1700,13 +1845,13 @@ fn build_plan_collecting(
 
     // Repairs the operator has authorized, named but not yet performed. This
     // is the read-only preview: the rebuild happens under the lock inside
-    // `PreparedCleanup::prepare`, and until it has, nothing that reads an
+    // `PreparedCompaction::prepare`, and until it has, nothing that reads an
     // index can be planned. So while any repair is pending this plan is
     // deliberately partial — it names the repairs and stops. `prepare`
     // repairs first and then plans in full, and the CLI's existing
     // authoritative-plan comparison shows the operator the difference before
     // a single further byte moves.
-    let pending_repairs = if options.contains(CleanupTask::RepairArchives) {
+    let pending_repairs = if options.contains(MaintenanceTask::RepairArchives) {
         // Refuse here, in the read-only preview, where nothing has been
         // touched. An index-less number that scans to nothing dooms the run
         // however it is retried, and without this the filter below would
@@ -1750,13 +1895,17 @@ fn build_plan_collecting(
             ),
         });
     }
-    let checkpoint_archive_number = if checkpoints.names.is_empty() {
-        None
-    } else {
-        Some(next_cleanup_archive_number(directory)?)
-    };
-    if options.contains(CleanupTask::Segments)
-        || options.contains(CleanupTask::StaleArchives)
+    // A run that moves the head needs a certified output archive number,
+    // whether the head moves because checkpoints were removed from it or
+    // because the whole tree was copied into a fresh generation.
+    let checkpoint_archive_number =
+        if checkpoints.names.is_empty() && options.compaction_kind.is_none() {
+            None
+        } else {
+            Some(next_cleanup_archive_number(directory)?)
+        };
+    if options.contains(MaintenanceTask::Segments)
+        || options.contains(MaintenanceTask::StaleArchives)
         || !checkpoints.names.is_empty()
     {
         // While repairs are pending only the cross-number half can be
@@ -1771,7 +1920,7 @@ fn build_plan_collecting(
             reject_cross_number_duplicate_active_segments(&repository)?;
         }
     }
-    let stale_archives = if index_available && options.contains(CleanupTask::StaleArchives) {
+    let stale_archives = if index_available && options.contains(MaintenanceTask::StaleArchives) {
         crate::progress::observe(
             observer,
             &Step::new("scanning for stale archives", WorkUnit::Archives)
@@ -1783,10 +1932,23 @@ fn build_plan_collecting(
     };
 
     let reference_generation = generation_from_header(&repository, current_head.segment)?;
+    // One rule per run, read by the head-safety guard and by the mark phase
+    // below. Binding it here rather than rebuilding it at each use is what
+    // makes "the guard proved exactly what the sweep will apply" a property of
+    // the code instead of a coincidence between two constants.
+    let reclaim_rule = ReclaimRule {
+        reference: reference_generation,
+        full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+        retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
+    };
     let mut current_closure = HashSet::new();
-    if index_available && (options.contains(CleanupTask::Segments) || !checkpoints.names.is_empty())
+    let mut residue_segments = 0usize;
+    if index_available
+        && (options.contains(MaintenanceTask::Segments) || !checkpoints.names.is_empty())
     {
         let active_index_generations = active_index_generations(&repository)?;
+        residue_segments =
+            segments_ahead_of_the_head(&active_index_generations, reference_generation);
         crate::progress::observe(
             observer,
             &Step::new(
@@ -1802,16 +1964,91 @@ fn build_plan_collecting(
                 )
             },
         )?;
-        validate_current_generation_invariant(
+        validate_reclaim_reference_invariant(
             &repository,
             &current_closure,
             &active_index_generations,
-            reference_generation,
+            reclaim_rule,
         )?;
     }
+    // The residue sweep, planned with the generation predicate disabled so
+    // nothing is reclaimed by age: `i32::MAX` retained generations makes
+    // `is_reclaimable` false for every realistic triple, leaving only the
+    // dangling-future rule — which reclaims exactly the compacted entries
+    // positioned after the head in global reverse order — and the rule that
+    // frees a bulk segment nothing points at. Planned before the copy, so the
+    // next run heals what a killed run left rather than accumulating it.
+    let residue_sweep = if index_available && residue_segments != 0 {
+        Some(crate::progress::observe(
+            observer,
+            &Step::new("planning residue retirement", WorkUnit::Archives)
+                .with_total(crate::progress::count(repository.archives().len())),
+            |observer| {
+                plan_standalone_segment_cleanup(
+                    directory,
+                    &repository,
+                    ReclaimRule {
+                        reference: reference_generation,
+                        full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+                        retained_generations: i32::MAX,
+                    },
+                    current_head.segment,
+                    &HashSet::new(),
+                    options.archive_rewrite_policy,
+                    observer,
+                )
+            },
+        )?)
+    } else {
+        None
+    };
+    // What the copy's own reclaim pass will do, planned read-only so the
+    // operator sees which archives go before authorizing the run. Exact rather
+    // than estimated: the same mark and the same per-archive planner the run
+    // itself uses, seeded with the bulk segments the copy will share in place.
+    let predicted_sweep = match options.compaction_kind {
+        Some(kind) if index_available => {
+            let omitted: BTreeSet<String> = checkpoints.names.iter().cloned().collect();
+            let shared =
+                predict_shared_bulk_segments(&repository, current_head, &omitted, observer)?;
+            let target = compaction_target_generation(reference_generation, kind);
+            let absent: HashSet<String> = stale_archives
+                .iter()
+                .map(|stale| stale.file_name.clone())
+                .collect();
+            Some(crate::progress::observe(
+                observer,
+                &Step::new("predicting the reclamation", WorkUnit::Archives)
+                    .with_total(crate::progress::count(repository.archives().len())),
+                |_observer| {
+                    crate::writer::store_writer::predict_post_compaction_reclamation(
+                        directory,
+                        &repository,
+                        ReclaimRule {
+                            reference: target,
+                            full: kind == CompactionKind::Full,
+                            retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
+                        },
+                        &shared,
+                        options.archive_rewrite_policy,
+                        &absent,
+                    )
+                },
+            )?)
+        }
+        _ => None,
+    };
     let mut protected_history_segments = HashSet::new();
     let mut history_protection = HistoryProtection::default();
-    let segment_plan = if index_available && options.contains(CleanupTask::Segments) {
+    // A sweep planned here judges every segment against the *current* head
+    // generation. When this run copies the head into a fresh generation, that
+    // reference is superseded before a single archive is touched and the plan
+    // would authorize the wrong set. The copy's own reclaim pass sweeps
+    // instead, against the generation it just created.
+    let segment_plan = if index_available
+        && options.contains(MaintenanceTask::Segments)
+        && options.compaction_kind.is_none()
+    {
         // Captured before the head closure is consumed as the history seed:
         // afterwards the two are indistinguishable, and the difference is
         // exactly what the journal history costs.
@@ -1857,9 +2094,10 @@ fn build_plan_collecting(
                 plan_standalone_segment_cleanup(
                     directory,
                     &repository,
-                    reference_generation,
+                    reclaim_rule,
                     current_head.segment,
                     &protected_history_segments,
+                    options.archive_rewrite_policy,
                     observer,
                 )
             },
@@ -1877,8 +2115,9 @@ fn build_plan_collecting(
                     crate::writer::store_writer::measure_unvetoed_reclamation(
                         directory,
                         &repository,
-                        reference_generation,
+                        reclaim_rule,
                         current_head.segment,
+                        options.archive_rewrite_policy,
                         observer,
                     )
                 },
@@ -1914,7 +2153,7 @@ fn build_plan_collecting(
         None
     };
 
-    let temporaries = if index_available && options.contains(CleanupTask::StaleTemporaries) {
+    let temporaries = if index_available && options.contains(MaintenanceTask::StaleTemporaries) {
         crate::progress::observe(
             observer,
             &Step::new("scanning for stale temporary files", WorkUnit::Files),
@@ -1925,7 +2164,7 @@ fn build_plan_collecting(
     } else {
         Vec::new()
     };
-    let recovery_backups = if options.contains(CleanupTask::RecoveryBackups) {
+    let recovery_backups = if options.contains(MaintenanceTask::RecoveryBackups) {
         plan_recovery_backups(
             directory,
             now,
@@ -1954,7 +2193,7 @@ fn build_plan_collecting(
     if manifest_upgrade {
         ensure_numbered_name_available(directory, "manifest.cleaning")?;
     }
-    if options.contains(CleanupTask::Journal) && journal_analysis.plan.removed_lines != 0 {
+    if options.contains(MaintenanceTask::Journal) && journal_analysis.plan.removed_lines != 0 {
         ensure_numbered_name_available(directory, "journal.log.cleaning")?;
         ensure_numbered_name_available(directory, "journal.log.bak")?;
     }
@@ -1968,7 +2207,52 @@ fn build_plan_collecting(
     // reclaiming them, so it stays out of the reclaimable estimate.
     actions.extend(pending_repairs);
     if manifest_upgrade {
-        actions.push(CleanupAction::UpgradeManifest);
+        actions.push(CompactionAction::UpgradeManifest);
+    }
+    if residue_sweep.is_some() {
+        actions.push(CompactionAction::RetireInterruptedCompactionResidue {
+            segments: residue_segments,
+        });
+    }
+    if let Some(kind) = options.compaction_kind {
+        actions.push(CompactionAction::CopyHeadIntoFreshGeneration {
+            head_nodes,
+            target_generation: compaction_target_generation(reference_generation, kind),
+            kind,
+        });
+    }
+    if let Some(predicted) = &predicted_sweep {
+        for archive in &predicted.archives {
+            match archive {
+                PlannedArchiveSweep::Remove {
+                    file_name,
+                    segment_count,
+                    file_bytes,
+                } => {
+                    actions.push(CompactionAction::RemoveReclaimableArchive {
+                        file_name: file_name.clone(),
+                        segments: *segment_count,
+                        bytes: *file_bytes,
+                    });
+                    add_estimate(&mut estimated_reclaimable_bytes, *file_bytes)?;
+                }
+                PlannedArchiveSweep::Rewrite {
+                    file_name,
+                    replacement_name,
+                    segment_count,
+                    eligible_entry_bytes,
+                } => {
+                    actions.push(CompactionAction::RewriteArchive {
+                        file_name: file_name.clone(),
+                        replacement_name: replacement_name.clone(),
+                        segments: *segment_count,
+                        eligible_bytes: *eligible_entry_bytes,
+                    });
+                    add_estimate(&mut estimated_reclaimable_bytes, *eligible_entry_bytes)?;
+                }
+                other => retained_reclaimable_from(other, &mut retained_reclaimable, warnings)?,
+            }
+        }
     }
     if let Some(plan) = &segment_plan {
         for archive in &plan.archives {
@@ -1978,7 +2262,7 @@ fn build_plan_collecting(
                     segment_count,
                     file_bytes,
                 } => {
-                    actions.push(CleanupAction::RemoveReclaimableArchive {
+                    actions.push(CompactionAction::RemoveReclaimableArchive {
                         file_name: file_name.clone(),
                         segments: *segment_count,
                         bytes: *file_bytes,
@@ -1995,7 +2279,7 @@ fn build_plan_collecting(
                         &mut estimated_archive_rewrite_source_bytes,
                         std::fs::symlink_metadata(directory.join(file_name))?.len(),
                     )?;
-                    actions.push(CleanupAction::RewriteArchive {
+                    actions.push(CompactionAction::RewriteArchive {
                         file_name: file_name.clone(),
                         replacement_name: replacement_name.clone(),
                         segments: *segment_count,
@@ -2011,7 +2295,8 @@ fn build_plan_collecting(
                     retained_reclaimable.below_savings_gate += segment_count;
                     add_estimate(&mut retained_reclaimable.bytes, *eligible_entry_bytes)?;
                     warnings.push(format!(
-                        "{file_name}: {segment_count} reclaimable segments ({eligible_entry_bytes} bytes) retained because savings do not exceed Oak's 25% rewrite gate"
+                        "{file_name}: {segment_count} reclaimable segments ({}) retained because savings do not exceed Oak's 25% rewrite gate",
+                        crate::units::format_byte_size(*eligible_entry_bytes)
                     ));
                 }
                 PlannedArchiveSweep::DeferredAtLastGeneration {
@@ -2022,7 +2307,8 @@ fn build_plan_collecting(
                     retained_reclaimable.at_last_generation += segment_count;
                     add_estimate(&mut retained_reclaimable.bytes, *eligible_entry_bytes)?;
                     warnings.push(format!(
-                        "{file_name}: {segment_count} reclaimable segments ({eligible_entry_bytes} bytes) retained because archive generation z cannot be rewritten"
+                        "{file_name}: {segment_count} reclaimable segments ({}) retained because archive generation z cannot be rewritten",
+                        crate::units::format_byte_size(*eligible_entry_bytes)
                     ));
                 }
                 PlannedArchiveSweep::BlockedByOccupiedGeneration {
@@ -2034,7 +2320,8 @@ fn build_plan_collecting(
                     retained_reclaimable.blocked_by_occupied_generation += segment_count;
                     add_estimate(&mut retained_reclaimable.bytes, *eligible_entry_bytes)?;
                     warnings.push(format!(
-                        "{file_name}: {segment_count} reclaimable segments ({eligible_entry_bytes} bytes) retained because {occupied_name} already exists"
+                        "{file_name}: {segment_count} reclaimable segments ({}) retained because {occupied_name} already exists",
+                        crate::units::format_byte_size(*eligible_entry_bytes)
                     ));
                 }
             }
@@ -2056,7 +2343,7 @@ fn build_plan_collecting(
         );
     }
     for stale in &stale_archives {
-        actions.push(CleanupAction::RemoveStaleArchive {
+        actions.push(CompactionAction::RemoveStaleArchive {
             file_name: stale.file_name.clone(),
             reason: stale.reason,
             bytes: stale.bytes,
@@ -2064,14 +2351,24 @@ fn build_plan_collecting(
         add_estimate(&mut estimated_reclaimable_bytes, stale.bytes)?;
     }
     if !checkpoints.names.is_empty() {
-        actions.push(CleanupAction::RemoveCheckpoints {
+        actions.push(CompactionAction::RemoveCheckpoints {
             names: checkpoints.names.clone(),
             expired: checkpoints.expired,
             unreferenced: checkpoints.unreferenced,
         });
     }
-    if options.contains(CleanupTask::Journal) && journal_analysis.plan.removed_lines != 0 {
-        actions.push(CleanupAction::PruneJournal {
+    if options.compaction_kind.is_some() {
+        // Every revision goes, whether or not it still resolves: the run keeps
+        // only the line naming the head it is about to write. This is the
+        // irreversible half of a maintenance run, so the plan states it plainly
+        // rather than leaving the operator to infer it from a prune count that
+        // describes a different rule.
+        actions.push(CompactionAction::RetireJournalHistory {
+            revisions: raw_journal.lines().len(),
+        });
+    } else if options.contains(MaintenanceTask::Journal) && journal_analysis.plan.removed_lines != 0
+    {
+        actions.push(CompactionAction::PruneJournal {
             lines: journal_analysis.plan.removed_lines,
             parser_ignored: journal_analysis.plan.parser_ignored,
             missing_segments: journal_analysis.plan.missing_segments,
@@ -2080,14 +2377,14 @@ fn build_plan_collecting(
         });
     }
     for temporary in &temporaries {
-        actions.push(CleanupAction::RemoveTemporary {
+        actions.push(CompactionAction::RemoveTemporary {
             file_name: temporary.file_name.clone(),
             bytes: temporary.bytes,
         });
         add_estimate(&mut estimated_reclaimable_bytes, temporary.bytes)?;
     }
     for backup in &recovery_backups {
-        actions.push(CleanupAction::RemoveRecoveryBackup {
+        actions.push(CompactionAction::RemoveRecoveryBackup {
             file_name: backup.file_name.clone(),
             bytes: backup.bytes,
         });
@@ -2102,7 +2399,7 @@ fn build_plan_collecting(
         });
     }
 
-    let mut plan = CleanupPlan {
+    let mut plan = CompactionPlan {
         directory: directory.to_owned(),
         tasks: options.tasks().collect(),
         current_head,
@@ -2122,6 +2419,7 @@ fn build_plan_collecting(
         temporaries,
         recovery_backups,
         segment_plan,
+        residue_sweep,
         reference_generation,
         protected_history_segments,
         manifest_upgrade,
@@ -2194,12 +2492,25 @@ fn verify_exact_super_root(
     head: RecordIdentifier,
     observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
+    verify_exact_super_root_counting_nodes(repository, head, observer).map(|_| ())
+}
+
+/// Verifies exactly like [`verify_exact_super_root`], returning how many
+/// distinct node records the head reaches. The walk happens either way, so
+/// the count is free; it is what the plan reports as the size of the tree a
+/// copy would rewrite.
+fn verify_exact_super_root_counting_nodes(
+    repository: &Repository,
+    head: RecordIdentifier,
+    observer: &mut dyn ProgressObserver,
+) -> Result<u64> {
     crate::progress::observe(
         observer,
         &Step::new("verifying the current head", WorkUnit::Nodes),
         |observer| {
             let mut verifier = NodeTreeVerifier::new(repository);
-            verify_exact_super_root_with_verifier(repository, head, &mut verifier, observer)
+            verify_exact_super_root_with_verifier(repository, head, &mut verifier, observer)?;
+            Ok(verifier.verified_nodes())
         },
     )
 }
@@ -2495,12 +2806,12 @@ fn analyze_journal_lines(
 
 fn plan_checkpoints(
     repository: &Repository,
-    options: &CleanupOptions,
+    options: &CompactionOptions,
     now: SystemTime,
     warnings: &mut Vec<String>,
 ) -> Result<CheckpointPlan> {
-    if !options.contains(CleanupTask::ExpiredCheckpoints)
-        && !options.contains(CleanupTask::UnreferencedCheckpoints)
+    if !options.contains(MaintenanceTask::ExpiredCheckpoints)
+        && !options.contains(MaintenanceTask::UnreferencedCheckpoints)
     {
         return Ok(CheckpointPlan::default());
     }
@@ -2508,7 +2819,7 @@ fn plan_checkpoints(
         duration.as_millis().min(i64::MAX as u128) as i64
     });
     let checkpoints = repository.checkpoints()?;
-    let referenced = if options.contains(CleanupTask::UnreferencedCheckpoints) {
+    let referenced = if options.contains(MaintenanceTask::UnreferencedCheckpoints) {
         async_checkpoint_references(repository)?
     } else {
         HashSet::new()
@@ -2516,7 +2827,7 @@ fn plan_checkpoints(
     let mut expired_names = BTreeSet::new();
     let mut unreferenced_names = BTreeSet::new();
     for (name, checkpoint) in checkpoints {
-        if options.contains(CleanupTask::ExpiredCheckpoints) {
+        if options.contains(MaintenanceTask::ExpiredCheckpoints) {
             match checkpoint.property("timestamp")? {
                 Some(property) => match property.values {
                     PropertyValues::Single(PropertyValue::Long(timestamp)) => {
@@ -2533,7 +2844,7 @@ fn plan_checkpoints(
                 )),
             }
         }
-        if options.contains(CleanupTask::UnreferencedCheckpoints)
+        if options.contains(MaintenanceTask::UnreferencedCheckpoints)
             && !referenced.contains(&name)
             && !expired_names.contains(&name)
         {
@@ -2819,16 +3130,15 @@ fn indexless_archive_refusal(
          it — move that file aside to proceed, and keep it, it is the only copy of whatever it \
          holds"
     } else if newest_is_indexless {
-        "rerun with `--task repair-archives` (alongside the tasks you want) to rebuild the \
-         missing index from the archive's own entries, retaining the original bytes under a \
-         `.bak` name"
+        "rerun with `--repair-archive-indexes` to rebuild the missing index from the \
+         archive's own entries, retaining the original bytes under a `.bak` name"
     } else {
         // A closed archive that stopped validating is not a missing trailer;
         // a scan of it may read fewer segments than it holds, and repairing
         // makes that the served truth in everything but the `.bak`.
-        "inspect before repairing: `--task repair-archives` would rebuild the missing indexes \
-         from a recovery scan, which retains the original bytes under a `.bak` name but cannot \
-         recover a segment the scan cannot read"
+        "inspect before repairing: `--repair-archive-indexes` would rebuild the missing \
+         indexes from a recovery scan, which retains the original bytes under a `.bak` name but \
+         cannot recover a segment the scan cannot read"
     };
     format!(
         "{subject} ({names}); the index was rejected because {reasons}; {ordinality}. Refusing \
@@ -2881,7 +3191,7 @@ fn unrepairable_archive_names(repository: &Repository) -> Vec<String> {
         .collect()
 }
 
-fn planned_archive_repairs(repository: &Repository) -> Vec<CleanupAction> {
+fn planned_archive_repairs(repository: &Repository) -> Vec<CompactionAction> {
     struct Group {
         target: String,
         retired: Vec<String>,
@@ -2936,7 +3246,7 @@ fn planned_archive_repairs(repository: &Repository) -> Vec<CleanupAction> {
         .filter(|group| group.scanned_segments > 0)
         .map(|mut group| {
             group.retired.sort();
-            CleanupAction::RepairArchiveIndex {
+            CompactionAction::RepairArchiveIndex {
                 file_name: group.target,
                 retired_file_names: group.retired,
                 reason: group.reason,
@@ -2944,6 +3254,209 @@ fn planned_archive_repairs(repository: &Repository) -> Vec<CleanupAction> {
             }
         })
         .collect()
+}
+
+/// Pre-existing bulk segments the compacted generation will reference where
+/// they lie rather than re-encoding.
+///
+/// This is a second implementation of the sharing rule in
+/// `RecordWriter::copy_binary_value`, and it must agree with it exactly or the
+/// predicted sweep names the wrong archives. The rule, in the order that
+/// function applies it: only `PropertyType::Binary`; only
+/// `BinaryValue::Inline` (an external binary carries a blob identifier and no
+/// blocks); only at or above `MEDIUM_VALUE_LIMIT`, because a shorter value is
+/// materialized and re-encoded whole; and then only those blocks whose own
+/// segment `is_bulk_segment()`, because a block in a *data* segment is copied.
+///
+/// Checkpoints this run retires are not walked: their content is not copied,
+/// so it seeds nothing.
+/// The generation a compaction of this kind writes into.
+///
+/// Named once, because the plan states it and the apply writes it: two
+/// spellings of the same arithmetic is how a plan comes to describe a
+/// generation the run does not produce.
+fn compaction_target_generation(
+    base: GarbageCollectionGeneration,
+    kind: CompactionKind,
+) -> GarbageCollectionGeneration {
+    match kind {
+        CompactionKind::Full => GarbageCollectionGeneration {
+            generation: base.generation.wrapping_add(1),
+            full_generation: base.full_generation.wrapping_add(1),
+            is_compacted: true,
+        },
+        CompactionKind::Tail => GarbageCollectionGeneration {
+            generation: base.generation.wrapping_add(1),
+            full_generation: base.full_generation,
+            is_compacted: true,
+        },
+    }
+}
+
+/// Records one non-actionable disposition: counted, and named in a warning.
+fn retained_reclaimable_from(
+    planned: &PlannedArchiveSweep,
+    retained: &mut RetainedReclaimable,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    match planned {
+        PlannedArchiveSweep::DeferredBySavings {
+            file_name,
+            segment_count,
+            eligible_entry_bytes,
+        } => {
+            retained.below_savings_gate += segment_count;
+            add_estimate(&mut retained.bytes, *eligible_entry_bytes)?;
+            warnings.push(format!(
+                "{file_name}: {segment_count} reclaimable segments ({}) retained because savings do not exceed Oak's 25% rewrite gate",
+                crate::units::format_byte_size(*eligible_entry_bytes)
+            ));
+        }
+        PlannedArchiveSweep::DeferredAtLastGeneration {
+            file_name,
+            segment_count,
+            eligible_entry_bytes,
+        } => {
+            retained.at_last_generation += segment_count;
+            add_estimate(&mut retained.bytes, *eligible_entry_bytes)?;
+            warnings.push(format!(
+                "{file_name}: {segment_count} reclaimable segments ({}) retained because archive generation z cannot be rewritten",
+                crate::units::format_byte_size(*eligible_entry_bytes)
+            ));
+        }
+        PlannedArchiveSweep::BlockedByOccupiedGeneration {
+            file_name,
+            occupied_name,
+            segment_count,
+            eligible_entry_bytes,
+        } => {
+            retained.blocked_by_occupied_generation += segment_count;
+            add_estimate(&mut retained.bytes, *eligible_entry_bytes)?;
+            warnings.push(format!(
+                "{file_name}: {segment_count} reclaimable segments ({}) retained because {occupied_name} already exists",
+                crate::units::format_byte_size(*eligible_entry_bytes)
+            ));
+        }
+        PlannedArchiveSweep::Remove { .. } | PlannedArchiveSweep::Rewrite { .. } => {}
+    }
+    Ok(())
+}
+
+fn predict_shared_bulk_segments(
+    repository: &Repository,
+    head: RecordIdentifier,
+    omitted_checkpoints: &BTreeSet<String>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<HashSet<SegmentIdentifier>> {
+    crate::progress::observe(
+        observer,
+        &Step::new("predicting the shared binary content", WorkUnit::Nodes),
+        |observer| {
+            let mut shared = HashSet::new();
+            let mut visited: HashSet<RecordIdentifier> = HashSet::new();
+            let mut pending = vec![head];
+            let mut traced = crate::progress::StrideCounter::new(SEGMENT_TRACE_REPORT_STRIDE);
+            while let Some(record) = pending.pop() {
+                if !visited.insert(record) {
+                    continue;
+                }
+                traced.advance(observer);
+                let node = repository.node(record);
+                for property in node.properties()? {
+                    if property.property_type != crate::content::property::PropertyType::Binary {
+                        continue;
+                    }
+                    let values = match &property.values {
+                        crate::content::node::PropertyValues::Single(value) => {
+                            std::slice::from_ref(value)
+                        }
+                        crate::content::node::PropertyValues::Multiple(values) => values.as_slice(),
+                    };
+                    for value in values {
+                        let crate::content::property::PropertyValue::Binary(
+                            crate::content::value::BinaryValue::Inline {
+                                length,
+                                record_identifier,
+                            },
+                        ) = value
+                        else {
+                            continue;
+                        };
+                        if *length < crate::writer::record_writer::MEDIUM_VALUE_LIMIT as u64 {
+                            continue;
+                        }
+                        collect_shared_bulk_blocks(
+                            repository,
+                            *record_identifier,
+                            *length,
+                            &mut shared,
+                        )?;
+                    }
+                }
+                let is_checkpoint_container = record == head;
+                for (name, child) in node.child_node_entries()? {
+                    // The one place a name matters, and the same one the copy
+                    // reads: a checkpoint this run retires is not descended
+                    // into, exactly as `deep_copy_super_root_with_progress`
+                    // declines to enter it.
+                    if !is_checkpoint_container
+                        && !omitted_checkpoints.is_empty()
+                        && omitted_checkpoints.contains(&name)
+                    {
+                        continue;
+                    }
+                    pending.push(child.record_identifier());
+                }
+            }
+            traced.finish(observer);
+            Ok(shared)
+        },
+    )
+}
+
+/// The bulk segments holding one long inline binary's blocks.
+fn collect_shared_bulk_blocks(
+    repository: &Repository,
+    value: RecordIdentifier,
+    length: u64,
+    shared: &mut HashSet<SegmentIdentifier>,
+) -> Result<()> {
+    let block_count = length.div_ceil(crate::content::value::BLOCK_SIZE);
+    let view = repository.segment(value.segment)?;
+    let list_identifier = view.read_record_identifier(value.record_number, 8, 0)?;
+    for block in
+        crate::content::list::uncounted_list_entries(repository, list_identifier, block_count)?
+    {
+        if block.segment.is_bulk_segment() {
+            shared.insert(block.segment);
+        }
+    }
+    Ok(())
+}
+
+/// Active data segments stamped ahead of the head's own generation.
+///
+/// Nothing legitimate sits ahead of the head: the writer stamps what it writes
+/// at the head's generation, and a compaction publishes its head before
+/// anything else observes the generation it wrote. So every one of these is
+/// output from an earlier run that died between finishing its copy and
+/// committing the head.
+///
+/// They matter because no ordinary rule removes them. Compaction's own mark
+/// disables the dangling-future rule, and the generation predicate spares a
+/// segment *newer* than its reference on both clauses — so residue would
+/// survive every future run while continuing to hold bulk segments alive
+/// through its references. Left alone it accumulates once per killed run.
+fn segments_ahead_of_the_head(
+    active_index_generations: &HashMap<SegmentIdentifier, GarbageCollectionGeneration>,
+    reference: GarbageCollectionGeneration,
+) -> usize {
+    active_index_generations
+        .iter()
+        .filter(|(identifier, generation)| {
+            identifier.is_data_segment() && generation.generation > reference.generation
+        })
+        .count()
 }
 
 fn active_index_generations(
@@ -3054,11 +3567,21 @@ fn extend_segment_closure(
     Ok(())
 }
 
-fn validate_current_generation_invariant(
+/// Proves the current head reaches nothing the run's own reclaim rule would
+/// discard.
+///
+/// The predicate alone does not make head-reachable data safe — it only makes
+/// *older-generation* data reclaimable, and whether the head reaches any is a
+/// property of the store, not of the arithmetic. So this re-evaluates the
+/// identical rule the mark phase will consume, over the head's transitive
+/// segment closure, and refuses before any mutation. Bulk segments are skipped
+/// deliberately: they carry the null generation triple by format mandate and
+/// are reclaimed by reachability, which the mark phase's reference set decides.
+fn validate_reclaim_reference_invariant(
     repository: &Repository,
     current_closure: &HashSet<SegmentIdentifier>,
     active_index_generations: &HashMap<SegmentIdentifier, GarbageCollectionGeneration>,
-    reference: GarbageCollectionGeneration,
+    rule: ReclaimRule,
 ) -> Result<()> {
     for &identifier in current_closure {
         if !identifier.is_data_segment() {
@@ -3079,12 +3602,7 @@ fn validate_current_generation_invariant(
                 ),
             });
         }
-        if is_reclaimable(
-            reference,
-            header,
-            crate::writer::store_writer::STANDALONE_FULL_GARBAGE_COLLECTION,
-            crate::writer::store_writer::STANDALONE_RETAINED_GENERATIONS,
-        ) {
+        if is_reclaimable(rule.reference, header, rule.full, rule.retained_generations) {
             return Err(Error::InvalidFormat {
                 details: format!(
                     "current head reaches data segment {identifier} in reclaimable generation {header:?}; refusing to trust generation cleanup"
@@ -3122,7 +3640,7 @@ impl SegmentProvider for ExcludingProvider<'_> {
 fn validate_prospective_segment_plan(
     directory: &Path,
     repository: &Repository,
-    plan: &StandaloneSegmentCleanupPlan,
+    plan: &StandaloneSegmentCompactionPlan,
     retained_roots: &[RecordIdentifier],
     observer: &mut dyn ProgressObserver,
 ) -> Result<()> {
@@ -3182,11 +3700,11 @@ fn validate_prospective_segment_plan(
 fn prospective_retained_roots<'roots>(
     directory: &Path,
     repository: &Repository,
-    plan: &StandaloneSegmentCleanupPlan,
+    plan: &StandaloneSegmentCompactionPlan,
     retained_roots: &'roots [RecordIdentifier],
 ) -> Cow<'roots, [RecordIdentifier]> {
     #[cfg(test)]
-    if crate::writer::cleanup_fault_injection::is_substitution_armed(
+    if crate::writer::maintenance_fault_injection::is_substitution_armed(
         "cleanup.before-prospective-retained-root-verification",
     ) {
         let unavailable = planned_unavailable_segments(directory, plan)
@@ -3457,11 +3975,164 @@ fn plan_recovery_backups(
     clippy::too_many_lines,
     reason = "the apply path intentionally presents its crash-safe mutation order as one linear transaction"
 )]
-fn apply_prepared(
-    prepared: PreparedCleanup,
+/// What the compaction phase of a merged run did.
+#[derive(Clone, Debug)]
+struct CompactionPhaseOutcome {
+    /// The head the copy published. Equals the plan's current head only when
+    /// no compaction ran.
+    head_after: RecordIdentifier,
+    /// The generation the copy wrote into.
+    target_generation: GarbageCollectionGeneration,
+    /// Distinct node records the copy rewrote.
+    copied_nodes: u64,
+    /// What the reclaim pass that follows the copy did.
+    sweep: crate::writer::store_writer::SegmentSweepOutcome,
+    /// The exact `gc.log` line this cycle appended.
+    garbage_collection_entry: String,
+}
+
+/// Deep-copies the head into a fresh generation and reclaims what the copy
+/// supersedes, in one writable session under the held lock.
+///
+/// The ordering inside is the whole safety argument. The copy is purely
+/// additive — it appends fresh archives and touches no existing byte — so a
+/// failure or a refusal anywhere before the head moves leaves the store
+/// exactly as it was, minus some orphan archives a later run retires. Only
+/// once the copy is committed and the head published does anything get
+/// unlinked, and by then every segment the new head reaches lives in the
+/// generation the sweep is about to retain.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the copy, the head commit, the reclaim pass and the cycle record are one ordered sequence whose adjacency is the safety argument"
+)]
+fn apply_compaction_phase(
+    directory: &Path,
+    plan: &CompactionPlan,
+    repository_lock: &Arc<RepositoryLock>,
+    kind: CompactionKind,
+    rewrite_policy: ArchiveRewritePolicy,
     observer: &mut dyn ProgressObserver,
-) -> Result<CleanupOutcome> {
-    let PreparedCleanup {
+) -> Result<CompactionPhaseOutcome> {
+    repository_lock.validate_path_identity(directory)?;
+    let certified_archive_number =
+        plan.checkpoint_archive_number
+            .ok_or_else(|| Error::InvalidFormat {
+                details: "the compaction phase has no certified output archive number".to_owned(),
+            })?;
+    let mut store = WritableRepository::open_prepared(
+        directory,
+        Arc::clone(repository_lock),
+        certified_archive_number,
+    )?;
+    if store.head() != plan.current_head {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "the compaction phase expected head {}, but strict writable open selected {}",
+                plan.current_head,
+                store.head()
+            ),
+        });
+    }
+
+    let base_generation = store
+        .segment_generation(store.head().segment)
+        .ok_or_else(|| Error::InvalidFormat {
+            details: format!(
+                "the head segment {} carries no generation triple",
+                store.head().segment
+            ),
+        })?;
+    let target_generation = compaction_target_generation(base_generation, kind);
+
+    // Refuse a damaged source before the copy appends anything, so a retry
+    // against a pre-existing defect does not durably append another full copy
+    // before failing. The proof travels to the reclaim pass below.
+    let certified_sources = store.preflight_reclaim_sources_with_progress(observer)?;
+
+    let archive_bytes_before = archive_file_bytes(directory)?;
+    let omitted_checkpoints: std::collections::BTreeSet<String> =
+        plan.checkpoints.names.iter().cloned().collect();
+    let mut writer = store.record_writer_with_identifier(target_generation, "c");
+    let (new_head, copied_nodes) = crate::progress::observe(
+        observer,
+        &Step::new("copying nodes into a fresh generation", WorkUnit::Nodes),
+        |observer| {
+            crate::writer::compaction::deep_copy_super_root_with_progress(
+                &store,
+                &mut writer,
+                plan.current_head,
+                &omitted_checkpoints,
+                observer,
+            )
+        },
+    )?;
+    writer.finish()?;
+
+    if !store.set_head(plan.current_head, new_head) {
+        return Err(Error::InvalidFormat {
+            details: "the head moved during the compaction phase".to_owned(),
+        });
+    }
+    store.flush()?;
+
+    let sweep = crate::progress::observe(
+        observer,
+        &Step::new("reclaiming old generations", WorkUnit::Archives),
+        |_observer| {
+            store.reclaim_old_generations_with(
+                crate::writer::store_writer::GenerationReclaimRequest {
+                    rule: ReclaimRule {
+                        reference: target_generation,
+                        full: kind == CompactionKind::Full,
+                        retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
+                    },
+                    rewrite_policy,
+                    certified_sources: Some(&certified_sources),
+                    expected: None,
+                },
+            )
+        },
+    )?;
+
+    store.close()?;
+    sync_directory_strict(directory)?;
+
+    // Oak reads `gc.log` to find the previous cycle when it tail-compacts, so
+    // a completed cycle must record itself. The exact bytes are kept, because
+    // the line carries a timestamp and the final verification proves the file
+    // grew by *these* bytes rather than by something that merely looks alike.
+    let archive_bytes_after = archive_file_bytes(directory)?;
+    let garbage_collection_entry = crate::writer::compaction::garbage_collection_log_entry(
+        archive_bytes_after,
+        archive_bytes_before.saturating_sub(archive_bytes_after),
+        target_generation,
+        copied_nodes,
+        new_head,
+    );
+    crate::writer::compaction::append_garbage_collection_log_entry(
+        directory,
+        &garbage_collection_entry,
+    )?;
+    sync_directory_strict(directory)?;
+
+    Ok(CompactionPhaseOutcome {
+        head_after: new_head,
+        target_generation,
+        copied_nodes,
+        sweep,
+        garbage_collection_entry,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered mutation sequence and the barriers between its phases are one safety argument that reads worse split apart"
+)]
+fn apply_prepared(
+    prepared: PreparedCompaction,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CompactionOutcome> {
+    let PreparedCompaction {
         directory,
         options,
         plan,
@@ -3494,14 +4165,19 @@ fn apply_prepared(
         upgrade_manifest_atomically(&directory)?;
     }
 
-    let mut segment_outcome = StandaloneSegmentCleanupOutcome::default();
+    let mut segment_outcome = StandaloneSegmentCompactionOutcome::default();
     if let Some(expected) = &plan.segment_plan {
         repository_lock.validate_path_identity(&directory)?;
         let (_, outcome) = apply_standalone_segment_cleanup(
             &directory,
-            plan.reference_generation,
+            ReclaimRule {
+                reference: plan.reference_generation,
+                full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+                retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
+            },
             plan.current_head.segment,
             &plan.protected_history_segments,
+            options.archive_rewrite_policy,
             Some(expected),
             observer,
         )?;
@@ -3510,7 +4186,7 @@ fn apply_prepared(
 
     repository_lock.validate_path_identity(&directory)?;
     let (removed_stale_archives, mut stale_not_deleted) =
-        if options.contains(CleanupTask::StaleArchives) {
+        if options.contains(MaintenanceTask::StaleArchives) {
             crate::progress::observe(
                 observer,
                 &Step::new("removing stale archives", WorkUnit::Files)
@@ -3534,8 +4210,57 @@ fn apply_prepared(
             (0, Vec::new())
         };
 
+    // Before the copy, because a killed run's output holds bulk segments alive
+    // through its references, and because retiring it first means a retry
+    // converges instead of accumulating one more orphan generation.
+    if let Some(expected) = &plan.residue_sweep {
+        repository_lock.validate_path_identity(&directory)?;
+        crate::progress::observe(
+            observer,
+            &Step::new(
+                "retiring interrupted-compaction residue",
+                WorkUnit::Archives,
+            ),
+            |observer| -> Result<()> {
+                apply_standalone_segment_cleanup(
+                    &directory,
+                    ReclaimRule {
+                        reference: plan.reference_generation,
+                        full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+                        retained_generations: i32::MAX,
+                    },
+                    plan.current_head.segment,
+                    &HashSet::new(),
+                    options.archive_rewrite_policy,
+                    Some(expected),
+                    observer,
+                )
+                .map(|_| ())
+            },
+        )?;
+    }
+
     let mut expected_head_after = plan.current_head;
-    let removed_checkpoints = if plan.checkpoints.names.is_empty() {
+    let mut compaction_outcome: Option<CompactionPhaseOutcome> = None;
+    let removed_checkpoints = if let Some(kind) = options.compaction_kind {
+        // The head moves exactly once, and the checkpoints this run retires
+        // are simply never carried into the fresh generation. Removing them
+        // from the live head first would move the head twice, append a second
+        // journal line, and strand records at a generation this same run then
+        // reclaims — inside a session archive the reclaim pass never sweeps.
+        let outcome = apply_compaction_phase(
+            &directory,
+            &plan,
+            &repository_lock,
+            kind,
+            options.archive_rewrite_policy,
+            observer,
+        )?;
+        expected_head_after = outcome.head_after;
+        let omitted = plan.checkpoints.names.len() as u64;
+        compaction_outcome = Some(outcome);
+        omitted
+    } else if plan.checkpoints.names.is_empty() {
         0
     } else {
         let (removed, head_after_checkpoints) = crate::progress::observe(
@@ -3588,7 +4313,32 @@ fn apply_prepared(
     // No step wraps this phase: the head verification and the journal
     // analysis inside it report steps of their own, and a step around
     // them would mix nodes and journal lines into one count.
-    let journal_outcome = if options.contains(CleanupTask::Journal) {
+    let journal_outcome = if let Some(compaction) = &compaction_outcome {
+        // A compacting run retires history by identity, not by re-analysis.
+        // The plan's retained roots named revisions of a head this run has
+        // since replaced, and the segments behind them are already reclaimed,
+        // so comparing a fresh analysis against them would refuse every run.
+        // What is provable instead is exact: the journal keeps the single
+        // physical line naming the head the copy just published, and nothing
+        // else. That is the same shape Oak's own offline compact tool leaves.
+        repository_lock.validate_path_identity(&directory)?;
+        let repository = Repository::open_with_progress(&directory, observer)?;
+        verify_exact_super_root(&repository, compaction.head_after, observer)?;
+        let raw = scan_raw_journal(&directory)?;
+        let retained = retained_compacted_head_line(&raw, compaction.head_after)?;
+        verify_retained_journal_lines(&raw, &[raw.lines()[retained].content_bytes().to_vec()])?;
+        if raw.lines().len() == 1 {
+            JournalRewriteOutcome {
+                changed: false,
+                backup_path: None,
+                retained_record_count: 1,
+                removed_line_count: 0,
+                bytes_written: raw.source_bytes().len(),
+            }
+        } else {
+            rewrite_journal_atomically(&raw, &[retained])?
+        }
+    } else if options.contains(MaintenanceTask::Journal) {
         repository_lock.validate_path_identity(&directory)?;
         let repository = Repository::open_with_progress(&directory, observer)?;
         let head = repository.head_record_identifier();
@@ -3636,12 +4386,34 @@ fn apply_prepared(
 
     sync_directory_strict(&directory)?;
 
+    // `gc.log` records completed compaction cycles and nothing else. A run
+    // that did not compact must leave it byte-identical; a run that did must
+    // have appended exactly the one line describing the cycle it completed,
+    // and changed nothing already in the file.
     let gc_log_after = read_optional_regular_file(&directory.join("gc.log"))?;
-    if gc_log_before != gc_log_after {
-        return Err(Error::InvalidFormat {
-            details: "standalone cleanup changed gc.log, which is reserved for completed compaction cycles"
-                .to_owned(),
-        });
+    match &compaction_outcome {
+        None => {
+            if gc_log_before != gc_log_after {
+                return Err(Error::InvalidFormat {
+                    details: "a run that did not compact changed gc.log, which is reserved for completed compaction cycles"
+                        .to_owned(),
+                });
+            }
+        }
+        Some(compaction) => {
+            let before = gc_log_before.as_deref().unwrap_or_default();
+            let after = gc_log_after.as_deref().unwrap_or_default();
+            let expected = compaction.garbage_collection_entry.as_bytes();
+            if after.len() != before.len() + expected.len()
+                || !after.starts_with(before)
+                || &after[before.len()..] != expected
+            {
+                return Err(Error::InvalidFormat {
+                    details: "the completed compaction did not append exactly its own gc.log entry"
+                        .to_owned(),
+                });
+            }
+        }
     }
 
     // All old archive mappings and writable caches are out of scope here.
@@ -3671,20 +4443,39 @@ fn apply_prepared(
         observer,
     )?;
     inject_final_retained_root_fault(&mut final_journal_analysis.retained_record_ids);
-    verify_retained_journal_roots(
-        &plan.journal.retained_record_ids,
-        &final_journal_analysis.retained_record_ids,
-    )?;
-    if options.contains(CleanupTask::Journal) && final_journal_analysis.plan.removed_lines != 0 {
-        return Err(Error::InvalidFormat {
-            details: format!(
-                "journal cleanup left {} removable physical lines after its atomic rewrite",
-                final_journal_analysis.plan.removed_lines
-            ),
-        });
+    if let Some(compaction) = &compaction_outcome {
+        // Exactly one line, naming exactly the head the copy published.
+        // Stronger than the root comparison it replaces: that proved a set of
+        // revisions still resolved, this proves the file holds one line and
+        // which one.
+        if final_raw_journal.lines().len() != 1 {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "a completed compaction left {} journal lines instead of one",
+                    final_raw_journal.lines().len()
+                ),
+            });
+        }
+        retained_compacted_head_line(&final_raw_journal, compaction.head_after)?;
+    } else {
+        verify_retained_journal_roots(
+            &plan.journal.retained_record_ids,
+            &final_journal_analysis.retained_record_ids,
+        )?;
+        if options.contains(MaintenanceTask::Journal)
+            && final_journal_analysis.plan.removed_lines != 0
+        {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "journal cleanup left {} removable physical lines after its atomic rewrite",
+                    final_journal_analysis.plan.removed_lines
+                ),
+            });
+        }
+        let expected_retained_lines =
+            final_expected_retained_lines(&plan.journal.retained_raw_lines);
+        verify_retained_journal_lines(&final_raw_journal, &expected_retained_lines)?;
     }
-    let expected_retained_lines = final_expected_retained_lines(&plan.journal.retained_raw_lines);
-    verify_retained_journal_lines(&final_raw_journal, &expected_retained_lines)?;
 
     // Recovery/staging material is the final, independent mutation. Never
     // discard it until every repository mutation has passed a fresh exact-head
@@ -3696,7 +4487,7 @@ fn apply_prepared(
     // task has nothing to remove, and announcing the work anyway told the
     // operator froe had considered backups it was never asked to touch.
     let (removed_temporaries, mut temporary_not_deleted) =
-        if options.contains(CleanupTask::StaleTemporaries) {
+        if options.contains(MaintenanceTask::StaleTemporaries) {
             crate::progress::observe(
                 observer,
                 &Step::new("removing stale temporary files", WorkUnit::Files)
@@ -3714,7 +4505,7 @@ fn apply_prepared(
             (0, Vec::new())
         };
     let (removed_recovery_backups, mut backup_not_deleted) =
-        if options.contains(CleanupTask::RecoveryBackups) {
+        if options.contains(MaintenanceTask::RecoveryBackups) {
             crate::progress::observe(
                 observer,
                 &Step::new("removing old recovery backups", WorkUnit::Files)
@@ -3739,9 +4530,9 @@ fn apply_prepared(
         .into_iter()
         .map(|failure| {
             if failure.target_was_already_absent {
-                CleanupDeletionFailure::already_absent(failure.file_name, failure.error)
+                FileDeletionFailure::already_absent(failure.file_name, failure.error)
             } else {
-                CleanupDeletionFailure::retained(failure.file_name, failure.error)
+                FileDeletionFailure::retained(failure.file_name, failure.error)
             }
         })
         .collect();
@@ -3763,13 +4554,29 @@ fn apply_prepared(
     let removed_journal_lines = journal_outcome.removed_line_count;
     let journal_backup_path = journal_outcome.backup_path;
 
-    Ok(CleanupOutcome {
+    // A run either sweeps through the directory-level engine or through the
+    // compaction phase's own reclaim pass; never both, because a pre-copy plan
+    // describes a store the copy replaces. Whichever ran carries the counts.
+    let (rewritten_archives, removed_reclaimable_archives, removed_segments) =
+        match &compaction_outcome {
+            Some(compaction) => (
+                compaction.sweep.rewritten_archives,
+                compaction.sweep.removed_archives,
+                compaction.sweep.removed_segments,
+            ),
+            None => (
+                segment_outcome.rewritten_archives,
+                segment_outcome.removed_archives,
+                segment_outcome.removed_segments,
+            ),
+        };
+    Ok(CompactionOutcome {
         head_before: plan.current_head,
         head_after,
         removed_checkpoints,
         removed_journal_lines,
-        rewritten_archives: segment_outcome.rewritten_archives,
-        removed_reclaimable_archives: segment_outcome.removed_archives,
+        rewritten_archives,
+        removed_reclaimable_archives,
         removed_stale_archives,
         removed_temporaries,
         removed_recovery_backups,
@@ -3778,10 +4585,47 @@ fn apply_prepared(
         archive_bytes_before,
         archive_bytes_after,
         retained_recovery_backup_bytes: recovery_backup_file_bytes(&directory)?,
-        removed_segments: segment_outcome.removed_segments,
+        compacted: compaction_outcome
+            .as_ref()
+            .map(|compaction| CompactedGeneration {
+                nodes: compaction.copied_nodes,
+                generation: compaction.target_generation,
+            }),
+        removed_segments,
         journal_backup_path,
         deletion_failures,
     })
+}
+
+/// The index of the single physical journal line naming `head`.
+///
+/// Located by identity rather than by position: the copy appended its line to
+/// whatever the journal already held, and a corrupt or duplicated file must be
+/// refused rather than guessed at.
+fn retained_compacted_head_line(raw: &RawJournal, head: RecordIdentifier) -> Result<usize> {
+    let matching: Vec<usize> = raw
+        .lines()
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| match line.classification() {
+            RawJournalLineClassification::Record(record) => record.record_identifier == head,
+            RawJournalLineClassification::ParserSkippedNoSpace
+            | RawJournalLineClassification::InvalidRecordIdentifier { .. } => false,
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match matching.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(Error::InvalidFormat {
+            details: format!("the journal holds no line naming the compacted head {head}"),
+        }),
+        many => Err(Error::InvalidFormat {
+            details: format!(
+                "the journal holds {} lines naming the compacted head {head}; refusing to choose one",
+                many.len()
+            ),
+        }),
+    }
 }
 
 fn verify_retained_journal_roots(
@@ -3814,7 +4658,7 @@ fn verify_retained_journal_roots(
 
 fn inject_final_retained_root_fault(actual: &mut Vec<RecordIdentifier>) {
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::omit_last_if_armed(
+    crate::writer::maintenance_fault_injection::omit_last_if_armed(
         "cleanup.before-final-retained-root-verification",
         actual,
     );
@@ -3826,7 +4670,7 @@ fn final_expected_retained_lines(expected: &[Vec<u8>]) -> Cow<'_, [Vec<u8>]> {
     #[cfg(test)]
     {
         let mut injected = expected.to_vec();
-        crate::writer::cleanup_fault_injection::append_missing_journal_line_if_armed(
+        crate::writer::maintenance_fault_injection::append_missing_journal_line_if_armed(
             "cleanup.before-final-retained-line-verification",
             &mut injected,
         );
@@ -3919,7 +4763,7 @@ fn verify_planned_file_target(
 fn accept_planned_file_verification(
     verification: Result<PlannedFileTargetVerification>,
     failure_mode: PlannedFileRemovalFailureMode,
-    failures: &mut Vec<CleanupDeletionFailure>,
+    failures: &mut Vec<FileDeletionFailure>,
     file_name: &str,
 ) -> Result<bool> {
     match verification {
@@ -3928,7 +4772,7 @@ fn accept_planned_file_verification(
             record_planned_file_removal_failure(
                 PlannedFileRemovalFailureMode::Partial,
                 failures,
-                CleanupDeletionFailure::already_absent(
+                FileDeletionFailure::already_absent(
                     file_name.to_owned(),
                     ALREADY_ABSENT_DELETION_DETAIL,
                 ),
@@ -3939,7 +4783,7 @@ fn accept_planned_file_verification(
             record_planned_file_removal_failure(
                 failure_mode,
                 failures,
-                CleanupDeletionFailure::retained(file_name.to_owned(), error.to_string()),
+                FileDeletionFailure::retained(file_name.to_owned(), error.to_string()),
             )?;
             Ok(false)
         }
@@ -3948,8 +4792,8 @@ fn accept_planned_file_verification(
 
 fn record_planned_file_removal_failure(
     mode: PlannedFileRemovalFailureMode,
-    failures: &mut Vec<CleanupDeletionFailure>,
-    failure: CleanupDeletionFailure,
+    failures: &mut Vec<FileDeletionFailure>,
+    failure: FileDeletionFailure,
 ) -> Result<()> {
     if mode == PlannedFileRemovalFailureMode::RequireCertifiedTarget {
         return Err(Error::InvalidFormat {
@@ -3968,7 +4812,7 @@ fn remove_planned_files(
     files: impl IntoIterator<Item = PlannedFileRemoval>,
     failure_mode: PlannedFileRemovalFailureMode,
     observer: &mut dyn ProgressObserver,
-) -> Result<(usize, Vec<CleanupDeletionFailure>)> {
+) -> Result<(usize, Vec<FileDeletionFailure>)> {
     // Count files the engine has *finished with*. The removal engine is
     // a lazy consumer, so pulling file N means files 0..N have been
     // resolved — reporting the count *before* the increment is therefore
@@ -3996,7 +4840,7 @@ fn remove_planned_files_with(
     files: impl IntoIterator<Item = PlannedFileRemoval>,
     failure_mode: PlannedFileRemovalFailureMode,
     unlink: impl FnMut(&Path) -> std::io::Result<()>,
-) -> Result<(usize, Vec<CleanupDeletionFailure>)> {
+) -> Result<(usize, Vec<FileDeletionFailure>)> {
     #[cfg(test)]
     {
         remove_planned_files_core(directory, files, failure_mode, |_, _| {}, unlink)
@@ -4014,7 +4858,7 @@ fn remove_planned_files_with_after_open(
     failure_mode: PlannedFileRemovalFailureMode,
     after_open: impl FnMut(&Path, usize),
     unlink: impl FnMut(&Path) -> std::io::Result<()>,
-) -> Result<(usize, Vec<CleanupDeletionFailure>)> {
+) -> Result<(usize, Vec<FileDeletionFailure>)> {
     remove_planned_files_core(directory, files, failure_mode, after_open, unlink)
 }
 
@@ -4024,7 +4868,7 @@ fn remove_planned_files_core(
     failure_mode: PlannedFileRemovalFailureMode,
     #[cfg(test)] mut after_open: impl FnMut(&Path, usize),
     mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
-) -> Result<(usize, Vec<CleanupDeletionFailure>)> {
+) -> Result<(usize, Vec<FileDeletionFailure>)> {
     let mut removed = 0usize;
     let mut failures = Vec::new();
     for file in files {
@@ -4046,7 +4890,7 @@ fn remove_planned_files_core(
                 record_planned_file_removal_failure(
                     PlannedFileRemovalFailureMode::Partial,
                     &mut failures,
-                    CleanupDeletionFailure::already_absent(
+                    FileDeletionFailure::already_absent(
                         file.file_name,
                         ALREADY_ABSENT_DELETION_DETAIL,
                     ),
@@ -4057,7 +4901,7 @@ fn remove_planned_files_core(
                 record_planned_file_removal_failure(
                     failure_mode,
                     &mut failures,
-                    CleanupDeletionFailure::retained(file.file_name, error.to_string()),
+                    FileDeletionFailure::retained(file.file_name, error.to_string()),
                 )?;
                 continue;
             }
@@ -4074,14 +4918,14 @@ fn remove_planned_files_core(
             continue;
         }
         #[cfg(test)]
-        if let Err(error) = crate::writer::cleanup_fault_injection::substitute_path_if_armed(
+        if let Err(error) = crate::writer::maintenance_fault_injection::substitute_path_if_armed(
             "remove-planned-file.before-final-identity",
             &path,
         ) {
             record_planned_file_removal_failure(
                 failure_mode,
                 &mut failures,
-                CleanupDeletionFailure::retained(file.file_name, error.to_string()),
+                FileDeletionFailure::retained(file.file_name, error.to_string()),
             )?;
             continue;
         }
@@ -4110,7 +4954,7 @@ fn remove_planned_files_core(
                 record_planned_file_removal_failure(
                     PlannedFileRemovalFailureMode::Partial,
                     &mut failures,
-                    CleanupDeletionFailure::already_absent(
+                    FileDeletionFailure::already_absent(
                         file.file_name,
                         ALREADY_ABSENT_DELETION_DETAIL,
                     ),
@@ -4119,7 +4963,7 @@ fn remove_planned_files_core(
             Err(error) => record_planned_file_removal_failure(
                 PlannedFileRemovalFailureMode::Partial,
                 &mut failures,
-                CleanupDeletionFailure::retained(file.file_name, error.to_string()),
+                FileDeletionFailure::retained(file.file_name, error.to_string()),
             )?,
         }
     }
@@ -4216,13 +5060,13 @@ fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
         "staged manifest replacement",
     )?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("manifest.temporary-durable")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("manifest.temporary-durable")?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed("manifest.temporary-durable");
+    crate::writer::maintenance_fault_injection::crash_if_armed("manifest.temporary-durable");
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("manifest.before-rename")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("manifest.before-rename")?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed("manifest.before-rename");
+    crate::writer::maintenance_fault_injection::crash_if_armed("manifest.before-rename");
     source_certificate.recertify(
         &manifest_path,
         &source,
@@ -4244,20 +5088,20 @@ fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
     )?;
     drop(source_certificate);
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed(
+    crate::writer::maintenance_fault_injection::fail_if_armed(
         "manifest.renamed-before-directory-sync",
     )?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed(
+    crate::writer::maintenance_fault_injection::crash_if_armed(
         "manifest.renamed-before-directory-sync",
     );
     guard.commit();
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed(
+    crate::writer::maintenance_fault_injection::fail_if_armed(
         "manifest.before-post-rename-directory-sync",
     )?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed(
+    crate::writer::maintenance_fault_injection::crash_if_armed(
         "manifest.before-post-rename-directory-sync",
     );
     temporary_certificate.recertify(
@@ -4274,9 +5118,9 @@ fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
         "installed manifest replacement",
     )?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("manifest.rename-durable")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("manifest.rename-durable")?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed("manifest.rename-durable");
+    crate::writer::maintenance_fault_injection::crash_if_armed("manifest.rename-durable");
     temporary_certificate.recertify(
         &manifest_path,
         &output,
@@ -4493,10 +5337,10 @@ mod tests {
         validate_plan_apply_identity_for_credentials,
     };
     use super::{
-        CleanupAction, CleanupOptions, CleanupTask, JOURNAL_LINE_PREVIEW_LIMIT,
-        JournalRemovalReason, PlannedFileRemoval, PlannedFileRemovalFailureMode, PreparedCleanup,
-        RecoveryBackupPolicy, attach_planning_warnings, cleanup, cleanup_with_progress,
-        file_fingerprint, indexless_archive_refusal, manifest_upgrade_bytes, plan_cleanup,
+        CompactionAction, CompactionOptions, JOURNAL_LINE_PREVIEW_LIMIT, JournalRemovalReason,
+        MaintenanceTask, PlannedFileRemoval, PlannedFileRemovalFailureMode, PreparedCompaction,
+        RecoveryBackupPolicy, attach_planning_warnings, compact, compact_with_progress,
+        file_fingerprint, indexless_archive_refusal, manifest_upgrade_bytes, plan_compaction,
         recovery_backup_target, remove_planned_files, remove_planned_files_with,
     };
     use crate::checksum::crc32;
@@ -4862,13 +5706,13 @@ mod tests {
             .file_name()
             .to_owned();
         drop(repository);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("healthy rewrite plan");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("healthy rewrite plan");
         let replacement_name = plan
             .actions()
             .iter()
             .find_map(|action| match action {
-                CleanupAction::RewriteArchive {
+                CompactionAction::RewriteArchive {
                     file_name,
                     replacement_name,
                     ..
@@ -4927,11 +5771,11 @@ mod tests {
             .file_name()
             .to_owned();
         drop(repository);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("healthy removal plan");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("healthy removal plan");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveReclaimableArchive { file_name, .. }
+            CompactionAction::RemoveReclaimableArchive { file_name, .. }
                 if file_name == &source_name
         )));
         (directory, source_name, orphan.segment)
@@ -4948,10 +5792,10 @@ mod tests {
         let journal_before = std::fs::read(directory.path.join("journal.log")).expect("journal");
         let before = file_bytes(&directory.path);
         for options in [
-            CleanupOptions::default().with_tasks([CleanupTask::Segments]),
-            CleanupOptions::default(),
+            CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+            CompactionOptions::default(),
         ] {
-            let error = plan_cleanup(&directory.path, &options)
+            let error = plan_compaction(&directory.path, &options)
                 .expect_err("read-only planning must reject an uncertified active archive");
             assert!(
                 error.to_string().contains(expected_error),
@@ -4964,9 +5808,9 @@ mod tests {
             );
         }
 
-        let error = cleanup(
+        let error = compact(
             &directory.path,
-            CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect_err("locked replan must reject an uncertified active archive");
         assert!(
@@ -4998,7 +5842,7 @@ mod tests {
         let before = file_bytes(&directory.path);
         let mtimes_before = file_mtimes(&directory.path);
 
-        let plan = plan_cleanup(&directory.path, &CleanupOptions::default()).expect("plan");
+        let plan = plan_compaction(&directory.path, &CompactionOptions::default()).expect("plan");
 
         assert!(plan.is_empty());
         assert_eq!(file_bytes(&directory.path), before);
@@ -5019,9 +5863,9 @@ mod tests {
             .write_all(&hostile)
             .expect("append long invalid line");
 
-        let plan = plan_cleanup(
+        let plan = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Journal]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Journal]),
         )
         .expect("plan long invalid line");
         let removal = plan
@@ -5046,19 +5890,19 @@ mod tests {
             .write_all(b"parser-skipped\n")
             .expect("append parser-skipped line");
 
-        let plan = plan_cleanup(
+        let plan = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect("segment-only plan");
 
-        assert_eq!(plan.tasks(), &[CleanupTask::Segments]);
+        assert_eq!(plan.tasks(), &[MaintenanceTask::Segments]);
         assert!(plan.journal_line_removals().is_empty());
         assert!(
             !plan
                 .actions()
                 .iter()
-                .any(|action| matches!(action, CleanupAction::PruneJournal { .. }))
+                .any(|action| matches!(action, CompactionAction::PruneJournal { .. }))
         );
     }
 
@@ -5113,9 +5957,9 @@ mod tests {
         store.close().expect("close fixture writer");
         let before = file_bytes(&directory.path);
 
-        let error = plan_cleanup(
+        let error = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect_err("prospective deletion must reject a surviving cross-reference");
 
@@ -5164,8 +6008,8 @@ mod tests {
 
         let (directory, source_name, _, _) =
             rewrite_certificate_fixture("foreign-owned-rewrite-preflight");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("healthy rewrite plan");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("healthy rewrite plan");
         let owner = std::fs::metadata(directory.path.join(&source_name))
             .expect("source metadata")
             .uid();
@@ -5205,7 +6049,7 @@ mod tests {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let directory = TestDirectory::repository("planned-identity-directory-metadata");
-        let plan = plan_cleanup(&directory.path, &CleanupOptions::new().with_tasks([]))
+        let plan = plan_compaction(&directory.path, &CompactionOptions::new().with_tasks([]))
             .expect("plan health-only cleanup");
         let mut permissions = std::fs::symlink_metadata(&directory.path)
             .expect("repository metadata before mode change")
@@ -5243,9 +6087,9 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
 
         let directory = TestDirectory::repository("preview-service-user-warning");
-        let mut plan = plan_cleanup(
+        let mut plan = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect("read-only plan");
         let journal_owner = std::fs::symlink_metadata(directory.path.join("journal.log"))
@@ -5298,9 +6142,9 @@ mod tests {
 
         let (directory, source_name, _, _) =
             rewrite_certificate_fixture("preview-unprovable-warning");
-        let mut plan = plan_cleanup(
+        let mut plan = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect("read-only rewrite plan");
         let journal_metadata = std::fs::symlink_metadata(directory.path.join("journal.log"))
@@ -5498,14 +6342,14 @@ mod tests {
             .file_name()
             .to_owned();
         drop(repository);
-        let plan = plan_cleanup(
+        let plan = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect("plan newest whole removal");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveReclaimableArchive { file_name, .. }
+            CompactionAction::RemoveReclaimableArchive { file_name, .. }
                 if file_name == &orphan_archive
         )));
 
@@ -5529,9 +6373,9 @@ mod tests {
     fn recovery_backup_task_requires_an_explicit_policy_without_writing() {
         let directory = TestDirectory::repository("backup-policy-required");
         let before = file_bytes(&directory.path);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::RecoveryBackups]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::RecoveryBackups]);
 
-        let error = plan_cleanup(&directory.path, &options)
+        let error = plan_compaction(&directory.path, &options)
             .expect_err("recovery backup cleanup without retention must be rejected");
 
         let crate::error::Error::InvalidFormat { details } = error else {
@@ -5615,7 +6459,7 @@ mod tests {
             "mid-store damage does not get the unconditional repair advice: {two}"
         );
         assert!(
-            one.contains("--task repair-archives"),
+            one.contains("--repair-archive-indexes"),
             "a killed writer is pointed at the task that repairs it: {one}"
         );
 
@@ -5624,7 +6468,7 @@ mod tests {
         let unrecoverable =
             indexless_archive_refusal(2, 1, &[("data00009a.tar", MAGIC)], true, true);
         assert!(
-            !unrecoverable.contains("--task repair-archives"),
+            !unrecoverable.contains("--repair-archive-indexes"),
             "an unrecoverable archive must not be sent to a command that will refuse it: \
              {unrecoverable}"
         );
@@ -5710,7 +6554,7 @@ mod tests {
         break_index_magic(&directory.path.join("data00000a.tar"));
         let before = file_bytes(&directory.path);
 
-        let error = plan_cleanup(&directory.path, &CleanupOptions::default())
+        let error = plan_compaction(&directory.path, &CompactionOptions::default())
             .expect_err("an index-less active archive must refuse generation cleanup");
         let crate::error::Error::InvalidFormat { details } = error else {
             panic!("unexpected refusal variant");
@@ -5752,27 +6596,27 @@ mod tests {
         break_index_magic(&directory.path.join("data00000a.tar"));
 
         // Without the task, the default set still refuses and points at it.
-        let refusal = plan_cleanup(&directory.path, &CleanupOptions::default())
+        let refusal = plan_compaction(&directory.path, &CompactionOptions::default())
             .expect_err("the default set must still refuse");
         assert!(
-            refusal.to_string().contains("--task repair-archives"),
+            refusal.to_string().contains("--repair-archive-indexes"),
             "the refusal names the task that fixes it: {refusal}"
         );
 
         // With it, the preview names the repair and nothing else yet.
-        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
-        let preview = plan_cleanup(&directory.path, &options).expect("preview must not refuse");
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
+        let preview = plan_compaction(&directory.path, &options).expect("preview must not refuse");
         assert!(
             preview.actions().iter().any(|action| matches!(
                 action,
-                CleanupAction::RepairArchiveIndex { file_name, .. }
+                CompactionAction::RepairArchiveIndex { file_name, .. }
                     if file_name == "data00000a.tar"
             )),
             "the preview names the repair: {:?}",
             preview.actions()
         );
 
-        let outcome = PreparedCleanup::prepare(&directory.path, options)
+        let outcome = PreparedCompaction::prepare(&directory.path, options)
             .expect("prepare repairs under the lock")
             .apply()
             .expect("apply");
@@ -5791,7 +6635,7 @@ mod tests {
                 .any(TarArchiveReader::is_recovered),
             "no archive is served through the recovery scan any more"
         );
-        plan_cleanup(&directory.path, &CleanupOptions::default())
+        plan_compaction(&directory.path, &CompactionOptions::default())
             .expect("the default set plans cleanly against the healed store");
     }
 
@@ -5818,10 +6662,10 @@ mod tests {
             .expect("unrecoverable residue");
         let before = file_bytes(&directory.path);
 
-        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
 
         // The read-only preview says so, before any authorization.
-        let preview = plan_cleanup(&directory.path, &options)
+        let preview = plan_compaction(&directory.path, &options)
             .expect_err("the preview must refuse an unrepairable archive");
         assert!(
             preview.to_string().contains("data00500a.tar"),
@@ -5829,7 +6673,7 @@ mod tests {
         );
 
         // And a library caller skipping the preview pays no rewrite either.
-        match PreparedCleanup::prepare(&directory.path, options) {
+        match PreparedCompaction::prepare(&directory.path, options) {
             Ok(_) => panic!("prepare must refuse too"),
             Err(error) => assert!(
                 error.to_string().contains("data00500a.tar"),
@@ -5876,8 +6720,8 @@ mod tests {
         )
         .expect("staging residue");
 
-        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
-        let details = match PreparedCleanup::prepare(&directory.path, options) {
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
+        let details = match PreparedCompaction::prepare(&directory.path, options) {
             Ok(_) => panic!("the staging residue must refuse the run"),
             Err(crate::error::Error::InvalidFormat { details }) => details,
             Err(other) => panic!("unexpected refusal variant: {other}"),
@@ -5919,9 +6763,9 @@ mod tests {
         std::fs::write(directory.path.join("journal.log.compacting"), b"").expect("temporary");
         let before = file_bytes(&directory.path);
 
-        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
         let prepared =
-            PreparedCleanup::prepare(&directory.path, options).expect("prepare must succeed");
+            PreparedCompaction::prepare(&directory.path, options).expect("prepare must succeed");
         assert_eq!(
             prepared.repaired_archives(),
             0,
@@ -5960,8 +6804,8 @@ mod tests {
         .expect("v3 manifest");
         let before = file_bytes(&directory.path);
 
-        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
-        match PreparedCleanup::prepare(&directory.path, options) {
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
+        match PreparedCompaction::prepare(&directory.path, options) {
             Ok(_) => panic!("a store version this reader does not support must be refused"),
             Err(error) => assert!(
                 error.to_string().contains("newer"),
@@ -5995,8 +6839,8 @@ mod tests {
         break_index_magic(&directory.path.join("data00000a.tar"));
 
         // The preview must state the unfitness itself, before authorizing.
-        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
-        let preview = plan_cleanup(&directory.path, &options)
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
+        let preview = plan_compaction(&directory.path, &options)
             .expect_err("the cross-number duplicate must refuse in the read-only preview");
         assert!(
             preview.to_string().contains("occurs in active archives"),
@@ -6031,9 +6875,9 @@ mod tests {
         .expect("v1 manifest");
         let before = file_bytes(&directory.path);
 
-        let options = CleanupOptions::default().with_task(CleanupTask::RepairArchives);
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
         assert!(
-            PreparedCleanup::prepare(&directory.path, options).is_err(),
+            PreparedCompaction::prepare(&directory.path, options).is_err(),
             "the residue must refuse the run"
         );
         assert_eq!(
@@ -6084,11 +6928,11 @@ mod tests {
     /// one run can delete the only copy of what the rebuild could not read.
     #[test]
     fn repair_archives_and_recovery_backups_cannot_run_together() {
-        let options = CleanupOptions::default()
-            .with_task(CleanupTask::RepairArchives)
+        let options = CompactionOptions::default()
+            .with_task(MaintenanceTask::RepairArchives)
             .with_recovery_backup_policy(RecoveryBackupPolicy::new(Duration::ZERO, 0));
         let directory = TestDirectory::repository("repair-and-backups");
-        let error = plan_cleanup(&directory.path, &options)
+        let error = plan_compaction(&directory.path, &options)
             .expect_err("the combination must be refused before anything is read");
         let crate::error::Error::InvalidFormat { details } = error else {
             panic!("unexpected refusal variant");
@@ -6106,7 +6950,7 @@ mod tests {
     #[test]
     fn empty_directory_is_refused_without_bootstrapping_anything() {
         let directory = TestDirectory::new("empty");
-        let error = plan_cleanup(&directory.path, &CleanupOptions::default())
+        let error = plan_compaction(&directory.path, &CompactionOptions::default())
             .expect_err("an empty directory is not a repository");
         let crate::error::Error::InvalidFormat { details } = error else {
             panic!("unexpected repository-shape error: {error}");
@@ -6133,7 +6977,7 @@ mod tests {
         symlink("victim", &staging).expect("staging symlink");
         let before = file_bytes(&directory.path);
 
-        let error = plan_cleanup(&directory.path, &CleanupOptions::default())
+        let error = plan_compaction(&directory.path, &CompactionOptions::default())
             .expect_err("managed symlink must be rejected");
         let crate::error::Error::InvalidFormat { details } = error else {
             panic!("unexpected managed-file-type error: {error}");
@@ -6162,11 +7006,12 @@ mod tests {
         symlink(&directory.path, &link).expect("create repository root symlink");
 
         let expected = std::fs::canonicalize(&directory.path).expect("canonical target");
-        let plan = plan_cleanup(&link, &CleanupOptions::default()).expect("plan through alias");
+        let plan =
+            plan_compaction(&link, &CompactionOptions::default()).expect("plan through alias");
         assert_eq!(plan.directory(), expected);
-        let prepared = PreparedCleanup::prepare(
+        let prepared = PreparedCompaction::prepare(
             &link,
-            CleanupOptions::default().with_tasks(std::iter::empty()),
+            CompactionOptions::default().with_tasks(std::iter::empty()),
         )
         .expect("prepare through alias");
         assert_eq!(prepared.plan().directory(), expected);
@@ -6199,10 +7044,10 @@ mod tests {
         let _ = std::fs::remove_file(&alias);
         symlink(&first_parent.path, &alias).expect("create ancestor alias");
         let aliased_repository = alias.join("segmentstore");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::StaleTemporaries]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
 
-        let prepared =
-            PreparedCleanup::prepare(&aliased_repository, options).expect("prepare first target");
+        let prepared = PreparedCompaction::prepare(&aliased_repository, options)
+            .expect("prepare first target");
         assert_eq!(
             prepared.plan().directory(),
             std::fs::canonicalize(&first_repository).expect("canonical first repository")
@@ -6228,7 +7073,8 @@ mod tests {
         let relative = relative_path_from(&current, &target);
         assert!(!relative.is_absolute());
 
-        let plan = plan_cleanup(&relative, &CleanupOptions::default()).expect("relative plan");
+        let plan =
+            plan_compaction(&relative, &CompactionOptions::default()).expect("relative plan");
 
         assert_eq!(plan.directory(), target);
         assert!(plan.directory().is_absolute());
@@ -6254,10 +7100,10 @@ mod tests {
         )
         .expect("version-one manifest");
         let manifest_before = std::fs::read(directory.path.join("manifest")).expect("manifest");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Journal]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Journal]);
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan");
-        assert_eq!(plan.tasks(), &[CleanupTask::Journal]);
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
+        assert_eq!(plan.tasks(), &[MaintenanceTask::Journal]);
         assert_eq!(plan.journal_line_removals().len(), 1);
         let removal = &plan.journal_line_removals()[0];
         assert_eq!(
@@ -6273,12 +7119,12 @@ mod tests {
         assert!(!removal.preview_truncated());
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::PruneJournal {
+            CompactionAction::PruneJournal {
                 missing_segments: 1,
                 ..
             }
         )));
-        let outcome = cleanup(&directory.path, options).expect("apply");
+        let outcome = compact(&directory.path, options).expect("apply");
 
         assert_eq!(outcome.removed_journal_lines, 1);
         let expected_backup =
@@ -6320,12 +7166,12 @@ mod tests {
         let source = format!("{retained}parser-skipped\n");
         std::fs::write(directory.path.join("journal.log"), source.as_bytes())
             .expect("write mixed journal fixture");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Journal]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Journal]);
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan mixed cleanup");
+        let plan = plan_compaction(&directory.path, &options).expect("plan mixed cleanup");
         assert_eq!(plan.journal_line_removals().len(), 1);
         assert_eq!(plan.journal_line_removals()[0].line_number(), 4);
-        cleanup(&directory.path, options).expect("apply mixed cleanup");
+        compact(&directory.path, options).expect("apply mixed cleanup");
 
         assert_eq!(
             std::fs::read(directory.path.join("journal.log")).expect("read rewritten journal"),
@@ -6355,9 +7201,9 @@ mod tests {
             .expect("occupy backup name");
         }
         let before = file_bytes(&directory.path);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Journal]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Journal]);
 
-        let error = plan_cleanup(&directory.path, &options)
+        let error = plan_compaction(&directory.path, &options)
             .expect_err("planning must discover exhausted backup names before apply");
         assert!(error.to_string().contains("journal.log.bak"));
         assert_eq!(
@@ -6383,9 +7229,9 @@ mod tests {
         drop(journal);
         let before = file_bytes(&directory.path);
 
-        let error = plan_cleanup(
+        let error = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Journal]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Journal]),
         )
         .expect_err("the exact selected head record is corrupt");
 
@@ -6433,7 +7279,10 @@ mod tests {
         assert!(store.set_head(store.head(), malformed_head));
         store.close().expect("close");
 
-        let result = plan_cleanup(&directory.path, &CleanupOptions::default().with_tasks([]));
+        let result = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([]),
+        );
         assert!(
             result.is_err(),
             "cleanup must not bless a checkpoint without its snapshot root"
@@ -6448,15 +7297,15 @@ mod tests {
             directory.path.join("data00000b.tar"),
         )
         .expect("copy archive generation");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::StaleArchives]);
-        let plan = plan_cleanup(&directory.path, &options).expect("plan");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleArchives]);
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveStaleArchive { file_name, .. }
+            CompactionAction::RemoveStaleArchive { file_name, .. }
                 if file_name == "data00000a.tar"
         )));
 
-        cleanup(&directory.path, options).expect("cleanup");
+        compact(&directory.path, options).expect("cleanup");
         assert!(!directory.path.join("data00000a.tar").exists());
         assert!(directory.path.join("data00000b.tar").exists());
         Repository::open(&directory.path).expect("healthy repository");
@@ -6477,12 +7326,12 @@ mod tests {
             let selected = TarArchiveReader::open(&newer).expect("index remains valid");
             assert!(!selected.is_recovered());
             assert!(selected.segment_graph().is_none() || selected.binary_references().is_none());
-            let options = CleanupOptions::default().with_tasks([CleanupTask::StaleArchives]);
-            let plan = plan_cleanup(&directory.path, &options).expect("plan");
+            let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleArchives]);
+            let plan = plan_compaction(&directory.path, &options).expect("plan");
 
             assert!(!plan.actions().iter().any(|action| matches!(
                 action,
-                CleanupAction::RemoveStaleArchive { file_name, .. }
+                CompactionAction::RemoveStaleArchive { file_name, .. }
                     if file_name == "data00000a.tar"
             )));
             assert!(
@@ -6538,12 +7387,12 @@ mod tests {
             assert!(repacked.segment_graph().is_some());
             assert!(repacked.binary_references().is_some());
 
-            let options = CleanupOptions::default().with_tasks([CleanupTask::StaleArchives]);
-            let plan = plan_cleanup(&directory.path, &options).expect("plan");
+            let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleArchives]);
+            let plan = plan_compaction(&directory.path, &options).expect("plan");
 
             assert!(!plan.actions().iter().any(|action| matches!(
                 action,
-                CleanupAction::RemoveStaleArchive { file_name, .. }
+                CompactionAction::RemoveStaleArchive { file_name, .. }
                     if file_name == "data00001a.tar"
             )));
             assert!(
@@ -6561,7 +7410,7 @@ mod tests {
         std::fs::write(directory.path.join("notes.tar"), b"foreign tar").expect("foreign tar");
         std::fs::write(directory.path.join("operator-notes.txt"), b"keep me").expect("notes");
 
-        let plan = plan_cleanup(&directory.path, &CleanupOptions::default()).expect("plan");
+        let plan = plan_compaction(&directory.path, &CompactionOptions::default()).expect("plan");
         assert!(plan.is_empty());
         assert_eq!(
             std::fs::read(directory.path.join("notes.tar")).expect("foreign tar"),
@@ -6578,9 +7427,9 @@ mod tests {
         let directory = TestDirectory::repository("archive-needs-recovery");
         let damaged = directory.path.join("data00001a.tar");
         std::fs::write(&damaged, b"not a complete tar archive").expect("damaged archive");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::StaleArchives]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleArchives]);
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan");
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
 
         assert!(plan.actions().is_empty());
         assert!(
@@ -6597,8 +7446,8 @@ mod tests {
     #[test]
     fn prepared_plan_rejects_same_length_inode_replacement() {
         let directory = TestDirectory::repository("stale-plan");
-        let options = CleanupOptions::default().with_tasks([]);
-        let prepared = PreparedCleanup::prepare(&directory.path, options).expect("prepare");
+        let options = CompactionOptions::default().with_tasks([]);
+        let prepared = PreparedCompaction::prepare(&directory.path, options).expect("prepare");
         let journal_path = directory.path.join("journal.log");
         let bytes = std::fs::read(&journal_path).expect("journal");
         let replacement = directory.path.join("replacement");
@@ -6662,11 +7511,11 @@ mod tests {
 
     #[test]
     fn deletion_absence_state_does_not_depend_on_diagnostic_text() {
-        let retained = super::CleanupDeletionFailure::retained(
+        let retained = super::FileDeletionFailure::retained(
             "data00000a.tar".to_owned(),
             super::ALREADY_ABSENT_DELETION_DETAIL,
         );
-        let absent = super::CleanupDeletionFailure::already_absent(
+        let absent = super::FileDeletionFailure::already_absent(
             "data00001a.tar".to_owned(),
             "a deliberately different ENOENT diagnostic",
         );
@@ -6853,8 +7702,8 @@ mod tests {
         let staging = directory.path.join("journal.log.compacting");
         std::fs::copy(directory.path.join("journal.log"), &staging)
             .expect("create redundant staging journal");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::StaleTemporaries]);
-        let prepared = PreparedCleanup::prepare(&directory.path, options).expect("prepare");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
+        let prepared = PreparedCompaction::prepare(&directory.path, options).expect("prepare");
         let metadata = std::fs::metadata(&staging).expect("staging metadata");
         std::thread::sleep(std::time::Duration::from_millis(2));
         let changed = vec![b'x'; metadata.len() as usize];
@@ -6887,10 +7736,12 @@ mod tests {
     fn prepared_cleanup_is_excluded_by_an_existing_writer_lock() {
         let directory = TestDirectory::repository("lock-exclusion");
         let writer = WritableRepository::open(&directory.path).expect("hold writer lock");
-        plan_cleanup(&directory.path, &CleanupOptions::default())
+        plan_compaction(&directory.path, &CompactionOptions::default())
             .expect("lock-free preview remains read-only");
 
-        assert!(PreparedCleanup::prepare(&directory.path, CleanupOptions::default()).is_err());
+        assert!(
+            PreparedCompaction::prepare(&directory.path, CompactionOptions::default()).is_err()
+        );
         writer.close().expect("close writer");
         Repository::open(&directory.path).expect("repository healthy");
     }
@@ -6901,8 +7752,8 @@ mod tests {
         let staging = directory.path.join("journal.log.compacting");
         std::fs::copy(directory.path.join("journal.log"), &staging)
             .expect("create removable staging file");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::StaleTemporaries]);
-        let prepared = PreparedCleanup::prepare(&directory.path, options).expect("prepare");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
+        let prepared = PreparedCompaction::prepare(&directory.path, options).expect("prepare");
         let lock_path = directory.path.join("repo.lock");
         std::fs::remove_file(&lock_path).expect("unlink held lock pathname");
         std::fs::write(&lock_path, b"replacement inode").expect("replace lock inode");
@@ -6967,7 +7818,7 @@ mod tests {
         let backup = directory.path.join("data00000a.tar.2.ro.bak");
         std::fs::create_dir(&backup).expect("create hostile managed-name directory");
 
-        let error = plan_cleanup(&directory.path, &CleanupOptions::default())
+        let error = plan_compaction(&directory.path, &CompactionOptions::default())
             .expect_err("managed backup names must remain regular files in dry-run");
 
         assert_eq!(
@@ -6997,16 +7848,18 @@ mod tests {
             )
             .expect("set distinct backup time");
         }
-        let options = CleanupOptions::default()
+        let options = CompactionOptions::default()
             .with_tasks([])
             .with_recovery_backup_policy(RecoveryBackupPolicy::new(Duration::ZERO, 1));
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan grouped backups");
+        let plan = plan_compaction(&directory.path, &options).expect("plan grouped backups");
         let removals: Vec<_> = plan
             .actions()
             .iter()
             .filter_map(|action| match action {
-                CleanupAction::RemoveRecoveryBackup { file_name, .. } => Some(file_name.as_str()),
+                CompactionAction::RemoveRecoveryBackup { file_name, .. } => {
+                    Some(file_name.as_str())
+                }
                 _ => None,
             })
             .collect();
@@ -7040,22 +7893,23 @@ mod tests {
                 ),
             )
             .expect("future-date backup");
-        let default_plan = plan_cleanup(&directory.path, &CleanupOptions::default()).expect("plan");
+        let default_plan =
+            plan_compaction(&directory.path, &CompactionOptions::default()).expect("plan");
         assert!(
             !default_plan
                 .actions()
                 .iter()
-                .any(|action| matches!(action, CleanupAction::RemoveRecoveryBackup { .. }))
+                .any(|action| matches!(action, CompactionAction::RemoveRecoveryBackup { .. }))
         );
         assert!(backup.exists());
 
-        let options = CleanupOptions::default()
+        let options = CompactionOptions::default()
             .with_tasks([])
             .with_recovery_backup_policy(RecoveryBackupPolicy {
                 minimum_age: std::time::Duration::ZERO,
                 keep_latest_per_target: 0,
             });
-        cleanup(&directory.path, options).expect("remove backup");
+        compact(&directory.path, options).expect("remove backup");
         assert!(!backup.exists());
         assert!(
             future_backup.exists(),
@@ -7072,23 +7926,23 @@ mod tests {
         std::fs::copy(directory.path.join("data00000a.tar"), &backup)
             .expect("create Oak-style numbered read-only backup");
 
-        let default_plan = plan_cleanup(&directory.path, &CleanupOptions::default())
+        let default_plan = plan_compaction(&directory.path, &CompactionOptions::default())
             .expect("default plan preserves recovery evidence");
         assert!(!default_plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveRecoveryBackup { file_name, .. } if file_name == name
+            CompactionAction::RemoveRecoveryBackup { file_name, .. } if file_name == name
         )));
 
-        let options = CleanupOptions::default()
+        let options = CompactionOptions::default()
             .with_tasks([])
             .with_recovery_backup_policy(RecoveryBackupPolicy::new(std::time::Duration::ZERO, 0));
-        let plan = plan_cleanup(&directory.path, &options).expect("plan numbered backup");
+        let plan = plan_compaction(&directory.path, &options).expect("plan numbered backup");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveRecoveryBackup { file_name, .. } if file_name == name
+            CompactionAction::RemoveRecoveryBackup { file_name, .. } if file_name == name
         )));
 
-        let outcome = cleanup(&directory.path, options).expect("remove numbered backup");
+        let outcome = compact(&directory.path, options).expect("remove numbered backup");
         assert_eq!(outcome.removed_recovery_backups, 1);
         assert!(outcome.is_complete());
         assert!(!backup.exists());
@@ -7111,16 +7965,18 @@ mod tests {
             file.set_times(std::fs::FileTimes::new().set_modified(modified))
                 .expect("set exact backup mtime");
         }
-        let options = CleanupOptions::default()
+        let options = CompactionOptions::default()
             .with_tasks([])
             .with_recovery_backup_policy(RecoveryBackupPolicy::new(std::time::Duration::ZERO, 1));
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan tied backups");
+        let plan = plan_compaction(&directory.path, &options).expect("plan tied backups");
         let removals: Vec<_> = plan
             .actions()
             .iter()
             .filter_map(|action| match action {
-                CleanupAction::RemoveRecoveryBackup { file_name, .. } => Some(file_name.as_str()),
+                CompactionAction::RemoveRecoveryBackup { file_name, .. } => {
+                    Some(file_name.as_str())
+                }
                 _ => None,
             })
             .collect();
@@ -7250,7 +8106,7 @@ mod tests {
             .expect("write ambiguous staging journal");
         std::fs::write(directory.path.join("gc.log"), b"operator gc state\n").expect("seed gc log");
 
-        cleanup(&directory.path, CleanupOptions::default()).expect("first cleanup");
+        compact(&directory.path, CompactionOptions::default()).expect("first cleanup");
         assert!(!staging.exists());
         assert!(forensic_staging.exists());
         assert_eq!(
@@ -7259,9 +8115,9 @@ mod tests {
         );
         let before = file_bytes(&directory.path);
         let second =
-            plan_cleanup(&directory.path, &CleanupOptions::default()).expect("second plan");
+            plan_compaction(&directory.path, &CompactionOptions::default()).expect("second plan");
         assert!(second.is_empty(), "second plan: {:?}", second.actions());
-        let outcome = PreparedCleanup::prepare(&directory.path, CleanupOptions::default())
+        let outcome = PreparedCompaction::prepare(&directory.path, CompactionOptions::default())
             .expect("prepare no-op")
             .apply()
             .expect("apply no-op");
@@ -7278,21 +8134,21 @@ mod tests {
         let ambiguous = directory.path.join("data00001a.tar.recovering");
         std::fs::write(&ambiguous, b"nonempty recovery evidence")
             .expect("write ambiguous staging archive");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::StaleTemporaries]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan");
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveTemporary { file_name, .. }
+            CompactionAction::RemoveTemporary { file_name, .. }
                 if file_name == "data00000b.tar.cleaning.000"
         )));
         assert!(!plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveTemporary { file_name, .. }
+            CompactionAction::RemoveTemporary { file_name, .. }
                 if file_name == "data00001a.tar.recovering"
         )));
 
-        cleanup(&directory.path, options).expect("cleanup");
+        compact(&directory.path, options).expect("cleanup");
         assert!(!exact.exists());
         assert!(ambiguous.exists());
         Repository::open(&directory.path).expect("healthy repository");
@@ -7312,14 +8168,14 @@ mod tests {
         let divergent = directory.path.join("manifest.cleaning.002");
         std::fs::write(&divergent, b"store.version=2\noperator.data=lost\n")
             .expect("write divergent staging manifest");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::StaleTemporaries]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan stale manifests");
+        let plan = plan_compaction(&directory.path, &options).expect("plan stale manifests");
         let planned_names: Vec<_> = plan
             .actions()
             .iter()
             .filter_map(|action| match action {
-                CleanupAction::RemoveTemporary { file_name, .. } => Some(file_name.as_str()),
+                CompactionAction::RemoveTemporary { file_name, .. } => Some(file_name.as_str()),
                 _ => None,
             })
             .collect();
@@ -7331,7 +8187,7 @@ mod tests {
             warning.contains("manifest.cleaning.002") && warning.contains("not provably redundant")
         }));
 
-        cleanup(&directory.path, options).expect("remove proven manifest staging files");
+        compact(&directory.path, options).expect("remove proven manifest staging files");
         assert!(!identical.exists());
         assert!(!exact_upgrade.exists());
         assert!(divergent.exists());
@@ -7349,9 +8205,10 @@ mod tests {
         create_checkpoint(&store, 1, &[]).expect("checkpoint");
         store.close().expect("close writer");
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let options = CleanupOptions::default().with_tasks([CleanupTask::ExpiredCheckpoints]);
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
 
-        let outcome = cleanup(&directory.path, options).expect("cleanup");
+        let outcome = compact(&directory.path, options).expect("cleanup");
 
         assert_eq!(outcome.removed_checkpoints, 1);
         let repository = Repository::open(&directory.path).expect("healthy repository");
@@ -7371,10 +8228,13 @@ mod tests {
         // then retire the very head the plan retained, and the run would
         // abort its own apply — after the checkpoint removal had already
         // been committed. Refuse while planning, where nothing has moved.
-        let options = CleanupOptions::default()
-            .with_tasks([CleanupTask::ExpiredCheckpoints, CleanupTask::Journal])
+        let options = CompactionOptions::default()
+            .with_tasks([
+                MaintenanceTask::ExpiredCheckpoints,
+                MaintenanceTask::Journal,
+            ])
             .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"));
-        let error = plan_cleanup(&directory.path, &options).expect_err("must refuse");
+        let error = plan_compaction(&directory.path, &options).expect_err("must refuse");
         assert!(
             error.to_string().contains("checkpoint"),
             "unexpected refusal: {error}"
@@ -7399,9 +8259,10 @@ mod tests {
         std::fs::write(directory.path.join("data4294967295z.tar"), b"")
             .expect("install maximum-number residue");
         let before = file_bytes(&directory.path);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::ExpiredCheckpoints]);
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
 
-        let error = plan_cleanup(&directory.path, &options)
+        let error = plan_compaction(&directory.path, &options)
             .expect_err("planning must reject u32::MAX before checkpoint mutation");
 
         assert!(
@@ -7437,11 +8298,12 @@ mod tests {
         let occupied_name = format!("data{occupied_number:05}a.tar");
         std::fs::write(directory.path.join(&occupied_name), b"")
             .expect("install zero-byte otherwise-next residue");
-        let options = CleanupOptions::default().with_tasks([CleanupTask::ExpiredCheckpoints]);
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
 
-        let plan = plan_cleanup(&directory.path, &options).expect("plan checkpoint cleanup");
+        let plan = plan_compaction(&directory.path, &options).expect("plan checkpoint cleanup");
         assert_eq!(plan.checkpoint_archive_number, Some(certified_number));
-        let outcome = cleanup(&directory.path, options).expect("apply checkpoint cleanup");
+        let outcome = compact(&directory.path, options).expect("apply checkpoint cleanup");
 
         assert_eq!(outcome.removed_checkpoints, 1);
         assert_eq!(
@@ -7487,9 +8349,10 @@ mod tests {
             header_generation.saturating_add(1),
         );
         let before = file_bytes(&directory.path);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::ExpiredCheckpoints]);
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
 
-        let error = plan_cleanup(&directory.path, &options)
+        let error = plan_compaction(&directory.path, &options)
             .expect_err("checkpoint head update must reject corrupt index generation");
 
         assert!(error.to_string().contains("index generation"), "{error}");
@@ -7545,9 +8408,10 @@ mod tests {
             header_generation.saturating_add(1),
         );
         let before = file_bytes(&directory.path);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::ExpiredCheckpoints]);
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
 
-        let error = plan_cleanup(&directory.path, &options)
+        let error = plan_compaction(&directory.path, &options)
             .expect_err("checkpoint write must reject ambiguous duplicate segment locations");
 
         assert!(
@@ -7585,15 +8449,16 @@ mod tests {
                 .expect("source manifest metadata");
             (metadata.uid(), metadata.gid())
         };
-        let options = CleanupOptions::default().with_tasks([CleanupTask::ExpiredCheckpoints]);
-        let plan = plan_cleanup(&directory.path, &options).expect("plan");
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
         assert!(
             plan.actions()
                 .iter()
-                .any(|action| matches!(action, CleanupAction::UpgradeManifest))
+                .any(|action| matches!(action, CompactionAction::UpgradeManifest))
         );
 
-        cleanup(&directory.path, options).expect("cleanup");
+        compact(&directory.path, options).expect("cleanup");
 
         let manifest = std::fs::read_to_string(directory.path.join("manifest"))
             .expect("read upgraded manifest");
@@ -7733,30 +8598,30 @@ mod tests {
         };
         assert!(directory.path.join("data00002a.tar").is_file());
 
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("segment plan");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveReclaimableArchive { file_name, .. }
+            CompactionAction::RemoveReclaimableArchive { file_name, .. }
                 if file_name == "data00001a.tar"
         )));
         assert!(!plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveReclaimableArchive { file_name, .. }
+            CompactionAction::RemoveReclaimableArchive { file_name, .. }
                 if file_name == "data00000a.tar"
         )));
         let planned_removed_segments: usize = plan
             .actions()
             .iter()
             .filter_map(|action| match action {
-                CleanupAction::RemoveReclaimableArchive { segments, .. }
-                | CleanupAction::RewriteArchive { segments, .. } => Some(*segments),
+                CompactionAction::RemoveReclaimableArchive { segments, .. }
+                | CompactionAction::RewriteArchive { segments, .. } => Some(*segments),
                 _ => None,
             })
             .sum();
         assert!(planned_removed_segments != 0);
 
-        let outcome = cleanup(&directory.path, options).expect("segment cleanup");
+        let outcome = compact(&directory.path, options).expect("segment cleanup");
         assert_eq!(outcome.head_after, new_head);
         assert_eq!(outcome.removed_segments(), planned_removed_segments);
         assert!(!directory.path.join("data00001a.tar").exists());
@@ -7884,19 +8749,19 @@ mod tests {
 
         // The default task set, with no retention bound: the loosened check
         // lives on this path, so this is where it must be pinned.
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
 
         // Unconditional. Restoring the stricter check must fail this, so the
         // plan is required to exist rather than merely be well-explained if
         // it does not.
-        let plan = plan_cleanup(&directory.path, &options)
+        let plan = plan_compaction(&directory.path, &options)
             .expect("a dead survivor pointing at removed garbage must not refuse the plan");
         let removed: usize = plan
             .actions()
             .iter()
             .filter_map(|action| match action {
-                CleanupAction::RemoveReclaimableArchive { segments, .. }
-                | CleanupAction::RewriteArchive { segments, .. } => Some(*segments),
+                CompactionAction::RemoveReclaimableArchive { segments, .. }
+                | CompactionAction::RewriteArchive { segments, .. } => Some(*segments),
                 _ => None,
             })
             .sum();
@@ -7905,7 +8770,7 @@ mod tests {
             "the fixture must actually remove something, or it proves nothing"
         );
 
-        let outcome = cleanup(&directory.path, options).expect("apply the plan");
+        let outcome = compact(&directory.path, options).expect("apply the plan");
         assert_eq!(outcome.head_after, new_head);
         assert!(outcome.removed_segments() != 0);
         let repository = Repository::open(&directory.path).expect("healthy store");
@@ -7917,8 +8782,8 @@ mod tests {
     fn the_plan_prices_the_history_veto_against_oaks_own_predicate() {
         let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-price");
 
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("segment plan");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
 
         // The bootstrap revision's segments are reachable from the old
         // journal line and from nothing else.
@@ -8012,19 +8877,19 @@ mod tests {
             store.close().expect("close new head writer");
         }
 
-        let priced = plan_cleanup(
+        let priced = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect("priced plan");
         let (_priced_segments, priced_bytes) = priced.history_protected_reclaimable();
 
         // Now actually retire the history and compare. The quoted price must
         // be what the operation delivers, not the data-segment fraction of it.
-        let outcome = cleanup(
+        let outcome = compact(
             &directory.path,
-            CleanupOptions::default()
-                .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+            CompactionOptions::default()
+                .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
                 .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
         )
         .expect("bounded cleanup");
@@ -8042,25 +8907,25 @@ mod tests {
     #[test]
     fn a_journal_retention_bound_retires_the_history_the_veto_protects() {
         let (directory, old_head, new_head) = history_veto_fixture("history-veto-retention");
-        let protected = plan_cleanup(
+        let protected = plan_compaction(
             &directory.path,
-            &CleanupOptions::default().with_tasks([CleanupTask::Segments]),
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
         )
         .expect("unbounded plan");
         assert!(protected.history_protected_reclaimable().0 != 0);
         assert!(
             !protected.actions().iter().any(|action| matches!(
                 action,
-                CleanupAction::RemoveReclaimableArchive { file_name, .. }
+                CompactionAction::RemoveReclaimableArchive { file_name, .. }
                     if file_name == "data00000a.tar"
             )),
             "without a bound the veto must keep the bootstrap archive"
         );
 
-        let bounded = CleanupOptions::default()
-            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+        let bounded = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
             .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"));
-        let plan = plan_cleanup(&directory.path, &bounded).expect("bounded plan");
+        let plan = plan_compaction(&directory.path, &bounded).expect("bounded plan");
 
         // The older line is pruned for the retention reason, not for damage.
         assert!(
@@ -8074,14 +8939,14 @@ mod tests {
         assert!(
             plan.actions().iter().any(|action| matches!(
                 action,
-                CleanupAction::RemoveReclaimableArchive { file_name, .. }
+                CompactionAction::RemoveReclaimableArchive { file_name, .. }
                     if file_name == "data00000a.tar"
             )),
             "the bound must release the bootstrap archive to Oak's predicate"
         );
         assert!(plan.estimated_reclaimable_bytes() != 0);
 
-        let outcome = cleanup(&directory.path, bounded).expect("bounded cleanup");
+        let outcome = compact(&directory.path, bounded).expect("bounded cleanup");
         assert_eq!(outcome.head_after, new_head);
         assert!(!directory.path.join("data00000a.tar").exists());
         let repository = Repository::open(&directory.path).expect("healthy final repository");
@@ -8107,10 +8972,10 @@ mod tests {
         // Un-rooting without pruning would leave the line in the journal for
         // the prospective-plan check to verify as retained history, and the
         // run would refuse itself with a far less actionable message.
-        let options = CleanupOptions::default()
+        let options = CompactionOptions::default()
             .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"))
-            .with_tasks([CleanupTask::Segments]);
-        let error = plan_cleanup(&directory.path, &options).expect_err("must refuse");
+            .with_tasks([MaintenanceTask::Segments]);
+        let error = plan_compaction(&directory.path, &options).expect_err("must refuse");
         assert!(
             error.to_string().contains("requires the journal task"),
             "unexpected refusal: {error}"
@@ -8143,10 +9008,10 @@ mod tests {
         std::fs::write(&journal_path, format!("{}\n", lines.join("\n")))
             .expect("insert unreadable line");
 
-        let options = CleanupOptions::default()
-            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+        let options = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
             .with_journal_revision_retention(NonZeroUsize::new(2).expect("two revisions"));
-        let plan = plan_cleanup(&directory.path, &options).expect("bounded plan");
+        let plan = plan_compaction(&directory.path, &options).expect("bounded plan");
 
         // The unreadable line goes, as it always did. What must not happen is
         // the older *readable* revision going with it to satisfy a bound the
@@ -8164,10 +9029,10 @@ mod tests {
     #[test]
     fn a_bound_larger_than_the_journal_removes_nothing() {
         let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-wide-bound");
-        let options = CleanupOptions::default()
-            .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+        let options = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
             .with_journal_revision_retention(NonZeroUsize::new(64).expect("wide bound"));
-        let plan = plan_cleanup(&directory.path, &options).expect("wide plan");
+        let plan = plan_compaction(&directory.path, &options).expect("wide plan");
         assert!(
             !plan
                 .journal_line_removals()
@@ -8178,13 +9043,13 @@ mod tests {
         assert!(plan.history_protected_reclaimable().0 != 0);
     }
 
-    #[test]
-    fn gate_deferred_garbage_is_counted_rather_than_reported_as_nothing() {
-        let directory = TestDirectory::repository("retained-reclaimable");
-        // One archive holding a single dead generation-zero segment beside
-        // enough live head-generation segments that removing the dead one
-        // cannot repay a rewrite. This is the field report in miniature:
-        // real garbage, correctly identified, correctly declined.
+    /// One archive holding a single dead generation-zero segment beside
+    /// enough live head-generation segments that removing the dead one
+    /// frees less than a quarter of the file. This is the field report in
+    /// miniature: real garbage, correctly identified, and — under Oak's
+    /// heuristic — declined by every run forever.
+    fn sub_gate_garbage_fixture(name: &str) -> (TestDirectory, RecordIdentifier) {
+        let directory = TestDirectory::repository(name);
         let new_head = {
             let store = WritableRepository::open(&directory.path).expect("open writer");
             let mut dead = store.record_writer(GarbageCollectionGeneration {
@@ -8227,9 +9092,17 @@ mod tests {
             store.close().expect("close writer");
             head
         };
+        (directory, new_head)
+    }
 
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
-        let plan = plan_cleanup(&directory.path, &options).expect("segment plan");
+    #[test]
+    fn gate_deferred_garbage_is_counted_rather_than_reported_as_nothing() {
+        let (directory, new_head) = sub_gate_garbage_fixture("retained-reclaimable");
+
+        let options = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments])
+            .with_oak_savings_gate();
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
         assert_eq!(plan.current_head(), new_head);
         let deferred = plan
             .warnings()
@@ -8248,6 +9121,42 @@ mod tests {
         // The distinction the old output could not express: nothing is
         // reclaimable *by this run*, yet the store is not clean.
         assert_eq!(plan.estimated_reclaimable_bytes(), 0);
+    }
+
+    #[test]
+    fn the_default_policy_reclaims_what_the_oak_gate_declines() {
+        let (directory, new_head) = sub_gate_garbage_fixture("default-policy-reclaims");
+
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
+        assert_eq!(plan.current_head(), new_head);
+        assert!(
+            !plan
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("rewrite gate")),
+            "the default policy never defers for savings: {:?}",
+            plan.warnings()
+        );
+        assert_eq!(
+            plan.retained_reclaimable_segments(),
+            0,
+            "nothing identified may be left behind on an archive with letters to spare"
+        );
+        assert_eq!(plan.retained_reclaimable_bytes(), 0);
+        assert!(
+            plan.estimated_reclaimable_bytes() != 0,
+            "the garbage the gate declined is now actually reclaimed"
+        );
+        assert!(
+            plan.actions().iter().any(|action| matches!(
+                action,
+                CompactionAction::RewriteArchive { file_name, replacement_name, .. }
+                    if file_name == "data00001a.tar" && replacement_name == "data00001b.tar"
+            )),
+            "the sub-gate archive is rewritten to its next generation: {:?}",
+            plan.actions()
+        );
     }
 
     /// Records the step names an operation reports, so a test can assert
@@ -8273,13 +9182,13 @@ mod tests {
         // recovery-backups is not among the defaults, so announcing its
         // removal step told the operator froe had considered backups it was
         // never asked to touch.
-        cleanup_with_progress(
+        compact_with_progress(
             &directory.path,
-            CleanupOptions::default()
+            CompactionOptions::default()
                 .with_tasks([
-                    CleanupTask::Segments,
-                    CleanupTask::Journal,
-                    CleanupTask::StaleTemporaries,
+                    MaintenanceTask::Segments,
+                    MaintenanceTask::Journal,
+                    MaintenanceTask::StaleTemporaries,
                 ])
                 .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
             &mut observer,
@@ -8311,10 +9220,10 @@ mod tests {
         let retired = directory.path.join("data00000a.tar.bak");
         std::fs::write(&retired, vec![7u8; 4096]).expect("write retired original");
 
-        let outcome = cleanup(
+        let outcome = compact(
             &directory.path,
-            CleanupOptions::default()
-                .with_tasks([CleanupTask::Segments, CleanupTask::Journal])
+            CompactionOptions::default()
+                .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
                 .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
         )
         .expect("bounded cleanup");
@@ -8343,15 +9252,22 @@ mod tests {
     }
 
     #[test]
-    fn current_head_reaching_a_retained_two_boundary_segment_fails_closed() {
+    fn current_head_reaching_a_one_generation_old_segment_fails_closed() {
         let directory = TestDirectory::repository("generation-invariant");
         let store = WritableRepository::open(&directory.path).expect("open writer");
-        let old_root = store
-            .head_node()
-            .child_node("root")
-            .expect("read root")
-            .expect("root exists")
-            .record_identifier();
+        // Exactly one generation behind the head: the boundary the retention
+        // value moved. At two retained generations the arithmetic spared this
+        // child, so the run proceeded on the predicate alone; at one it is
+        // reclaimable and only the reference guard keeps the head's own data.
+        let mut root_writer = store.record_writer(GarbageCollectionGeneration {
+            generation: 1,
+            full_generation: 1,
+            is_compacted: false,
+        });
+        let old_root = root_writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("one-generation-old content root");
+        root_writer.finish().expect("finish the older generation");
         let mut writer = store.record_writer(GarbageCollectionGeneration {
             generation: 2,
             full_generation: 2,
@@ -8372,10 +9288,10 @@ mod tests {
         assert!(store.set_head(store.head(), new_head));
         store.close().expect("close");
         let before = file_bytes(&directory.path);
-        let options = CleanupOptions::default().with_tasks([CleanupTask::Segments]);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
 
-        let error = plan_cleanup(&directory.path, &options)
-            .expect_err("a live generation-zero child at reference two is unsafe");
+        let error = plan_compaction(&directory.path, &options)
+            .expect_err("a live one-generation-old child is unsafe at one retained generation");
         assert!(
             error
                 .to_string()

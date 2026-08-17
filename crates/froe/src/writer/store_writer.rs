@@ -325,7 +325,7 @@ impl FinalizedSessionCertificate {
     #[cfg(test)]
     fn substitute_first_path_if_armed(&self, cutpoint: &str) -> Result<()> {
         if let Some(archive) = self.archives.first() {
-            crate::writer::cleanup_fault_injection::substitute_path_if_armed(
+            crate::writer::maintenance_fault_injection::substitute_path_if_armed(
                 cutpoint,
                 &archive.path,
             )?;
@@ -657,73 +657,76 @@ impl WritableRepository {
         Ok(total)
     }
 
+    /// The file names of the archives that existed when this session opened.
+    fn base_archive_names(&self) -> std::collections::HashSet<String> {
+        self.base_archives
+            .iter()
+            .map(|archive| archive.file_name().to_owned())
+            .collect()
+    }
+
     /// Proves that every archive which a subsequent compaction cleanup may
     /// mutate has complete, self-consistent payloads and trailers.
     ///
-    /// Compaction calls this before writing its deep copy. The reclaim pass
-    /// repeats the same fresh-reader certification immediately before
-    /// mutation, because an out-of-process pathname or byte change must still
-    /// fail closed even while froe holds its advisory repository lock.
-    /// Certifies every reclamation source before the first mutation,
-    /// reporting it. The pass parses every data segment of every base
-    /// archive, so compaction would otherwise begin with a long silence
-    /// before its first reported step.
+    /// Compaction calls this before writing its deep copy, so a pre-existing
+    /// defect is refused before the run appends a full copy that a retry
+    /// would then append again. Each source is certified once more through a
+    /// fresh no-follow descriptor immediately before it is mutated, because
+    /// an out-of-process pathname or byte change must still fail closed even
+    /// while froe holds its advisory repository lock.
+    ///
+    /// The pass parses every data segment of every base archive, so
+    /// compaction would otherwise begin with a long silence before its first
+    /// reported step. That cost is also why the returned proof exists: see
+    /// [`CertifiedReclaimSources`].
     pub(crate) fn preflight_reclaim_sources_with_progress(
         &self,
         observer: &mut dyn crate::progress::ProgressObserver,
-    ) -> Result<()> {
-        drop(self.open_certified_base_repository_with_progress(observer)?);
-        Ok(())
+    ) -> Result<CertifiedReclaimSources> {
+        drop(self.open_base_repository_with_progress(BaseSourceCertification::Derive, observer)?);
+        Ok(CertifiedReclaimSources {
+            base_names: self.base_archive_names(),
+        })
     }
 
-    fn open_certified_base_repository(&self) -> Result<crate::store::Repository> {
-        self.open_certified_base_repository_with_progress(&mut crate::progress::DiscardedProgress)
-    }
-
-    fn open_certified_base_repository_with_progress(
+    /// Opens a fresh, lazy provider over this session's base archives,
+    /// deriving the full certificate for each one unless `certification`
+    /// says the caller already holds it.
+    ///
+    /// The base-name check below runs either way. It is the cheap half — it
+    /// proves the fresh open still sees every archive the session is about
+    /// to reclaim from — and nothing may skip it.
+    fn open_base_repository_with_progress(
         &self,
+        certification: BaseSourceCertification,
         observer: &mut dyn crate::progress::ProgressObserver,
     ) -> Result<crate::store::Repository> {
-        let base_names: std::collections::HashSet<String> = self
-            .base_archives
+        let base_names = self.base_archive_names();
+        let repository = crate::store::Repository::open_with_progress(&self.directory, observer)?;
+        reject_duplicate_active_segments(repository.archives())?;
+        let base_archives: Vec<&TarArchiveReader> = repository
+            .archives()
+            .iter()
+            .filter(|archive| base_names.contains(archive.file_name()))
+            .collect();
+        // Before certifying, not after: an archive that has gone missing is
+        // the cheaper refusal, and there is no reason to prove the ones that
+        // remain first.
+        let opened_base_names: std::collections::HashSet<String> = base_archives
             .iter()
             .map(|archive| archive.file_name().to_owned())
             .collect();
-        let repository = crate::store::Repository::open_with_progress(&self.directory, observer)?;
-        reject_duplicate_active_segments(repository.archives())?;
-        let mut certified_base_names = std::collections::HashSet::new();
-        observer.step_began(
-            &crate::progress::Step::new(
-                "certifying source archives",
-                crate::progress::WorkUnit::Archives,
-            )
-            .with_total(crate::progress::count(base_names.len())),
-        );
-        let mut certified = 0usize;
-        for archive in repository.archives() {
-            if base_names.contains(archive.file_name()) {
-                observer.step_advanced(crate::progress::count(certified));
-                if let Err(error) = certify_active_archive(&repository, archive) {
-                    observer.step_ended();
-                    return Err(error);
-                }
-                certified += 1;
-                certified_base_names.insert(archive.file_name().to_owned());
-            }
-        }
-        observer.step_advanced(crate::progress::count(certified));
-        observer.step_ended();
-        if certified_base_names != base_names {
-            let mut missing: Vec<_> = base_names
-                .difference(&certified_base_names)
-                .cloned()
-                .collect();
+        if opened_base_names != base_names {
+            let mut missing: Vec<_> = base_names.difference(&opened_base_names).cloned().collect();
             missing.sort();
             return Err(Error::InvalidFormat {
                 details: format!(
                     "fresh reclamation source provider omitted active base archive(s) {missing:?}"
                 ),
             });
+        }
+        if matches!(certification, BaseSourceCertification::Derive) {
+            certify_archives_in_parallel(&repository, &base_archives, observer)?;
         }
         Ok(repository)
     }
@@ -747,15 +750,42 @@ impl WritableRepository {
     /// *mark* — their retained data segments protect the bulk segments
     /// they reference, wherever those live — but are never swept
     /// themselves; the next compaction run sees them as base archives.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "session validation, source certification, global marking, and ordered sweeping form one safety sequence"
-    )]
     pub fn reclaim_old_generations(
         &mut self,
         reference_generation: GarbageCollectionGeneration,
         full: bool,
     ) -> Result<()> {
+        self.reclaim_old_generations_with(GenerationReclaimRequest {
+            rule: ReclaimRule {
+                reference: reference_generation,
+                full,
+                retained_generations: RETAINED_GENERATIONS,
+            },
+            rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
+            certified_sources: None,
+            expected: None,
+        })
+        .map(|_| ())
+    }
+
+    /// Reclaims exactly like [`Self::reclaim_old_generations`], accepting a
+    /// proof that the caller already certified these sources under the
+    /// currently held lock.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "session validation, source certification, global marking, and ordered sweeping form one safety sequence"
+    )]
+    pub(crate) fn reclaim_old_generations_with(
+        &mut self,
+        request: GenerationReclaimRequest<'_>,
+    ) -> Result<SegmentSweepOutcome> {
+        let GenerationReclaimRequest {
+            rule,
+            rewrite_policy,
+            certified_sources,
+            expected,
+        } = request;
+        let mut sweep_outcome = SegmentSweepOutcome::default();
         #[cfg(test)]
         let parsed_cache_entries_before_reclaim = self
             .parsed_segment_cache
@@ -822,12 +852,27 @@ impl WritableRepository {
         // Keeping this provider alive also gives each immediate reopened-source
         // certificate a complete, stable cross-archive fallback without
         // repopulating `self.parsed_segment_cache`.
-        let base_names: std::collections::HashSet<String> = self
-            .base_archives
-            .iter()
-            .map(|archive| archive.file_name().to_owned())
-            .collect();
-        let certification_repository = self.open_certified_base_repository()?;
+        //
+        // Deriving the certificate here is what a caller's proof can excuse,
+        // and only that: the provider is still opened fresh, still rejects
+        // duplicate active segments, and still proves it sees every base
+        // archive. What the proof stands in for is re-reading bytes this same
+        // locked run already read, which for compaction is a second full
+        // parse and CRC of the whole store between its preflight and its
+        // sweeps. The certificate that guards each mutation is neither of
+        // these: it is the per-archive one `sweep_one_archive` derives
+        // through a fresh no-follow descriptor, immediately before acting.
+        let base_names = self.base_archive_names();
+        let certification =
+            if certified_sources.is_some_and(|proof| proof.certifies_exactly(&base_names)) {
+                BaseSourceCertification::AlreadyProven
+            } else {
+                BaseSourceCertification::Derive
+            };
+        let certification_repository = self.open_base_repository_with_progress(
+            certification,
+            &mut crate::progress::DiscardedProgress,
+        )?;
 
         // Archives this session wrote (now closed and complete on disk):
         // newer than every base archive. They are never swept, so every
@@ -886,9 +931,7 @@ impl WritableRepository {
             mark_one_archive(
                 archive,
                 ReclaimPolicy {
-                    reference: reference_generation,
-                    full,
-                    retained_generations: 1,
+                    rule,
                     protected_data_segments: &protected_data_segments,
                 },
                 &mut references,
@@ -909,8 +952,34 @@ impl WritableRepository {
         let mut fallback_provider: Option<ArchiveSegmentsProvider<'_>> = None;
         let mut planned_base_sweeps = HashMap::new();
         for archive in &self.base_archives {
-            if let Some(planned) = plan_archive_sweep(&self.directory, archive, &reclaimable)? {
+            // Compaction has already paid for a full deep copy of the live
+            // tree. Declining to move the survivors of an archive whose data
+            // segments all died would hand the operator a store the very next
+            // maintenance run reports as dirty and equally cannot clean, which
+            // is the field report this default policy fixes.
+            if let Some(planned) = plan_archive_sweep(
+                &self.directory,
+                archive,
+                &reclaimable,
+                rewrite_policy,
+                &std::collections::HashSet::new(),
+            )? {
                 planned_base_sweeps.insert(archive.file_name().to_owned(), planned);
+            }
+        }
+        // Nothing has been unlinked yet. This is the last instant at which a
+        // disagreement between what the operator confirmed and what the store
+        // now says can be answered by refusing rather than by explaining, so
+        // it is where the comparison belongs — the same position the
+        // directory-level engine puts it in.
+        if let Some(expected) = expected {
+            let replanned = sorted_sweep_plan(&planned_base_sweeps, &reclaimable);
+            if replanned != *expected {
+                return Err(Error::InvalidFormat {
+                    details: "the archive sweep changed after confirmation; refusing to apply an \
+                              unconfirmed archive mutation"
+                        .to_owned(),
+                });
             }
         }
         let mut actually_unavailable = std::collections::HashSet::new();
@@ -939,8 +1008,18 @@ impl WritableRepository {
                     &provider_order,
                     &mut fallback_provider,
                     Some(&certification_repository),
+                    rewrite_policy,
                 )?;
                 finalized_session_certificate.recertify()?;
+                match outcome.disposition {
+                    ArchiveSweepDisposition::Removed => sweep_outcome.removed_archives += 1,
+                    ArchiveSweepDisposition::Rewritten => sweep_outcome.rewritten_archives += 1,
+                    ArchiveSweepDisposition::Unchanged => {}
+                }
+                sweep_outcome.removed_segments += outcome.newly_unavailable.len();
+                sweep_outcome
+                    .deletion_failures
+                    .extend(outcome.deletion_failures);
                 actually_unavailable.extend(outcome.newly_unavailable);
             }
             #[cfg(test)]
@@ -984,7 +1063,7 @@ impl WritableRepository {
         // Make the archive deletions and any swept replacements durable
         // before the caller proceeds to the journal rewrite.
         sync_directory_strict(&self.directory)?;
-        Ok(())
+        Ok(sweep_outcome)
     }
 
     /// Appends one entry to the session's physical write-order ledger.
@@ -1240,7 +1319,7 @@ impl WritableRepository {
             #[cfg(test)]
             certificate.substitute_first_path_if_armed("checkpoint.tar-durable-before-journal")?;
             #[cfg(test)]
-            crate::writer::cleanup_fault_injection::crash_if_armed(
+            crate::writer::maintenance_fault_injection::crash_if_armed(
                 "checkpoint.tar-durable-before-journal",
             );
             Some(certificate)
@@ -1498,7 +1577,7 @@ impl WritableRepository {
                         .extend(disk_segment.structure.referenced_segments.iter().copied());
                 }
                 let binary_references =
-                    read_blob_identifiers(&provider, &disk_segment.structure).map_err(|error| {
+                    read_blob_identifiers(&provider, &disk_segment).map_err(|error| {
                         Error::InvalidFormat {
                             details: format!(
                                 "cannot reconstruct binary references for finalized session segment {identifier}: {error}"
@@ -1819,21 +1898,40 @@ impl PlannedArchiveSweep {
 
 /// Read-only result of the standalone FULL/retained-two mark phase.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StandaloneSegmentCleanupPlan {
+pub(crate) struct StandaloneSegmentCompactionPlan {
     pub(crate) archives: Vec<PlannedArchiveSweep>,
     pub(crate) marked_segments: usize,
     reclaimable: std::collections::HashSet<SegmentIdentifier>,
 }
 
-impl StandaloneSegmentCleanupPlan {
+impl StandaloneSegmentCompactionPlan {
     pub(crate) fn reclaimable_segments(&self) -> &std::collections::HashSet<SegmentIdentifier> {
         &self.reclaimable
     }
 }
 
+/// Assembles a comparable plan from a per-archive disposition map.
+///
+/// Sorted by file name for the same reason the directory-level planner sorts
+/// its own: two plans built over the same store must compare equal whatever
+/// order the archives were visited in, or the authorization check would refuse
+/// runs that agree.
+fn sorted_sweep_plan(
+    planned: &HashMap<String, PlannedArchiveSweep>,
+    reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+) -> StandaloneSegmentCompactionPlan {
+    let mut archives: Vec<PlannedArchiveSweep> = planned.values().cloned().collect();
+    archives.sort_by(|left, right| left.file_name().cmp(right.file_name()));
+    StandaloneSegmentCompactionPlan {
+        archives,
+        marked_segments: reclaimable.len(),
+        reclaimable: reclaimable.clone(),
+    }
+}
+
 /// Physical result of applying a standalone segment cleanup.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct StandaloneSegmentCleanupOutcome {
+pub(crate) struct StandaloneSegmentCompactionOutcome {
     pub(crate) rewritten_archives: usize,
     pub(crate) removed_archives: usize,
     pub(crate) removed_segments: usize,
@@ -1870,35 +1968,82 @@ struct ArchiveSweepOutcome {
     newly_unavailable: std::collections::HashSet<SegmentIdentifier>,
 }
 
-/// Whether standalone cleanup marks with Oak's FULL garbage-collection
+/// Everything a post-compaction reclaim pass needs, including the plan it is
+/// authorized to carry out.
+#[derive(Clone, Copy)]
+pub(crate) struct GenerationReclaimRequest<'sources> {
+    /// The generation predicate this pass applies.
+    pub(crate) rule: ReclaimRule,
+    /// Which archives holding reclaimable segments may be rewritten.
+    pub(crate) rewrite_policy: ArchiveRewritePolicy,
+    /// A proof the caller already certified these sources under the lock.
+    pub(crate) certified_sources: Option<&'sources CertifiedReclaimSources>,
+    /// The confirmed plan. When present, the pass replans from disk and
+    /// refuses — before it unlinks anything — if the two disagree, so a run
+    /// can never mutate an archive its operator did not authorize.
+    pub(crate) expected: Option<&'sources StandaloneSegmentCompactionPlan>,
+}
+
+/// What a reclaim pass did, so a caller can report it rather than guess.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SegmentSweepOutcome {
+    /// Archives unlinked whole.
+    pub(crate) removed_archives: usize,
+    /// Archives republished at the next generation letter.
+    pub(crate) rewritten_archives: usize,
+    /// Segments the sweep made unavailable, by either disposition.
+    pub(crate) removed_segments: usize,
+    /// Planned unlinks that did not happen, each with its reason.
+    pub(crate) deletion_failures: Vec<DeferredFileDeletion>,
+}
+
+/// Whether a maintenance run marks with Oak's FULL garbage-collection
 /// predicate. Named so plan reporting cannot silently drift from the mark
 /// phase it describes.
-pub(crate) const STANDALONE_FULL_GARBAGE_COLLECTION: bool = true;
+pub(crate) const FULL_GARBAGE_COLLECTION: bool = true;
 
-/// Generations standalone cleanup retains behind the reference. Oak's
-/// `SegmentGCOptions` default, and the same constant the mark phase uses.
-pub(crate) const STANDALONE_RETAINED_GENERATIONS: i32 = 2;
+/// Generations a froe maintenance run retains behind its reference. One
+/// value, read by every phase of the run through [`ReclaimRule`].
+///
+/// This is the value Oak's own offline tooling uses:
+/// `SegmentGCOptions.setOffline()` sets `retainedGenerations = 1`
+/// (`docs/analysis/write-compaction.md` §4, lines 486 and 531;
+/// `write-backup-restore-recovery.md` line 238). The online default of two
+/// protects against two things froe does not have: a concurrent writer, and a
+/// head that reuses records in place from an older generation. froe's
+/// exclusive `repo.lock` excludes the first; a deep copy that rewrites the
+/// head into the reference generation excludes the second.
+///
+/// At this value head safety no longer follows from the predicate — the
+/// predicate only decides which *older* generations are reclaimable, and
+/// whether the head reaches one is a property of the store. It is proved per
+/// run instead, by `validate_reclaim_reference_invariant`, which re-evaluates
+/// this exact rule over the head's transitive closure and refuses before any
+/// mutation.
+pub(crate) const RETAINED_GENERATIONS: i32 = 1;
 
 /// Plans Oak's standalone cleanup predicate: FULL GC, the current committed
-/// head generation as reference, and two retained generations. `protected`
+/// head generation as reference, and one retained generation. `protected`
 /// is a conservative keep-veto for journal history; it never makes a segment
 /// reclaimable and therefore cannot weaken Oak's head/checkpoint safety.
 pub(crate) fn plan_standalone_segment_cleanup(
     directory: &Path,
     repository: &crate::store::Repository,
-    reference: GarbageCollectionGeneration,
+    rule: ReclaimRule,
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
+    rewrite_policy: ArchiveRewritePolicy,
     observer: &mut dyn crate::progress::ProgressObserver,
-) -> Result<StandaloneSegmentCleanupPlan> {
+) -> Result<StandaloneSegmentCompactionPlan> {
     reject_duplicate_active_segments(repository.archives())?;
     certify_active_archives(repository, repository.archives())?;
     analyze_standalone_segment_cleanup(
         directory,
         repository.archives(),
-        reference,
+        rule,
         current_head_segment,
         protected,
+        rewrite_policy,
         observer,
     )
 }
@@ -1908,7 +2053,7 @@ pub(crate) fn plan_standalone_segment_cleanup(
 ///
 /// A whole-file removal frees the archive's own size — index and trailers
 /// included — while a rewrite frees only the entry bytes it drops.
-pub(crate) fn plan_reclaimed_totals(plan: &StandaloneSegmentCleanupPlan) -> (usize, u64) {
+pub(crate) fn plan_reclaimed_totals(plan: &StandaloneSegmentCompactionPlan) -> (usize, u64) {
     let mut segments = 0usize;
     let mut bytes = 0u64;
     for archive in &plan.archives {
@@ -1949,16 +2094,18 @@ pub(crate) fn plan_reclaimed_totals(plan: &StandaloneSegmentCleanupPlan) -> (usi
 pub(crate) fn measure_unvetoed_reclamation(
     directory: &Path,
     repository: &crate::store::Repository,
-    reference: GarbageCollectionGeneration,
+    rule: ReclaimRule,
     current_head_segment: SegmentIdentifier,
+    rewrite_policy: ArchiveRewritePolicy,
     observer: &mut dyn crate::progress::ProgressObserver,
 ) -> Result<(usize, u64)> {
     let unvetoed = analyze_standalone_segment_cleanup(
         directory,
         repository.archives(),
-        reference,
+        rule,
         current_head_segment,
         &std::collections::HashSet::new(),
+        rewrite_policy,
         observer,
     )?;
     Ok(plan_reclaimed_totals(&unvetoed))
@@ -1970,7 +2117,7 @@ pub(crate) fn measure_unvetoed_reclamation(
 /// plan, so each identifier has exactly one physical active copy.
 pub(crate) fn planned_unavailable_segments(
     directory: &Path,
-    plan: &StandaloneSegmentCleanupPlan,
+    plan: &StandaloneSegmentCompactionPlan,
 ) -> Result<std::collections::HashSet<SegmentIdentifier>> {
     let actionable: std::collections::HashSet<&str> = plan
         .archives
@@ -2013,14 +2160,15 @@ pub(crate) fn planned_unavailable_segments(
 )]
 pub(crate) fn apply_standalone_segment_cleanup(
     directory: &Path,
-    reference: GarbageCollectionGeneration,
+    rule: ReclaimRule,
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
-    expected: Option<&StandaloneSegmentCleanupPlan>,
+    rewrite_policy: ArchiveRewritePolicy,
+    expected: Option<&StandaloneSegmentCompactionPlan>,
     observer: &mut dyn crate::progress::ProgressObserver,
 ) -> Result<(
-    StandaloneSegmentCleanupPlan,
-    StandaloneSegmentCleanupOutcome,
+    StandaloneSegmentCompactionPlan,
+    StandaloneSegmentCompactionOutcome,
 )> {
     // A cleanup apply is allowed to destroy an entire source archive. Open a
     // fresh, lazy provider over the exact active set and certify every source
@@ -2033,9 +2181,10 @@ pub(crate) fn apply_standalone_segment_cleanup(
         directory,
         repository.archives(),
         Some(&repository),
-        reference,
+        rule,
         current_head_segment,
         protected,
+        rewrite_policy,
         expected,
         observer,
         #[cfg(test)]
@@ -2044,7 +2193,8 @@ pub(crate) fn apply_standalone_segment_cleanup(
 }
 
 #[cfg(test)]
-type StandaloneAfterPlanHook<'hook> = dyn Fn(&StandaloneSegmentCleanupPlan) -> Result<()> + 'hook;
+type StandaloneAfterPlanHook<'hook> =
+    dyn Fn(&StandaloneSegmentCompactionPlan) -> Result<()> + 'hook;
 
 #[allow(
     clippy::too_many_arguments,
@@ -2055,15 +2205,16 @@ fn apply_standalone_segment_cleanup_from_archives(
     directory: &Path,
     archives: &[TarArchiveReader],
     source_certificate_provider: Option<&dyn SegmentProvider>,
-    reference: GarbageCollectionGeneration,
+    rule: ReclaimRule,
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
-    expected: Option<&StandaloneSegmentCleanupPlan>,
+    rewrite_policy: ArchiveRewritePolicy,
+    expected: Option<&StandaloneSegmentCompactionPlan>,
     observer: &mut dyn crate::progress::ProgressObserver,
     #[cfg(test)] after_plan: Option<&StandaloneAfterPlanHook<'_>>,
 ) -> Result<(
-    StandaloneSegmentCleanupPlan,
-    StandaloneSegmentCleanupOutcome,
+    StandaloneSegmentCompactionPlan,
+    StandaloneSegmentCompactionOutcome,
 )> {
     let plan = crate::progress::observe(
         observer,
@@ -2076,9 +2227,10 @@ fn apply_standalone_segment_cleanup_from_archives(
             analyze_standalone_segment_cleanup(
                 directory,
                 archives,
-                reference,
+                rule,
                 current_head_segment,
                 protected,
+                rewrite_policy,
                 observer,
             )
         },
@@ -2140,6 +2292,7 @@ fn apply_standalone_segment_cleanup_from_archives(
                         &provider_order,
                         &mut fallback_provider,
                         source_certificate_provider,
+                        rewrite_policy,
                     )?;
                     if outcome.disposition != ArchiveSweepDisposition::Unchanged {
                         observed_sweeps.insert(
@@ -2164,11 +2317,11 @@ fn apply_standalone_segment_cleanup_from_archives(
     drop(provider_order);
     sync_directory_strict(directory)?;
 
-    let mut outcome = StandaloneSegmentCleanupOutcome {
+    let mut outcome = StandaloneSegmentCompactionOutcome {
         archive_bytes_before,
         archive_bytes_after: archive_file_bytes(directory)?,
         deletion_failures,
-        ..StandaloneSegmentCleanupOutcome::default()
+        ..StandaloneSegmentCompactionOutcome::default()
     };
     for archive in &plan.archives {
         match archive {
@@ -2499,19 +2652,18 @@ pub(crate) fn preserve_file_metadata(target: &File, source: &std::fs::Metadata) 
 fn analyze_standalone_segment_cleanup(
     directory: &Path,
     archives: &[TarArchiveReader],
-    reference: GarbageCollectionGeneration,
+    rule: ReclaimRule,
     current_head_segment: SegmentIdentifier,
     protected: &std::collections::HashSet<SegmentIdentifier>,
+    rewrite_policy: ArchiveRewritePolicy,
     observer: &mut dyn crate::progress::ProgressObserver,
-) -> Result<StandaloneSegmentCleanupPlan> {
+) -> Result<StandaloneSegmentCompactionPlan> {
     reject_duplicate_active_segments(archives)?;
 
     let mut references = std::collections::HashSet::new();
     let mut reclaimable = std::collections::HashSet::new();
     let policy = ReclaimPolicy {
-        reference,
-        full: STANDALONE_FULL_GARBAGE_COLLECTION,
-        retained_generations: STANDALONE_RETAINED_GENERATIONS,
+        rule,
         protected_data_segments: protected,
     };
     // A skipped standalone compaction uses the exact durable head as Oak's
@@ -2541,13 +2693,19 @@ fn analyze_standalone_segment_cleanup(
 
     let mut planned_archives = Vec::new();
     for archive in archives {
-        if let Some(planned) = plan_archive_sweep(directory, archive, &reclaimable)? {
+        if let Some(planned) = plan_archive_sweep(
+            directory,
+            archive,
+            &reclaimable,
+            rewrite_policy,
+            &std::collections::HashSet::new(),
+        )? {
             planned_archives.push(planned);
         }
     }
     planned_archives.sort_by(|left, right| left.file_name().cmp(right.file_name()));
 
-    Ok(StandaloneSegmentCleanupPlan {
+    Ok(StandaloneSegmentCompactionPlan {
         archives: planned_archives,
         marked_segments: reclaimable.len(),
         reclaimable,
@@ -2579,10 +2737,120 @@ fn unique_active_segment_locations(
     Ok(locations)
 }
 
+/// Which archives a sweep is willing to rewrite to the next generation
+/// letter.
+///
+/// Oak's `TarReader.sweep` rewrites an archive only when the survivors would
+/// occupy less than three quarters of the original TAR-entry bytes
+/// (`docs/analysis/write-cleanup.md` §4.1). That gate is an input/output
+/// economics heuristic for an online collector competing with a running
+/// repository, not a format rule: it is evaluated *after* the whole-file
+/// removal branch, so Oak already drops one hundred per cent of an archive
+/// with no gate at all while refusing to drop twenty-four per cent of one,
+/// and the rewrite itself — survivor copy in file-position order, filtered
+/// graph and binary-reference trailers, validated publication — is the same
+/// operation whatever volume it drops.
+///
+/// froe reclaims offline, under the exclusive repository lock, because an
+/// operator asked it to. Leaving proven garbage on disk to save a copy that
+/// operator already authorized is the wrong trade, and it is why a
+/// compaction followed by a cleanup could identify hundreds of megabytes of
+/// garbage and reclaim none of it: both passes deferred the same archives,
+/// forever. [`Self::EveryReclaimableArchive`] is therefore the default; Oak's
+/// heuristic stays available, byte-exact, for anyone who wants it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArchiveRewritePolicy {
+    /// Rewrite whenever any entry in the archive is reclaimable.
+    #[default]
+    EveryReclaimableArchive,
+    /// Oak's exact Java signed-32-bit `afterSize >= beforeSize * 3 / 4`
+    /// heuristic, reproduced including its wrapping multiplication.
+    OakSavingsGate,
+}
+
+/// Plans one archive's sweep.
+///
+/// `absent_names` are archive file names this same run has already committed
+/// to unlink but has not unlinked yet. Both obstacles this function reads off
+/// the live directory — an alternate generation letter that a whole-file
+/// removal would promote, and an occupied rewrite target — must treat those
+/// names as gone, or a plan built before the removals and a replan built after
+/// them would disagree about archives the run never mentioned. Every applying
+/// call passes an empty set, because by then the removals really have happened.
+/// The sweep a post-compaction reclaim pass will perform, planned read-only.
+///
+/// Mirrors `reclaim_old_generations_with`'s mark exactly: the same
+/// `mark_one_archive` over the same base archives in the same order, with the
+/// dangling-future rule disabled and no protected set — because the run it
+/// predicts has just published a compacted head, so nothing is dangling and
+/// nothing is vetoed. What it cannot observe directly is the reference set the
+/// copy's own session archives would seed, so the caller supplies it:
+/// `seed_references` are the pre-existing bulk segments the copy will
+/// reference where they lie.
+///
+/// `absent_names` are archives this run removes before it copies, so the
+/// prediction and the replan agree about a namespace the prediction can see
+/// but the replan will not.
+pub(crate) fn predict_post_compaction_reclamation(
+    directory: &Path,
+    repository: &crate::store::Repository,
+    rule: ReclaimRule,
+    seed_references: &std::collections::HashSet<SegmentIdentifier>,
+    rewrite_policy: ArchiveRewritePolicy,
+    absent_names: &std::collections::HashSet<String>,
+) -> Result<StandaloneSegmentCompactionPlan> {
+    let protected = std::collections::HashSet::new();
+    let policy = ReclaimPolicy {
+        rule,
+        protected_data_segments: &protected,
+    };
+    let mut references = seed_references.clone();
+    let mut reclaimable = std::collections::HashSet::new();
+    // No dangling-future root: the run being predicted commits its head before
+    // it sweeps, so every compacted entry it will see belongs at or before it.
+    let mut ahead_of_root = None;
+    for archive in repository.archives() {
+        if absent_names.contains(archive.file_name()) {
+            continue;
+        }
+        mark_one_archive(
+            archive,
+            policy,
+            &mut references,
+            &mut reclaimable,
+            &mut ahead_of_root,
+        )?;
+    }
+
+    let mut planned_archives = Vec::new();
+    for archive in repository.archives() {
+        if absent_names.contains(archive.file_name()) {
+            continue;
+        }
+        if let Some(planned) = plan_archive_sweep(
+            directory,
+            archive,
+            &reclaimable,
+            rewrite_policy,
+            absent_names,
+        )? {
+            planned_archives.push(planned);
+        }
+    }
+    planned_archives.sort_by(|left, right| left.file_name().cmp(right.file_name()));
+    Ok(StandaloneSegmentCompactionPlan {
+        archives: planned_archives,
+        marked_segments: reclaimable.len(),
+        reclaimable,
+    })
+}
+
 fn plan_archive_sweep(
     directory: &Path,
     archive: &TarArchiveReader,
     reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+    rewrite_policy: ArchiveRewritePolicy,
+    absent_names: &std::collections::HashSet<String>,
 ) -> Result<Option<PlannedArchiveSweep>> {
     let Some(name) = ArchiveFileName::parse(archive.file_name()) else {
         return Ok(None);
@@ -2638,7 +2906,7 @@ fn plan_archive_sweep(
         // residue on the next open, potentially shadowing healthy segments
         // with obsolete/damaged copies. Archive hygiene must classify every
         // alternate before whole-file deletion proceeds.
-        if let Some(occupied_name) = alternate_generation_residue(directory, &name)? {
+        if let Some(occupied_name) = alternate_generation_residue(directory, &name, absent_names)? {
             return Ok(Some(PlannedArchiveSweep::BlockedByOccupiedGeneration {
                 file_name: name.file_name,
                 occupied_name,
@@ -2652,11 +2920,16 @@ fn plan_archive_sweep(
             file_bytes: archive.file_size(),
         }));
     }
-    // Exact Oak gate: both sizes are Java `int`s, multiplication by three
-    // wraps in signed 32-bit arithmetic, division truncates toward zero, and
-    // equality at 75% is deferred. Prove the accumulated entry sizes fit the
-    // source domain before reproducing those arithmetic semantics.
-    if oak_sweep_defers(before_entry_bytes, after_entry_bytes, archive.file_name())? {
+    // Exact Oak gate, when it is the selected policy: both sizes are Java
+    // `int`s, multiplication by three wraps in signed 32-bit arithmetic,
+    // division truncates toward zero, and equality at 75% is deferred. Prove
+    // the accumulated entry sizes fit the source domain before reproducing
+    // those arithmetic semantics. The default policy evaluates none of it,
+    // which also means an archive whose entry bytes exceed Java's signed
+    // domain is rewritten rather than refused.
+    if rewrite_policy == ArchiveRewritePolicy::OakSavingsGate
+        && oak_sweep_defers(before_entry_bytes, after_entry_bytes, archive.file_name())?
+    {
         return Ok(Some(PlannedArchiveSweep::DeferredBySavings {
             file_name: name.file_name,
             segment_count: reclaimable_count,
@@ -2672,7 +2945,9 @@ fn plan_archive_sweep(
     }
     let next_letter = char::from(name.file_generation as u8 + 1);
     let replacement_name = format!("data{:05}{next_letter}.tar", name.archive_number);
-    if directory.join(&replacement_name).try_exists()? {
+    if !absent_names.contains(&replacement_name)
+        && directory.join(&replacement_name).try_exists()?
+    {
         return Ok(Some(PlannedArchiveSweep::BlockedByOccupiedGeneration {
             file_name: name.file_name,
             occupied_name: replacement_name,
@@ -2726,9 +3001,11 @@ fn segment_entry_disk_bytes(archive_name: &str, size: u32) -> Result<u64> {
 fn alternate_generation_residue(
     directory: &Path,
     active: &ArchiveFileName,
+    absent_names: &std::collections::HashSet<String>,
 ) -> Result<Option<String>> {
     Ok(crate::store::list_archive_file_names(directory)?
         .into_iter()
+        .filter(|file_name| !absent_names.contains(file_name))
         .filter_map(|file_name| ArchiveFileName::parse(&file_name))
         .filter(|candidate| {
             candidate.archive_number == active.archive_number
@@ -2749,11 +3026,27 @@ fn alternate_generation_residue(
 /// following every target for which Java's `isDataSegmentId` is false.
 /// Reclaimable identifiers are
 /// accumulated into one store-wide set shared by every archive.
+/// The generation predicate one maintenance run applies, everywhere.
+///
+/// Built once per run and passed by value to the mark phase and to the
+/// head-safety guard, so the two can never read different values. They used to
+/// read the same pair of constants from five hundred lines apart, which was a
+/// coincidence rather than a guarantee — and the moment the retention value
+/// became a per-run quantity, that coincidence would have converted a refusal
+/// into the silent deletion of head-reachable data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReclaimRule {
+    /// The generation every candidate is judged against.
+    pub(crate) reference: GarbageCollectionGeneration,
+    /// Oak's FULL predicate when true, its TAIL predicate when false.
+    pub(crate) full: bool,
+    /// How many generations behind the reference survive.
+    pub(crate) retained_generations: i32,
+}
+
 #[derive(Clone, Copy)]
 struct ReclaimPolicy<'protected> {
-    reference: GarbageCollectionGeneration,
-    full: bool,
-    retained_generations: i32,
+    rule: ReclaimRule,
     protected_data_segments: &'protected std::collections::HashSet<SegmentIdentifier>,
 }
 
@@ -2821,10 +3114,10 @@ fn mark_one_archive(
         } else if identifier.is_data_segment() {
             generation.is_some_and(|generation| {
                 is_reclaimable(
-                    policy.reference,
+                    policy.rule.reference,
                     generation,
-                    policy.full,
-                    policy.retained_generations,
+                    policy.rule.full,
+                    policy.rule.retained_generations,
                 )
             })
         } else {
@@ -3009,7 +3302,15 @@ pub(crate) fn certify_active_archive(
             .ok_or(Error::SegmentNotFound {
                 segment_identifier: identifier,
             })?;
-        let structure = ParsedSegment::parse(identifier, bytes)?;
+        // Parsed once and carried as a view. Handing the view to
+        // `read_blob_identifiers` keeps the certificate reading the record
+        // table that belongs to these exact bytes, and spares this pass a
+        // second parse of every data segment in the store.
+        let segment = SegmentView {
+            structure: Arc::new(ParsedSegment::parse(identifier, bytes)?),
+            bytes: bytes.into(),
+        };
+        let structure = &segment.structure;
         if entry.generation != structure.generation
             || entry.full_generation != structure.full_generation
             || entry.is_compacted != structure.is_compacted
@@ -3027,7 +3328,7 @@ pub(crate) fn certify_active_archive(
             );
         }
         let binary_references =
-            read_blob_identifiers(provider, &structure).map_err(|error| Error::InvalidFormat {
+            read_blob_identifiers(provider, &segment).map_err(|error| Error::InvalidFormat {
                 details: format!(
                     "{description} cannot reconstruct binary references for segment {identifier} through the complete active repository ({error})"
                 ),
@@ -3053,7 +3354,7 @@ pub(crate) fn certify_active_archive(
 }
 
 pub(crate) fn certify_active_archives(
-    provider: &dyn SegmentProvider,
+    provider: &(dyn SegmentProvider + Sync),
     archives: &[TarArchiveReader],
 ) -> Result<()> {
     certify_active_archives_with_progress(
@@ -3069,10 +3370,124 @@ pub(crate) fn certify_active_archives(
 /// operator has confirmed a destructive cleanup, which is the worst
 /// possible moment to say nothing.
 pub(crate) fn certify_active_archives_with_progress(
-    provider: &dyn SegmentProvider,
+    provider: &(dyn SegmentProvider + Sync),
     archives: &[TarArchiveReader],
     observer: &mut dyn crate::progress::ProgressObserver,
 ) -> Result<()> {
+    let archives: Vec<&TarArchiveReader> = archives.iter().collect();
+    certify_archives_in_parallel(provider, &archives, observer)
+}
+
+/// One certification pass shared by every worker: the archives still to be
+/// claimed, and what the pass has concluded so far.
+struct ArchiveCertificationPass<'pass> {
+    provider: &'pass (dyn SegmentProvider + Sync),
+    archives: &'pass [&'pass TarArchiveReader],
+    /// The next archive no worker has claimed yet.
+    next: std::sync::atomic::AtomicUsize,
+    /// Archives certified, for the progress counter only.
+    certified: std::sync::atomic::AtomicUsize,
+    /// Read before claiming, so workers stop starting new archives once the
+    /// pass is already going to fail.
+    failed: std::sync::atomic::AtomicBool,
+    /// The failure to report, with the archive's position so the lowest one
+    /// wins however the workers interleave.
+    failure: std::sync::Mutex<Option<(usize, Error)>>,
+}
+
+impl ArchiveCertificationPass<'_> {
+    /// Claims and certifies one archive. Returns `false` when nothing is
+    /// left to claim, or when the pass has already failed.
+    fn certify_one(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        if self.failed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let position = self.next.fetch_add(1, Ordering::Relaxed);
+        let Some(archive) = self.archives.get(position) else {
+            return false;
+        };
+        match certify_active_archive(self.provider, archive) {
+            Ok(()) => {
+                self.certified.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => self.record_failure(position, error),
+        }
+        true
+    }
+
+    /// Records one archive's failure, keeping whichever is lowest-positioned.
+    ///
+    /// Workers reach this in whatever order they finish, so the comparison —
+    /// not the arrival order — is what makes the reported failure the one a
+    /// single-threaded pass would have reported.
+    fn record_failure(&self, position: usize, error: Error) {
+        let mut failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failure
+            .as_ref()
+            .is_none_or(|(reported, _)| position < *reported)
+        {
+            *failure = Some((position, error));
+        }
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The failure this pass will report, if any.
+    fn reported_failure(self) -> Option<Error> {
+        self.failure
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|(_, error)| error)
+    }
+}
+
+/// Certifies every archive across as many threads as the host offers,
+/// reporting one step whose counter advances as archives complete.
+///
+/// The unit of work is a whole archive, and certifying one is almost
+/// entirely provider-free: a segment is proven from the bytes and record
+/// table of the archive that holds it, so `provider` is consulted only to
+/// follow a `0xF0`-class blob identifier out of the segment being read.
+/// The locked caches behind it are therefore touched per external blob
+/// identifier rather than per segment, which is what lets this scale.
+///
+/// Memory scales with the worker count, not the archive count: a worker
+/// holds the reconstructed graph and binary-reference catalog of the one
+/// archive it is certifying, so the peak is that per-archive metadata times
+/// the workers, and a worker is never started for an archive that is not
+/// there.
+///
+/// The reported failure is the lowest-positioned one, which is what a
+/// single-threaded pass over this order would have reported. Positions are
+/// handed out in order, so every archive before the first failure is
+/// claimed, and a claimed archive is always finished — no earlier failure
+/// can be missed. Archives after it may go unexamined, exactly as before.
+fn certify_archives_in_parallel(
+    provider: &(dyn SegmentProvider + Sync),
+    archives: &[&TarArchiveReader],
+    observer: &mut dyn crate::progress::ProgressObserver,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let pass = ArchiveCertificationPass {
+        provider,
+        archives,
+        next: std::sync::atomic::AtomicUsize::new(0),
+        certified: std::sync::atomic::AtomicUsize::new(0),
+        failed: std::sync::atomic::AtomicBool::new(false),
+        failure: std::sync::Mutex::new(None),
+    };
+    // One thread per archive at most, so a single-archive store spawns
+    // nothing and runs exactly as it did before.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(archives.len().max(1));
+
     crate::progress::observe(
         observer,
         &crate::progress::Step::new(
@@ -3081,12 +3496,22 @@ pub(crate) fn certify_active_archives_with_progress(
         )
         .with_total(crate::progress::count(archives.len())),
         |observer| {
-            for (certified, archive) in archives.iter().enumerate() {
-                observer.step_advanced(crate::progress::count(certified));
-                certify_active_archive(provider, archive)?;
-            }
-            observer.step_advanced(crate::progress::count(archives.len()));
-            Ok(())
+            std::thread::scope(|scope| {
+                for _ in 1..workers {
+                    scope.spawn(|| while pass.certify_one() {});
+                }
+                // This thread is the last worker, and the only one that may
+                // touch the observer.
+                while pass.certify_one() {
+                    observer.step_advanced(crate::progress::count(
+                        pass.certified.load(Ordering::Relaxed),
+                    ));
+                }
+            });
+            observer.step_advanced(crate::progress::count(
+                pass.certified.load(Ordering::Relaxed),
+            ));
+            pass.reported_failure().map_or(Ok(()), Err)
         },
     )
 }
@@ -3108,8 +3533,9 @@ fn next_archive_staging_name(directory: &Path, replacement_name: &str) -> Result
 }
 
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "staging, semantic validation, atomic publication, and source unlinking form one deliberately linear safety sequence"
+    reason = "staging, semantic validation, atomic publication, and source unlinking form one deliberately linear safety sequence, and each parameter names one input that sequence must not re-derive"
 )]
 fn sweep_one_archive<'archives>(
     directory: &Path,
@@ -3119,9 +3545,17 @@ fn sweep_one_archive<'archives>(
     all_archives: &[&'archives TarArchiveReader],
     fallback_provider: &mut Option<ArchiveSegmentsProvider<'archives>>,
     source_certificate_provider: Option<&dyn SegmentProvider>,
+    rewrite_policy: ArchiveRewritePolicy,
 ) -> Result<ArchiveSweepOutcome> {
     let path = directory.join(reader.file_name());
-    let Some(planned) = plan_archive_sweep(directory, reader, reclaimable)? else {
+    let Some(planned) = plan_archive_sweep(
+        directory,
+        reader,
+        reclaimable,
+        rewrite_policy,
+        &std::collections::HashSet::new(),
+    )?
+    else {
         return Ok(ArchiveSweepOutcome::default());
     };
 
@@ -3138,7 +3572,16 @@ fn sweep_one_archive<'archives>(
         if let Some(provider) = source_certificate_provider {
             certify_reopened_active_archive(provider, &reopened)?;
         }
-        if plan_archive_sweep(directory, &reopened, reclaimable)?.as_ref() != Some(&planned) {
+        if plan_archive_sweep(
+            directory,
+            &reopened,
+            reclaimable,
+            rewrite_policy,
+            &std::collections::HashSet::new(),
+        )?
+        .as_ref()
+            != Some(&planned)
+        {
             return Err(Error::InvalidFormat {
                 details: format!(
                     "the actionable source archive {} changed before its immediate cleanup certificate",
@@ -3172,14 +3615,14 @@ fn sweep_one_archive<'archives>(
                 .as_ref()
                 .expect("an archive removal always has an actionable reopened source");
             #[cfg(test)]
-            crate::writer::cleanup_fault_injection::substitute_path_if_armed(
+            crate::writer::maintenance_fault_injection::substitute_path_if_armed(
                 "sweep.remove-before-source-identity",
                 &path,
             )?;
             require_held_file_identity(source_file, *source_identity, "certified removal source")?;
             require_path_file_identity(&path, *source_identity, "certified removal source")?;
             #[cfg(test)]
-            crate::writer::cleanup_fault_injection::remove_path_if_armed(
+            crate::writer::maintenance_fault_injection::remove_path_if_armed(
                 "sweep.remove-before-source-unlink-not-found",
                 &path,
             )?;
@@ -3348,7 +3791,9 @@ fn sweep_one_archive<'archives>(
     }
     writer.close()?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.staging-before-validation-open")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed(
+        "sweep.staging-before-validation-open",
+    )?;
     let staging_file = open_regular_file_no_follow(&staging_path, true)?;
     preserve_file_metadata(&staging_file, &source_metadata)?;
     let staging_identity = held_file_identity(&staging_file)?;
@@ -3370,7 +3815,7 @@ fn sweep_one_archive<'archives>(
         });
     }
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::substitute_path_if_armed(
+    crate::writer::maintenance_fault_injection::substitute_path_if_armed(
         "sweep.staging-validated-before-publish",
         &staging_path,
     )?;
@@ -3393,7 +3838,7 @@ fn sweep_one_archive<'archives>(
     // cannot overwrite a final path created after planning. Both names refer
     // to the already-synced, validated inode until staging cleanup.
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.before-publish-link")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-publish-link")?;
     std::fs::hard_link(&staging_path, &replacement_path)?;
 
     // A pathname substitution in the narrow interval between the pre-link
@@ -3453,17 +3898,23 @@ fn sweep_one_archive<'archives>(
         });
     }
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.after-publish-link")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-publish-link")?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.before-publish-directory-sync")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed(
+        "sweep.before-publish-directory-sync",
+    )?;
     sync_directory_strict(directory)?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.after-publish-directory-sync")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed(
+        "sweep.after-publish-directory-sync",
+    )?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed("sweep.published-before-source-unlink");
+    crate::writer::maintenance_fault_injection::crash_if_armed(
+        "sweep.published-before-source-unlink",
+    );
     let mut deletion_failures = Vec::new();
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.before-staging-unlink")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-staging-unlink")?;
     if let Err(error) = std::fs::remove_file(&staging_path) {
         deletion_failures.push(DeferredFileDeletion {
             file_name: staging_name,
@@ -3472,15 +3923,15 @@ fn sweep_one_archive<'archives>(
         });
     }
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.after-staging-unlink")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-staging-unlink")?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed(
+    crate::writer::maintenance_fault_injection::crash_if_armed(
         "sweep.staging-unlinked-before-source-unlink",
     );
     // Deletion failures are consistency-safe: the published higher letter
     // wins and preserves every survivor; the old source is reported later.
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.before-source-unlink")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-source-unlink")?;
     let pre_source_unlink_identity = (|| {
         require_held_file_identity(
             &replacement_file,
@@ -3512,9 +3963,9 @@ fn sweep_one_archive<'archives>(
         });
     }
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::fail_if_armed("sweep.after-source-unlink")?;
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-source-unlink")?;
     #[cfg(test)]
-    crate::writer::cleanup_fault_injection::crash_if_armed("sweep.source-unlinked");
+    crate::writer::maintenance_fault_injection::crash_if_armed("sweep.source-unlinked");
     Ok(ArchiveSweepOutcome {
         disposition: ArchiveSweepDisposition::Rewritten,
         deletion_failures,
@@ -3524,8 +3975,8 @@ fn sweep_one_archive<'archives>(
 
 #[cfg(test)]
 fn probe_archive_sweep_phase_boundary(cutpoint: &str) -> Result<()> {
-    crate::writer::cleanup_fault_injection::fail_if_armed(cutpoint)?;
-    crate::writer::cleanup_fault_injection::crash_if_armed(cutpoint);
+    crate::writer::maintenance_fault_injection::fail_if_armed(cutpoint)?;
+    crate::writer::maintenance_fault_injection::crash_if_armed(cutpoint);
     Ok(())
 }
 
@@ -4289,18 +4740,19 @@ fn recover_archive_number(
     let temporary_name = format!("{target_name}.recovering");
     let temporary_path = directory.join(&temporary_name);
     let _ = std::fs::remove_file(&temporary_path);
-    let write_replacement = || -> Result<()> {
-        let mut writer = TarArchiveWriter::new(directory, &temporary_name);
-        for (identifier, bytes) in &recovered {
-            let (generation, references, binary_references) =
-                if let Some(parsed) = parsed_segments.get(identifier) {
-                    // Fail closed when a blob identifier cannot be
-                    // resolved: publishing an incomplete catalog would let
-                    // AEM's blob garbage collection delete a
-                    // still-referenced binary.
-                    let binary_references =
-                        read_blob_identifiers(&provider, parsed).map_err(|error| {
-                            Error::InvalidFormat {
+    let write_replacement =
+        || -> Result<()> {
+            let mut writer = TarArchiveWriter::new(directory, &temporary_name);
+            for (identifier, bytes) in &recovered {
+                let (generation, references, binary_references) =
+                    if let Some(parsed) = parsed_segments.get(identifier) {
+                        // Fail closed when a blob identifier cannot be
+                        // resolved: publishing an incomplete catalog would let
+                        // AEM's blob garbage collection delete a
+                        // still-referenced binary.
+                        let segment = provider.segment(*identifier)?;
+                        let binary_references = read_blob_identifiers(&provider, &segment)
+                            .map_err(|error| Error::InvalidFormat {
                                 details: format!(
                                     "cannot rebuild the binary references catalog while \
                                      recovering {target_name}: an external blob identifier in \
@@ -4309,39 +4761,38 @@ fn recover_archive_number(
                                      catalog, which could let blob garbage collection delete \
                                      referenced binaries"
                                 ),
-                            }
-                        })?;
-                    (
-                        GarbageCollectionGeneration {
-                            generation: parsed.generation,
-                            full_generation: parsed.full_generation,
-                            is_compacted: parsed.is_compacted,
-                        },
-                        parsed.referenced_segments.clone(),
-                        binary_references,
-                    )
-                } else {
-                    (
-                        GarbageCollectionGeneration {
-                            generation: 0,
-                            full_generation: 0,
-                            is_compacted: false,
-                        },
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                };
-            writer.write_segment(
-                *identifier,
-                bytes,
-                generation,
-                &references,
-                &binary_references,
-            )?;
-        }
-        writer.close()?;
-        Ok(())
-    };
+                            })?;
+                        (
+                            GarbageCollectionGeneration {
+                                generation: parsed.generation,
+                                full_generation: parsed.full_generation,
+                                is_compacted: parsed.is_compacted,
+                            },
+                            parsed.referenced_segments.clone(),
+                            binary_references,
+                        )
+                    } else {
+                        (
+                            GarbageCollectionGeneration {
+                                generation: 0,
+                                full_generation: 0,
+                                is_compacted: false,
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    };
+                writer.write_segment(
+                    *identifier,
+                    bytes,
+                    generation,
+                    &references,
+                    &binary_references,
+                )?;
+            }
+            writer.close()?;
+            Ok(())
+        };
     if let Err(error) = write_replacement() {
         let _ = std::fs::remove_file(&temporary_path);
         return Err(error);
@@ -4600,14 +5051,8 @@ impl FilteredTrailers {
             // `TarArchiveWriter::add_binary_references` instead.
             None => Vec::new(),
             Some(provider) => {
-                let parsed = provider
-                    .segments
-                    .get(&identifier)
-                    .map(|(parsed, _)| Arc::clone(parsed))
-                    .ok_or(Error::SegmentNotFound {
-                        segment_identifier: identifier,
-                    })?;
-                read_blob_identifiers(provider, &parsed).map_err(|error| Error::InvalidFormat {
+                let segment = provider.segment(identifier)?;
+                read_blob_identifiers(provider, &segment).map_err(|error| Error::InvalidFormat {
                     details: format!(
                         "cannot rebuild the binary references catalog while sweeping: an \
                              external blob identifier in segment {identifier} does not resolve \
@@ -4681,30 +5126,84 @@ fn seed_references_from_archive(
     Ok(())
 }
 
+/// Whether opening a fresh base-source provider must also derive the full
+/// certificate for every base archive it serves.
+#[derive(Clone, Copy)]
+enum BaseSourceCertification {
+    /// Prove every base archive before returning the provider.
+    Derive,
+    /// The caller holds a [`CertifiedReclaimSources`] covering exactly these
+    /// archives, taken under the lock still held, and has mutated none of
+    /// them since.
+    AlreadyProven,
+}
+
+/// Proof that every base archive of one store was certified under the
+/// repository lock the holder still holds.
+///
+/// Returned by [`WritableRepository::preflight_reclaim_sources_with_progress`]
+/// and accepted by
+/// [`WritableRepository::reclaim_old_generations_from_sources`]. Compaction
+/// certifies its sources before allocating the compacted copy and reclaims
+/// from the same sources afterwards; without this the reclaim pass re-derived
+/// the identical certificate over the identical bytes, parsing and hashing the
+/// whole store a second time within one locked run. Nothing froe does between
+/// those two points writes to a base archive: the deep copy only appends new
+/// archives.
+///
+/// The proof names the archives it covers rather than asserting a bare fact,
+/// and reclamation compares that set against its own base archives, so it can
+/// only excuse work it actually did. A set that has shifted — an archive
+/// renamed, added, or retired since — fails the comparison and the full
+/// certificate is derived again.
+///
+/// What this never stands in for is the certificate immediately before a
+/// mutation. Each archive that will change on disk is certified again in
+/// `sweep_one_archive`, through a no-follow descriptor bound to the exact
+/// inode about to be acted on, and its sweep plan is re-derived from those
+/// fresh bytes and compared against the planned one.
+pub(crate) struct CertifiedReclaimSources {
+    base_names: std::collections::HashSet<String>,
+}
+
+impl CertifiedReclaimSources {
+    /// Whether this proof covers exactly `base_names` — no archive missing
+    /// from what was certified, and none certified that is no longer a base
+    /// archive.
+    fn certifies_exactly(&self, base_names: &std::collections::HashSet<String>) -> bool {
+        self.base_names == *base_names
+    }
+}
+
 /// Extracts every external blob identifier recorded in one segment,
 /// resolving large (`0xF0`-class) identifiers through `provider`. Fails
 /// when any identifier cannot be resolved: a rebuilt catalog missing an
 /// entry would let AEM's blob garbage collection delete a binary that is
 /// still referenced, so callers that *publish* the catalog must fail
 /// closed instead.
+///
+/// The segment is taken as a resolved [`SegmentView`] rather than resolved
+/// again here. Every caller already holds one, so re-resolving cost a second
+/// parse of the same bytes on each certified segment; taking the view also
+/// makes it structural, rather than a property of the provider passed, that
+/// the record table read is the one belonging to these payload bytes.
 pub(crate) fn read_blob_identifiers(
     provider: &dyn SegmentProvider,
-    structure: &ParsedSegment,
+    segment: &SegmentView<'_>,
 ) -> Result<Vec<String>> {
     let mut identifiers = Vec::new();
-    let view = provider.segment(structure.identifier)?;
-    for entry in structure.record_table() {
+    for entry in segment.structure.record_table() {
         if entry.record_type() != Some(RecordType::ExternalBlobIdentifier) {
             continue;
         }
-        let head = view.read_u8(entry.record_number, 0)?;
+        let head = segment.read_u8(entry.record_number, 0)?;
         if head & 0xF0 == 0xE0 {
-            let stored = view.read_u16(entry.record_number, 0)?;
+            let stored = segment.read_u16(entry.record_number, 0)?;
             let length = usize::from(stored & 0x0FFF);
-            let reference_bytes = view.read_bytes(entry.record_number, 2, length)?;
+            let reference_bytes = segment.read_bytes(entry.record_number, 2, length)?;
             identifiers.push(String::from_utf8_lossy(reference_bytes).into_owned());
         } else if head & 0xF8 == 0xF0 {
-            let string_identifier = view.read_record_identifier(entry.record_number, 1, 0)?;
+            let string_identifier = segment.read_record_identifier(entry.record_number, 1, 0)?;
             identifiers.push(read_string(provider, string_identifier)?);
         }
     }
@@ -4728,9 +5227,12 @@ fn certify_reopened_active_archive(
 
 /// A complete provider whose freshly reopened source archive shadows the
 /// caller's earlier repository mapping. This is required for semantic source
-/// certification: `read_blob_identifiers` starts by resolving the segment
-/// being inspected, and delegating that UUID would compare a fresh record
-/// table against stale payload bytes.
+/// certification: a `0xF0`-class blob identifier resolves through a record
+/// identifier that may name the very segment being inspected, and delegating
+/// that UUID would read the string out of stale payload bytes. The segment
+/// under inspection no longer reaches the provider at all — it is passed to
+/// `read_blob_identifiers` as an already-resolved view — but every UUID it
+/// *references* still does, so the shadowing stays load-bearing.
 struct ReopenedSourceProvider<'source, 'fallback> {
     source: ArchiveSegmentsProvider<'source>,
     fallback: &'fallback dyn SegmentProvider,
@@ -4790,15 +5292,23 @@ mod tests {
     use std::io::Write as _;
     use std::sync::{Arc, RwLock};
 
-    use super::{DEFAULT_MAXIMUM_ARCHIVE_SIZE, SessionSegment, session_cache_budget_bytes};
+    use super::{
+        CertifiedReclaimSources, DEFAULT_MAXIMUM_ARCHIVE_SIZE, SessionSegment,
+        session_cache_budget_bytes,
+    };
     use crate::cache::BoundedCache;
 
     #[cfg(unix)]
-    use super::certify_active_archive;
     use super::{
-        PlannedArchiveSweep, ReclaimPolicy, WritableRepository, analyze_standalone_segment_cleanup,
-        archive_segments_provider, is_reclaimable, mark_one_archive, next_cleanup_archive_number,
-        oak_sweep_defers, oak_sweep_threshold, plan_archive_sweep, read_blob_identifiers,
+        ArchiveCertificationPass, ArchiveSegmentsProvider, certify_active_archive,
+        certify_active_archives,
+    };
+    use super::{
+        ArchiveRewritePolicy, GenerationReclaimRequest, PlannedArchiveSweep, RETAINED_GENERATIONS,
+        ReclaimPolicy, ReclaimRule, SegmentSweepOutcome, StandaloneSegmentCompactionPlan,
+        WritableRepository, analyze_standalone_segment_cleanup, archive_segments_provider,
+        is_reclaimable, mark_one_archive, next_cleanup_archive_number, oak_sweep_defers,
+        oak_sweep_threshold, plan_archive_sweep, read_blob_identifiers,
         seed_references_from_archive, stored_segment_generation, sweep_one_archive,
         validate_swept_archive,
     };
@@ -4925,19 +5435,30 @@ mod tests {
     // payloads and no journal. Production standalone cleanup enters through
     // the repository-backed certificate wrappers; these helpers keep the
     // arithmetic/ordering unit tests scoped to their primitive.
+    /// The rule standalone planning applies, so a test wrapper names the
+    /// reference generation and nothing else.
+    fn standalone_rule(reference: GarbageCollectionGeneration) -> ReclaimRule {
+        ReclaimRule {
+            reference,
+            full: super::FULL_GARBAGE_COLLECTION,
+            retained_generations: super::RETAINED_GENERATIONS,
+        }
+    }
+
     fn plan_standalone_segment_cleanup(
         directory: &std::path::Path,
         reference: GarbageCollectionGeneration,
         current_head_segment: SegmentIdentifier,
         protected: &HashSet<SegmentIdentifier>,
-    ) -> crate::error::Result<super::StandaloneSegmentCleanupPlan> {
+    ) -> crate::error::Result<super::StandaloneSegmentCompactionPlan> {
         let archives = crate::store::open_all_archives(directory)?;
         analyze_standalone_segment_cleanup(
             directory,
             &archives,
-            reference,
+            standalone_rule(reference),
             current_head_segment,
             protected,
+            ArchiveRewritePolicy::default(),
             &mut crate::progress::DiscardedProgress,
         )
     }
@@ -4947,19 +5468,20 @@ mod tests {
         reference: GarbageCollectionGeneration,
         current_head_segment: SegmentIdentifier,
         protected: &HashSet<SegmentIdentifier>,
-        expected: Option<&super::StandaloneSegmentCleanupPlan>,
+        expected: Option<&super::StandaloneSegmentCompactionPlan>,
     ) -> crate::error::Result<(
-        super::StandaloneSegmentCleanupPlan,
-        super::StandaloneSegmentCleanupOutcome,
+        super::StandaloneSegmentCompactionPlan,
+        super::StandaloneSegmentCompactionOutcome,
     )> {
         let archives = crate::store::open_all_archives(directory)?;
         super::apply_standalone_segment_cleanup_from_archives(
             directory,
             &archives,
             None,
-            reference,
+            standalone_rule(reference),
             current_head_segment,
             protected,
+            ArchiveRewritePolicy::default(),
             expected,
             &mut crate::progress::DiscardedProgress,
             None,
@@ -5031,7 +5553,7 @@ mod tests {
         let generation = stored_segment_generation(target, &structure);
         let mut references = structure.referenced_segments.clone();
         let mut binary_references =
-            read_blob_identifiers(store, &structure).expect("reconstruct fixture BRF");
+            read_blob_identifiers(store, &view).expect("reconstruct fixture BRF");
         match omitted {
             OmittedSessionTrailer::Graph => references.clear(),
             OmittedSessionTrailer::BinaryReferences => binary_references.clear(),
@@ -5060,7 +5582,7 @@ mod tests {
             let structure = Arc::clone(&view.structure);
             let bytes = view.bytes.to_vec();
             let binary_references =
-                read_blob_identifiers(store, &structure).expect("reconstruct fixture BRF");
+                read_blob_identifiers(store, &view).expect("reconstruct fixture BRF");
             writer
                 .write_segment(
                     *identifier,
@@ -5132,8 +5654,32 @@ mod tests {
         assert!(!is_reclaimable(reference, generation(4, 5, true), false, 1));
     }
 
+    /// The boundary the retention value actually moves, and the store shape
+    /// that sits on it: a head Oak tail-compacted to `(1,0,compacted)` over
+    /// generation-zero data segments it still reaches. At two retained
+    /// generations those segments are spared by arithmetic; at one they are
+    /// reclaimable, and only `validate_reclaim_reference_invariant` stands
+    /// between the head and its own data.
     #[test]
-    fn exact_twenty_five_percent_savings_is_deferred_but_more_is_rewritten() {
+    fn one_retained_generation_reclaims_what_two_spared() {
+        let tail_compacted_head = generation(1, 0, true);
+        let untouched_tail = generation(0, 0, false);
+        assert!(is_reclaimable(tail_compacted_head, untouched_tail, true, 1));
+        assert!(!is_reclaimable(
+            tail_compacted_head,
+            untouched_tail,
+            true,
+            2
+        ));
+        assert_eq!(
+            super::RETAINED_GENERATIONS,
+            1,
+            "the run's own retention value is the one this boundary describes"
+        );
+    }
+
+    #[test]
+    fn the_oak_savings_gate_defers_at_exactly_twenty_five_percent() {
         let directory = TestDirectory::new("savings-gate");
         let entries: Vec<_> = (1..=4)
             .map(|seed| TestArchiveEntry::new(data_identifier(seed), 1, generation(0, 0, false)))
@@ -5143,9 +5689,15 @@ mod tests {
             TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
 
         let exactly_one_quarter = HashSet::from([entries[0].identifier]);
-        let exact = plan_archive_sweep(&directory.path, &reader, &exactly_one_quarter)
-            .expect("plan exact threshold")
-            .expect("one segment is eligible");
+        let exact = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &exactly_one_quarter,
+            ArchiveRewritePolicy::OakSavingsGate,
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan exact threshold")
+        .expect("one segment is eligible");
         assert!(matches!(
             exact,
             PlannedArchiveSweep::DeferredBySavings {
@@ -5156,9 +5708,15 @@ mod tests {
         ));
 
         let more_than_one_quarter = HashSet::from([entries[0].identifier, entries[1].identifier]);
-        let rewrite = plan_archive_sweep(&directory.path, &reader, &more_than_one_quarter)
-            .expect("plan above threshold")
-            .expect("two segments are eligible");
+        let rewrite = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &more_than_one_quarter,
+            ArchiveRewritePolicy::OakSavingsGate,
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan above threshold")
+        .expect("two segments are eligible");
         assert!(matches!(
             rewrite,
             PlannedArchiveSweep::Rewrite {
@@ -5168,6 +5726,41 @@ mod tests {
                 ..
             } if replacement_name == "data00000b.tar"
         ));
+    }
+
+    #[test]
+    fn the_default_policy_rewrites_what_the_oak_savings_gate_defers() {
+        let directory = TestDirectory::new("savings-gate-default");
+        let entries: Vec<_> = (1..=4)
+            .map(|seed| TestArchiveEntry::new(data_identifier(seed), 1, generation(0, 0, false)))
+            .collect();
+        write_test_archive(&directory, "data00000a.tar", &entries);
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
+
+        // The same one-in-four reclaimable set the gate defers above.
+        let exactly_one_quarter = HashSet::from([entries[0].identifier]);
+        let planned = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &exactly_one_quarter,
+            ArchiveRewritePolicy::EveryReclaimableArchive,
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan exact threshold")
+        .expect("one segment is eligible");
+        assert!(
+            matches!(
+                planned,
+                PlannedArchiveSweep::Rewrite {
+                    segment_count: 1,
+                    eligible_entry_bytes: 1024,
+                    ref replacement_name,
+                    ..
+                } if replacement_name == "data00000b.tar"
+            ),
+            "the default policy rewrites regardless of how little it frees, got {planned:?}"
+        );
     }
 
     #[test]
@@ -5210,9 +5803,11 @@ mod tests {
             TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
         let protected = HashSet::new();
         let policy = ReclaimPolicy {
-            reference,
-            full: true,
-            retained_generations: 1,
+            rule: ReclaimRule {
+                reference,
+                full: true,
+                retained_generations: 1,
+            },
             protected_data_segments: &protected,
         };
         let mut references = HashSet::new();
@@ -5325,6 +5920,76 @@ mod tests {
             .expect("content remains healthy");
     }
 
+    /// A stale archive letter this same run has already committed to unlink
+    /// must not block the sweep of the archive it shadows. Planning before the
+    /// removals and replanning after them would otherwise disagree about an
+    /// archive the run never named — which is a plan authorizing one mutation
+    /// and an apply performing another.
+    #[test]
+    fn a_sweep_plan_treats_a_pending_stale_removal_as_already_absent() {
+        let directory = TestDirectory::new("pending-stale-removal");
+        let old_one = data_identifier(210);
+        let old_two = data_identifier(211);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+            ],
+        );
+        // The superseded-letter condition a stale-archive removal retires.
+        std::fs::write(
+            directory.path.join("data00000b.tar"),
+            b"stale letter this run removes first",
+        )
+        .expect("write the stale letter");
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open source");
+        let cleaned = HashSet::from([old_one, old_two]);
+
+        let blocked = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &cleaned,
+            ArchiveRewritePolicy::default(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan against the live namespace")
+        .expect("every entry is reclaimable");
+        assert!(
+            matches!(
+                blocked,
+                PlannedArchiveSweep::BlockedByOccupiedGeneration {
+                    ref occupied_name,
+                    ..
+                } if occupied_name == "data00000b.tar"
+            ),
+            "the live namespace still holds the stale letter, so the removal is blocked: {blocked:?}"
+        );
+
+        let absent = HashSet::from(["data00000b.tar".to_owned()]);
+        let unblocked = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &cleaned,
+            ArchiveRewritePolicy::default(),
+            &absent,
+        )
+        .expect("plan against the namespace this run will leave behind")
+        .expect("every entry is reclaimable");
+        assert!(
+            matches!(
+                unblocked,
+                PlannedArchiveSweep::Remove {
+                    segment_count: 2,
+                    ..
+                }
+            ),
+            "a letter this run removes first cannot block the whole-file removal: {unblocked:?}"
+        );
+    }
+
     #[test]
     fn occupied_next_generation_is_never_truncated_or_rewritten() {
         let directory = TestDirectory::new("occupied-next-generation");
@@ -5347,9 +6012,15 @@ mod tests {
             TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open source");
         let cleaned = HashSet::from([old_one, old_two]);
 
-        let planned = plan_archive_sweep(&directory.path, &reader, &cleaned)
-            .expect("plan")
-            .expect("archive has reclaimable entries");
+        let planned = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &cleaned,
+            ArchiveRewritePolicy::default(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan")
+        .expect("archive has reclaimable entries");
         assert!(matches!(
             planned,
             PlannedArchiveSweep::BlockedByOccupiedGeneration {
@@ -5366,6 +6037,7 @@ mod tests {
             &[&reader],
             &mut fallback,
             None,
+            ArchiveRewritePolicy::default(),
         )
         .expect("blocked sweep is a safe no-op");
         assert_eq!(
@@ -5402,9 +6074,14 @@ mod tests {
             .expect("occupy staging name");
         }
         let reader = TarArchiveReader::open(&source_path).expect("open source");
-        let error =
-            plan_archive_sweep(&directory.path, &reader, &HashSet::from([old_one, old_two]))
-                .expect_err("planning must detect that no exclusive staging name exists");
+        let error = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &HashSet::from([old_one, old_two]),
+            ArchiveRewritePolicy::default(),
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("planning must detect that no exclusive staging name exists");
         assert!(
             error
                 .to_string()
@@ -5445,7 +6122,13 @@ mod tests {
         let cleaned = HashSet::from([obsolete]);
 
         assert!(matches!(
-            plan_archive_sweep(&directory.path, &reader, &cleaned)
+            plan_archive_sweep(
+                &directory.path,
+                &reader,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
                 .expect("plan")
                 .expect("eligible archive"),
             PlannedArchiveSweep::BlockedByOccupiedGeneration {
@@ -5463,6 +6146,7 @@ mod tests {
             &[&reader],
             &mut fallback,
             None,
+            ArchiveRewritePolicy::default(),
         )
         .expect("blocked removal is a no-op");
         assert_eq!(
@@ -5498,7 +6182,13 @@ mod tests {
         let cleaned = HashSet::from([obsolete]);
 
         assert!(matches!(
-            plan_archive_sweep(&directory.path, &active, &cleaned)
+            plan_archive_sweep(
+                &directory.path,
+                &active,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
                 .expect("plan")
                 .expect("eligible archive"),
             PlannedArchiveSweep::BlockedByOccupiedGeneration {
@@ -5516,6 +6206,7 @@ mod tests {
             &[&active],
             &mut fallback,
             None,
+            ArchiveRewritePolicy::default(),
         )
         .expect("blocked removal is a no-op");
         assert_eq!(
@@ -5548,9 +6239,15 @@ mod tests {
         let reader = TarArchiveReader::open(&path).expect("open source");
         let cleaned = HashSet::from([old_one, old_two]);
         assert!(matches!(
-            plan_archive_sweep(&directory.path, &reader, &cleaned)
-                .expect("plan")
-                .expect("has eligible entries"),
+            plan_archive_sweep(
+                &directory.path,
+                &reader,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("plan")
+            .expect("has eligible entries"),
             PlannedArchiveSweep::DeferredAtLastGeneration { .. }
         ));
         let mut fallback = None;
@@ -5562,6 +6259,7 @@ mod tests {
             &[&reader],
             &mut fallback,
             None,
+            ArchiveRewritePolicy::default(),
         )
         .expect("z sweep is a no-op");
         assert_eq!(std::fs::read(path).expect("read after"), before);
@@ -5601,9 +6299,11 @@ mod tests {
             TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
         let protected = HashSet::from([protected_future]);
         let policy = ReclaimPolicy {
-            reference: current,
-            full: true,
-            retained_generations: 2,
+            rule: ReclaimRule {
+                reference: current,
+                full: true,
+                retained_generations: 2,
+            },
             protected_data_segments: &protected,
         };
         let mut references = HashSet::from([referenced_future_bulk]);
@@ -5648,9 +6348,10 @@ mod tests {
         let error = analyze_standalone_segment_cleanup(
             &directory.path,
             &[reader],
-            generation(4, 4, true),
+            standalone_rule(generation(4, 4, true)),
             missing_root,
             &HashSet::new(),
+            ArchiveRewritePolicy::default(),
             &mut crate::progress::DiscardedProgress,
         )
         .expect_err("missing root must refuse cleanup");
@@ -5842,9 +6543,13 @@ mod tests {
         let old_two = data_identifier(79);
         let root = data_identifier(80);
         let reference = generation(5, 5, false);
+        // Generation `z` is the deferral the default policy still produces:
+        // the `a`–`z` namespace is a format limit, not an economic choice, so
+        // this archive keeps its reclaimable target on disk however little
+        // rewriting it would free.
         write_test_archive(
             &directory,
-            "data00000a.tar",
+            "data00000z.tar",
             &[
                 TestArchiveEntry::new(target, 1, generation(0, 0, false)),
                 TestArchiveEntry::new(retained_one, 1, reference),
@@ -5868,8 +6573,8 @@ mod tests {
                 .expect("plan");
         assert!(expected.archives.iter().any(|archive| matches!(
             archive,
-            PlannedArchiveSweep::DeferredBySavings { file_name, .. }
-                if file_name == "data00000a.tar"
+            PlannedArchiveSweep::DeferredAtLastGeneration { file_name, .. }
+                if file_name == "data00000z.tar"
         )));
         assert!(expected.archives.iter().any(|archive| matches!(
             archive,
@@ -5887,8 +6592,8 @@ mod tests {
         .expect("apply");
 
         assert!(
-            directory.path.join("data00000a.tar").exists(),
-            "the savings-deferred target remains physically available"
+            directory.path.join("data00000z.tar").exists(),
+            "the deferred target remains physically available"
         );
         let swept = TarArchiveReader::open(&directory.path.join("data00001b.tar"))
             .expect("open rewritten source");
@@ -5920,7 +6625,7 @@ mod tests {
 
         let archives = crate::store::open_all_archives(&directory.path).expect("open archives");
         let occupied = b"occupied after authoritative planning";
-        let after_plan = |plan: &super::StandaloneSegmentCleanupPlan| {
+        let after_plan = |plan: &super::StandaloneSegmentCompactionPlan| {
             let replacement = plan
                 .archives
                 .iter()
@@ -5940,9 +6645,10 @@ mod tests {
             &directory.path,
             &archives,
             None,
-            reference,
+            standalone_rule(reference),
             root,
             &HashSet::new(),
+            ArchiveRewritePolicy::default(),
             None,
             &mut crate::progress::DiscardedProgress,
             Some(&after_plan),
@@ -5967,6 +6673,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture, two sequenced sweeps, and the assertions that separate their outcomes belong in one place"
+    )]
     fn rewrite_replan_noop_reports_no_unavailable_graph_targets() {
         let directory = TestDirectory::new("rewrite-replan-noop-graph-target");
         let target = data_identifier(83);
@@ -5999,15 +6709,27 @@ mod tests {
             .expect("open second rewrite source");
         let reclaimable = HashSet::from([target, old_one, old_two]);
         assert!(matches!(
-            plan_archive_sweep(&directory.path, &first, &reclaimable)
-                .expect("initial first plan")
-                .expect("first archive is initially actionable"),
+            plan_archive_sweep(
+                &directory.path,
+                &first,
+                &reclaimable,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("initial first plan")
+            .expect("first archive is initially actionable"),
             PlannedArchiveSweep::Rewrite { .. }
         ));
         assert!(matches!(
-            plan_archive_sweep(&directory.path, &second, &reclaimable)
-                .expect("initial second plan")
-                .expect("second archive is actionable"),
+            plan_archive_sweep(
+                &directory.path,
+                &second,
+                &reclaimable,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("initial second plan")
+            .expect("second archive is actionable"),
             PlannedArchiveSweep::Rewrite { .. }
         ));
 
@@ -6028,6 +6750,7 @@ mod tests {
             &provider_order,
             &mut fallback,
             None,
+            ArchiveRewritePolicy::default(),
         )
         .expect("blocked immediate replan is a no-op");
         assert!(first_outcome.deletion_failures.is_empty());
@@ -6054,6 +6777,7 @@ mod tests {
             &provider_order,
             &mut fallback,
             None,
+            ArchiveRewritePolicy::default(),
         )
         .expect("second rewrite publishes");
         assert_eq!(
@@ -6653,8 +7377,17 @@ mod tests {
         std::fs::rename(&swap_path, &source_path).expect("replace source pathname");
 
         let reopened = TarArchiveReader::open(&source_path).expect("reopen changed source");
-        certify_active_archive(&stale_repository, &reopened)
-            .expect("the fixture demonstrates that the stale provider alone misses the change");
+        // The certificate reconstructs from the payload bytes of the archive
+        // it was handed, so an inline (`0xE0`-class) identifier is caught
+        // whatever provider is passed — a stale one no longer masks it. The
+        // provider still resolves every UUID the segment *references*, which
+        // is what the reopened-source shadowing below remains needed for.
+        let stale_provider_error = certify_active_archive(&stale_repository, &reopened)
+            .expect_err("the reopened payload is certified against itself, not the stale mapping");
+        assert!(
+            stale_provider_error.to_string().contains("catalog differs"),
+            "{stale_provider_error}"
+        );
 
         let cleaned: HashSet<_> = source
             .segment_identifiers()
@@ -6665,7 +7398,14 @@ mod tests {
             "the fixture must request a partial rewrite"
         );
         assert!(matches!(
-            plan_archive_sweep(&directory.path, source, &cleaned).expect("source sweep plan"),
+            plan_archive_sweep(
+                &directory.path,
+                source,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("source sweep plan"),
             Some(PlannedArchiveSweep::Rewrite { .. })
         ));
         let mut fallback_provider = None;
@@ -6677,6 +7417,7 @@ mod tests {
             &[source],
             &mut fallback_provider,
             Some(&stale_repository),
+            ArchiveRewritePolicy::default(),
         )
         .expect_err("fresh source payload must invalidate its stale BRF before publication");
 
@@ -6697,6 +7438,147 @@ mod tests {
                 .exists(),
             "no replacement may be published after the fresh certificate fails"
         );
+    }
+
+    /// Builds a store whose base archive holds one dead generation-zero
+    /// segment beside live head-generation ones, opens it for a session at the
+    /// given target generation, and returns the writable store plus the
+    /// certified sources a reclaim pass needs.
+    fn reclaimable_base_fixture(name: &str) -> (TestDirectory, GarbageCollectionGeneration) {
+        let directory = TestDirectory::new(name);
+        let store = WritableRepository::open(&directory.path).expect("open the fixture writer");
+        let mut dead = store.record_writer(generation(0, 0, false));
+        dead.write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("write the dead node");
+        dead.finish().expect("finish the dead segment");
+
+        let live = generation(2, 2, true);
+        // Enough live segments beside the dead ones that dropping them frees
+        // well under a quarter of the archive — which is the only shape where
+        // Oak's savings heuristic and the default policy disagree, and so the
+        // only shape that can tell whether the policy reached the sweep.
+        for _ in 0..8 {
+            let mut filler = store.record_writer(live);
+            filler
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("write a live filler node");
+            filler.finish().expect("finish the filler segment");
+        }
+        let mut writer = store.record_writer(live);
+        let root = writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("write the content root");
+        let head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: root,
+                },
+                &[],
+            )
+            .expect("write the super root");
+        writer.finish().expect("finish the live segment");
+        assert!(store.set_head(store.head(), head));
+        store.flush().expect("flush");
+        store.close().expect("close the fixture writer");
+        (directory, live)
+    }
+
+    /// The authorization the post-compaction sweep never had: a confirmed plan
+    /// it must match before it unlinks anything. A disagreement is answered by
+    /// refusing, not by explaining afterwards.
+    #[test]
+    fn a_post_compaction_sweep_refuses_an_unconfirmed_disposition_before_it_unlinks() {
+        let (directory, live) = reclaimable_base_fixture("sweep-authorization");
+        let before: Vec<String> = crate::store::list_archive_file_names(&directory.path)
+            .expect("list the archives before");
+        assert!(!before.is_empty());
+
+        // A plan naming a disposition this store cannot produce.
+        let impossible = StandaloneSegmentCompactionPlan {
+            archives: vec![PlannedArchiveSweep::Remove {
+                file_name: "data09999a.tar".to_owned(),
+                segment_count: 1,
+                file_bytes: 1,
+            }],
+            marked_segments: 1,
+            reclaimable: std::collections::HashSet::new(),
+        };
+
+        let mut store = WritableRepository::open(&directory.path).expect("open for the sweep");
+        let error = store
+            .reclaim_old_generations_with(GenerationReclaimRequest {
+                rule: ReclaimRule {
+                    reference: live,
+                    full: true,
+                    retained_generations: RETAINED_GENERATIONS,
+                },
+                rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
+                certified_sources: None,
+                expected: Some(&impossible),
+            })
+            .expect_err("an unconfirmed disposition must be refused");
+        store.close().expect("close after the refusal");
+
+        assert!(
+            error.to_string().contains("changed after confirmation"),
+            "the refusal names its reason: {error}"
+        );
+        assert_eq!(
+            crate::store::list_archive_file_names(&directory.path)
+                .expect("list the archives after"),
+            before,
+            "a refused sweep unlinks nothing"
+        );
+    }
+
+    /// The rewrite policy now reaches the code that acts on it. Before this,
+    /// a run under Oak's savings heuristic predicted a deferral and then
+    /// rewrote the archive anyway.
+    #[test]
+    fn the_savings_gate_reaches_the_post_compaction_sweep() {
+        for (policy, expect_unchanged) in [
+            (ArchiveRewritePolicy::OakSavingsGate, true),
+            (ArchiveRewritePolicy::EveryReclaimableArchive, false),
+        ] {
+            let (directory, live) = reclaimable_base_fixture(&format!("sweep-policy-{policy:?}"));
+            let before = crate::store::list_archive_file_names(&directory.path).expect("list");
+
+            let mut store = WritableRepository::open(&directory.path).expect("open for the sweep");
+            let outcome = store
+                .reclaim_old_generations_with(GenerationReclaimRequest {
+                    rule: ReclaimRule {
+                        reference: live,
+                        full: true,
+                        retained_generations: RETAINED_GENERATIONS,
+                    },
+                    rewrite_policy: policy,
+                    certified_sources: None,
+                    expected: None,
+                })
+                .expect("the sweep runs");
+            store.close().expect("close after the sweep");
+
+            let after = crate::store::list_archive_file_names(&directory.path).expect("list");
+            if expect_unchanged {
+                assert_eq!(
+                    after, before,
+                    "Oak's heuristic leaves an archive it will not repay: {outcome:?}"
+                );
+                assert_eq!(outcome, SegmentSweepOutcome::default());
+            } else {
+                assert_ne!(
+                    after, before,
+                    "the default policy reclaims what the heuristic declined"
+                );
+                assert!(
+                    outcome.removed_archives + outcome.rewritten_archives > 0,
+                    "and reports what it did: {outcome:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7126,7 +8008,7 @@ mod tests {
         let mut bytes = view.bytes.to_vec();
         let generation = stored_segment_generation(target, &structure);
         let binary_references =
-            read_blob_identifiers(store, &structure).expect("reconstruct fixture BRF");
+            read_blob_identifiers(store, &view).expect("reconstruct fixture BRF");
         // Flip a payload byte well past the header the parser needs.
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
@@ -7860,6 +8742,230 @@ mod tests {
             "post-compaction certification must not change the journal"
         );
         assert!(!directory.path.join("data00000b.tar").exists());
+    }
+
+    /// A caller's proof excuses re-deriving the bulk certificate, never the
+    /// certificate that guards a mutation. This is the same corrupt source as
+    /// the test above, reclaimed with a proof naming exactly these archives —
+    /// the strongest thing a caller can present, and what compaction presents
+    /// after certifying them before its deep copy. The corruption must still
+    /// be refused, by the per-archive certificate `sweep_one_archive` derives
+    /// through a fresh descriptor, and nothing may be mutated on the way.
+    #[test]
+    fn a_reclaim_proof_never_lets_a_corrupt_source_reach_a_mutation() {
+        let directory = TestDirectory::new("postcomp-proven-source-still-certified");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let base_path = directory.path.join("data00000a.tar");
+        let repository = Repository::open(&directory.path).expect("open healthy base");
+        let head = repository.head_record_identifier();
+        let entry = *repository
+            .archives()
+            .iter()
+            .find_map(|archive| archive.index_entry(head.segment))
+            .expect("head index entry");
+        drop(repository);
+        let mut corrupt_base = std::fs::read(&base_path).expect("read base");
+        corrupt_base[entry.position as usize + entry.size as usize - 1] ^= 0x01;
+        std::fs::write(&base_path, &corrupt_base).expect("corrupt base payload CRC");
+        let journal_before =
+            std::fs::read(directory.path.join("journal.log")).expect("journal before");
+
+        let mut store =
+            WritableRepository::open(&directory.path).expect("open corrupt-indexed base");
+        // The proof a successful preflight would have returned, presented
+        // after the bytes it covered were changed underneath it.
+        let proof = CertifiedReclaimSources {
+            base_names: store.base_archive_names(),
+        };
+        assert!(
+            proof.certifies_exactly(&store.base_archive_names()),
+            "the fixture must present a proof the skip actually accepts"
+        );
+
+        let error = store
+            .reclaim_old_generations_with(GenerationReclaimRequest {
+                rule: ReclaimRule {
+                    reference: generation(2, 2, true),
+                    full: true,
+                    retained_generations: RETAINED_GENERATIONS,
+                },
+                rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
+                certified_sources: Some(&proof),
+                expected: None,
+            })
+            .expect_err("a proven source is still certified at its mutation boundary");
+
+        assert!(error.to_string().contains("payload CRC"), "{error}");
+        assert_eq!(
+            std::fs::read(&base_path).expect("base after refusal"),
+            corrupt_base,
+            "a skipped bulk pass must not let the sweep rewrite its corrupt source"
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("journal.log")).expect("journal after refusal"),
+            journal_before,
+            "a skipped bulk pass must not let the sweep change the journal"
+        );
+        assert!(!directory.path.join("data00000b.tar").exists());
+    }
+
+    /// Builds `count` byte-identical certifiable archives in their own
+    /// directory, named as consecutive archive numbers, and returns the
+    /// directory beside the payload offset that carries the last byte of the
+    /// head segment — the byte a caller flips to break one copy's CRC.
+    fn build_identical_certifiable_archives(
+        name: &str,
+        count: usize,
+    ) -> (TestDirectory, TestDirectory, usize) {
+        let source = TestDirectory::new(&format!("{name}-source"));
+        {
+            let store = WritableRepository::open(&source.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let repository = Repository::open(&source.path).expect("open healthy source");
+        let head = repository.head_record_identifier();
+        let entry = *repository
+            .archives()
+            .iter()
+            .find_map(|archive| archive.index_entry(head.segment))
+            .expect("head index entry");
+        drop(repository);
+        let last_payload_byte = entry.position as usize + entry.size as usize - 1;
+
+        let copies = TestDirectory::new(&format!("{name}-copies"));
+        let bytes = std::fs::read(source.path.join("data00000a.tar")).expect("read source archive");
+        for number in 0..count {
+            std::fs::write(copies.path.join(format!("data{number:05}a.tar")), &bytes)
+                .expect("write archive copy");
+        }
+        (source, copies, last_payload_byte)
+    }
+
+    /// Certification hands archives out to workers, so no position may be
+    /// left unclaimed. Proven by breaking one archive at a time and
+    /// requiring the pass to find it: a worker loop that skipped a position
+    /// would still pass the all-healthy case, and fail here.
+    #[test]
+    fn parallel_certification_proves_every_archive() {
+        const ARCHIVES: usize = 12;
+        let (source, copies, last_payload_byte) =
+            build_identical_certifiable_archives("parallel-certify-all", ARCHIVES);
+        let provider = Repository::open(&source.path).expect("open provider");
+        let path_of = |number: usize| copies.path.join(format!("data{number:05}a.tar"));
+        let pristine = std::fs::read(path_of(0)).expect("read pristine copy");
+        let open_all = || -> Vec<TarArchiveReader> {
+            (0..ARCHIVES)
+                .map(|number| TarArchiveReader::open(&path_of(number)).expect("open archive copy"))
+                .collect()
+        };
+
+        certify_active_archives(&provider, &open_all())
+            .expect("every healthy archive is certified");
+
+        for corrupt in 0..ARCHIVES {
+            let mut bytes = pristine.clone();
+            bytes[last_payload_byte] ^= 0x01;
+            std::fs::write(path_of(corrupt), &bytes).expect("corrupt one copy");
+            let error = certify_active_archives(&provider, &open_all())
+                .expect_err("the one corrupt archive must be found");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("data{corrupt:05}a.tar")),
+                "position {corrupt} went unclaimed: {error}"
+            );
+            std::fs::write(path_of(corrupt), &pristine).expect("restore the copy");
+        }
+    }
+
+    /// Which failure an operator is shown must not depend on how the workers
+    /// interleaved: the lowest-positioned one is what a single-threaded pass
+    /// over this order would have reported.
+    ///
+    /// Exercised through `record_failure` rather than through a corrupt
+    /// multi-archive fixture, because that fixture cannot make the claim.
+    /// Positions are handed out in ascending order, so the earlier archive
+    /// also starts earlier and, on equal-sized archives, reliably fails
+    /// first — a run reports the right archive whether or not any comparison
+    /// happens. Arrival order is inverted here instead, which is the only
+    /// case the comparison exists for.
+    #[test]
+    fn a_certification_pass_reports_its_lowest_positioned_failure() {
+        static NO_SEGMENTS: std::sync::LazyLock<ArchiveSegmentsProvider<'static>> =
+            std::sync::LazyLock::new(|| ArchiveSegmentsProvider {
+                segments: HashMap::new(),
+            });
+        let failure_at = |position: usize| crate::Error::InvalidFormat {
+            details: format!("archive at position {position}"),
+        };
+        let empty: [&TarArchiveReader; 0] = [];
+        let new_pass = |provider: &'static (dyn SegmentProvider + Sync)| ArchiveCertificationPass {
+            provider,
+            archives: &empty,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            certified: std::sync::atomic::AtomicUsize::new(0),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
+        };
+
+        // Later position recorded first: the comparison must displace it.
+        let pass = new_pass(&*NO_SEGMENTS);
+        pass.record_failure(9, failure_at(9));
+        pass.record_failure(3, failure_at(3));
+        assert!(
+            pass.reported_failure()
+                .expect("a failure was recorded")
+                .to_string()
+                .contains("position 3")
+        );
+
+        // Ascending arrival: the first recorded is already the lowest, and
+        // must not be displaced by anything later.
+        let pass = new_pass(&*NO_SEGMENTS);
+        pass.record_failure(3, failure_at(3));
+        pass.record_failure(9, failure_at(9));
+        assert!(
+            pass.reported_failure()
+                .expect("a failure was recorded")
+                .to_string()
+                .contains("position 3")
+        );
+    }
+
+    /// The proof names what it covers, so it cannot excuse work it did not
+    /// do. A base archive set that has gained, lost, or exchanged a name
+    /// since the certificate was taken is not the set it proved.
+    #[test]
+    fn a_reclaim_proof_covers_only_the_sources_it_named() {
+        let proved: std::collections::HashSet<String> =
+            ["data00000a.tar".to_owned(), "data00001a.tar".to_owned()]
+                .into_iter()
+                .collect();
+        let proof = CertifiedReclaimSources {
+            base_names: proved.clone(),
+        };
+        assert!(proof.certifies_exactly(&proved));
+
+        for divergent in [
+            // One retired since.
+            vec!["data00000a.tar"],
+            // One added since.
+            vec!["data00000a.tar", "data00001a.tar", "data00002a.tar"],
+            // One rewritten to the next generation letter since.
+            vec!["data00000a.tar", "data00001b.tar"],
+            // Nothing left.
+            vec![],
+        ] {
+            let current: std::collections::HashSet<String> =
+                divergent.iter().map(|name| (*name).to_owned()).collect();
+            assert!(
+                !proof.certifies_exactly(&current),
+                "a proof of {proved:?} must not cover {current:?}"
+            );
+        }
     }
 
     #[test]

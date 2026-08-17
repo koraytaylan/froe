@@ -2,7 +2,7 @@
 //! `TarMK` store.
 //!
 //! These tests verify that froe can read stores written by Oak, write stores
-//! that Oak can read, and perform maintenance operations (compact, cleanup,
+//! that Oak can read, and perform maintenance operations (compact,
 //! backup, restore, recover-journal) that leave the store in a state Oak
 //! boots against cleanly.
 //!
@@ -42,21 +42,21 @@
 //!    tree via the library's commit API, then Sling reads them back. If
 //!    this fails, froe cannot write content that Oak reads — the core
 //!    interop claim. There is no point testing checkpoint, compact,
-//!    cleanup, backup, or recover if the writer cannot produce content
+//!    backup, or recover if the writer cannot produce content
 //!    Oak reads.
 //!
 //! 4. **`checkpoint`** — froe writes a checkpoint against the Oak store.
 //!    A metadata-only write-path test (logical head update). If this
 //!    fails, the writer's checkpoint machinery is broken, which affects
-//!    cleanup's expired-checkpoint test and compact's checkpoint
+//!    compact's expired-checkpoint handling and its checkpoint
 //!    preservation.
 //!
 //! 5. **`compact`** — froe compacts a copy of the store and Sling boots
 //!    against the result. Depends on `read` (to verify the result) and
-//!    `commit` (to trust the writer). If this fails, cleanup's
+//!    `commit` (to trust the writer). If this fails, the reclamation
 //!    multi-generational fixture cannot be built (it uses two compactions).
 //!
-//! 6. **`cleanup`** — froe cleanup against a multi-generational store built
+//! 6. **`cleanup`** — froe compact against a multi-generational store built
 //!    by two compactions, with an expired checkpoint, a stale archive, a
 //!    truncated journal, and corrupt journal lines. Depends on `compact`
 //!    (to build the gen 0→1→2 fixture) and `checkpoint` (for the expired
@@ -65,7 +65,7 @@
 //!
 //! 7. **`backup`** — froe backup + restore, Sling boots against the
 //!    restored store. Depends on `read` and `commit`. Independent of
-//!    compact/cleanup but later in the chain because it is lower-risk.
+//!    compact but later in the chain because it is lower-risk.
 //!
 //! 8. **`recover`** — froe recover-journal after deleting journal.log,
 //!    Sling boots against the recovered store. Depends on `read`. Last
@@ -292,7 +292,7 @@ fn froe(args: &[&str]) -> String {
 
 /// Run froe expecting it to refuse; assert failure and return stderr.
 ///
-/// A refusal is part of the contract for a destructive tool — that cleanup
+/// A refusal is part of the contract for a destructive tool — that a run
 /// declines a store it cannot safely act on is as much a claim as what it
 /// does when it can — so the suite asserts refusals the same way it asserts
 /// successes, rather than only exercising the happy path.
@@ -591,12 +591,23 @@ fn populate_content(port: u16) {
             &format!("Page {i}"),
         );
     }
-    // Binary node: nt:file with inline jcr:data.
+    // Binary node: nt:file with inline jcr:data, deliberately large enough to
+    // be stored as bulk segments rather than materialized inline.
+    //
+    // Oak splits a value at or above 16512 bytes into a block list, and full
+    // 256 KiB runs of those blocks become bulk segments. That is what makes
+    // this fixture resemble a real repository: compaction references bulk
+    // segments where they lie instead of copying them, so the archives holding
+    // them survive a compaction while their data segments die — which is the
+    // only shape that exercises the partial-archive rewrite, and the shape the
+    // field report that motivated one-command maintenance was made of. A short
+    // binary is materialized whole and never produces a bulk segment at all.
     let binary_path = work_root().join("binary.txt");
     std::fs::write(
         &binary_path,
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
-         Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\n",
+         Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\n"
+            .repeat(16_384),
     )
     .expect("write binary.txt");
     let _ = Command::new("curl")
@@ -801,7 +812,7 @@ fn assert_content_matches_baseline(port: u16, phase: &str) {
 
 /// The integer immediately preceding `suffix` in froe's output.
 ///
-/// froe reports its cleanup counts inside one formatted line, so each count is
+/// froe reports its counts inside one formatted line, so each count is
 /// identified by the text that follows it. Parsing the number is what makes an
 /// assertion fail on a zero count — matching the surrounding phrase cannot,
 /// because the phrase comes from an unconditional format template.
@@ -812,9 +823,12 @@ fn parse_count(output: &str, suffix: &str) -> u64 {
     let reversed: String = output[..position]
         .chars()
         .rev()
-        .take_while(char::is_ascii_digit)
+        .take_while(|character| character.is_ascii_digit() || *character == ',')
         .collect();
-    let digits: String = reversed.chars().rev().collect();
+    // froe groups long counts with thousands separators; scanning without
+    // accepting them would silently read `18,796,598` as `598` and leave a
+    // "greater than zero" assertion passing on a truncated number.
+    let digits: String = reversed.chars().rev().filter(|c| *c != ',').collect();
     digits
         .parse()
         .unwrap_or_else(|_| panic!("an integer precedes {suffix:?} in: {output}"))
@@ -903,8 +917,8 @@ fn store_into_volume(src: &Path, volume: &str) {
 /// Make a stale archive: copy the active data*.tar to the next generation
 /// letter. This is the on-disk condition Oak leaves behind after its own
 /// compaction publishes a newer generation.
-/// Confirm every condition the cleanup fixture is meant to contain is really
-/// present before cleanup runs.
+/// Confirm every condition the reclamation fixture is meant to contain is
+/// really present before the run.
 ///
 /// Without this, a fixture step that silently failed to build its condition
 /// would leave the post-cleanup assertions vacuously satisfied — the condition
@@ -973,6 +987,18 @@ fn write_orphan_nodes(store_path: &Path) -> PathBuf {
     orphan_archive
 }
 
+/// The `data*.tar` names currently in a store, sorted.
+fn archive_names(store: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(store)
+        .expect("list the store directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("data") && name.ends_with(".tar"))
+        .collect();
+    names.sort();
+    names
+}
+
 fn assert_cleanup_fixture_built(
     store: &Path,
     stale: &StaleArchive,
@@ -1016,7 +1042,7 @@ fn assert_cleanup_conditions_removed(
         "the superseded archive letter {} is gone from disk after cleanup",
         stale.superseded.display()
     );
-    // The safety-relevant direction: cleanup removed the superseded letter and
+    // The safety-relevant direction: the run removed the superseded letter and
     // left the winner, rather than deleting the archive Oak will actually open.
     assert!(
         stale.winner.exists(),
@@ -1803,15 +1829,66 @@ fn cleanup() {
 
     // Build a multi-generational store: compact twice to advance the head
     // to full_generation=2.
+    //
+    // `--keep-expired-checkpoints` on both, because these two runs build the
+    // fixture rather than being the thing under test. Every run drops expired
+    // checkpoints by default, and the checkpoint this phase must watch the
+    // *third* run expire was created — with a one-second lifetime — back in
+    // the checkpoint phase. Without the flag the setup would consume the
+    // condition before the assertion could observe it.
+    // Step 1 is where the partial-archive rewrite happens, and the only place
+    // it can: the Oak store carries a binary large enough to live in bulk
+    // segments, so this first compaction keeps those where they lie while the
+    // data segments beside them die — an archive that must be rewritten to its
+    // next generation letter rather than unlinked. By step 2 the surviving
+    // archives hold nothing but referenced bulk, which is wholly live and has
+    // nothing left to reclaim.
     eprintln!("  step 1: froe compact (gen 0 -> 1)");
-    froe(&["compact", clean_store.to_str().unwrap(), "--yes"]);
+    let archives_before_first = archive_names(&clean_store);
+    let first_compaction = froe(&[
+        "compact",
+        clean_store.to_str().unwrap(),
+        "--keep-expired-checkpoints",
+        "--yes",
+    ]);
+    let archives_after_first = archive_names(&clean_store);
+    assert!(
+        parse_count(&first_compaction, " rewritten") >= 1,
+        "the first compaction rewrote at least one partially dead archive: {first_compaction}"
+    );
+    let rewritten_pairs: Vec<String> = archives_before_first
+        .iter()
+        .filter(|name| !archives_after_first.contains(*name))
+        .filter_map(|name| {
+            let letter = name.as_bytes()[name.len() - 5];
+            let successor = format!(
+                "data{}{}.tar",
+                &name[4..name.len() - 5],
+                (letter + 1) as char
+            );
+            archives_after_first
+                .contains(&successor)
+                .then(|| format!("{name} -> {successor}"))
+        })
+        .collect();
+    assert!(
+        !rewritten_pairs.is_empty(),
+        "a source archive is gone and its successor letter holds the survivors; \
+         before {archives_before_first:?} after {archives_after_first:?}"
+    );
+    eprintln!("  archives rewritten in place: {rewritten_pairs:?}");
 
     eprintln!("  step 2: froe compact again (gen 1 -> 2)");
-    froe(&["compact", clean_store.to_str().unwrap(), "--yes"]);
+    froe(&[
+        "compact",
+        clean_store.to_str().unwrap(),
+        "--keep-expired-checkpoints",
+        "--yes",
+    ]);
 
     // Orphan nodes, written directly at generation zero and never linked to
-    // any head. Two full generations behind the compacted head, so the FULL
-    // predicate with two retained generations reclaims them.
+    // any head. Generations behind the compacted head, so the FULL predicate
+    // reclaims them.
     //
     // This used to restore the pre-compaction gen-0 archive at a spare
     // archive number, which stopped working once compaction began sharing
@@ -1822,6 +1899,13 @@ fn cleanup() {
     // actually wants, and cannot collide with anything the head holds.
     eprintln!("  step 3: writing orphan nodes at generation zero");
     let orphan_archive = write_orphan_nodes(&clean_store);
+
+    // The second reclamation shape needs no fixture: the store carries a
+    // binary large enough to live in bulk segments, and compaction references
+    // those where they lie. The archives holding them therefore survive with
+    // their data segments dead — a partial archive the sweep must rewrite to
+    // its next generation letter rather than unlink. Oak reads the result at
+    // the end of this phase.
 
     // Wait for the checkpoint from phase 3 to expire.
     eprintln!("  waiting 2s for the checkpoint to expire");
@@ -1838,8 +1922,8 @@ fn cleanup() {
     append_corrupt_journal_lines(&clean_store);
 
     // Dry-run: verify the plan sees the orphan segments.
-    eprintln!("  froe cleanup --dry-run");
-    let dry_run = froe(&["cleanup", clean_store.to_str().unwrap(), "--dry-run"]);
+    eprintln!("  froe compact --dry-run");
+    let dry_run = froe(&["compact", clean_store.to_str().unwrap(), "--dry-run"]);
     assert!(
         dry_run.contains("orphan segments"),
         "dry-run found orphan segments: {dry_run}"
@@ -1861,8 +1945,8 @@ fn cleanup() {
         &orphan_archive,
     );
 
-    eprintln!("  froe cleanup --yes");
-    let cleanup_output = froe(&["cleanup", clean_store.to_str().unwrap(), "--yes"]);
+    eprintln!("  froe compact --yes");
+    let cleanup_output = froe(&["compact", clean_store.to_str().unwrap(), "--yes"]);
 
     // Parse the reported counts and require each condition to have been acted
     // on, so a run that removed nothing cannot pass.
@@ -1872,23 +1956,50 @@ fn cleanup() {
     let removed_journal_lines = parse_count(&cleanup_output, " journal lines removed");
     assert!(
         removed_segments > 0,
-        "cleanup reclaimed orphan segments, not zero: {cleanup_output}"
+        "the run reclaimed orphan segments, not zero: {cleanup_output}"
     );
     assert!(
         removed_stale >= 1,
-        "cleanup removed the stale archive: {cleanup_output}"
+        "the run removed the stale archive: {cleanup_output}"
     );
     assert_eq!(
         removed_checkpoints, 1,
-        "cleanup removed the one expired checkpoint: {cleanup_output}"
+        "the run dropped the one expired checkpoint: {cleanup_output}"
     );
+    // Every earlier revision goes, not only the two corrupt lines: a run
+    // retires history to the head it just compacted. Asserting the end state
+    // is both stronger and stable against the fixture's line count.
+    assert!(
+        removed_journal_lines >= 2,
+        "the run retired at least the two corrupt journal lines: {cleanup_output}"
+    );
+    let journal_after = std::fs::read_to_string(clean_store.join("journal.log"))
+        .expect("read the journal after the run");
     assert_eq!(
-        removed_journal_lines, 2,
-        "cleanup removed both corrupt journal lines: {cleanup_output}"
+        journal_after.lines().count(),
+        1,
+        "the run leaves exactly one journal line: {journal_after}"
     );
     assert!(
-        cleanup_output.contains("cleanup complete"),
-        "cleanup completed without deferred or failed deletions: {cleanup_output}"
+        !journal_after.contains("this_line_has_no_space")
+            && !journal_after.contains("not-a-uuid:bad"),
+        "and neither corrupt line survives: {journal_after}"
+    );
+    assert!(
+        cleanup_output.contains("compaction complete"),
+        "the run completed without deferred or failed deletions: {cleanup_output}"
+    );
+    // The rewrite itself was asserted at step 1, which is where a partially
+    // dead archive exists. What matters here is that the archive it produced —
+    // a froe-written successor carrying a survivor subset and reconstructed
+    // `.gph`, `.brf` and `.idx` trailers — is still in the store Oak boots
+    // against at the end of this phase.
+    assert!(
+        archive_names(&clean_store)
+            .iter()
+            .any(|name| !name.ends_with("a.tar")),
+        "a rewritten successor archive is part of the store Oak will open: {:?}",
+        archive_names(&clean_store)
     );
 
     // Then confirm the same effects on disk, independently of what was
@@ -1926,7 +2037,7 @@ fn cleanup() {
 
 /// Phase 6b: froe retires journal history, and Oak boots the result.
 ///
-/// `--retain-journal-revisions` is the only froe operation that makes
+/// Retiring journal history is the one thing froe does that makes
 /// repository bytes unreachable *by policy* rather than by Oak's own
 /// generation predicate: it removes journal lines whose revisions still
 /// resolve, and the segments behind them are then swept in the same run. A
@@ -1957,45 +2068,30 @@ fn journal_retention() {
         "the fixture needs history to retire; Oak wrote {revisions_before} revisions"
     );
 
-    // The default task set includes expired-checkpoints, which moves the head
-    // and is refused beside a retention bound. Name the two tasks the bound
-    // needs instead.
-    eprintln!("  froe cleanup --retain-journal-revisions 1 --dry-run");
-    let dry_run = froe(&[
-        "cleanup",
-        retention_store.to_str().unwrap(),
-        "--task",
-        "journal",
-        "--task",
-        "segments",
-        "--retain-journal-revisions",
-        "1",
-        "--dry-run",
-    ]);
+    // Retiring history is no longer an opt-in bound: a plain run retires
+    // every revision but the head it just compacted. That is what makes this
+    // phase load-bearing — it is the only evidence that a real Oak opens a
+    // store whose history froe deliberately destroyed.
+    eprintln!("  froe compact --dry-run");
+    let dry_run = froe(&["compact", retention_store.to_str().unwrap(), "--dry-run"]);
     assert!(
-        dry_run.contains("beyond retention"),
-        "the plan names the revisions the bound retires: {dry_run}"
+        dry_run.contains("retire all") && dry_run.contains("journal lines"),
+        "the plan names the history it retires: {dry_run}"
+    );
+    assert!(
+        dry_run.contains("not recoverable from the store"),
+        "and says the retirement is irreversible: {dry_run}"
     );
 
-    eprintln!("  froe cleanup --retain-journal-revisions 1 --yes");
-    let output = froe(&[
-        "cleanup",
-        retention_store.to_str().unwrap(),
-        "--task",
-        "journal",
-        "--task",
-        "segments",
-        "--retain-journal-revisions",
-        "1",
-        "--yes",
-    ]);
+    eprintln!("  froe compact --yes");
+    let output = froe(&["compact", retention_store.to_str().unwrap(), "--yes"]);
     let removed_lines = parse_count(&output, " journal lines removed");
     assert!(
         removed_lines > 0,
-        "the bound retired journal revisions, not zero: {output}"
+        "the run retired journal revisions, not zero: {output}"
     );
     assert!(
-        output.contains("cleanup complete"),
+        output.contains("compaction complete"),
         "cleanup completed without deferred or failed deletions: {output}"
     );
 
@@ -2041,8 +2137,8 @@ fn journal_retention() {
 /// simulated: the JVM is killed with SIGKILL while it holds an archive open,
 /// which is what an OOM kill or a yanked host does and what leaves the
 /// newest archive complete but without its `.gph`, `.brf` and index
-/// trailers. Every other froe command refuses such a store; `--task
-/// repair-archives` rebuilds it.
+/// trailers. Every other froe command refuses such a store;
+/// `--repair-archive-indexes` rebuilds it.
 ///
 /// This phase exists because a froe-to-froe round trip is not evidence for a
 /// format-writing feature — `CONTRIBUTING.md` says so in as many words. The
@@ -2110,36 +2206,25 @@ fn repair() {
         .to_owned();
     eprintln!("  Oak left {damaged} untrailered");
 
-    // The default task set must still refuse, and name the task that fixes it.
-    eprintln!("  froe cleanup without the task must refuse");
-    let refusal = froe_failure(&["cleanup", repair_store.to_str().unwrap(), "--dry-run"]);
+    // A run must still refuse, and name the flag that fixes it.
+    eprintln!("  froe compact without the repair flag must refuse");
+    let refusal = froe_failure(&["compact", repair_store.to_str().unwrap(), "--dry-run"]);
     assert!(
-        refusal.contains("--task repair-archives"),
-        "the refusal points at the task that repairs it: {refusal}"
+        refusal.contains("--repair-archive-indexes"),
+        "the refusal points at the flag that repairs it: {refusal}"
     );
 
-    eprintln!("  froe cleanup --task repair-archives");
+    eprintln!("  froe compact --repair-archive-indexes");
     let output = froe(&[
-        "cleanup",
+        "compact",
         repair_store.to_str().unwrap(),
         "--yes",
-        "--task",
-        "journal",
-        "--task",
-        "segments",
-        "--task",
-        "stale-archives",
-        "--task",
-        "expired-checkpoints",
-        "--task",
-        "stale-temporaries",
-        "--task",
-        "repair-archives",
+        "--repair-archive-indexes",
     ]);
     assert!(
         parse_count(&output, " (originals retained") > 0
             || output.contains("archive indexes rebuilt"),
-        "cleanup reports the rebuild: {output}"
+        "the run reports the rebuild: {output}"
     );
     assert!(
         repair_store.join(format!("{damaged}.bak")).exists(),
@@ -2402,15 +2487,18 @@ fn write_run_record() {
          \x20 removal     applied; the checkpoint Oak's async indexer references\n\
          \x20             survived remove-unreferenced, and Oak served the exact\n\
          \x20             baseline tree afterwards\n\
-         \x20 cleanup     Oak served the exact baseline tree after orphan, stale-archive,\n\
-         \x20             expired-checkpoint and corrupt-journal-line removal\n\
-         \x20 journal     froe retired resolvable journal history with\n\
-         \x20 retention   --retain-journal-revisions 1 and swept the segments behind\n\
-         \x20             it; Oak booted the result and served the exact baseline\n\
-         \x20             tree from the single revision froe kept\n\
+         \x20 reclaim     Oak served the exact baseline tree after orphan, stale-archive,\n\
+         \x20             expired-checkpoint and corrupt-journal-line removal, and after\n\
+         \x20             a partially dead archive was rewritten to its next generation\n\
+         \x20             letter with a survivor subset and reconstructed .gph, .brf\n\
+         \x20             and .idx trailers\n\
+         \x20 journal     a plain froe compact retired every revision but the head it\n\
+         \x20 retention   wrote and swept the segments behind them; Oak booted the\n\
+         \x20             result and served the exact baseline tree from the single\n\
+         \x20             revision froe kept\n\
          \x20 repair      Oak's own JVM was killed with SIGKILL while it held an archive\n\
-         \x20             open, leaving it without its trailers; froe cleanup\n\
-         \x20             --task repair-archives rebuilt the index, and Oak then served\n\
+         \x20             open, leaving it without its trailers; froe compact\n\
+         \x20             --repair-archive-indexes rebuilt the index, and Oak then served\n\
          \x20             the exact baseline tree from the rebuilt archive\n\
          \x20 backup      Oak served the exact baseline tree after backup and restore\n\
          \x20 recover     Oak served the exact baseline tree after journal recovery\n\

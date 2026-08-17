@@ -5,10 +5,10 @@
 //! is never taken, so they are safe against a live repository (archives
 //! are memory-mapped under the store's never-modify-in-place file
 //! protocol, the same reliance a running Oak instance has). The
-//! mutating maintenance commands — `compact`, `cleanup` apply, `backup`,
-//! `restore`, `recover-journal`, and checkpoint mutation — take the exclusive
-//! repository lock, so they must only be run against a *stopped* repository
-//! and ask for confirmation first. `cleanup --dry-run` is strictly read-only.
+//! mutating maintenance commands — `compact`, `backup`, `restore`,
+//! `recover-journal`, and checkpoint mutation — take the exclusive repository
+//! lock, so they must only be run against a *stopped* repository and ask for
+//! confirmation first. `compact --dry-run` is strictly read-only.
 
 mod content_display;
 mod inspection;
@@ -38,8 +38,9 @@ use crate::progress::{ProgressWhen, Reporter};
                   export commands are read-only and safe against a live repository (archives \
                   are memory-mapped under the store's never-modify-in-place file protocol, the \
                   same reliance a running Oak instance has); the compact, backup, restore, \
-                  cleanup, recover-journal, and checkpoint commands modify the store and must be run \
-                  against a stopped repository. If repo.lock is absent, every mutating command \
+                  recover-journal, and checkpoint commands modify the store and must be run \
+                  against a stopped repository. `compact` is the one maintenance command: it \
+                  compacts and reclaims in a single run, and `--dry-run` previews it read-only. If repo.lock is absent, every mutating command \
                   requires same-directory hard-link and durable directory-fsync support to publish \
                   that lock safely."
 )]
@@ -224,12 +225,36 @@ enum Command {
         #[arg(long, default_value_t = 10_000)]
         limit: usize,
     },
-    /// Compact the repository offline (modifies the store).
+    /// Compact the repository and reclaim everything the compacted head does
+    /// not reach (modifies the store).
     ///
-    /// Reclamation may publish validated successor TARs with absent-only,
+    /// This is froe's one maintenance command. It deep-copies the head and
+    /// every retained checkpoint into a fresh garbage-collection generation,
+    /// retires the journal to that single revision, and removes every archive
+    /// the new head does not need — reclaiming orphan storage, stale archive
+    /// leftovers, expired checkpoints and proven-redundant staging files in the
+    /// same run. Exactly one generation is retained, which is what Apache Oak's
+    /// own offline compact tool does (SegmentGCOptions.setOffline sets
+    /// retainedGenerations = 1).
+    ///
+    /// --dry-run is strictly read-only: it writes no bytes, creates no files,
+    /// and does not create or acquire repo.lock. Applying is Unix-only offline
+    /// maintenance: stop Oak/AEM, run as the operating-system owner of
+    /// journal.log (normally the service account, not sudo), and keep a
+    /// recoverable copy of important stores. The repository argument is
+    /// resolved once to its canonical absolute target before planning or
+    /// locking, and that target is shown in the plan.
+    ///
+    /// Journal history is retired, not preserved: after a successful run
+    /// journal.log holds exactly one line, naming the compacted head. The
+    /// removed history is not recoverable from the store afterwards;
+    /// journal.log is copied to a numbered .bak first. Recovery backups are
+    /// retained unless an explicit age/count policy is supplied.
+    ///
+    /// Reclamation publishes validated successor TARs with absent-only,
     /// same-directory hard links. A filesystem without hard-link or durable
-    /// directory-fsync support can fail safely after the new compacted head is
-    /// committed, leaving old source archives for a later retry. When repo.lock
+    /// directory-fsync support can fail safely after the compacted head is
+    /// committed, leaving the source archives for a later retry. When repo.lock
     /// is absent, publication independently requires same-directory hard-link
     /// and durable directory-fsync support.
     Compact {
@@ -238,65 +263,59 @@ enum Command {
         /// Run a tail compaction instead of a full one.
         #[arg(long)]
         tail: bool,
+        /// Print the complete plan and exit without taking repo.lock or
+        /// writing a byte.
+        #[arg(long)]
+        dry_run: bool,
         /// Proceed without the interactive confirmation.
         #[arg(long)]
         yes: bool,
-    },
-    /// Conservatively reclaim orphaned storage and stale repository metadata.
-    ///
-    /// Dry-run is strictly read-only and does not create or acquire repo.lock.
-    /// Applying cleanup is Unix-only offline maintenance: stop Oak/AEM, run as
-    /// the operating-system owner of journal.log (normally the service account,
-    /// not sudo), and keep a recoverable copy of important stores.
-    /// The repository argument is resolved once to its canonical absolute
-    /// target before planning or locking, and that target is shown in the plan.
-    /// Recovery backups are retained unless an explicit age/count policy is
-    /// supplied. Applying also requires same-directory hard-link and durable
-    /// directory-fsync support when repo.lock is absent. See docs/cleanup.md
-    /// for the full safety contract.
-    Cleanup {
-        /// The segment store directory.
-        repository: PathBuf,
-        /// Cleanup category to run (repeatable). Supplying any --task
-        /// replaces the defaults: journal, segments, stale-archives,
-        /// expired-checkpoints, and stale-temporaries.
+        /// Rebuild the index of an active archive that has none — what a
+        /// killed Oak writer leaves behind — keeping the original under a
+        /// .bak name.
         ///
-        /// repair-archives is not a default: it rebuilds the index of an
-        /// active archive that has none — what a killed Oak writer leaves —
-        /// keeping the original under a .bak name. Every other category is
-        /// blocked until that is done, so a store in that state plans only
-        /// the repair until you opt in, and the full plan is shown again
-        /// under the lock before anything else is touched.
-        #[arg(long = "task", value_enum)]
-        tasks: Vec<CleanupTaskArgument>,
-        /// Analyze and print the plan without taking repo.lock or writing.
+        /// Not a default: it rewrites an archive, and a store damaged in the
+        /// middle rather than at the tail is a case to look at before
+        /// authorizing. Every other stage is blocked until this has run, so a
+        /// store in that state plans only the repair until you opt in, and the
+        /// full plan is shown again under the lock before anything else is
+        /// touched.
         #[arg(long)]
-        dry_run: bool,
-        /// Proceed without prompts (locked replan and verification still run).
+        repair_archive_indexes: bool,
+        /// Copy checkpoints whose valid timestamp has passed into the fresh
+        /// generation instead of dropping them.
+        ///
+        /// Dropping is the default: an expired checkpoint's content is
+        /// otherwise copied into the new generation, where one retained
+        /// generation can never reclaim it.
         #[arg(long)]
-        yes: bool,
-        /// Remove backups at least this old; with --backup-keep-latest this
-        /// enables recovery-backups in addition to the selected task set.
+        keep_expired_checkpoints: bool,
+        /// Also drop checkpoints that no string value under /:async
+        /// references. Not a default: an operator-created checkpoint held for
+        /// a backup is unreferenced by that rule.
+        #[arg(long)]
+        remove_unreferenced_checkpoints: bool,
+        /// Remove recovery backups at least this old; with
+        /// --backup-keep-latest this enables recovery-backup retirement,
+        /// which is otherwise never performed.
         #[arg(long, requires = "backup_keep_latest")]
-        backup_min_age_days: Option<u64>,
+        backup_minimum_age_days: Option<u64>,
         /// Retain at least this many newest backups per target (all mtime ties
-        /// at the boundary are kept); with --backup-min-age-days this enables
-        /// recovery-backups.
-        #[arg(long, requires = "backup_min_age_days")]
+        /// at the boundary are kept); with --backup-minimum-age-days this
+        /// enables recovery-backup retirement.
+        #[arg(long, requires = "backup_minimum_age_days")]
         backup_keep_latest: Option<usize>,
-        /// Keep only this many newest journal revisions, removing the older
-        /// lines and releasing their segments from the history keep-veto.
+        /// Which archives holding reclaimable segments may be rewritten.
         ///
-        /// By default froe treats every readable journal revision as a
-        /// garbage-collection root. That is stricter than Oak, which judges
-        /// data segments by their index generation alone and never rewrites
-        /// journal.log, and on a long-lived store it is usually why cleanup
-        /// reclaims nothing. A bound of 1 leaves the current head as the only
-        /// root. The removed history is not recoverable from the store
-        /// afterwards; journal.log is backed up to a numbered .bak first.
-        /// This selects the journal task.
-        #[arg(long)]
-        retain_journal_revisions: Option<std::num::NonZeroUsize>,
+        /// every-reclaimable-archive, the default, rewrites any archive that
+        /// holds identified garbage. oak-savings-gate reproduces Apache Oak's
+        /// heuristic, which leaves an archive untouched unless the rewrite
+        /// would shrink it by at least a quarter — so an archive holding live
+        /// binary content beside dead node segments keeps that garbage for the
+        /// life of the store, whatever it is asked. The policy applies to the
+        /// one sweep this command performs.
+        #[arg(long, value_enum, default_value_t = ArchiveRewritePolicyArgument::EveryReclaimableArchive)]
+        archive_rewrite_policy: ArchiveRewritePolicyArgument,
     },
     /// Copy a repository's head into a target store (modifies the target).
     ///
@@ -418,30 +437,11 @@ enum CheckpointAction {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
-enum CleanupTaskArgument {
-    Journal,
-    Segments,
-    StaleArchives,
-    ExpiredCheckpoints,
-    StaleTemporaries,
-    UnreferencedCheckpoints,
-    RecoveryBackups,
-    RepairArchives,
-}
-
-impl From<CleanupTaskArgument> for froe::CleanupTask {
-    fn from(task: CleanupTaskArgument) -> Self {
-        match task {
-            CleanupTaskArgument::Journal => Self::Journal,
-            CleanupTaskArgument::Segments => Self::Segments,
-            CleanupTaskArgument::StaleArchives => Self::StaleArchives,
-            CleanupTaskArgument::ExpiredCheckpoints => Self::ExpiredCheckpoints,
-            CleanupTaskArgument::StaleTemporaries => Self::StaleTemporaries,
-            CleanupTaskArgument::UnreferencedCheckpoints => Self::UnreferencedCheckpoints,
-            CleanupTaskArgument::RecoveryBackups => Self::RecoveryBackups,
-            CleanupTaskArgument::RepairArchives => Self::RepairArchives,
-        }
-    }
+enum ArchiveRewritePolicyArgument {
+    /// Rewrite every archive holding reclaimable segments.
+    EveryReclaimableArchive,
+    /// Apply Oak's 25% savings heuristic.
+    OakSavingsGate,
 }
 
 /// Parses a `NAME=VALUE` search predicate.
@@ -685,40 +685,37 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
         Command::Compact {
             repository,
             tail,
-            yes,
-        } => {
-            if !mutation::run_compact(&repository, tail, yes, reporter)? {
-                return Ok(ExitCode::FAILURE);
-            }
-        }
-        Command::Cleanup {
-            repository,
-            tasks,
             dry_run,
             yes,
-            backup_min_age_days,
+            repair_archive_indexes,
+            keep_expired_checkpoints,
+            remove_unreferenced_checkpoints,
+            backup_minimum_age_days,
             backup_keep_latest,
-            retain_journal_revisions,
+            archive_rewrite_policy,
         } => {
-            let recovery_backups_selected = tasks.contains(&CleanupTaskArgument::RecoveryBackups);
-            if recovery_backups_selected
-                && (backup_min_age_days.is_none() || backup_keep_latest.is_none())
-            {
-                eprintln!(
-                    "froe: --task recovery-backups requires --backup-min-age-days and --backup-keep-latest"
-                );
-                return Ok(ExitCode::FAILURE);
+            let kind = if tail {
+                froe::CompactionKind::Tail
+            } else {
+                froe::CompactionKind::Full
+            };
+            let mut options = froe::CompactionOptions::default().with_compaction(kind);
+            if archive_rewrite_policy == ArchiveRewritePolicyArgument::OakSavingsGate {
+                options = options.with_oak_savings_gate();
             }
-            let journal_task_withheld =
-                !tasks.is_empty() && !tasks.contains(&CleanupTaskArgument::Journal);
-            let mut options = froe::CleanupOptions::default();
-            if !tasks.is_empty() {
-                options = options.with_tasks(tasks.into_iter().map(Into::into));
+            if keep_expired_checkpoints {
+                options = options.keeping_expired_checkpoints();
             }
-            match (backup_min_age_days, backup_keep_latest) {
+            if remove_unreferenced_checkpoints {
+                options = options.with_unreferenced_checkpoint_removal();
+            }
+            if repair_archive_indexes {
+                options = options.with_archive_index_repair();
+            }
+            match (backup_minimum_age_days, backup_keep_latest) {
                 (Some(days), Some(keep_latest)) => {
                     let Some(seconds) = days.checked_mul(24 * 60 * 60) else {
-                        eprintln!("froe: --backup-min-age-days is too large");
+                        eprintln!("froe: --backup-minimum-age-days is too large");
                         return Ok(ExitCode::FAILURE);
                     };
                     options = options.with_recovery_backup_policy(froe::RecoveryBackupPolicy::new(
@@ -729,25 +726,12 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                 (None, None) => {}
                 _ => {
                     eprintln!(
-                        "froe: --backup-min-age-days and --backup-keep-latest must be supplied together"
+                        "froe: --backup-minimum-age-days and --backup-keep-latest must be supplied together"
                     );
                     return Ok(ExitCode::FAILURE);
                 }
             }
-            if let Some(revisions) = retain_journal_revisions {
-                // Selecting an explicit task set and then bounding the journal
-                // would otherwise silently re-add the journal task. Say so
-                // instead: this rewrites journal.log, which is not what
-                // "--task segments --retain-journal-revisions 1" reads like.
-                if journal_task_withheld {
-                    eprintln!(
-                        "froe: --retain-journal-revisions rewrites journal.log; add --task journal to confirm"
-                    );
-                    return Ok(ExitCode::FAILURE);
-                }
-                options = options.with_journal_revision_retention(revisions);
-            }
-            if !mutation::run_cleanup(&repository, options, dry_run, yes, reporter)? {
+            if !mutation::run_compact(&repository, options, dry_run, yes, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -1243,7 +1227,7 @@ fn run_checkpoint(action: CheckpointAction, reporter: &Reporter) -> froe::Result
 mod tests {
     use clap::Parser;
 
-    use super::{CleanupTaskArgument, Command, CommandLine, ExportFormat, ProgressWhen};
+    use super::{ArchiveRewritePolicyArgument, Command, CommandLine, ExportFormat, ProgressWhen};
 
     #[test]
     fn extract_parses_as_the_hidden_export_alias() {
@@ -1299,9 +1283,9 @@ mod tests {
     #[test]
     fn silence_is_global_and_abbreviated() {
         for arguments in [
-            ["froe", "cleanup", "/store", "--silent"],
-            ["froe", "cleanup", "/store", "-s"],
-            ["froe", "cleanup", "/store", "--quiet"],
+            ["froe", "compact", "/store", "--silent"],
+            ["froe", "compact", "/store", "-s"],
+            ["froe", "compact", "/store", "--quiet"],
         ] {
             let parsed =
                 CommandLine::try_parse_from(arguments).expect("silence parses on every command");
@@ -1331,7 +1315,7 @@ mod tests {
     fn silence_and_an_explicit_progress_mode_are_refused_together() {
         let parsed = CommandLine::try_parse_from([
             "froe",
-            "cleanup",
+            "compact",
             "/store",
             "--silent",
             "--progress",
@@ -1349,7 +1333,7 @@ mod tests {
         // Global arguments reach the subcommands only once the command is
         // built; an unbuilt tree would report them missing.
         command.build();
-        for path in [&["cleanup"][..], &["export"], &["summary"], &["compact"]] {
+        for path in [&["export"][..], &["summary"], &["compact"]] {
             let mut selected = &mut command;
             for component in path {
                 selected = selected
@@ -1387,131 +1371,109 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_parses_repeatable_tasks_and_backup_policy() {
+    fn compact_parses_the_backup_retention_policy() {
         let parsed = CommandLine::try_parse_from([
             "froe",
-            "cleanup",
+            "compact",
             "/store",
-            "--task",
-            "journal",
-            "--task",
-            "recovery-backups",
-            "--backup-min-age-days",
+            "--backup-minimum-age-days",
             "30",
             "--backup-keep-latest",
             "3",
             "--dry-run",
         ])
-        .expect("cleanup arguments parse");
-        let Command::Cleanup {
+        .expect("compact arguments parse");
+        let Command::Compact {
             repository,
-            tasks,
+            tail,
             dry_run,
             yes,
-            backup_min_age_days,
+            repair_archive_indexes,
+            keep_expired_checkpoints,
+            remove_unreferenced_checkpoints,
+            backup_minimum_age_days,
             backup_keep_latest,
-            retain_journal_revisions,
+            archive_rewrite_policy,
         } = parsed.command
         else {
-            panic!("cleanup must dispatch");
+            panic!("compact must dispatch");
         };
-        assert_eq!(retain_journal_revisions, None);
         assert_eq!(repository, std::path::PathBuf::from("/store"));
-        assert_eq!(
-            tasks,
-            [
-                CleanupTaskArgument::Journal,
-                CleanupTaskArgument::RecoveryBackups
-            ]
-        );
         assert!(dry_run);
         assert!(!yes);
-        assert_eq!(backup_min_age_days, Some(30));
+        assert!(!tail, "a full compaction is the default");
+        assert_eq!(backup_minimum_age_days, Some(30));
         assert_eq!(backup_keep_latest, Some(3));
-    }
-
-    #[test]
-    fn cleanup_parses_a_journal_retention_bound() {
-        let parsed = CommandLine::try_parse_from([
-            "froe",
-            "cleanup",
-            "/store",
-            "--retain-journal-revisions",
-            "1",
-        ])
-        .expect("retention bound parses");
-        let Command::Cleanup {
-            retain_journal_revisions,
-            tasks,
-            ..
-        } = parsed.command
-        else {
-            panic!("cleanup must dispatch");
-        };
         assert_eq!(
-            retain_journal_revisions,
-            Some(std::num::NonZeroUsize::new(1).expect("one revision"))
+            archive_rewrite_policy,
+            ArchiveRewritePolicyArgument::EveryReclaimableArchive,
+            "reclaiming every identified segment is the default"
         );
-        assert!(tasks.is_empty(), "the bound alone keeps the default tasks");
-    }
-
-    #[test]
-    fn a_journal_retention_bound_of_zero_is_rejected_at_parse_time() {
-        // A bound of zero would retain no revision at all, including the
-        // current head. The type refuses it before froe ever opens the store.
         assert!(
-            CommandLine::try_parse_from([
-                "froe",
-                "cleanup",
-                "/store",
-                "--retain-journal-revisions",
-                "0",
-            ])
-            .is_err(),
-            "zero is not a retention bound"
+            !repair_archive_indexes,
+            "rewriting a damaged archive stays opt-in"
+        );
+        assert!(
+            !keep_expired_checkpoints,
+            "an expired checkpoint is dropped from the copy by default"
+        );
+        assert!(
+            !remove_unreferenced_checkpoints,
+            "dropping an unreferenced checkpoint stays opt-in"
         );
     }
 
+    /// Either retention flag alone is refused before froe opens the store:
+    /// an age with no count, or a count with no age, is not a policy.
     #[test]
-    fn cleanup_help_states_the_journal_retention_bound_rewrites_the_journal() {
-        let mut command = <CommandLine as clap::CommandFactory>::command();
-        let cleanup = command
-            .find_subcommand_mut("cleanup")
-            .expect("cleanup subcommand");
-        let mut help = Vec::new();
-        cleanup.write_long_help(&mut help).expect("render help");
-        let help = String::from_utf8(help).expect("help is UTF-8");
-        // The flag deletes history irreversibly. The operator must be able to
-        // learn that from the help, not from the diff afterwards.
-        for required in ["not recoverable", "journal task", "keep-veto"] {
+    fn a_lone_backup_retention_flag_is_refused_at_parse_time() {
+        for arguments in [
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--backup-minimum-age-days",
+                "30",
+            ],
+            vec!["froe", "compact", "/store", "--backup-keep-latest", "3"],
+        ] {
             assert!(
-                help.contains(required),
-                "cleanup help omitted {required:?}: {help}"
+                CommandLine::try_parse_from(arguments.clone()).is_err(),
+                "half a retention policy is not a policy: {arguments:?}"
             );
         }
     }
 
+    /// Everything the one maintenance command's help owes an operator before
+    /// they authorize it: what it is, what it destroys irreversibly, what it
+    /// requires of the host, and what stays opt-in.
     #[test]
-    fn cleanup_help_states_the_offline_safety_preconditions() {
+    fn compact_help_states_the_offline_safety_preconditions_and_what_it_retires() {
         let mut command = <CommandLine as clap::CommandFactory>::command();
-        let cleanup = command
-            .find_subcommand_mut("cleanup")
-            .expect("cleanup subcommand");
+        let compact = command
+            .find_subcommand_mut("compact")
+            .expect("compact subcommand");
         let mut help = Vec::new();
-        cleanup.write_long_help(&mut help).expect("render help");
+        compact.write_long_help(&mut help).expect("render help");
         let help = String::from_utf8(help).expect("valid UTF-8");
         for required in [
+            // The offline preconditions the cleanup help used to carry.
             "Unix-only offline maintenance",
             "stop Oak/AEM",
             "owner of journal.log",
             "Recovery backups are retained",
             "strictly read-only",
             "canonical absolute",
-            "enables recovery-backups",
+            // The history it retires, which is the irreversible part.
+            "not recoverable",
+            "exactly one line",
+            "journal.log is copied to a numbered .bak",
+            // And the retention value, which is the safety argument.
+            "retainedGenerations = 1",
         ] {
             assert!(
                 help.contains(required),
-                "cleanup help omitted {required:?}: {help}"
+                "compact help omitted {required:?}: {help}"
             );
         }
     }
@@ -1554,7 +1516,6 @@ mod tests {
 
         for path in [
             &["compact"][..],
-            &["cleanup"],
             &["backup"],
             &["restore"],
             &["recover-journal"],

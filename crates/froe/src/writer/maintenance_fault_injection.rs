@@ -124,10 +124,10 @@ mod tests {
     use crate::store::Repository;
     use crate::tar_archive::archive::TarArchiveReader;
     use crate::tar_archive::file_name::ArchiveFileName;
-    use crate::writer::cleanup::{
-        CleanupAction, CleanupOptions, CleanupTask, cleanup, plan_cleanup,
-    };
     use crate::writer::commit::create_checkpoint;
+    use crate::writer::maintenance::{
+        CompactionAction, CompactionOptions, MaintenanceTask, compact, plan_compaction,
+    };
     use crate::writer::record_writer::ChildNodesToWrite;
     use crate::writer::repository_lock::RepositoryLock;
     use crate::writer::segment_builder::GarbageCollectionGeneration;
@@ -135,7 +135,7 @@ mod tests {
 
     const REPOSITORY_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_REPOSITORY";
     const SCENARIO_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_SCENARIO";
-    const CHILD_TEST_NAME: &str = "writer::cleanup_fault_injection::tests::cleanup_fault_child";
+    const CHILD_TEST_NAME: &str = "writer::maintenance_fault_injection::tests::cleanup_fault_child";
 
     const CHECKPOINT_SCENARIO: &str = "checkpoint";
     const SWEEP_SCENARIO: &str = "sweep";
@@ -298,19 +298,21 @@ mod tests {
         );
     }
 
-    fn scenario_options(scenario: &str) -> CleanupOptions {
+    fn scenario_options(scenario: &str) -> CompactionOptions {
         let task = match scenario {
-            CHECKPOINT_SCENARIO | MANIFEST_SCENARIO => CleanupTask::UnreferencedCheckpoints,
-            SWEEP_SCENARIO => CleanupTask::Segments,
-            JOURNAL_SCENARIO => CleanupTask::Journal,
-            REMOVAL_SCENARIO => CleanupTask::StaleTemporaries,
+            CHECKPOINT_SCENARIO | MANIFEST_SCENARIO => MaintenanceTask::UnreferencedCheckpoints,
+            SWEEP_SCENARIO => MaintenanceTask::Segments,
+            JOURNAL_SCENARIO => MaintenanceTask::Journal,
+            REMOVAL_SCENARIO => MaintenanceTask::StaleTemporaries,
             STALE_ARCHIVE_SCENARIO => {
-                return CleanupOptions::default()
-                    .with_tasks([CleanupTask::StaleArchives, CleanupTask::ExpiredCheckpoints]);
+                return CompactionOptions::default().with_tasks([
+                    MaintenanceTask::StaleArchives,
+                    MaintenanceTask::ExpiredCheckpoints,
+                ]);
             }
             other => panic!("unknown fault-injection scenario {other}"),
         };
-        CleanupOptions::default().with_tasks([task])
+        CompactionOptions::default().with_tasks([task])
     }
 
     /// Child entrypoint. A normal `cargo test` invocation leaves the marker
@@ -363,7 +365,7 @@ mod tests {
             // an isolated child whose error path was checked above.
             unsafe { libc::_exit(VERIFIED_EXIT_CODE) }
         }
-        let outcome = cleanup(&directory, scenario_options(&scenario));
+        let outcome = compact(&directory, scenario_options(&scenario));
         match mode.as_str() {
             ERROR_MODE => {
                 let error = outcome.expect_err("cleanup completed without the injected error");
@@ -715,12 +717,12 @@ mod tests {
         store.close().expect("close sweep fixture writer");
 
         let options = scenario_options(SWEEP_SCENARIO);
-        let plan = plan_cleanup(&directory.path, &options).expect("plan partial sweep fixture");
+        let plan = plan_compaction(&directory.path, &options).expect("plan partial sweep fixture");
         let (source, replacement) = plan
             .actions()
             .iter()
             .find_map(|action| match action {
-                CleanupAction::RewriteArchive {
+                CompactionAction::RewriteArchive {
                     file_name,
                     replacement_name,
                     ..
@@ -775,12 +777,12 @@ mod tests {
         }
 
         let options = scenario_options(SWEEP_SCENARIO);
-        let plan = plan_cleanup(&directory.path, &options).expect("plan whole-archive sweep");
+        let plan = plan_compaction(&directory.path, &options).expect("plan whole-archive sweep");
         let source = plan
             .actions()
             .iter()
             .find_map(|action| match action {
-                CleanupAction::RemoveReclaimableArchive { file_name, .. } => {
+                CompactionAction::RemoveReclaimableArchive { file_name, .. } => {
                     Some(file_name.clone())
                 }
                 _ => None,
@@ -811,13 +813,13 @@ mod tests {
         }
 
         let options = scenario_options(SWEEP_SCENARIO);
-        let plan = plan_cleanup(&directory.path, &options)
+        let plan = plan_compaction(&directory.path, &options)
             .expect("plan removal followed by rewrite fixture");
         let removal_source = plan
             .actions()
             .iter()
             .find_map(|action| match action {
-                CleanupAction::RemoveReclaimableArchive { file_name, .. } => {
+                CompactionAction::RemoveReclaimableArchive { file_name, .. } => {
                     Some(file_name.clone())
                 }
                 _ => None,
@@ -825,7 +827,7 @@ mod tests {
             .expect("fixture must contain a whole-archive removal");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RewriteArchive {
+            CompactionAction::RewriteArchive {
                 file_name,
                 replacement_name,
                 ..
@@ -1190,12 +1192,12 @@ mod tests {
         let staged_bytes = std::fs::read(directory.path.join("journal.log"))
             .expect("read canonical journal for redundant staging fixture");
         std::fs::write(&staged_path, &staged_bytes).expect("write redundant journal staging file");
-        let plan = plan_cleanup(&directory.path, &scenario_options(REMOVAL_SCENARIO))
+        let plan = plan_compaction(&directory.path, &scenario_options(REMOVAL_SCENARIO))
             .expect("plan redundant staging removal");
         assert!(plan.actions().iter().any(|action| {
             matches!(
                 action,
-                CleanupAction::RemoveTemporary { file_name, .. }
+                CompactionAction::RemoveTemporary { file_name, .. }
                     if file_name == "journal.log.cleaning.000"
             )
         }));
@@ -1237,18 +1239,16 @@ mod tests {
         )
         .expect("create semantically identical higher archive generation");
         let options = scenario_options(STALE_ARCHIVE_SCENARIO);
-        let plan = plan_cleanup(&directory.path, &options).expect("plan combined cleanup");
+        let plan = plan_compaction(&directory.path, &options).expect("plan combined cleanup");
         assert!(plan.actions().iter().any(|action| matches!(
             action,
-            CleanupAction::RemoveStaleArchive { file_name, .. }
+            CompactionAction::RemoveStaleArchive { file_name, .. }
                 if file_name == "data00000a.tar"
         )));
-        assert!(
-            plan.actions().iter().any(|action| matches!(
-                action,
-                CleanupAction::RemoveCheckpoints { expired: 1, .. }
-            ))
-        );
+        assert!(plan.actions().iter().any(|action| matches!(
+            action,
+            CompactionAction::RemoveCheckpoints { expired: 1, .. }
+        )));
         let snapshot = snapshot_repository(&directory.path);
         let checkpoints_before = Repository::open(&directory.path)
             .expect("repository before strict refusal")

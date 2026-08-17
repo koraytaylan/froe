@@ -14,7 +14,7 @@ and it changes how every walk terminates on a corrupt record graph.
 Covers `crates/froe/src/cache.rs`, `crates/froe/src/store.rs`,
 `crates/froe/src/content/{map,traversal}.rs`,
 `crates/froe/src/tar_archive/archive.rs`, `crates/froe/src/tooling/{check,diff,search}.rs`,
-`crates/froe/src/writer/{backup,cleanup,compaction,store_writer}.rs`, and
+`crates/froe/src/writer/{backup,maintenance,compaction,store_writer}.rs`, and
 `crates/froe-export/src/{refresh,sqlite}.rs`.
 
 ## Scope and retention
@@ -34,7 +34,7 @@ revisions that actually resolve and removes the rest. The removed history is
 **not recoverable**: the segment sweep runs before the journal rewrite in the
 same run, so by the time `journal.log.bak.NNN` exists it names revisions whose
 segments are already unlinked. The backup restores the journal *file*, not the
-history. The flag selects `CleanupTask::Journal`, because the bounded lines
+history. Retirement is now unconditional rather than flag-selected, because the retired lines
 must leave the journal in the same run — see Guards.
 
 **Deliberately not retained.** Payload bytes of segments this session wrote,
@@ -61,7 +61,7 @@ journal root against locked state are as before. Two additions bind to it:
 | Archive rotation (`close_archive_writer`) | segment appended; writer at threshold | Archive closed with trailers, fsynced | Complete archive on disk; journal unmoved | Same | Next open reads a complete archive |
 | Archive reopen (new in this range) | archive durable per the row above | None — reopen is read-only | Complete archive, journal unmoved; session ends | Not reachable: no mutation follows the reopen within the boundary | Next open reads the archive normally |
 | Session payload certificate (`validate_finalized_session_semantics`) | every session archive finalized | None; refuses before the journal append | Journal unchanged, archives intact | Journal unchanged | Retry replans from disk |
-| Segment sweep (`apply_standalone_segment_cleanup`) | plan replanned under lock; sources certified | Successor archives published, sources retired | Typed partial outcome names retained/absent targets | Prefix-safe per the existing cleanup case | Next plan re-derives from disk |
+| Segment sweep (`apply_standalone_segment_cleanup`) | plan replanned under lock; sources certified | Successor archives published, sources retired | Typed partial outcome names retained/absent targets | Prefix-safe per the existing case | Next plan re-derives from disk |
 | Journal rewrite with a retention bound | `journal.log.bak.NNN` durable; retained roots verified | `journal.log` replaced with the retained lines | Journal old or new, never partial | Same | Backup names the pre-rewrite content |
 
 The reopen row is the only new boundary. It adds a failure point *after* a
@@ -93,19 +93,20 @@ followed by restoring the pristine source and rerunning the original test.
 ## Resources
 
 The point of the range. Every cache below is a function of configuration
-rather than of repository size — with two deliberate exceptions, both stated
-as such rather than hidden: the compaction sharing memo, now proportional to
-the tree by design, and the walk state that replaced the depth caps, now
-proportional to depth. See "The one store-proportional cache" and "What
+rather than of repository size — with three deliberate exceptions, all stated
+as such rather than hidden: the compaction sharing memo and the verifier's
+certificate set, both proportional to the tree by design, and the walk state
+that replaced the depth caps, now proportional to depth. See "The two store-proportional memos" and "What
 removing the depth caps costs".
 
 * Read caches: 192 MiB parsed segments, 48 MiB strings, 48 MiB templates.
 * Writer base-segment cache: 192 MiB. Session read-back cache: twice the
   archive rotation threshold (512 MiB by default), sized so the archive being
   written is always resident.
-* Verified-subtree memo 192 MiB; recovery visited memo 128 MiB; SQLite string
-  dictionary 64 MiB. The compaction sharing memo is no longer among these: it
-  is exact and unbudgeted, and is treated separately below.
+* Recovery visited memo 128 MiB; SQLite string dictionary 64 MiB. Two memos
+  are no longer among these — the compaction sharing memo and the
+  verified-subtree memo are both exact and unbudgeted, and are treated
+  separately below.
 
 Planning is *not* bounded by configuration. On the default `--task segments`
 path, under the lock, peak store-scale sets are `head_data_segments`,
@@ -121,7 +122,7 @@ records. Compaction no longer copies binary content at all when the source
 blocks live in bulk segments, which on a store written by Oak is most of the
 bytes.
 
-### The one store-proportional cache
+### The two store-proportional memos
 
 The compaction sharing memo used to be an evicting FIFO under a 256 MiB
 budget. A miss did not cost one duplicated subtree; it re-walked the subtree,
@@ -147,6 +148,20 @@ needs 2^25 slots, or 512 MiB. The rejected alternative — the same map keyed on
 `RecordIdentifier` — measured 104 to 115 bytes a node, or roughly 2.1 GB on the
 same head, which is why interning and packing are load-bearing rather than an
 optimization.
+
+The verifier's certificate set is the second, for the same reason and with the
+same shape. `NodeTreeVerifier` held an evicting 192 MiB `BoundedCache`, which
+on that same 18.8M-node repository retained about a sixth of the tree; a miss
+re-walked the subtree below it, and the walk reported one node per miss, so
+`froe compact` announced 56,389,743 nodes for a head holding 18,796,598. It is
+now `PackedRecordSet` — the same interned, open-addressed, never-evicting
+table, keys only, so 8 bytes a slot and about 11.4 a node: 256 MiB of slots for
+that head, with a 384 MiB peak across the final doubling, against the 204 MiB
+the evicting cache actually occupied. The count is now asserted equal to the
+number of certificates the walk issued, and a re-walk would trip the set's
+duplicate-insert assertion rather than inflate a number, so the defect cannot
+return quietly. `NodeTreeVerifier::with_memo_budget` is gone; no knob replaces
+it, for the reason below.
 
 `--memo-budget-mb`, `compact_with_memo_budget` and
 `COMPACTION_MEMO_BYTES_PER_NODE` are gone with it. No knob replaces them: the

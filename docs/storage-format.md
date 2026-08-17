@@ -16,7 +16,7 @@ A repository is one flat directory:
 
 | File | Role |
 | --- | --- |
-| `data00000a.tar`, `data00001a.tar`, … | Segment archives. The five-plus digits are the archive number; the trailing letter is the *file generation*, bumped (`a` → `b` → …) when cleanup rewrites an archive. A reader opens only the highest letter of each number. |
+| `data00000a.tar`, `data00001a.tar`, … | Segment archives. The five-plus digits are the archive number; the trailing letter is the *file generation*, bumped (`a` → `b` → …) when a maintenance run rewrites an archive. A reader opens only the highest letter of each number. |
 | `journal.log` | Append-only text file of head revisions. |
 | `manifest` | Java properties file; key `store.version` is `1` (Oak 1.6) or `2` (Oak 1.8 and later). Archives without a manifest mean the legacy pre-tar format. |
 | `gc.log` | One comma-separated line per completed garbage collection cycle. |
@@ -257,7 +257,7 @@ subsequent Oak (or AEM) start depends on:
   is never written or deleted.
 * **Manifest.** An ordinary writable-store open rewrites the manifest with
   `store.version=2`; a directory with archives but no manifest is rejected.
-  Read-only cleanup planning never changes it. Cleanup apply atomically makes
+  Read-only planning never changes it. Applying atomically makes
   the one-way version-one-to-version-two upgrade only when a selected
   checkpoint removal or segment-archive rewrite will write version-two state,
   and exposes that upgrade as a separate plan action.
@@ -274,7 +274,7 @@ subsequent Oak (or AEM) start depends on:
   segments followed by the `.brf`, `.gph`, and `.idx` trailers and two
   zero blocks, with index entries sorted by signed UUID halves. The graph
   lists every data segment's references and the binary references catalog
-  lists every external binary — cleanup and blob garbage collection trust
+  lists every external binary — reclamation and blob garbage collection trust
   these.
 * **Generations.** Normal writes carry the head's generation with the
   compacted flag cleared; full compaction advances generation and full

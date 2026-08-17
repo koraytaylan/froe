@@ -12,11 +12,10 @@ use std::path::Path;
 use froe::writer::commit::{
     create_checkpoint, release_checkpoint, remove_all_checkpoints, remove_unreferenced_checkpoints,
 };
-use froe::writer::compaction::CompactionKind;
 use froe::writer::store_writer::WritableRepository;
 use froe::{
-    CleanupAction, CleanupDeletionFailure, CleanupOptions, CleanupPlan, PreparedCleanup,
-    backup_with_progress, plan_cleanup_with_progress, recover_journal_with_progress,
+    CompactionAction, CompactionOptions, CompactionPlan, FileDeletionFailure, PreparedCompaction,
+    backup_with_progress, plan_compaction_with_progress, recover_journal_with_progress,
     restore_with_progress,
 };
 
@@ -45,60 +44,13 @@ fn confirm(action: &str, assume_yes: bool, reporter: &Reporter) -> bool {
 }
 
 /// `froe compact`: offline full or tail compaction.
-pub(crate) fn run_compact(
-    repository: &Path,
-    tail: bool,
-    assume_yes: bool,
-    reporter: &Reporter,
-) -> froe::Result<bool> {
-    let kind = if tail {
-        CompactionKind::Tail
-    } else {
-        CompactionKind::Full
-    };
-    reporter.status(
-        "note: post-compaction TAR rewrites require same-directory hard-link and directory-fsync support; an unsupported filesystem fails safely with source archives retained",
-    );
-    if !confirm(
-        &format!(
-            "about to run {} compaction on {}",
-            kind_name(kind),
-            crate::output::sanitize_terminal_path(repository)
-        ),
-        assume_yes,
-        reporter,
-    ) {
-        eprintln!("froe: compaction cancelled");
-        return Ok(false);
-    }
-    let mut store = WritableRepository::open_with_progress(repository, &mut reporter.clone())?;
-    let outcome = froe::writer::compact_with_progress(&mut store, kind, &mut reporter.clone())?;
-    store.close()?;
-    reporter.finish();
-    println!(
-        "compacted {} nodes; {} bytes -> {} bytes ({} reclaimed)",
-        outcome.compacted_nodes,
-        outcome.size_before,
-        outcome.size_after,
-        outcome.size_before.saturating_sub(outcome.size_after),
-    );
-    Ok(true)
-}
-
-fn kind_name(kind: CompactionKind) -> &'static str {
-    match kind {
-        CompactionKind::Full => "full",
-        CompactionKind::Tail => "tail",
-    }
-}
-
 /// Introduces the lock-protected plan, attributing why it differs.
 ///
 /// When repairs were selected the plan changed because cleanup itself
 /// rebuilt the indexes under the lock — that is the task working, not an
 /// outside writer, and saying otherwise sends the operator hunting for a
 /// process that does not exist.
-fn announce_authoritative_plan(plan: &froe::CleanupPlan, repaired: usize) {
+fn announce_authoritative_plan(plan: &froe::CompactionPlan, repaired: usize) {
     if repaired == 0 {
         eprintln!(
             "froe: repository state changed before the lock was acquired; authoritative plan:"
@@ -115,14 +67,25 @@ fn announce_authoritative_plan(plan: &froe::CleanupPlan, repaired: usize) {
 
 /// `froe cleanup`: read-only preview, lock-protected replan, confirmation,
 /// application, and fresh final verification.
-pub(crate) fn run_cleanup(
+/// `froe compact`: the one maintenance command.
+///
+/// Plans read-only first and prints the plan, because the operator's evidence
+/// for authorizing a destructive run has to exist before the run does. With
+/// `--dry-run` that is the whole command. Otherwise the plan is confirmed, the
+/// exclusive lock taken, the plan rebuilt from disk under it, and — if the
+/// authoritative plan differs from what was confirmed — shown and confirmed
+/// again before anything is touched.
+pub(crate) fn run_compact(
     repository: &Path,
-    options: CleanupOptions,
+    options: CompactionOptions,
     dry_run: bool,
     assume_yes: bool,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
-    let preview = plan_cleanup_with_progress(repository, &options, &mut reporter.clone())?;
+    reporter.status(
+        "note: archive rewrites require same-directory hard-link and directory-fsync support; an unsupported filesystem fails safely with source archives retained",
+    );
+    let preview = plan_compaction_with_progress(repository, &options, &mut reporter.clone())?;
     // The plan is the operator's evidence for a destructive decision: end
     // every report before a single line of it is written.
     reporter.finish();
@@ -132,22 +95,22 @@ pub(crate) fn run_cleanup(
         return Ok(true);
     }
     if preview.is_empty() {
-        println!("no cleanup mutations are needed; review any warnings above");
+        println!("no maintenance mutations are needed; review any warnings above");
         return Ok(true);
     }
     if !confirm(
         &format!(
-            "about to apply this cleanup plan to {}",
+            "about to apply this compaction plan to {}",
             crate::output::sanitize_terminal_path(preview.directory())
         ),
         assume_yes,
         reporter,
     ) {
-        eprintln!("froe: cleanup cancelled");
+        eprintln!("froe: compaction cancelled");
         return Ok(false);
     }
 
-    let prepared = PreparedCleanup::prepare_with_progress(
+    let prepared = PreparedCompaction::prepare_with_progress(
         preview.directory(),
         options,
         &mut reporter.clone(),
@@ -157,11 +120,11 @@ pub(crate) fn run_cleanup(
         let repaired = prepared.repaired_archives();
         announce_authoritative_plan(prepared.plan(), repaired);
         if !confirm(
-            "about to apply the changed authoritative cleanup plan",
+            "about to apply the changed authoritative compaction plan",
             assume_yes,
             reporter,
         ) {
-            eprintln!("froe: cleanup cancelled");
+            eprintln!("froe: compaction cancelled");
             if repaired != 0 {
                 // The repair is already durable. Saying "cancelled" alone
                 // would imply the store is untouched, and it is not.
@@ -212,7 +175,7 @@ struct RetentionSummary {
 }
 
 impl RetentionSummary {
-    fn of(plan: &froe::CleanupPlan) -> Self {
+    fn of(plan: &froe::CompactionPlan) -> Self {
         let (history_reclaimable_segments, history_reclaimable_bytes) =
             plan.history_protected_reclaimable();
         Self {
@@ -226,14 +189,14 @@ impl RetentionSummary {
 }
 
 fn print_cleanup_summary(
-    outcome: &froe::CleanupOutcome,
+    outcome: &froe::CompactionOutcome,
     retention: RetentionSummary,
     complete: bool,
 ) {
     let status = if complete {
-        "cleanup complete"
+        "compaction complete"
     } else {
-        "cleanup partially completed"
+        "compaction partially completed"
     };
     println!(
         "{status}: head {} -> {}; {} checkpoints and {} journal lines removed",
@@ -243,26 +206,27 @@ fn print_cleanup_summary(
         outcome.removed_journal_lines,
     );
     println!(
-        "archives: {} rewritten, {} reclaimed, {} stale removed; {} orphan segments removed; {} -> {} bytes",
+        "archives: {} rewritten, {} reclaimed, {} stale removed; {} orphan segments removed; {} -> {}",
         outcome.rewritten_archives,
         outcome.removed_reclaimable_archives,
         outcome.removed_stale_archives,
-        outcome.removed_segments(),
-        outcome.archive_bytes_before,
-        outcome.archive_bytes_after,
+        crate::progress::format_count(outcome.removed_segments() as u64),
+        froe::format_byte_size(outcome.archive_bytes_before),
+        froe::format_byte_size(outcome.archive_bytes_after),
     );
     if retention.segments != 0 {
         println!(
-            "identified but retained: {} segments / {} bytes of reclaimable garbage were left in place; rewriting their archives does not repay the rewrite",
-            retention.segments, retention.bytes,
+            "identified but retained: {} segments / {} of reclaimable garbage were left in archives that cannot be rewritten; see the warnings above",
+            crate::progress::format_count(retention.segments as u64),
+            froe::format_byte_size(retention.bytes),
         );
     }
     if retention.history_segments != 0 {
         println!(
-            "journal history still protects {} data segments the head does not reach; retiring it would let this sweep free a further {} segments ({} bytes)",
-            retention.history_segments,
-            retention.history_reclaimable_segments,
-            retention.history_reclaimable_bytes,
+            "journal history still protects {} data segments the head does not reach; retiring it would let this sweep free a further {} segments ({})",
+            crate::progress::format_count(retention.history_segments as u64),
+            crate::progress::format_count(retention.history_reclaimable_segments as u64),
+            froe::format_byte_size(retention.history_reclaimable_bytes),
         );
     }
     if outcome.repaired_archives != 0 {
@@ -277,8 +241,8 @@ fn print_cleanup_summary(
     // the store stayed the same size.
     if outcome.retained_recovery_backup_bytes != 0 {
         println!(
-            "recovery backups on disk: {} bytes (outside the archive figures above; retire with --task recovery-backups)",
-            outcome.retained_recovery_backup_bytes
+            "recovery backups on disk: {} (outside the archive figures above; retire with --backup-minimum-age-days and --backup-keep-latest)",
+            froe::format_byte_size(outcome.retained_recovery_backup_bytes)
         );
     }
     if outcome.removed_temporaries != 0 || outcome.removed_recovery_backups != 0 {
@@ -295,7 +259,7 @@ fn print_cleanup_summary(
     }
 }
 
-fn cleanup_deletion_warning(failure: &CleanupDeletionFailure) -> String {
+fn cleanup_deletion_warning(failure: &FileDeletionFailure) -> String {
     cleanup_deletion_warning_fields(
         failure.file_name(),
         failure.error(),
@@ -321,7 +285,7 @@ fn cleanup_deletion_warning_fields(
     }
 }
 
-fn cleanup_partial_summary(failures: &[CleanupDeletionFailure]) -> String {
+fn cleanup_partial_summary(failures: &[FileDeletionFailure]) -> String {
     let already_absent = failures
         .iter()
         .filter(|failure| failure.target_was_already_absent())
@@ -333,13 +297,13 @@ fn cleanup_partial_summary(failures: &[CleanupDeletionFailure]) -> String {
 fn cleanup_partial_summary_counts(retained: usize, already_absent: usize) -> String {
     match (retained, already_absent) {
         (0, absent) => format!(
-            "froe: cleanup is partial because {absent} planned deletion targets were already absent and could not be confirmed as this cleanup's work"
+            "froe: compaction is partial because {absent} planned deletion targets were already absent and could not be confirmed as this run's work"
         ),
         (retained, 0) => format!(
-            "froe: cleanup is partial because {retained} planned file deletion targets remain"
+            "froe: compaction is partial because {retained} planned file deletion targets remain"
         ),
         (retained, absent) => format!(
-            "froe: cleanup is partial because {retained} planned file deletion targets remain and {absent} were already absent"
+            "froe: compaction is partial because {retained} planned file deletion targets remain and {absent} were already absent"
         ),
     }
 }
@@ -348,29 +312,18 @@ fn cleanup_partial_summary_counts(retained: usize, already_absent: usize) -> Str
     clippy::too_many_lines,
     reason = "the complete deterministic confirmation listing is clearest as one display pass"
 )]
-fn print_cleanup_plan(plan: &CleanupPlan) {
+fn print_cleanup_plan(plan: &CompactionPlan) {
     println!(
-        "cleanup plan for {} (verified head {}):",
+        "compaction plan for {} (verified head {}):",
         crate::output::sanitize_terminal_path(plan.directory()),
         plan.current_head()
     );
-    if plan.tasks().is_empty() {
-        println!("  selected tasks: none (health verification only)");
-    } else {
-        let selected = plan
-            .tasks()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  selected tasks: {selected}");
-    }
     if plan.actions().is_empty() {
         println!("  no mutations");
     }
     for action in plan.actions() {
         match action {
-            CleanupAction::RepairArchiveIndex {
+            CompactionAction::RepairArchiveIndex {
                 file_name,
                 retired_file_names,
                 reason,
@@ -395,9 +348,12 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
                         names.join(", ")
                     );
                 }
-                println!("    {bytes} bytes retained across the retired originals");
+                println!(
+                    "    {} retained across the retired originals",
+                    froe::format_byte_size(*bytes)
+                );
             }
-            CleanupAction::PruneJournal {
+            CompactionAction::PruneJournal {
                 lines,
                 parser_ignored,
                 missing_segments,
@@ -406,16 +362,16 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
             } => println!(
                 "  prune {lines} journal lines ({parser_ignored} parser-ignored, {missing_segments} missing-segment, {unreadable_revisions} unreadable historical, {beyond_retention} beyond retention)"
             ),
-            CleanupAction::UpgradeManifest => {
+            CompactionAction::UpgradeManifest => {
                 println!("  atomically upgrade manifest to store.version=2");
             }
-            CleanupAction::RemoveCheckpoints {
+            CompactionAction::RemoveCheckpoints {
                 names,
                 expired,
                 unreferenced,
             } => {
                 println!(
-                    "  remove {} checkpoints ({expired} expired, {unreferenced} unreferenced):",
+                    "  omit {} checkpoints from the copy ({expired} expired, {unreferenced} unreferenced):",
                     names.len()
                 );
                 for name in names {
@@ -425,29 +381,75 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
                     );
                 }
             }
-            CleanupAction::RemoveReclaimableArchive {
+            CompactionAction::RemoveReclaimableArchive {
                 file_name,
                 segments,
                 bytes,
-            } => println!("  remove {file_name}: {segments} orphan segments, {bytes} bytes"),
-            CleanupAction::RewriteArchive {
+            } => println!(
+                "  remove {file_name}: {segments} orphan segments, {}",
+                froe::format_byte_size(*bytes)
+            ),
+            CompactionAction::RewriteArchive {
                 file_name,
                 replacement_name,
                 segments,
                 eligible_bytes,
             } => println!(
-                "  rewrite {file_name} as {replacement_name}: omit {segments} orphan segments ({eligible_bytes} entry bytes)"
+                "  rewrite {file_name} as {replacement_name}: omit {segments} orphan segments ({} of entries)",
+                froe::format_byte_size(*eligible_bytes)
             ),
-            CleanupAction::RemoveStaleArchive {
+            CompactionAction::RemoveStaleArchive {
                 file_name,
                 reason,
                 bytes,
-            } => println!("  remove stale archive {file_name} ({reason}; {bytes} bytes)"),
-            CleanupAction::RemoveTemporary { file_name, bytes } => {
-                println!("  remove redundant temporary {file_name} ({bytes} bytes)");
+            } => println!(
+                "  remove stale archive {file_name} ({reason}; {})",
+                froe::format_byte_size(*bytes)
+            ),
+            CompactionAction::RemoveTemporary { file_name, bytes } => {
+                println!(
+                    "  remove redundant temporary {file_name} ({})",
+                    froe::format_byte_size(*bytes)
+                );
             }
-            CleanupAction::RemoveRecoveryBackup { file_name, bytes } => {
-                println!("  remove old recovery backup {file_name} ({bytes} bytes)");
+            CompactionAction::RetireJournalHistory { revisions } => {
+                println!(
+                    "  retire all {} journal lines, keeping only the compacted head",
+                    crate::progress::format_count(*revisions as u64)
+                );
+                println!("    journal.log is copied to a numbered .bak first");
+                println!("    the removed history is not recoverable from the store afterwards");
+            }
+            CompactionAction::RetireInterruptedCompactionResidue { segments } => {
+                println!(
+                    "  retire {} segments of interrupted-compaction residue",
+                    crate::progress::format_count(*segments as u64)
+                );
+            }
+            CompactionAction::CopyHeadIntoFreshGeneration {
+                head_nodes,
+                target_generation,
+                kind,
+            } => {
+                println!(
+                    "  {} compaction: copy the head into generation ({},{},compacted)",
+                    match kind {
+                        froe::CompactionKind::Full => "full",
+                        froe::CompactionKind::Tail => "tail",
+                    },
+                    target_generation.generation,
+                    target_generation.full_generation
+                );
+                println!(
+                    "    the head reaches {} nodes; the copy rewrites those it still retains",
+                    crate::progress::format_count(*head_nodes)
+                );
+            }
+            CompactionAction::RemoveRecoveryBackup { file_name, bytes } => {
+                println!(
+                    "  remove old recovery backup {file_name} ({})",
+                    froe::format_byte_size(*bytes)
+                );
             }
             _ => println!("  apply an action added by this froe version"),
         }
@@ -487,37 +489,38 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
         .actions()
         .iter()
         .filter_map(|action| match action {
-            CleanupAction::RepairArchiveIndex { bytes, .. } => Some(*bytes),
+            CompactionAction::RepairArchiveIndex { bytes, .. } => Some(*bytes),
             _ => None,
         })
         .sum();
     if repair_bytes != 0 {
+        let repair_size = froe::format_byte_size(repair_bytes);
         println!(
-            "index rebuilds need {repair_bytes} bytes of transient space and leave {repair_bytes} bytes of .bak files: the repository grows until those are retired"
+            "index rebuilds need {repair_size} of transient space and leave {repair_size} of .bak files: the repository grows until those are retired"
         );
     }
     println!(
-        "estimated reclaimable bytes: {}",
-        plan.estimated_reclaimable_bytes()
+        "estimated reclaimable: {}",
+        froe::format_byte_size(plan.estimated_reclaimable_bytes())
     );
     // A zero estimate has two very different meanings — "no garbage" and
     // "garbage this run declined to move" — and the run used to print the
     // same line for both. These two say which one it is.
     if plan.retained_reclaimable_segments() != 0 {
         println!(
-            "identified but retained: {} segments / {} bytes of reclaimable garbage, left in place because rewriting their archives does not repay the rewrite (see the warnings above)",
-            plan.retained_reclaimable_segments(),
-            plan.retained_reclaimable_bytes(),
+            "identified but retained: {} segments / {} of reclaimable garbage, left in archives this run cannot rewrite (see the warnings above)",
+            crate::progress::format_count(plan.retained_reclaimable_segments() as u64),
+            froe::format_byte_size(plan.retained_reclaimable_bytes()),
         );
     }
     let (history_reclaimable_segments, history_reclaimable_bytes) =
         plan.history_protected_reclaimable();
     if plan.history_protected_segments() != 0 {
         println!(
-            "journal history protects {} data segments the current head does not reach; retiring that history would let this same sweep free {} segments ({} bytes), binary content included",
-            plan.history_protected_segments(),
-            history_reclaimable_segments,
-            history_reclaimable_bytes,
+            "journal history protects {} data segments the current head does not reach; retiring that history would let this same sweep free {} segments ({}), binary content included",
+            crate::progress::format_count(plan.history_protected_segments() as u64),
+            crate::progress::format_count(history_reclaimable_segments as u64),
+            froe::format_byte_size(history_reclaimable_bytes),
         );
         if history_reclaimable_segments != 0 {
             println!(
@@ -527,8 +530,8 @@ fn print_cleanup_plan(plan: &CleanupPlan) {
     }
     if plan.estimated_archive_rewrite_source_bytes() != 0 {
         println!(
-            "archive rewrite working-space proxy: {} source bytes (additional headroom may be required)",
-            plan.estimated_archive_rewrite_source_bytes()
+            "archive rewrite working-space proxy: {} of source archives (additional headroom may be required)",
+            froe::format_byte_size(plan.estimated_archive_rewrite_source_bytes())
         );
     }
 }

@@ -236,7 +236,7 @@ impl TarArchiveWriter {
             self.file = Some(options.open(&self.path)?);
             #[cfg(test)]
             if self.path.file_name() != Some(std::ffi::OsStr::new(&self.file_name)) {
-                crate::writer::cleanup_fault_injection::fail_if_armed(
+                crate::writer::maintenance_fault_injection::fail_if_armed(
                     "sweep.staging-write-after-create",
                 )?;
             }
@@ -329,7 +329,7 @@ impl TarArchiveWriter {
         self.closed = true;
         #[cfg(test)]
         if self.path.file_name() != Some(std::ffi::OsStr::new(&self.file_name)) {
-            crate::writer::cleanup_fault_injection::fail_if_armed(
+            crate::writer::maintenance_fault_injection::fail_if_armed(
                 "sweep.staging-close-before-trailers",
             )?;
         }
