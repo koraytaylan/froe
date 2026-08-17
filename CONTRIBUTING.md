@@ -76,22 +76,11 @@ implementation is complete.
 
 ## Code standards
 
-* **No abbreviations** in file, method, or variable names:
-  `most_significant_bits`, not `msb`; `identifier`, not `id`;
-  `record_number`, not `rec_no`. Universally standard acronyms (UUID,
-  CRC32, JCR, TAR, JSON, CLI) are acceptable; ad-hoc shortenings are
-  not. The cargo-mandated `src/` directory is the tolerated exception.
 * **Minimal dependencies.** Everything in the tree must be strictly
   necessary and pull its weight. The crate manifests are the
   authoritative inventory; large format backends stay feature-gated.
   CRC32, Java string hashing, JSON encoding, and timestamp formatting
   are hand-implemented — a new dependency needs a reason those did not.
-* **Documented, concisely.** Every module starts with a doc comment
-  explaining what it models and the non-obvious facts of the format it
-  implements. Public items carry doc comments. Inline comments state
-  constraints the code cannot express — never what the next line does.
-  Safety comments describe the exact mechanism and scope proved by the
-  code, not a stronger idealized state.
 * **User-facing documentation moves with the code.** A change that adds,
   removes, or alters a capability updates the capability inventory in
   [`docs/oak-segment-tar-feature-map.md`](docs/oak-segment-tar-feature-map.md),
@@ -107,6 +96,118 @@ implementation is complete.
 * Rust edition 2024, workspace lints as configured in the root
   `Cargo.toml`: `missing_docs`, `unreachable_pub`, and clippy's
   `pedantic` group must all be clean.
+
+The rest of this section is craft guidance. It is a set of heuristics
+with a stated purpose, not a checklist to satisfy mechanically: a
+reviewer may ask why a rule was not followed, and "following it here
+made the code harder to read" is a complete answer. Where a heuristic
+collides with Rust idiom or with format fidelity, the idiom and the
+format win.
+
+### Naming
+
+* **No abbreviations** in file, method, or variable names:
+  `most_significant_bits`, not `msb`; `identifier`, not `id`;
+  `record_number`, not `rec_no`. Universally standard acronyms (UUID,
+  CRC32, JCR, TAR, JSON, CLI) are acceptable; ad-hoc shortenings are
+  not. The cargo-mandated `src/` directory is the tolerated exception.
+* **Names reveal intent, not mechanism or type.** `reclaimed_bytes`
+  beats `count`; `retained_generations` beats `filtered`. A name that
+  needs the line after it to be understood is the wrong name. Loop and
+  closure bindings are held to the same standard as fields — a
+  three-line closure does not earn `x`.
+* **Types are nouns, functions are verbs.** Predicates read as
+  questions: `is_reachable`, `has_binary_references`, `can_reclaim`.
+  Conversions follow the Rust API guidelines — `as_` for a borrowed
+  view, `to_` for a copy, `into_` for a consuming conversion — because
+  those prefixes carry cost information a reader relies on.
+* **The same concept keeps the same word everywhere.** The format
+  already has enough near-synonyms (segment, record, entry, blob); a
+  port that renames a concept per module makes every cross-module read
+  a translation exercise. When Oak's name is the clearest one, use
+  Oak's name so the analysis documents and the code share a vocabulary.
+
+### Functions
+
+* **One thing, at one level of abstraction.** A function that both
+  decides *what* to do and performs the byte-level *how* forces a
+  reader to hold two altitudes at once. Split at that seam. The
+  reliable smells are a comment introducing a block, a block whose
+  locals are used nowhere else, and a name containing "and".
+* **Length is a symptom, not the disease.** There is no line limit. A
+  long function whose body is one flat sequence at one altitude — a
+  serializer emitting fields in format order, a match over every record
+  type — is clearer whole than shattered into single-use helpers that
+  scatter the format across a file. Over-decomposition has its own
+  cost, paid at every read. Split for altitude and reuse, not to hit a
+  number.
+* **Few parameters, and none of them bare `bool`.** Past roughly three,
+  group them into a struct — a caller passing five positional arguments
+  cannot be reviewed for argument order. A boolean at a call site is
+  unreadable (`compact(store, true, false)`); use a two-variant enum
+  whose names say what each choice means. This matters most on the
+  write path, where a transposed flag is a data-loss bug.
+* **No side effects the name does not advertise.** A function named for
+  a question does not mutate; a function named for a query does not
+  write files, take the lock, or advance a generation. Where an
+  operation must both compute and persist, the name says so
+  (`write_and_flush`, not `prepare`). Read-only means read-only is the
+  same rule enforced at function granularity.
+* **Typed errors, never sentinel values.** Failure is a `Result` with a
+  variant a caller can match on. `Option` means absence, never failure;
+  `-1`, `0`, and empty collections never stand in for an error. A
+  variant carries the values needed to report the fault — the offending
+  offset, the expected and actual checksum — because a message the
+  caller must reconstruct gets reconstructed wrongly.
+
+### Comments
+
+* **Documented, concisely.** Every module starts with a doc comment
+  explaining what it models and the non-obvious facts of the format it
+  implements. Public items carry doc comments. Safety comments describe
+  the exact mechanism and scope proved by the code, not a stronger
+  idealized state.
+* **Comments explain why; the code explains what.** A comment
+  restating the next line is noise that goes stale. In this crate the
+  *why* is usually unavailable from the code at any quality — that Oak
+  writes a signed comparison here, that a constant was copied unchanged
+  into a later format version, that an arithmetic step wraps
+  deliberately. Those comments are mandatory and cite the Java.
+* **A comment compensating for a name is a rename.** If a line needs a
+  gloss to say what a variable holds, the variable is misnamed. Fix the
+  name and delete the comment.
+* **No commented-out code.** Version control keeps it. A disabled test
+  is either deleted or marked `#[ignore]` with a reason and a linked
+  issue.
+
+### Structure and design
+
+* **Related things stay close.** A helper sits directly below its only
+  caller; a type's inherent `impl` sits next to the type. Vertical
+  distance implies unrelatedness, so distance between two things that
+  must change together is a defect. A module that has grown past the
+  point where related things can stay close is a module to split.
+* **One reason to change per module and per type.** A type that
+  models a format structure does not also own I/O scheduling or
+  progress reporting.
+* **DRY, with two deliberate exceptions.** Duplication is the default
+  maintenance hazard, and shared logic belongs in one place. But the
+  independent encoder in `crates/froe/tests/support/` duplicates
+  production encoding *on purpose* — sharing code with production would
+  destroy the property that makes it evidence — and validation
+  constants repeated across format versions are duplicated because Oak
+  duplicates them. Both are documented at the site; neither is ever
+  "cleaned up".
+* **Tell, don't ask.** Behavior lives with the data it operates on. A
+  caller that reaches through two accessors to compute something the
+  owner could answer wants a method on the owner instead.
+* **Abstract on the second implementation, not the first.** Traits and
+  generics earn their place when there is a real second implementer or
+  a test needs a seam. A trait with one implementation, a builder for a
+  struct with two fields, or a configuration knob no caller sets is
+  speculative generality — the same instinct minimal dependencies
+  exists to resist. YAGNI applies to internal structure, not to format
+  coverage: the format's own complexity is not optional.
 
 ## Testing standards
 
@@ -138,6 +239,30 @@ layers green. New functionality explains why any layer does not apply:
    froe-to-froe round trip is not a substitute. Record the exact Oak/AEM
    build, producer-to-consumer direction, operation exercised, and
    verified post-state.
+
+### Tests are first-class code
+
+The standards above apply to test code without discount — a test suite
+this large is read far more often than it is written, and a test nobody
+can read is a test nobody dares change when the format demands it.
+
+* **One concept per test, named for the concept.** The name states the
+  property being pinned, so a failure line alone tells a reader what
+  broke: `rejects_index_entry_past_archive_end`, not `test_index_3`.
+  Several assertions that together pin one property are fine; two
+  unrelated properties in one test are two tests, because the first
+  failure hides the second.
+* **Independent and repeatable.** Tests share no mutable state, run in
+  any order, and depend on no wall-clock time, no ambient environment,
+  and no leftover directory from a previous run. Anything written goes
+  to a temporary directory the test owns and removes.
+* **Fixture-building belongs in helpers; the property belongs in the
+  test.** A reader should see the arrangement summarized and the
+  assertion in full, not thirty lines of byte-array setup obscuring one
+  comparison. Helpers are named for what they produce.
+* **Assert the observable post-state, not the implementation path.** A
+  test that pins internal call order breaks on every refactor and
+  proves nothing about the format.
 
 ### Make safety tests load-bearing
 
@@ -210,6 +335,14 @@ HEAD`. For committed work, check the complete review range with `git diff
 * A change to format-facing code cites the specification section (or the
   Java file and method) that justifies it, in the commit body or the
   code.
+* **Leave code cleaner than you found it — in its own commit.** Renaming
+  a confusing local, deleting a stale comment, or splitting a function
+  that has outgrown its name is welcome as you pass through. Keep those
+  edits in a `refactor:` commit separate from the behavior change,
+  because a format-facing diff that also carries unrelated cleanups
+  costs a reviewer the ability to see what actually changed on disk —
+  and on a high-risk path, that reviewer is the last line of defense.
+  A cleanup commit asserts that no byte written to disk changed.
 
 ### Review discipline
 
