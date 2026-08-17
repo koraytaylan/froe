@@ -1001,7 +1001,7 @@ mod tests {
     use std::io::Write;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use froe::progress::{ProgressObserver, Step, WorkUnit};
     use froe_export::{ExportSink, ExportedNode};
@@ -1208,30 +1208,44 @@ mod tests {
     /// steps across the run as well as within one.
     #[test]
     fn many_short_steps_are_neither_silenced_nor_spammed() {
+        const STEPS: u64 = 200;
+        const REDRAW: Duration = Duration::from_millis(200);
         let captured = SharedBuffer::new();
         let mut reporter = Reporter::with_output(
             Style::Plain,
             Duration::from_millis(50),
-            Duration::from_millis(200),
+            REDRAW,
             Some(100),
             Box::new(captured.clone()),
         );
         // Two hundred steps, each far shorter than the deferral, spanning
         // well past it in total.
-        for index in 0..200 {
+        let started = Instant::now();
+        for index in 0..STEPS {
             reporter.step_began(&Step::new("checking revision", WorkUnit::Nodes));
             reporter.step_advanced(index);
             std::thread::sleep(Duration::from_millis(3));
             reporter.step_ended();
         }
+        let elapsed = started.elapsed();
         let lines = captured.text().lines().count();
         assert!(
             lines > 0,
             "a run of short steps lasting well past the deferral must report something"
         );
+        // The ceiling follows from how long the run actually took, not from
+        // how many steps it ran: a line is written only once `REDRAW` has
+        // passed since the last one, and each one an announced step writes is
+        // followed by that step's completion line. Asserting a fixed count
+        // instead would be asserting how fast the host runs 200 sleeps —
+        // `thread::sleep` overshoots badly on a loaded CI runner, which is
+        // not a fact about the throttle.
+        let windows = elapsed.as_millis() / REDRAW.as_millis() + 1;
+        let ceiling = usize::try_from(windows * 2 + 4).expect("a small ceiling");
         assert!(
-            lines <= 40,
-            "200 short steps must not contribute a line each; got {lines}"
+            lines <= ceiling,
+            "{STEPS} short steps must be throttled by time, not contribute a line each; \
+             got {lines} over {elapsed:?}, which allows at most {ceiling}"
         );
     }
 
