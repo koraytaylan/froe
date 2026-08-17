@@ -144,6 +144,7 @@ introduction above):
 | `froe checkpoints REPOSITORY` | Checkpoint names with creation and expiry times. |
 | `froe export REPOSITORY [--path P] [--depth N] [--format json-lines\|parquet] [--output FILE\|DIRECTORY]` | Export the subtree as JSON lines (default) or Parquet tables. Progress is reported unless the export streams to a terminal's standard output. |
 | `froe check REPOSITORY [--path P]… [--binaries]` | The newest fully consistent revision. |
+| `froe digest REPOSITORY [--output FILE] [--baseline FILE]` | The repository's content rendered canonically — every node, property, type, arity, value and binary checksum, over the head and every checkpoint — for comparing a store before and after an operation. Oak has no equivalent: `oak-run check` answers whether records parse, not whether the content is the content. |
 | `froe difference REPOSITORY BEFORE AFTER [--path P]` | Changes between two revisions. |
 | `froe history REPOSITORY PATH` | A node's record across journal revisions. |
 | `froe search-nodes REPOSITORY [--has-property N]… [--value N=V]…` | Nodes matching predicates, over every segment. |

@@ -88,6 +88,27 @@ was unable to remove. `--archive-rewrite-policy oak-savings-gate` restores
 Oak's heuristic. Journal history is retired rather than retained, and the
 safety gate fails closed rather than guessing.
 
+**Prove maintenance changed nothing.** `froe check` answers whether a store
+still *parses*, which a store whose properties decoded at the wrong arity also
+does. `froe digest` answers the question an operator actually has — *did this
+maintenance change my content?* — by rendering the repository canonically:
+every node, property name, type, arity, value and binary checksum, across the
+head and every checkpoint, sorted by name and stripped of the record and
+segment identifiers that compaction legitimately changes. Take one before a
+maintenance run and compare after:
+
+```console
+$ froe digest /path/to/segmentstore --output before.digest
+$ froe compact /path/to/segmentstore --yes
+$ froe digest /path/to/segmentstore --baseline before.digest --output after.digest
+```
+
+It exits non-zero if anything differs and names the paths. Roughly 0.3 s over
+a 51,000-node store, and it also verifies every child and property is
+reachable by *lookup* rather than only by enumeration — a mis-ordered map leaf
+leaves nodes visible to a traversal while an application resolving the path
+finds nothing.
+
 **Query a repository in minutes, not hours.** Auditing a running Oak/AEM
 repository — finding unused DAM assets, mapping references, inventorying
 types — usually means a full JCR traversal that takes hours on a

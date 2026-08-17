@@ -170,6 +170,7 @@ Beyond that:
 | `history` | `tracing revisions` (revisions) |
 | `difference` | `comparing revisions` (nodes) |
 | `export` | `exporting nodes` / `re-exporting changed nodes` (nodes); the command then reports its own outcome, naming the destination |
+| `digest` | the archive scan only; the rendering itself is a single streaming walk, fast enough on real stores (~0.3 s over 51,000 nodes and 124 MB of binary content) that a counter would finish before it drew |
 | `summary`, `journal`, `archives`, `segments`, `segment`, `node`, `tree`, `checkpoints`, `debug` | the archive scan only — these do no other work worth waiting for |
 
 `check` gets one step *per revision* rather than one bar across all of
@@ -189,6 +190,14 @@ Known granularity limits, stated rather than hidden:
   single indivisible commits — so they report the time they took rather
   than a count. The ticker still announces them and prints their
   completion, in both rendering styles.
+* `digest` writes the digest to standard output and its summary — counts,
+  lookup failures, dangling `/:async` checkpoint references, and any
+  difference from `--baseline` — to standard error, **including** when
+  `--output` sends the digest to a file. The summary never moves to standard
+  output, because a command whose stream layout depends on its flags is
+  exactly what the contract above exists to prevent: `froe digest store |
+  diff - before.digest` and `froe digest store --output after.digest` report
+  the same way.
 * A step whose first work is one long call — the head verification of a
   node with hundreds of thousands of children must materialise them all
   before it can walk any — shows the clock moving with no count until

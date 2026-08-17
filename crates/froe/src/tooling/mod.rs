@@ -10,6 +10,7 @@
 pub mod archive_debug;
 pub mod check;
 pub mod diff;
+pub mod digest;
 pub mod history;
 pub mod search;
 pub mod segment_dump;
@@ -31,6 +32,9 @@ pub use check::{
 pub use diff::{
     NodeDifference, PropertyChange, diff_revisions, diff_revisions_visiting,
     diff_revisions_with_progress,
+};
+pub use digest::{
+    DigestDifference, DigestSummary, compare_digests, digest_repository, parse_digest,
 };
 pub use history::{NodeHistoryEntry, node_history, node_history_with_progress};
 pub use search::{

@@ -188,6 +188,26 @@ enum Command {
         #[arg(long)]
         revisions: Option<usize>,
     },
+    /// Render the repository's content canonically, for comparison
+    /// before and after an operation (read-only).
+    ///
+    /// Maintenance is supposed to move bytes without changing content.
+    /// `check` proves every record still parses, which a store whose
+    /// properties decoded at the wrong arity also does. This renders what
+    /// the content actually is — every node, property, type, arity, value
+    /// and binary, in the head and in every checkpoint — so the two can be
+    /// compared directly.
+    Digest {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Write the digest here instead of to standard output.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Compare against a digest written earlier and report the paths
+        /// that differ. Exits non-zero when anything differs.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+    },
     /// Show the differences between two revisions (read-only).
     Difference {
         /// The segment store directory.
@@ -642,6 +662,16 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                 revision_limit,
                 reporter,
             )? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Digest {
+            repository,
+            output,
+            baseline,
+        } => {
+            if !tooling_display::print_digest(&repository, output.as_deref(), baseline.as_deref())?
+            {
                 return Ok(ExitCode::FAILURE);
             }
         }

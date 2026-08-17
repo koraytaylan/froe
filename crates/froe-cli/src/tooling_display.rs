@@ -1,7 +1,9 @@
 //! Rendering for the read-only diagnostic commands: check, diff,
 //! history, search, segment dumps, and archive attribution.
 
+use std::fmt::Write as _;
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 
 use froe::content::node::PropertyValues;
@@ -11,6 +13,7 @@ use froe::tooling::archive_debug::{
     ArchiveDebugState, ArchiveGraphReferences, ArchivePathReference, debug_archive,
 };
 use froe::tooling::diff::{NodeDifference, PropertyChange};
+use froe::tooling::digest::{DigestSummary, compare_digests, digest_repository};
 use froe::tooling::search::SearchQuery;
 use froe::tooling::{
     check_consistency_with_progress, diff_revisions_with_progress, dump_segment,
@@ -279,6 +282,166 @@ pub(crate) fn print_check(
         println!("no good revision found");
         Ok(false)
     }
+}
+
+/// `froe digest`: the canonical content rendering, optionally compared
+/// against one taken earlier.
+///
+/// Returns whether the run was clean. Three separate things can make it
+/// not clean, and the caller only needs the one answer: the store
+/// disagreed with its baseline, a child or property was unreachable by
+/// lookup, or an index lane still references a checkpoint that is gone.
+///
+/// The digest is data and standard output carries only data, so the
+/// summary always goes to standard error — including when `--output`
+/// redirects the digest to a file. Splitting on the destination would make
+/// `froe digest store | diff - before.digest` work and
+/// `froe digest store --output after.digest` print to a different stream,
+/// which is exactly the kind of inconsistency the stream contract exists
+/// to prevent.
+pub(crate) fn print_digest(
+    repository_path: &Path,
+    output_path: Option<&Path>,
+    baseline_path: Option<&Path>,
+) -> froe::Result<bool> {
+    let repository = Repository::open(repository_path)?;
+
+    // Streamed straight to its destination unless it has to be compared.
+    // A digest is roughly 200 bytes per node, so a large production
+    // repository produces one far too big to hold in memory for no reason
+    // — and the common case, taking a digest before a maintenance run, has
+    // no baseline to compare against yet.
+    let Some(baseline_path) = baseline_path else {
+        let Some(summary) = stream_digest(&repository, output_path)? else {
+            // The consumer closed the pipe partway through, so there is no
+            // complete digest and no verdict to give.
+            return Ok(true);
+        };
+        eprint!("{}", format_digest_summary(&summary));
+        return Ok(summary.is_clean());
+    };
+
+    let mut rendered = Vec::new();
+    let summary = digest_repository(&repository, &mut rendered)?;
+    let digest = String::from_utf8(rendered).map_err(|error| froe::Error::InvalidFormat {
+        details: format!("the digest is not valid UTF-8: {error}"),
+    })?;
+
+    if let Some(path) = output_path {
+        std::fs::write(path, digest.as_bytes())?;
+    } else {
+        let stdout = io::stdout();
+        let mut locked = stdout.lock();
+        write_diagnostic_handling_observed_broken_pipe(&mut locked, |output| {
+            output.write_all(digest.as_bytes())?;
+            Ok(())
+        })?;
+    }
+
+    let mut clean = summary.is_clean();
+    let mut report = format_digest_summary(&summary);
+
+    {
+        let baseline = std::fs::read_to_string(baseline_path)?;
+        let difference = compare_digests(&baseline, &digest);
+        if difference.is_empty() {
+            report.push_str("content is identical to the baseline\n");
+        } else {
+            clean = false;
+            let _ = writeln!(
+                report,
+                "content differs from the baseline: {} changed, {} removed, {} added",
+                difference.changed.len(),
+                difference.removed.len(),
+                difference.added.len()
+            );
+            for (label, paths) in [
+                ("changed", &difference.changed),
+                ("removed", &difference.removed),
+                ("added", &difference.added),
+            ] {
+                for node_path in paths.iter().take(DIGEST_DIFFERENCE_REPORT_LIMIT) {
+                    let _ = writeln!(report, "  {label} {}", sanitize_terminal_text(node_path));
+                }
+                if paths.len() > DIGEST_DIFFERENCE_REPORT_LIMIT {
+                    let _ = writeln!(
+                        report,
+                        "  ... and {} more {label}",
+                        paths.len() - DIGEST_DIFFERENCE_REPORT_LIMIT
+                    );
+                }
+            }
+        }
+    }
+
+    eprint!("{report}");
+    Ok(clean)
+}
+
+/// Renders the digest straight to its destination, returning the summary,
+/// or `None` when a downstream consumer closed the pipe first.
+fn stream_digest(
+    repository: &Repository,
+    output_path: Option<&Path>,
+) -> froe::Result<Option<DigestSummary>> {
+    if let Some(path) = output_path {
+        let mut file = io::BufWriter::new(std::fs::File::create(path)?);
+        let summary = digest_repository(repository, &mut file)?;
+        file.flush()?;
+        return Ok(Some(summary));
+    }
+    let stdout = io::stdout();
+    let mut locked = io::BufWriter::new(stdout.lock());
+    let mut summary = None;
+    write_diagnostic_handling_observed_broken_pipe(&mut locked, |output| {
+        summary = Some(digest_repository(repository, output)?);
+        Ok(())
+    })?;
+    Ok(summary)
+}
+
+/// How many differing paths are named before the report summarizes the
+/// rest. A whole-store change would otherwise print a line per node.
+const DIGEST_DIFFERENCE_REPORT_LIMIT: usize = 20;
+
+fn format_digest_summary(summary: &DigestSummary) -> String {
+    let mut report = format!(
+        "digested {} nodes, {} properties, {} binaries ({} bytes) and {} checkpoints\n",
+        summary.nodes,
+        summary.properties,
+        summary.binaries,
+        summary.binary_bytes,
+        summary.checkpoints
+    );
+    if summary.lookup_failures > 0 {
+        let _ = writeln!(
+            report,
+            "{} children or properties are present when enumerated but not reachable by \
+             lookup, so an application resolving those paths finds nothing:",
+            summary.lookup_failures
+        );
+        for detail in &summary.reported_lookup_failures {
+            let _ = writeln!(report, "  {}", sanitize_terminal_text(detail));
+        }
+        let reported = summary.reported_lookup_failures.len() as u64;
+        if summary.lookup_failures > reported {
+            let _ = writeln!(
+                report,
+                "  ... and {} more",
+                summary.lookup_failures - reported
+            );
+        }
+    }
+    if !summary.dangling_async_checkpoints.is_empty() {
+        report.push_str(
+            "asynchronous index lanes reference checkpoints that no longer exist, so Oak \
+             will reindex from scratch rather than resume:\n",
+        );
+        for name in &summary.dangling_async_checkpoints {
+            let _ = writeln!(report, "  {}", sanitize_terminal_text(name));
+        }
+    }
+    report
 }
 
 fn print_path_verdict(verdict: &froe::tooling::PathVerdict, indent: &str) {

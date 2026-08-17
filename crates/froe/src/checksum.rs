@@ -61,7 +61,56 @@ const fn generate_crc32_tables() -> [[u32; 256]; STRIDE] {
 /// Computes the IEEE CRC32 checksum of `bytes`, matching `java.util.zip.CRC32`.
 #[must_use]
 pub fn crc32(bytes: &[u8]) -> u32 {
-    let mut checksum = 0xFFFF_FFFFu32;
+    let mut running = Crc32::new();
+    running.update(bytes);
+    running.finish()
+}
+
+/// A CRC32 computed over a value that arrives in pieces.
+///
+/// The checksum is a streaming operation, so folding a chunk at a time
+/// yields exactly what [`crc32`] returns for the concatenation — which is
+/// what lets a digest checksum a multi-megabyte binary through a fixed
+/// buffer instead of materializing it. Both paths run the same striding
+/// loop, so neither can drift from the other and the one-shot form keeps
+/// the throughput that archive certification depends on.
+#[derive(Clone, Copy, Debug)]
+pub struct Crc32 {
+    state: u32,
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32 {
+    /// Starts a checksum over an empty byte sequence.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { state: 0xFFFF_FFFF }
+    }
+
+    /// Folds the next chunk of the value into the checksum.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.state = fold(self.state, bytes);
+    }
+
+    /// The checksum of everything folded in so far.
+    #[must_use]
+    pub const fn finish(self) -> u32 {
+        !self.state
+    }
+}
+
+/// Folds `bytes` into a running checksum state, sixteen bytes at a time.
+///
+/// The stride is an optimization, not part of the definition: a chunk whose
+/// length is not a multiple of the stride finishes byte-at-a-time, and
+/// resuming with the next chunk is still the same polynomial. That is what
+/// makes [`Crc32`] agree with [`crc32`] at any chunking.
+fn fold(mut checksum: u32, bytes: &[u8]) -> u32 {
     let mut blocks = bytes.chunks_exact(STRIDE);
     for block in &mut blocks {
         // The first four bytes are folded into the running checksum before
@@ -88,12 +137,12 @@ pub fn crc32(bytes: &[u8]) -> u32 {
         let table_index = ((checksum ^ u32::from(byte)) & 0xFF) as usize;
         checksum = (checksum >> 8) ^ CRC32_TABLES[0][table_index];
     }
-    !checksum
+    checksum
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{STRIDE, crc32};
+    use super::{Crc32, STRIDE, crc32};
 
     /// The textbook bit-at-a-time definition of the reflected IEEE CRC32,
     /// written from the polynomial alone. It shares no table, no stride, and
@@ -133,6 +182,40 @@ mod tests {
     fn single_byte_matches_reference_value() {
         // Value produced by java.util.zip.CRC32 for a single zero byte.
         assert_eq!(crc32(&[0]), 0xD202_EF8D);
+    }
+
+    #[test]
+    fn chunked_updates_agree_with_the_one_shot_at_every_chunk_width() {
+        // A digest folds a binary in through a fixed buffer, so the chunk
+        // boundaries fall wherever the reader happens to stop — including
+        // inside a stride. Every width up to past two strides is covered
+        // here, and each result is checked against the independent
+        // bit-at-a-time definition rather than against `crc32` alone, so a
+        // shared mistake in the sliced tables could not hide.
+        let bytes: Vec<u8> = (0..=200u16).map(|index| (index % 251) as u8).collect();
+        let expected = crc32_bit_at_a_time(&bytes);
+        assert_eq!(crc32(&bytes), expected);
+
+        for chunk_width in 1..=(2 * STRIDE + 3) {
+            let mut running = Crc32::new();
+            for chunk in bytes.chunks(chunk_width) {
+                running.update(chunk);
+            }
+            assert_eq!(
+                running.finish(),
+                expected,
+                "folding in {chunk_width}-byte chunks must equal the one-shot checksum"
+            );
+        }
+
+        // An empty update anywhere in the sequence must not disturb it.
+        let mut running = Crc32::new();
+        running.update(&[]);
+        running.update(&bytes[..7]);
+        running.update(&[]);
+        running.update(&bytes[7..]);
+        assert_eq!(running.finish(), expected);
+        assert_eq!(Crc32::new().finish(), crc32(&[]));
     }
 
     #[test]
