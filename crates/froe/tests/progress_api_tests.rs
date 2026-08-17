@@ -438,7 +438,7 @@ fn every_observable_reader_reports_through_the_same_trait() {
     let report = froe::tooling::check_consistency_with_progress(
         directory.path(),
         &[],
-        false,
+        froe::tooling::BinaryCheck::RecordsOnly,
         usize::MAX,
         &mut log,
     )
@@ -532,7 +532,7 @@ fn a_bounded_check_never_labels_a_revision_past_its_bound() {
     froe::tooling::check_consistency_with_progress(
         directory.path(),
         &["/no/such/path".to_owned()],
-        false,
+        froe::tooling::BinaryCheck::RecordsOnly,
         2,
         &mut log,
     )

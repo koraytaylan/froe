@@ -41,6 +41,7 @@ use crate::segment::record::{RecordIdentifier, RecordType};
 use crate::segment::view::SegmentView;
 use crate::tar_archive::archive::TarArchiveReader;
 use crate::tar_archive::file_name::{ArchiveFileName, select_newest_file_generations};
+use crate::writer::compaction::CompactionKind;
 use crate::writer::record_writer::{ChildNodesToWrite, RecordWriter, SegmentSink};
 use crate::writer::repository_lock::RepositoryLock;
 use crate::writer::segment_builder::{BuiltSegment, GarbageCollectionGeneration};
@@ -734,8 +735,8 @@ impl WritableRepository {
     /// Reclaims segments older than `reference_generation` after a
     /// compaction: Oak's mark phase decides what goes, then each base
     /// archive is swept. Data segments are retained purely by the
-    /// generation predicate with a single retained generation (`full`
-    /// selects the full-compaction predicate); bulk segments are
+    /// generation predicate with a single retained generation, selected
+    /// by `kind`; bulk segments are
     /// retained purely by reachability from kept data segments, through
     /// a references set shared across all archives. A base archive whose
     /// segments all reclaim is deleted; one with survivors is rewritten
@@ -753,12 +754,12 @@ impl WritableRepository {
     pub fn reclaim_old_generations(
         &mut self,
         reference_generation: GarbageCollectionGeneration,
-        full: bool,
+        kind: CompactionKind,
     ) -> Result<()> {
         self.reclaim_old_generations_with(GenerationReclaimRequest {
             rule: ReclaimRule {
                 reference: reference_generation,
-                full,
+                kind,
                 retained_generations: RETAINED_GENERATIONS,
             },
             rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
@@ -1997,11 +1998,6 @@ pub(crate) struct SegmentSweepOutcome {
     pub(crate) deletion_failures: Vec<DeferredFileDeletion>,
 }
 
-/// Whether a maintenance run marks with Oak's FULL garbage-collection
-/// predicate. Named so plan reporting cannot silently drift from the mark
-/// phase it describes.
-pub(crate) const FULL_GARBAGE_COLLECTION: bool = true;
-
 /// Generations a froe maintenance run retains behind its reference. One
 /// value, read by every phase of the run through [`ReclaimRule`].
 ///
@@ -3038,8 +3034,8 @@ fn alternate_generation_residue(
 pub(crate) struct ReclaimRule {
     /// The generation every candidate is judged against.
     pub(crate) reference: GarbageCollectionGeneration,
-    /// Oak's FULL predicate when true, its TAIL predicate when false.
-    pub(crate) full: bool,
+    /// Which of Oak's two generation predicates judges each candidate.
+    pub(crate) kind: CompactionKind,
     /// How many generations behind the reference survive.
     pub(crate) retained_generations: i32,
 }
@@ -3116,7 +3112,7 @@ fn mark_one_archive(
                 is_reclaimable(
                     policy.rule.reference,
                     generation,
-                    policy.rule.full,
+                    policy.rule.kind,
                     policy.rule.retained_generations,
                 )
             })
@@ -4113,22 +4109,25 @@ fn validate_open_swept_archive(
 pub(crate) fn is_reclaimable(
     reference: GarbageCollectionGeneration,
     segment: GarbageCollectionGeneration,
-    full: bool,
+    kind: CompactionKind,
     retained_generations: i32,
 ) -> bool {
     // Wrapping subtraction matches Java's `GCGeneration.compareWith`, which
     // uses plain int subtraction; it also cannot panic on the pathological
     // generation values a corrupt archive index might carry.
-    if full {
-        reference
-            .full_generation
-            .wrapping_sub(segment.full_generation)
-            >= retained_generations
-            || (reference.generation.wrapping_sub(segment.generation) >= retained_generations
-                && !segment.is_compacted)
-    } else {
-        reference.generation.wrapping_sub(segment.generation) >= retained_generations
-            && !(segment.is_compacted && segment.full_generation == reference.full_generation)
+    match kind {
+        CompactionKind::Full => {
+            reference
+                .full_generation
+                .wrapping_sub(segment.full_generation)
+                >= retained_generations
+                || (reference.generation.wrapping_sub(segment.generation) >= retained_generations
+                    && !segment.is_compacted)
+        }
+        CompactionKind::Tail => {
+            reference.generation.wrapping_sub(segment.generation) >= retained_generations
+                && !(segment.is_compacted && segment.full_generation == reference.full_generation)
+        }
     }
 }
 
@@ -5321,6 +5320,7 @@ mod tests {
     use crate::tar_archive::archive::TarArchiveReader;
     #[cfg(unix)]
     use crate::tar_archive::file_name::ArchiveFileName;
+    use crate::writer::compaction::CompactionKind;
     use crate::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
     use crate::writer::repository_lock::RepositoryLock;
     use crate::writer::segment_builder::{GarbageCollectionGeneration, SegmentBufferBuilder};
@@ -5440,7 +5440,7 @@ mod tests {
     fn standalone_rule(reference: GarbageCollectionGeneration) -> ReclaimRule {
         ReclaimRule {
             reference,
-            full: super::FULL_GARBAGE_COLLECTION,
+            kind: CompactionKind::Full,
             retained_generations: super::RETAINED_GENERATIONS,
         }
     }
@@ -5615,12 +5615,37 @@ mod tests {
 
         // Full-generation age is decisive for compacted and non-compacted
         // segments, with equality at the retained count included.
-        assert!(is_reclaimable(reference, generation(10, 6, true), true, 2));
-        assert!(!is_reclaimable(reference, generation(10, 7, true), true, 2));
+        assert!(is_reclaimable(
+            reference,
+            generation(10, 6, true),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(10, 7, true),
+            CompactionKind::Full,
+            2
+        ));
         // Generation age is an alternate path only for non-compacted data.
-        assert!(is_reclaimable(reference, generation(8, 7, false), true, 2));
-        assert!(!is_reclaimable(reference, generation(8, 7, true), true, 2));
-        assert!(!is_reclaimable(reference, generation(9, 7, false), true, 2));
+        assert!(is_reclaimable(
+            reference,
+            generation(8, 7, false),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(8, 7, true),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(9, 7, false),
+            CompactionKind::Full,
+            2
+        ));
 
         // Java subtraction wraps in signed i32 arithmetic. These pairs
         // straddle the boundary and distinguish a wrapped delta of 1 from 2.
@@ -5628,19 +5653,19 @@ mod tests {
         assert!(!is_reclaimable(
             wrapping_reference,
             generation(i32::MAX, i32::MAX, false),
-            true,
+            CompactionKind::Full,
             2
         ));
         assert!(is_reclaimable(
             wrapping_reference,
             generation(i32::MAX - 1, i32::MAX - 1, false),
-            true,
+            CompactionKind::Full,
             2
         ));
         assert!(!is_reclaimable(
             generation(i32::MAX, i32::MAX, false),
             generation(i32::MIN, i32::MIN, false),
-            true,
+            CompactionKind::Full,
             2
         ));
     }
@@ -5648,10 +5673,30 @@ mod tests {
     #[test]
     fn post_compaction_reclaimer_still_retains_exactly_one_generation() {
         let reference = generation(5, 5, true);
-        assert!(is_reclaimable(reference, generation(4, 4, true), true, 1));
-        assert!(!is_reclaimable(reference, generation(5, 5, true), true, 1));
-        assert!(is_reclaimable(reference, generation(4, 5, false), false, 1));
-        assert!(!is_reclaimable(reference, generation(4, 5, true), false, 1));
+        assert!(is_reclaimable(
+            reference,
+            generation(4, 4, true),
+            CompactionKind::Full,
+            1
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(5, 5, true),
+            CompactionKind::Full,
+            1
+        ));
+        assert!(is_reclaimable(
+            reference,
+            generation(4, 5, false),
+            CompactionKind::Tail,
+            1
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(4, 5, true),
+            CompactionKind::Tail,
+            1
+        ));
     }
 
     /// The boundary the retention value actually moves, and the store shape
@@ -5664,11 +5709,16 @@ mod tests {
     fn one_retained_generation_reclaims_what_two_spared() {
         let tail_compacted_head = generation(1, 0, true);
         let untouched_tail = generation(0, 0, false);
-        assert!(is_reclaimable(tail_compacted_head, untouched_tail, true, 1));
+        assert!(is_reclaimable(
+            tail_compacted_head,
+            untouched_tail,
+            CompactionKind::Full,
+            1
+        ));
         assert!(!is_reclaimable(
             tail_compacted_head,
             untouched_tail,
-            true,
+            CompactionKind::Full,
             2
         ));
         assert_eq!(
@@ -5805,7 +5855,7 @@ mod tests {
         let policy = ReclaimPolicy {
             rule: ReclaimRule {
                 reference,
-                full: true,
+                kind: CompactionKind::Full,
                 retained_generations: 1,
             },
             protected_data_segments: &protected,
@@ -5842,7 +5892,7 @@ mod tests {
         assert_eq!(store.base_archives.len(), 2);
         let reference = store.writing_generation().expect("head generation");
         let error = store
-            .reclaim_old_generations(reference, true)
+            .reclaim_old_generations(reference, CompactionKind::Full)
             .expect_err("ambiguous global UUID marking must fail closed");
         assert!(error.to_string().contains("both active archives"));
         assert_eq!(
@@ -5902,7 +5952,7 @@ mod tests {
         );
 
         store
-            .reclaim_old_generations(generation(0, 0, false), false)
+            .reclaim_old_generations(generation(0, 0, false), CompactionKind::Tail)
             .expect("certify and retain the generation-zero base");
 
         assert!(
@@ -6301,7 +6351,7 @@ mod tests {
         let policy = ReclaimPolicy {
             rule: ReclaimRule {
                 reference: current,
-                full: true,
+                kind: CompactionKind::Full,
                 retained_generations: 2,
             },
             protected_data_segments: &protected,
@@ -7512,7 +7562,7 @@ mod tests {
             .reclaim_old_generations_with(GenerationReclaimRequest {
                 rule: ReclaimRule {
                     reference: live,
-                    full: true,
+                    kind: CompactionKind::Full,
                     retained_generations: RETAINED_GENERATIONS,
                 },
                 rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
@@ -7551,7 +7601,7 @@ mod tests {
                 .reclaim_old_generations_with(GenerationReclaimRequest {
                     rule: ReclaimRule {
                         reference: live,
-                        full: true,
+                        kind: CompactionKind::Full,
                         retained_generations: RETAINED_GENERATIONS,
                     },
                     rewrite_policy: policy,
@@ -7801,7 +7851,7 @@ mod tests {
                 is_compacted: false,
             };
             store
-                .reclaim_old_generations(reference_generation, false)
+                .reclaim_old_generations(reference_generation, CompactionKind::Tail)
                 .expect("reclaim");
         }
 
@@ -7834,7 +7884,7 @@ mod tests {
         let mut store = WritableRepository::open(&directory.path).expect("open");
         let generation = store.writing_generation().expect("generation");
         store
-            .reclaim_old_generations(generation, false)
+            .reclaim_old_generations(generation, CompactionKind::Tail)
             .expect("reclaim ignores the unrelated file");
         store.close().expect("close");
         assert!(
@@ -8371,7 +8421,7 @@ mod tests {
         rewrite_session_archive_omitting_trailer(&store, target, omitted);
 
         let error = store
-            .reclaim_old_generations(reference, true)
+            .reclaim_old_generations(reference, CompactionKind::Full)
             .expect_err("semantic session certificate must precede base mutation");
         assert!(
             error.to_string().contains(expected_error),
@@ -8428,7 +8478,7 @@ mod tests {
             .store(0, Ordering::Relaxed);
 
         store
-            .reclaim_old_generations(reference, true)
+            .reclaim_old_generations(reference, CompactionKind::Full)
             .expect("reclaim succeeds");
         assert_eq!(
             store
@@ -8691,7 +8741,7 @@ mod tests {
             .expect("normal commit exposes the deliberately invalid test head");
 
         let error = store
-            .reclaim_old_generations(reference, true)
+            .reclaim_old_generations(reference, CompactionKind::Full)
             .expect_err("finalized head validation must precede base sweep");
         assert!(error.to_string().contains("not a finalized node record"));
         assert_eq!(
@@ -8727,7 +8777,7 @@ mod tests {
         let mut store =
             WritableRepository::open(&directory.path).expect("open corrupt-indexed base");
         let error = store
-            .reclaim_old_generations(generation(2, 2, true), true)
+            .reclaim_old_generations(generation(2, 2, true), CompactionKind::Full)
             .expect_err("base source certificate must precede post-compaction sweeping");
 
         assert!(error.to_string().contains("payload CRC"), "{error}");
@@ -8789,7 +8839,7 @@ mod tests {
             .reclaim_old_generations_with(GenerationReclaimRequest {
                 rule: ReclaimRule {
                     reference: generation(2, 2, true),
-                    full: true,
+                    kind: CompactionKind::Full,
                     retained_generations: RETAINED_GENERATIONS,
                 },
                 rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,

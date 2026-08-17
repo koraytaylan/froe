@@ -24,8 +24,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use froe::progress::ProgressObserver as _;
 use froe::store::Repository;
+use froe::tooling::BinaryCheck;
 
-use crate::mutation::CheckpointRemoval;
+use crate::mutation::{CheckpointRemoval, CompactionRun, Confirmation};
 use crate::progress::{ProgressWhen, Reporter};
 
 #[derive(Parser)]
@@ -655,10 +656,15 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
         } => {
             // Absent limit = examine every revision, oak-run's default.
             let revision_limit = revisions.unwrap_or(usize::MAX);
+            let binary_check = if binaries {
+                BinaryCheck::EveryBlock
+            } else {
+                BinaryCheck::RecordsOnly
+            };
             if !tooling_display::print_check(
                 &repository,
                 &paths,
-                binaries,
+                binary_check,
                 revision_limit,
                 reporter,
             )? {
@@ -761,7 +767,13 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                     return Ok(ExitCode::FAILURE);
                 }
             }
-            if !mutation::run_compact(&repository, options, dry_run, yes, reporter)? {
+            if !mutation::run_compact(
+                &repository,
+                options,
+                CompactionRun::from_dry_run_flag(dry_run),
+                Confirmation::from_assume_yes_flag(yes),
+                reporter,
+            )? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -770,7 +782,12 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
             target,
             yes,
         } => {
-            if !mutation::run_backup(&source, &target, yes, reporter)? {
+            if !mutation::run_backup(
+                &source,
+                &target,
+                Confirmation::from_assume_yes_flag(yes),
+                reporter,
+            )? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -779,12 +796,21 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
             target,
             yes,
         } => {
-            if !mutation::run_restore(&backup, &target, yes, reporter)? {
+            if !mutation::run_restore(
+                &backup,
+                &target,
+                Confirmation::from_assume_yes_flag(yes),
+                reporter,
+            )? {
                 return Ok(ExitCode::FAILURE);
             }
         }
         Command::RecoverJournal { repository, yes } => {
-            if !mutation::run_recover_journal(&repository, yes, reporter)? {
+            if !mutation::run_recover_journal(
+                &repository,
+                Confirmation::from_assume_yes_flag(yes),
+                reporter,
+            )? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -1228,7 +1254,12 @@ fn run_checkpoint(action: CheckpointAction, reporter: &Reporter) -> froe::Result
             repository,
             lifetime_milliseconds,
             yes,
-        } => mutation::run_checkpoint_create(&repository, lifetime_milliseconds, yes, reporter),
+        } => mutation::run_checkpoint_create(
+            &repository,
+            lifetime_milliseconds,
+            Confirmation::from_assume_yes_flag(yes),
+            reporter,
+        ),
         CheckpointAction::Remove {
             repository,
             name,
@@ -1236,17 +1267,20 @@ fn run_checkpoint(action: CheckpointAction, reporter: &Reporter) -> froe::Result
         } => mutation::run_checkpoint_remove(
             &repository,
             &CheckpointRemoval::Named(name),
-            yes,
+            Confirmation::from_assume_yes_flag(yes),
             reporter,
         ),
-        CheckpointAction::RemoveAll { repository, yes } => {
-            mutation::run_checkpoint_remove(&repository, &CheckpointRemoval::All, yes, reporter)
-        }
+        CheckpointAction::RemoveAll { repository, yes } => mutation::run_checkpoint_remove(
+            &repository,
+            &CheckpointRemoval::All,
+            Confirmation::from_assume_yes_flag(yes),
+            reporter,
+        ),
         CheckpointAction::RemoveUnreferenced { repository, yes } => {
             mutation::run_checkpoint_remove(
                 &repository,
                 &CheckpointRemoval::Unreferenced,
-                yes,
+                Confirmation::from_assume_yes_flag(yes),
                 reporter,
             )
         }

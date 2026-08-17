@@ -125,6 +125,7 @@ mod tests {
     use crate::tar_archive::archive::TarArchiveReader;
     use crate::tar_archive::file_name::ArchiveFileName;
     use crate::writer::commit::create_checkpoint;
+    use crate::writer::compaction::CompactionKind;
     use crate::writer::maintenance::{
         CompactionAction, CompactionOptions, MaintenanceTask, compact, plan_compaction,
     };
@@ -341,7 +342,7 @@ mod tests {
             let reference = store
                 .writing_generation()
                 .expect("read post-compaction reference generation");
-            let outcome = store.reclaim_old_generations(reference, true);
+            let outcome = store.reclaim_old_generations(reference, CompactionKind::Full);
             match mode.as_str() {
                 ERROR_MODE => {
                     let error = outcome

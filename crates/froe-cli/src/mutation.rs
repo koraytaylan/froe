@@ -21,14 +21,52 @@ use froe::{
 
 use crate::progress::Reporter;
 
-/// Asks for confirmation before a mutating operation, unless `assume_yes`.
+/// Whether a mutating command asks the operator before it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// Prompt on the terminal, and abort unless the answer is yes.
+    Ask,
+    /// Proceed without prompting, as `--yes` requests.
+    AssumeYes,
+}
+
+impl Confirmation {
+    /// Maps the parsed `--yes` flag, the one place a bare flag becomes a
+    /// confirmation, so no command below this boundary takes one.
+    pub(crate) fn from_assume_yes_flag(assume_yes: bool) -> Self {
+        if assume_yes {
+            Self::AssumeYes
+        } else {
+            Self::Ask
+        }
+    }
+}
+
+/// Whether `froe compact` stops after reporting its plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionRun {
+    /// Report the plan and leave the repository untouched, as `--dry-run`
+    /// requests.
+    PlanOnly,
+    /// Apply the plan once the operator has confirmed it.
+    Apply,
+}
+
+impl CompactionRun {
+    /// Maps the parsed `--dry-run` flag.
+    pub(crate) fn from_dry_run_flag(dry_run: bool) -> Self {
+        if dry_run { Self::PlanOnly } else { Self::Apply }
+    }
+}
+
+/// Asks for confirmation before a mutating operation.
 ///
 /// The prompt is written with the reporter suspended, so a live progress
 /// line is erased first and nothing is drawn over the question while the
 /// operator is answering it. `--silent` never hides this prompt: it is a
 /// question about a destructive change, not a progress report.
-fn confirm(action: &str, assume_yes: bool, reporter: &Reporter) -> bool {
-    if assume_yes {
+fn confirm(action: &str, confirmation: Confirmation, reporter: &Reporter) -> bool {
+    if confirmation == Confirmation::AssumeYes {
         return true;
     }
     reporter.while_suspended(|| {
@@ -43,7 +81,6 @@ fn confirm(action: &str, assume_yes: bool, reporter: &Reporter) -> bool {
     })
 }
 
-/// `froe compact`: offline full or tail compaction.
 /// Introduces the lock-protected plan, attributing why it differs.
 ///
 /// When repairs were selected the plan changed because cleanup itself
@@ -65,9 +102,9 @@ fn announce_authoritative_plan(plan: &froe::CompactionPlan, repaired: usize) {
     print_cleanup_plan(plan);
 }
 
-/// `froe cleanup`: read-only preview, lock-protected replan, confirmation,
-/// application, and fresh final verification.
-/// `froe compact`: the one maintenance command.
+/// `froe compact`: the one maintenance command — offline full or tail
+/// compaction, with a read-only preview, a lock-protected replan,
+/// confirmation, application, and a fresh final verification.
 ///
 /// Plans read-only first and prints the plan, because the operator's evidence
 /// for authorizing a destructive run has to exist before the run does. With
@@ -78,8 +115,8 @@ fn announce_authoritative_plan(plan: &froe::CompactionPlan, repaired: usize) {
 pub(crate) fn run_compact(
     repository: &Path,
     options: CompactionOptions,
-    dry_run: bool,
-    assume_yes: bool,
+    run_mode: CompactionRun,
+    confirmation: Confirmation,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
     reporter.status(
@@ -90,7 +127,7 @@ pub(crate) fn run_compact(
     // every report before a single line of it is written.
     reporter.finish();
     print_cleanup_plan(&preview);
-    if dry_run {
+    if run_mode == CompactionRun::PlanOnly {
         println!("dry-run: repository was not modified");
         return Ok(true);
     }
@@ -103,7 +140,7 @@ pub(crate) fn run_compact(
             "about to apply this compaction plan to {}",
             crate::output::sanitize_terminal_path(preview.directory())
         ),
-        assume_yes,
+        confirmation,
         reporter,
     ) {
         eprintln!("froe: compaction cancelled");
@@ -121,7 +158,7 @@ pub(crate) fn run_compact(
         announce_authoritative_plan(prepared.plan(), repaired);
         if !confirm(
             "about to apply the changed authoritative compaction plan",
-            assume_yes,
+            confirmation,
             reporter,
         ) {
             eprintln!("froe: compaction cancelled");
@@ -540,7 +577,7 @@ fn print_cleanup_plan(plan: &CompactionPlan) {
 pub(crate) fn run_backup(
     source: &Path,
     target: &Path,
-    assume_yes: bool,
+    confirmation: Confirmation,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
     if !confirm(
@@ -549,7 +586,7 @@ pub(crate) fn run_backup(
             crate::output::sanitize_terminal_path(source),
             crate::output::sanitize_terminal_path(target)
         ),
-        assume_yes,
+        confirmation,
         reporter,
     ) {
         eprintln!("froe: backup cancelled");
@@ -569,7 +606,7 @@ pub(crate) fn run_backup(
 pub(crate) fn run_restore(
     backup_directory: &Path,
     target: &Path,
-    assume_yes: bool,
+    confirmation: Confirmation,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
     if !confirm(
@@ -578,7 +615,7 @@ pub(crate) fn run_restore(
             crate::output::sanitize_terminal_path(backup_directory),
             crate::output::sanitize_terminal_path(target)
         ),
-        assume_yes,
+        confirmation,
         reporter,
     ) {
         eprintln!("froe: restore cancelled");
@@ -597,7 +634,7 @@ pub(crate) fn run_restore(
 /// `froe recover-journal`: rebuild journal.log from the segments.
 pub(crate) fn run_recover_journal(
     repository: &Path,
-    assume_yes: bool,
+    confirmation: Confirmation,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
     if !confirm(
@@ -605,7 +642,7 @@ pub(crate) fn run_recover_journal(
             "about to rebuild the journal of {}",
             crate::output::sanitize_terminal_path(repository)
         ),
-        assume_yes,
+        confirmation,
         reporter,
     ) {
         eprintln!("froe: recovery cancelled");
@@ -630,7 +667,7 @@ pub(crate) fn run_recover_journal(
 pub(crate) fn run_checkpoint_create(
     repository: &Path,
     lifetime_milliseconds: i64,
-    assume_yes: bool,
+    confirmation: Confirmation,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
     if !confirm(
@@ -638,7 +675,7 @@ pub(crate) fn run_checkpoint_create(
             "about to create a checkpoint in {}",
             crate::output::sanitize_terminal_path(repository)
         ),
-        assume_yes,
+        confirmation,
         reporter,
     ) {
         eprintln!("froe: checkpoint creation cancelled");
@@ -659,7 +696,7 @@ pub(crate) fn run_checkpoint_create(
 pub(crate) fn run_checkpoint_remove(
     repository: &Path,
     target: &CheckpointRemoval,
-    assume_yes: bool,
+    confirmation: Confirmation,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
     let target_description = match target {
@@ -674,7 +711,7 @@ pub(crate) fn run_checkpoint_remove(
             "about to remove {target_description} from {}",
             crate::output::sanitize_terminal_path(repository)
         ),
-        assume_yes,
+        confirmation,
         reporter,
     ) {
         eprintln!("froe: checkpoint removal cancelled");

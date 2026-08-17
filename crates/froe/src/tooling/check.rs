@@ -92,21 +92,30 @@ struct PathToCheck {
     corrupt_paths: Vec<String>,
 }
 
+/// How thoroughly a consistency check verifies inline binary values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryCheck {
+    /// Resolve each binary value's record without reading its blocks.
+    RecordsOnly,
+    /// Read every block of every inline binary value, like Java's `--bin`.
+    EveryBlock,
+}
+
 /// Checks the store at `directory`, verifying the given content paths at
 /// each journal revision (newest first) against the head and against
-/// every checkpoint of the current head. `check_binaries` reads every
-/// block of inline binary values instead of only resolving their records.
-/// At most `revision_limit` revisions are examined.
+/// every checkpoint of the current head. `binary_check` decides whether
+/// inline binary values are read in full or only resolved. At most
+/// `revision_limit` revisions are examined.
 pub fn check_consistency(
     directory: &std::path::Path,
     filter_paths: &[String],
-    check_binaries: bool,
+    binary_check: BinaryCheck,
     revision_limit: usize,
 ) -> Result<ConsistencyReport> {
     check_consistency_with_progress(
         directory,
         filter_paths,
-        check_binaries,
+        binary_check,
         revision_limit,
         &mut DiscardedProgress,
     )
@@ -117,7 +126,7 @@ pub fn check_consistency(
 pub fn check_consistency_with_progress(
     directory: &std::path::Path,
     filter_paths: &[String],
-    check_binaries: bool,
+    binary_check: BinaryCheck,
     revision_limit: usize,
     observer: &mut dyn ProgressObserver,
 ) -> Result<ConsistencyReport> {
@@ -189,7 +198,7 @@ pub fn check_consistency_with_progress(
                 &provider,
                 &super_root,
                 path_to_check,
-                check_binaries,
+                binary_check,
                 &mut nodes,
             ) {
                 Ok(()) => {
@@ -347,7 +356,7 @@ fn check_one_path(
     provider: &dyn SegmentProvider,
     super_root: &NodeState<'_>,
     path_to_check: &mut PathToCheck,
-    check_binaries: bool,
+    binary_check: BinaryCheck,
     progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<(), String> {
     let node = match resolve_path(super_root, &path_to_check.root, &path_to_check.path) {
@@ -359,7 +368,7 @@ fn check_one_path(
         match resolve_relative(&node, corrupt_path) {
             Ok(Some(corrupt_node)) => {
                 if let Err(reason) =
-                    check_node_shallow(provider, corrupt_node.record_identifier(), check_binaries)
+                    check_node_shallow(provider, corrupt_node.record_identifier(), binary_check)
                 {
                     return Err(format!(
                         "previously corrupt path {}: {reason}",
@@ -385,7 +394,7 @@ fn check_one_path(
         provider,
         node.record_identifier(),
         SubtreeChecks {
-            binaries: check_binaries,
+            binaries: binary_check,
             stable_identifiers: false,
         },
         progress,
@@ -437,11 +446,11 @@ fn display_relative(relative_path: &str) -> &str {
 fn check_node_shallow(
     provider: &dyn SegmentProvider,
     record: RecordIdentifier,
-    check_binaries: bool,
+    binary_check: BinaryCheck,
 ) -> std::result::Result<(), String> {
     let node = NodeState::new(provider, record);
     let properties = node.properties().map_err(|error| error.to_string())?;
-    if check_binaries {
+    if binary_check == BinaryCheck::EveryBlock {
         for property in &properties {
             match &property.values {
                 crate::content::node::PropertyValues::Single(value) => {
@@ -595,7 +604,7 @@ impl<'provider> NodeTreeVerifier<'provider> {
             self.provider,
             root,
             SubtreeChecks {
-                binaries: true,
+                binaries: BinaryCheck::EveryBlock,
                 stable_identifiers: true,
             },
             &mut self.verified_subtrees,
@@ -630,7 +639,7 @@ fn node_tree_error(corrupt: &CorruptLocation) -> Error {
 
 #[derive(Clone, Copy)]
 struct SubtreeChecks {
-    binaries: bool,
+    binaries: BinaryCheck,
     stable_identifiers: bool,
 }
 
@@ -844,7 +853,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::{NodeTreeVerifier, check_consistency, verify_node_tree};
+    use super::{BinaryCheck, NodeTreeVerifier, check_consistency, verify_node_tree};
     use crate::content::node::NodeState;
     use crate::content::provider::SegmentProvider;
     use crate::content::provider::tests::MemorySegmentProvider;
@@ -1009,8 +1018,13 @@ mod tests {
         write_content_revision(&directory.path, "first");
         write_content_revision(&directory.path, "second");
 
-        let report =
-            check_consistency(&directory.path, &["/content".to_owned()], true, 100).expect("check");
+        let report = check_consistency(
+            &directory.path,
+            &["/content".to_owned()],
+            BinaryCheck::EveryBlock,
+            100,
+        )
+        .expect("check");
         assert!(report.has_good_revision(), "a consistent revision exists");
         assert_eq!(report.head_paths.len(), 1);
         let verdict = &report.head_paths[0];
@@ -1028,8 +1042,13 @@ mod tests {
     fn a_missing_path_is_reported_without_a_good_revision() {
         let directory = TestDirectory::new("missing-path");
         write_content_revision(&directory.path, "only");
-        let report = check_consistency(&directory.path, &["/nonexistent".to_owned()], false, 100)
-            .expect("check");
+        let report = check_consistency(
+            &directory.path,
+            &["/nonexistent".to_owned()],
+            BinaryCheck::RecordsOnly,
+            100,
+        )
+        .expect("check");
         assert!(!report.has_good_revision());
         assert!(report.overall_revision.is_none());
         let verdict = &report.head_paths[0];
@@ -1049,7 +1068,7 @@ mod tests {
         let report = check_consistency(
             &directory.path,
             &["/content".to_owned(), "/nonexistent".to_owned()],
-            false,
+            BinaryCheck::RecordsOnly,
             100,
         )
         .expect("check");
@@ -1071,7 +1090,8 @@ mod tests {
             crate::writer::commit::create_checkpoint(&store, 10_000_000, &[]).expect("checkpoint");
             store.close().expect("close");
         }
-        let report = check_consistency(&directory.path, &[], true, 100).expect("check");
+        let report =
+            check_consistency(&directory.path, &[], BinaryCheck::EveryBlock, 100).expect("check");
         assert!(report.has_good_revision());
         assert_eq!(report.checkpoints.len(), 1, "the checkpoint is expanded");
         assert_eq!(report.head_paths[0].path, "/");

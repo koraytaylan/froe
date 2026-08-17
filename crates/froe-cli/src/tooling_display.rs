@@ -16,7 +16,7 @@ use froe::tooling::diff::{NodeDifference, PropertyChange};
 use froe::tooling::digest::{DigestSummary, compare_digests, digest_repository};
 use froe::tooling::search::SearchQuery;
 use froe::tooling::{
-    check_consistency_with_progress, diff_revisions_with_progress, dump_segment,
+    BinaryCheck, check_consistency_with_progress, diff_revisions_with_progress, dump_segment,
     node_history_with_progress, search_nodes_visiting,
 };
 
@@ -239,14 +239,14 @@ fn oak_property_type_name(property_type: froe::PropertyType, is_multiple: bool) 
 pub(crate) fn print_check(
     repository: &Path,
     paths: &[String],
-    check_binaries: bool,
+    binary_check: BinaryCheck,
     revision_limit: usize,
     reporter: &Reporter,
 ) -> froe::Result<bool> {
     let report = check_consistency_with_progress(
         repository,
         paths,
-        check_binaries,
+        binary_check,
         revision_limit,
         &mut reporter.clone(),
     )?;

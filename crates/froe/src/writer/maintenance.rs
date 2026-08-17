@@ -1938,7 +1938,7 @@ fn build_plan_collecting(
     // the code instead of a coincidence between two constants.
     let reclaim_rule = ReclaimRule {
         reference: reference_generation,
-        full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+        kind: CompactionKind::Full,
         retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
     };
     let mut current_closure = HashSet::new();
@@ -1989,7 +1989,7 @@ fn build_plan_collecting(
                     &repository,
                     ReclaimRule {
                         reference: reference_generation,
-                        full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+                        kind: CompactionKind::Full,
                         retained_generations: i32::MAX,
                     },
                     current_head.segment,
@@ -2026,7 +2026,7 @@ fn build_plan_collecting(
                         &repository,
                         ReclaimRule {
                             reference: target,
-                            full: kind == CompactionKind::Full,
+                            kind,
                             retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
                         },
                         &shared,
@@ -3602,7 +3602,7 @@ fn validate_reclaim_reference_invariant(
                 ),
             });
         }
-        if is_reclaimable(rule.reference, header, rule.full, rule.retained_generations) {
+        if is_reclaimable(rule.reference, header, rule.kind, rule.retained_generations) {
             return Err(Error::InvalidFormat {
                 details: format!(
                     "current head reaches data segment {identifier} in reclaimable generation {header:?}; refusing to trust generation cleanup"
@@ -4083,7 +4083,7 @@ fn apply_compaction_phase(
                 crate::writer::store_writer::GenerationReclaimRequest {
                     rule: ReclaimRule {
                         reference: target_generation,
-                        full: kind == CompactionKind::Full,
+                        kind,
                         retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
                     },
                     rewrite_policy,
@@ -4172,7 +4172,7 @@ fn apply_prepared(
             &directory,
             ReclaimRule {
                 reference: plan.reference_generation,
-                full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+                kind: CompactionKind::Full,
                 retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
             },
             plan.current_head.segment,
@@ -4226,7 +4226,7 @@ fn apply_prepared(
                     &directory,
                     ReclaimRule {
                         reference: plan.reference_generation,
-                        full: crate::writer::store_writer::FULL_GARBAGE_COLLECTION,
+                        kind: CompactionKind::Full,
                         retained_generations: i32::MAX,
                     },
                     plan.current_head.segment,

@@ -683,7 +683,7 @@ pub(crate) fn compact_with_progress(
             store.reclaim_old_generations_with(GenerationReclaimRequest {
                 rule: ReclaimRule {
                     reference: target_generation,
-                    full: kind == CompactionKind::Full,
+                    kind,
                     retained_generations: RETAINED_GENERATIONS,
                 },
                 rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,

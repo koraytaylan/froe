@@ -26,7 +26,7 @@ pub use archive_debug::{
     debug_archive, debug_archive_with_options,
 };
 pub use check::{
-    ConsistencyReport, NodeTreeVerifier, PathVerdict, check_consistency,
+    BinaryCheck, ConsistencyReport, NodeTreeVerifier, PathVerdict, check_consistency,
     check_consistency_with_progress, verify_node_tree,
 };
 pub use diff::{
