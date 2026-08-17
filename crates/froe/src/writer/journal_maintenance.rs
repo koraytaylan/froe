@@ -233,6 +233,38 @@ pub(crate) fn rewrite_journal_atomically(
         StagingAccess::Read,
         "journal recovery backup",
     )?;
+    // The staged replacement and the recovery backup are re-proven at every
+    // fault boundary below. Naming the two shapes keeps five occurrences from
+    // drifting apart, and keeps the pre-rename path (the temporary) visibly
+    // distinct from the post-rename one (the journal itself).
+    let recertify_staged_replacement = || -> Result<()> {
+        temporary_certificate.recertify(
+            &temporary_path,
+            &output,
+            StagingAccess::ReadAppend,
+            "staged journal replacement",
+        )?;
+        backup_certificate.recertify(
+            &backup_path,
+            &snapshot.source_bytes,
+            StagingAccess::Read,
+            "journal recovery backup",
+        )
+    };
+    let recertify_installed_replacement = || -> Result<()> {
+        temporary_certificate.recertify(
+            &snapshot.path,
+            &output,
+            StagingAccess::ReadAppend,
+            "installed journal replacement",
+        )?;
+        backup_certificate.recertify(
+            &backup_path,
+            &snapshot.source_bytes,
+            StagingAccess::Read,
+            "journal recovery backup",
+        )
+    };
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed("journal.backup-file-durable")?;
     #[cfg(test)]
@@ -246,18 +278,7 @@ pub(crate) fn rewrite_journal_atomically(
     crate::writer::maintenance_fault_injection::fail_if_armed(
         "journal.after-pre-rename-directory-sync",
     )?;
-    temporary_certificate.recertify(
-        &temporary_path,
-        &output,
-        StagingAccess::ReadAppend,
-        "staged journal replacement",
-    )?;
-    backup_certificate.recertify(
-        &backup_path,
-        &snapshot.source_bytes,
-        StagingAccess::Read,
-        "journal recovery backup",
-    )?;
+    recertify_staged_replacement()?;
     backup_guard.commit();
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed(
@@ -276,31 +297,9 @@ pub(crate) fn rewrite_journal_atomically(
         StagingAccess::Read,
         "source journal",
     )?;
-    temporary_certificate.recertify(
-        &temporary_path,
-        &output,
-        StagingAccess::ReadAppend,
-        "staged journal replacement",
-    )?;
-    backup_certificate.recertify(
-        &backup_path,
-        &snapshot.source_bytes,
-        StagingAccess::Read,
-        "journal recovery backup",
-    )?;
+    recertify_staged_replacement()?;
     std::fs::rename(&temporary_path, &snapshot.path)?;
-    temporary_certificate.recertify(
-        &snapshot.path,
-        &output,
-        StagingAccess::ReadAppend,
-        "installed journal replacement",
-    )?;
-    backup_certificate.recertify(
-        &backup_path,
-        &snapshot.source_bytes,
-        StagingAccess::Read,
-        "journal recovery backup",
-    )?;
+    recertify_installed_replacement()?;
     drop(source_certificate);
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed("journal.after-rename")?;
@@ -313,47 +312,14 @@ pub(crate) fn rewrite_journal_atomically(
     crate::writer::maintenance_fault_injection::fail_if_armed(
         "journal.before-post-rename-directory-sync",
     )?;
-    temporary_certificate.recertify(
-        &snapshot.path,
-        &output,
-        StagingAccess::ReadAppend,
-        "installed journal replacement",
-    )?;
-    backup_certificate.recertify(
-        &backup_path,
-        &snapshot.source_bytes,
-        StagingAccess::Read,
-        "journal recovery backup",
-    )?;
+    recertify_installed_replacement()?;
     sync_directory_strict(directory)?;
-    temporary_certificate.recertify(
-        &snapshot.path,
-        &output,
-        StagingAccess::ReadAppend,
-        "installed journal replacement",
-    )?;
-    backup_certificate.recertify(
-        &backup_path,
-        &snapshot.source_bytes,
-        StagingAccess::Read,
-        "journal recovery backup",
-    )?;
+    recertify_installed_replacement()?;
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed(
         "journal.after-post-rename-directory-sync",
     )?;
-    temporary_certificate.recertify(
-        &snapshot.path,
-        &output,
-        StagingAccess::ReadAppend,
-        "installed journal replacement",
-    )?;
-    backup_certificate.recertify(
-        &backup_path,
-        &snapshot.source_bytes,
-        StagingAccess::Read,
-        "journal recovery backup",
-    )?;
+    recertify_installed_replacement()?;
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::crash_if_armed("journal.rename-durable");
 
