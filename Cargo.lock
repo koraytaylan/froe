@@ -232,7 +232,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "froe"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "memmap2",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "froe-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clap",
  "froe",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "froe-export"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "froe",
  "parquet",

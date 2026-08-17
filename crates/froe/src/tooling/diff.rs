@@ -589,6 +589,96 @@ mod tests {
         format!("{}:{}", head.segment, head.record_number as i32)
     }
 
+    /// Writes a revision whose content is one chain `levels` deep, with the
+    /// deepest node carrying `title`, and returns its revision string.
+    fn write_deep_revision(directory: &std::path::Path, title: &str, levels: usize) -> String {
+        let store = WritableRepository::open(directory).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let value = writer.write_string(title).expect("value");
+        let mut node = writer
+            .write_node(
+                Some("nt:unstructured"),
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[PropertyToWrite {
+                    name: "title".to_owned(),
+                    property_type: crate::content::property::PropertyType::String,
+                    values: PropertyValuesToWrite::Single(value),
+                }],
+            )
+            .expect("deepest");
+        for _ in 0..levels {
+            node = writer
+                .write_node(
+                    Some("nt:unstructured"),
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "down".to_owned(),
+                        node,
+                    },
+                    &[],
+                )
+                .expect("level");
+        }
+        let root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "content".to_owned(),
+                    node,
+                },
+                &[],
+            )
+            .expect("root");
+        let head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: root,
+                },
+                &[],
+            )
+            .expect("super root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, head));
+        store.close().expect("close");
+        format!("{}:{}", head.segment, head.record_number as i32)
+    }
+
+    #[test]
+    fn a_tree_deeper_than_any_call_stack_diffs_whole() {
+        // On the 2 MiB stack a spawned thread gets by default. The diff used
+        // to recurse twice a level and overflowed here around 1600.
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let directory = TestDirectory::new("deep-chain");
+                let before = write_deep_revision(&directory.path, "original", 60_000);
+                let after = write_deep_revision(&directory.path, "changed", 60_000);
+                let differences = diff_revisions(&directory.path, &before, &after, "/")
+                    .expect("a deep diff completes rather than aborting");
+                // The chains are identical except for the title on the
+                // deepest node, so exactly one difference is correct — and
+                // reaching it means the walk descended the whole chain and
+                // built the path the whole way down.
+                let [NodeDifference::PropertyChanged { path, .. }] = differences.as_slice() else {
+                    panic!("expected one property change, got {differences:?}");
+                };
+                assert_eq!(
+                    path.matches('/').count(),
+                    60_001,
+                    "the change is reported at the bottom of the chain, at {path}"
+                );
+            })
+            .expect("spawn");
+        handle.join().expect("the walk stays off the call stack");
+    }
+
     #[test]
     fn detects_property_and_child_changes() {
         let directory = TestDirectory::new("changes");

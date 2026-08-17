@@ -400,6 +400,73 @@ mod tests {
         }
     }
 
+    /// Writes a store whose content tree is one chain `levels` deep.
+    fn populate_deep_chain(directory: &std::path::Path, levels: usize) {
+        let store = WritableRepository::open(directory).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let mut node = writer
+            .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+            .expect("leaf");
+        for _ in 0..levels {
+            node = writer
+                .write_node(
+                    Some("nt:unstructured"),
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "down".to_owned(),
+                        node,
+                    },
+                    &[],
+                )
+                .expect("level");
+        }
+        let root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node,
+                },
+                &[],
+            )
+            .expect("root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, root));
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn a_tree_deeper_than_any_call_stack_traverses_whole() {
+        // On the 2 MiB stack a spawned thread gets by default. The walk has
+        // no depth limit, so the only thing that could refuse this tree is
+        // running out of memory for its own stack.
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let directory = TestDirectory::new("deep-chain");
+                populate_deep_chain(&directory.path, 100_000);
+                let repository = Repository::open(&directory.path).expect("reader");
+                let root = repository
+                    .node_at_path("/")
+                    .expect("resolve")
+                    .expect("present");
+                let mut traversal = DepthFirstTraversal::new(root, "/", None);
+                let mut visited = 0usize;
+                while traversal.next_node().expect("no depth limit").is_some() {
+                    visited += 1;
+                }
+                assert!(
+                    visited > 100_000,
+                    "the whole chain is visited, saw {visited}"
+                );
+            })
+            .expect("spawn");
+        handle.join().expect("the walk stays off the call stack");
+    }
+
     /// Writes a store whose content tree is `/content/{a, b/c}`.
     fn populate(directory: &std::path::Path) {
         let store = WritableRepository::open(directory).expect("open");

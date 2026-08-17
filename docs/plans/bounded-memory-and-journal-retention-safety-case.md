@@ -1,19 +1,21 @@
 # Safety case: bounded memory and `--retain-journal-revisions`
 
 The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for the
-range `bdcbe55..HEAD`, extended after `v0.8.0` by three further write-path
-changes: record reuse in the writer, binary value sharing in compaction, and an
-exact compaction sharing memo replacing the evicting one. In scope on three counts: it adds a task that makes
-repository bytes unreachable by design (`--retain-journal-revisions`), it
-rewrites how a write session holds and certifies what it wrote, and it
-*loosens* a refusal on the destructive path — the last reaching the default
-`--task segments` behaviour, not only the new flag.
+range `bdcbe55..HEAD`, extended after `v0.8.0` by record reuse in the writer,
+binary value sharing in compaction, an exact compaction sharing memo replacing
+the evicting one, and the removal of every depth limit — which rewrote all six
+walks over records from recursion to an explicit heap stack. In scope on four
+counts: it adds a task that makes repository bytes unreachable by design
+(`--retain-journal-revisions`), it rewrites how a write session holds and
+certifies what it wrote, it *loosens* a refusal on the destructive path — the
+last reaching the default `--task segments` behaviour, not only the new flag —
+and it changes how every walk terminates on a corrupt record graph.
 
 Covers `crates/froe/src/cache.rs`, `crates/froe/src/store.rs`,
+`crates/froe/src/content/{map,traversal}.rs`,
 `crates/froe/src/tar_archive/archive.rs`, `crates/froe/src/tooling/{check,diff,search}.rs`,
 `crates/froe/src/writer/{backup,cleanup,compaction,store_writer}.rs`, and
-`crates/froe-export/src/{refresh,sqlite}.rs` as of the commit introducing this
-file.
+`crates/froe-export/src/{refresh,sqlite}.rs`.
 
 ## Scope and retention
 
@@ -222,8 +224,16 @@ baseline tree after full compaction, tail compaction, all three checkpoint
 removals, and cleanup, and after `repair` with Oak's own JVM killed by
 `SIGKILL` while holding an archive. `backup` and `recover` passed.
 
-Re-verified twice after `v0.8.0` for the later write-path changes, most
-importantly binary value sharing: `compact` and `compact --tail` passed with
+Re-verified after every depth limit was removed and all six walks were
+rewritten to carry their own stack. Every phase passed against real Oak, and
+each boot asserted Oak logged none of its repair messages — so Oak consumed
+the store as the rewritten compactor wrote it, rather than reconstructing it.
+That run is the load-bearing evidence for the walk rewrites: the exact sharing
+memo changes which records a compacted store contains, and only Oak reading it
+back can show the result is the store Oak expects.
+
+Re-verified twice before that, after `v0.8.0`, for the earlier write-path
+changes, most importantly binary value sharing: `compact` and `compact --tail` passed with
 sharing active, so Oak served the exact baseline tree from bulk segments froe
 referenced rather than rewrote. That run also replaced the `cleanup` phase's
 reclaimable condition, which had built itself by restoring the pre-compaction
@@ -253,11 +263,11 @@ x86-64 host; MSRV `1.89.0` from `Cargo.toml`.
 | --- | --- |
 | `cargo +1.89.0 fmt --all -- --check` | 0 |
 | `cargo +1.89.0 clippy --workspace --all-targets --all-features -- -D warnings` | 0 |
-| `cargo +1.89.0 test --workspace --all-features --release --no-fail-fast` | 0 |
+| `cargo +1.89.0 test --workspace --all-features --release --no-fail-fast` | 0, 683 tests |
 | `RUSTDOCFLAGS="-D warnings" cargo +1.89.0 doc --workspace --all-features --no-deps` | 0 (failed first run on a dangling intra-doc link; fixed in `83a3ad0`) |
 | `RUSTFLAGS="-D warnings" cargo +1.89.0 check -p froe --all-targets --all-features --target i686-unknown-linux-gnu` | 0 |
-| `cargo test --workspace --all-features` (stable) | 0, 672 tests |
-| `cargo test -p froe-cli --features interop -- --ignored --test-threads=1 interop_full` | 0 (chain including the `journal_retention` phase) |
+| `cargo test --workspace` (stable) | 0, 681 tests |
+| `cargo test -p froe-cli --features interop -- --ignored --test-threads=1 interop_full` | 0, every phase, 376 s |
 
 Separations the guide asks for explicitly: everything above is **execution**,
 not cross-compilation, except the i686 row, which is a **compile-only width
