@@ -202,6 +202,10 @@ Difference from `writeString`: the binary path writes the final partial chunk as
 
 `writeStream` wrapper (lines 624–655): if the stream is a `SegmentStream` of this store (`getRecordIdIfAvailable`) and its id is **not** old-generation, return the id unchanged; if old-generation and the stream has `blockIds` (i.e. is a block-list stream, not an inline value), re-emit only the head: `writeValueRecord(segmentStream.getLength(), writeList(blockIds))` — **bulk segments are re-linked, never rewritten, across compaction**. Otherwise fully serialize. The stream is always closed; a close failure after success is only logged.
 
+> **The "of this store" qualifier is load-bearing, not incidental.** Both this wrapper and `writeBlob` (§3.7) gate re-linking on the stream belonging to the *same* store — `getRecordIdIfAvailable` returns nothing for a `SegmentStream` from another store, so a cross-store copy falls through to full serialization. Re-linking is a statement about reachability *within one store*: a reference from the new generation is what keeps a bulk segment alive there, and there alone.
+>
+> froe's port originally reproduced the generation half of that rule and dropped the store half, keying only on whether the block already lived in a bulk segment. Compaction was unaffected — it is same-store by construction — but `backup` and `restore` share the copier, and a reference into the *source's* bulk segments resolves to nothing in the target. The result was a backup holding the whole content tree and none of the binary content. `BulkBlockSharing` now makes the store boundary explicit at the call site rather than implicit in the segment kind; see the `backup` phase in [`interop.md`](../interop.md) for why every other check passed.
+
 ### 3.6 External blob ids — `writeBlobId` (`DefaultSegmentWriter.java:603–614`) + `SmallBlobIdWriter`/`LargeBlobIdWriter` (`RecordWriters.java:386–430`)
 
 ```

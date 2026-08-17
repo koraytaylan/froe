@@ -37,8 +37,8 @@ pub use commit::{
     replace_content_root,
 };
 pub use compaction::{
-    CompactionKind, deep_copy_super_root_with_progress, deep_copy_tree,
-    deep_copy_tree_with_progress,
+    CompactionKind, deep_copy_super_root_sharing, deep_copy_super_root_with_progress,
+    deep_copy_tree, deep_copy_tree_across_stores_with_progress, deep_copy_tree_with_progress,
 };
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};
 pub use maintenance::{
@@ -48,8 +48,8 @@ pub use maintenance::{
     plan_compaction_with_progress,
 };
 pub use record_writer::{
-    ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
-    sort_properties_for_template,
+    BulkBlockSharing, ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter,
+    SegmentSink, sort_properties_for_template,
 };
 pub use repository_lock::RepositoryLock;
 pub use segment_builder::{

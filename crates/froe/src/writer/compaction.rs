@@ -36,8 +36,8 @@ use crate::progress::{DiscardedProgress, ProgressObserver};
 use crate::progress::{Step, WorkUnit};
 use crate::segment::record::RecordIdentifier;
 use crate::writer::record_writer::{
-    ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
-    sort_properties_for_template,
+    BulkBlockSharing, ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter,
+    SegmentSink, sort_properties_for_template,
 };
 use crate::writer::segment_builder::GarbageCollectionGeneration;
 #[cfg(test)]
@@ -115,6 +115,33 @@ pub fn deep_copy_tree_with_progress<Sink: SegmentSink>(
     )
 }
 
+/// Deep-copies a tree from one store into a **different** one, copying
+/// every binary block rather than referencing bulk segments in place.
+///
+/// This is what backup and restore need. Using the same-store copy for
+/// them produces a target that opens, serves its whole content tree, and
+/// passes a consistency check that does not read binaries — while the
+/// binaries themselves stayed behind in the source.
+///
+/// # Panics
+///
+/// Panics on the same copy-once violations as [`deep_copy_tree_with_progress`].
+pub fn deep_copy_tree_across_stores_with_progress<Sink: SegmentSink>(
+    source: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    source_root: RecordIdentifier,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(RecordIdentifier, u64)> {
+    deep_copy_super_root_sharing(
+        source,
+        writer,
+        source_root,
+        &std::collections::BTreeSet::new(),
+        BulkBlockSharing::AcrossStores,
+        observer,
+    )
+}
+
 /// Deep-copies a super-root, omitting the named checkpoints.
 ///
 /// A checkpoint a maintenance run retires is never entered, so neither its
@@ -140,11 +167,39 @@ pub fn deep_copy_super_root_with_progress<Sink: SegmentSink>(
     omitted_checkpoints: &std::collections::BTreeSet<String>,
     observer: &mut dyn ProgressObserver,
 ) -> Result<(RecordIdentifier, u64)> {
+    deep_copy_super_root_sharing(
+        source,
+        writer,
+        super_root,
+        omitted_checkpoints,
+        BulkBlockSharing::WithinOneStore,
+        observer,
+    )
+}
+
+/// Deep-copies a super-root with an explicit bulk-block sharing mode.
+///
+/// Every copy that crosses a store boundary must pass
+/// [`BulkBlockSharing::AcrossStores`], or the result references bulk
+/// segments that exist only in the source.
+///
+/// # Panics
+///
+/// Panics on the same copy-once violations as [`deep_copy_tree_with_progress`].
+pub fn deep_copy_super_root_sharing<Sink: SegmentSink>(
+    source: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    super_root: RecordIdentifier,
+    omitted_checkpoints: &std::collections::BTreeSet<String>,
+    bulk_sharing: BulkBlockSharing,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(RecordIdentifier, u64)> {
     let source_root = super_root;
     let mut copier = Compactor {
         source,
         writer,
         omitted_checkpoints,
+        bulk_sharing,
         segments: SegmentInterner::new(),
         rewritten_nodes: RewrittenNodes::new(),
         nodes_on_path: std::collections::HashSet::new(),
@@ -282,6 +337,8 @@ impl RewrittenNodes {
 struct Compactor<'writer, Sink: SegmentSink> {
     source: &'writer dyn SegmentProvider,
     writer: &'writer mut RecordWriter<Sink>,
+    /// Whether bulk blocks may be referenced in place or must be copied.
+    bulk_sharing: BulkBlockSharing,
     /// Children of the super-root's `checkpoints` container this copy never
     /// enters. Empty for every copy that is not a maintenance run's.
     omitted_checkpoints: &'writer std::collections::BTreeSet<String>,
@@ -516,8 +573,11 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
                     // Copy the binary streaming, block by block, so a
                     // multi-gigabyte inline binary never has to fit in
                     // memory at once.
-                    self.writer
-                        .copy_binary_value(self.source, *record_identifier)
+                    self.writer.copy_binary_value_with_sharing(
+                        self.source,
+                        *record_identifier,
+                        self.bulk_sharing,
+                    )
                 }
                 _ => Err(Error::InvalidFormat {
                     details: "binary property did not decode to a binary value".to_owned(),

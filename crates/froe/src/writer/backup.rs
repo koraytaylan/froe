@@ -30,7 +30,7 @@ use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::RecordIdentifier;
 use crate::store::Repository;
-use crate::writer::compaction::deep_copy_tree_with_progress;
+use crate::writer::compaction::deep_copy_tree_across_stores_with_progress;
 use crate::writer::repository_lock::RepositoryLock;
 use crate::writer::segment_builder::GarbageCollectionGeneration;
 use crate::writer::store_writer::WritableRepository;
@@ -93,6 +93,14 @@ pub fn restore_with_progress(
 /// stamps `sourceHead.getSegmentId().getGcGeneration()` verbatim, and a
 /// later Java cleanup pass reclaims by generation distance, so an
 /// invented triple could make it delete segments the head still needs.
+///
+/// Both callers cross a store boundary, so the copy must carry every
+/// binary block rather than re-linking bulk segments where they lie. That
+/// re-linking is correct only within one store: it is what keeps a bulk
+/// segment reachable across a compaction, and it is meaningless when the
+/// target is a different directory, where the reference resolves to
+/// nothing. Getting it wrong is silent — the target opens, serves its
+/// whole content tree, and holds no binary content.
 fn copy_head_between(
     source: &Repository,
     source_head: RecordIdentifier,
@@ -105,7 +113,9 @@ fn copy_head_between(
     let (new_head, _) = crate::progress::observe(
         observer,
         &Step::new("copying nodes", WorkUnit::Nodes),
-        |observer| deep_copy_tree_with_progress(source, &mut writer, source_head, observer),
+        |observer| {
+            deep_copy_tree_across_stores_with_progress(source, &mut writer, source_head, observer)
+        },
     )?;
     writer.finish()?;
     target.replace_head(new_head);
@@ -871,6 +881,128 @@ mod tests {
         );
         // The source is untouched and still readable.
         assert_content(&source.path, "Backup Source");
+    }
+
+    /// A binary long enough that its blocks land in a bulk segment, which
+    /// is the only shape that distinguishes copying from referencing.
+    ///
+    /// Blocks are 4 KiB and a full 256 KiB run becomes a bulk segment, so
+    /// this is comfortably over that threshold.
+    const BULK_BINARY_BYTES: usize = 1024 * 1024;
+
+    fn bulk_binary_content() -> Vec<u8> {
+        (0..BULK_BINARY_BYTES)
+            .map(|index| (index % 251) as u8)
+            .collect()
+    }
+
+    /// Writes a store whose head carries one binary big enough to occupy a
+    /// bulk segment.
+    fn populate_with_bulk_binary(directory: &std::path::Path) -> Vec<u8> {
+        let content = bulk_binary_content();
+        let store = WritableRepository::open(directory).expect("open the source");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let binary = writer
+            .write_binary_content(&content)
+            .expect("write the binary");
+        let resource = writer
+            .write_node(
+                Some("nt:resource"),
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[PropertyToWrite {
+                    name: "jcr:data".to_owned(),
+                    property_type: crate::content::property::PropertyType::Binary,
+                    values: PropertyValuesToWrite::Single(binary),
+                }],
+            )
+            .expect("write the resource");
+        let root = writer
+            .write_node(
+                Some("rep:root"),
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "file".to_owned(),
+                    node: resource,
+                },
+                &[],
+            )
+            .expect("write the root");
+        let checkpoints = writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("write the checkpoints container");
+        let super_root = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::Many(vec![
+                    ("root".to_owned(), root),
+                    ("checkpoints".to_owned(), checkpoints),
+                ]),
+                &[],
+            )
+            .expect("write the super-root");
+        writer.finish().expect("finish");
+        let previous = store.head();
+        assert!(store.set_head(previous, super_root), "advance the head");
+        store.close().expect("close");
+        content
+    }
+
+    #[test]
+    fn a_backup_carries_binary_content_that_lived_in_a_bulk_segment() {
+        // Compaction shares bulk-segment blocks by reference rather than
+        // copying them, because within one store a reference from the new
+        // generation is exactly what keeps a bulk segment alive. Backup
+        // used the same copy, and a reference into the *source's* bulk
+        // segments resolves to nothing in the target — so the backup came
+        // out holding the whole content tree and none of the binary.
+        //
+        // Nothing caught it, because the damage is invisible to everything
+        // short of reading the bytes back: the target opens, its node and
+        // property structure is complete, and a consistency check that
+        // only resolves binary records rather than reading them passes.
+        let source = TestDirectory::new("backup-bulk-source");
+        let target = TestDirectory::new("backup-bulk-target");
+        let content = populate_with_bulk_binary(&source.path);
+
+        backup(&source.path, &target.path).expect("backup");
+
+        // Read the binary back out of the target *alone*. Opening the
+        // source anywhere in this assertion would let the missing blocks
+        // resolve through it and hide the defect.
+        let repository = Repository::open(&target.path).expect("open the backup");
+        let resource = repository
+            .content_root()
+            .expect("content root")
+            .child_node("file")
+            .expect("read")
+            .expect("the file node is present");
+        let data = resource
+            .property("jcr:data")
+            .expect("read")
+            .expect("jcr:data is present");
+        let PropertyValues::Single(PropertyValue::Binary(binary)) = &data.values else {
+            panic!("jcr:data did not decode as a single binary: {data:?}");
+        };
+        let crate::content::value::BinaryValue::Inline {
+            record_identifier, ..
+        } = binary
+        else {
+            panic!("expected an inline binary, got {binary:?}");
+        };
+        let copied = crate::content::value::read_binary_content(&repository, *record_identifier)
+            .expect("the backup holds every block of the binary");
+        assert_eq!(
+            copied.len(),
+            content.len(),
+            "the backup holds the whole binary, not a prefix of it"
+        );
+        assert!(
+            copied == content,
+            "the binary in the backup is byte-identical to the source's"
+        );
     }
 
     #[test]

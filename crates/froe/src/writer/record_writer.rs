@@ -105,6 +105,23 @@ pub enum PropertyValuesToWrite {
     },
 }
 
+/// Whether a binary copy may leave bulk-segment blocks where they lie.
+///
+/// Oak shares bulk blocks by reference during compaction because bulk
+/// segments are reclaimed by reachability rather than by the generation
+/// predicate, so a reference from the new generation is exactly what keeps
+/// one alive. That is a property of one store, not of copying in general.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BulkBlockSharing {
+    /// Source and target are the same store, so a block already in a bulk
+    /// segment is referenced where it lies. This is compaction.
+    WithinOneStore,
+    /// Source and target are different stores, so every block is copied.
+    /// A reference into the source's bulk segments would not resolve in
+    /// the target. This is backup and restore.
+    AcrossStores,
+}
+
 /// The child node shape of a node to be written.
 pub enum ChildNodesToWrite {
     /// No children.
@@ -393,15 +410,34 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     }
 
     /// Copies an inline binary value from `source` into a fresh value
+    /// record, sharing bulk-segment blocks the way compaction does.
+    ///
+    /// Only correct when `source` and this writer's target are the **same
+    /// store**; see [`Self::copy_binary_value_with_sharing`].
+    pub fn copy_binary_value(
+        &mut self,
+        source: &dyn crate::content::provider::SegmentProvider,
+        source_value: RecordIdentifier,
+    ) -> Result<RecordIdentifier> {
+        self.copy_binary_value_with_sharing(source, source_value, BulkBlockSharing::WithinOneStore)
+    }
+
+    /// Copies an inline binary value from `source` into a fresh value
     /// record without holding the whole binary in memory: short and medium
     /// binaries are materialized (they are small by definition), while a
     /// long binary is streamed 4 KiB block at a time into new block
     /// records and indexed by a fresh list. This lets compaction and
     /// backup re-copy multi-gigabyte inline binaries in bounded memory.
-    pub fn copy_binary_value(
+    ///
+    /// `sharing` decides what happens to a block that already lives in a
+    /// bulk segment, and getting it wrong is silent: the copy succeeds, the
+    /// store opens, the content tree serves, and only reading the binary
+    /// back reveals that its blocks are not there.
+    pub fn copy_binary_value_with_sharing(
         &mut self,
         source: &dyn crate::content::provider::SegmentProvider,
         source_value: RecordIdentifier,
+        sharing: BulkBlockSharing,
     ) -> Result<RecordIdentifier> {
         let length = crate::content::value::read_value_length(source, source_value)?;
         if length < MEDIUM_VALUE_LIMIT as u64 {
@@ -436,7 +472,15 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
             // referencing bytes the same run then deletes. froe's own writer
             // puts blocks in data segments, so this is the path a
             // froe-authored store takes; an Oak-authored one shares.
-            if source_block.segment.is_bulk_segment() {
+            //
+            // All of that reasoning assumes one store. Copying *between*
+            // stores — backup and restore — has no such option: a reference
+            // to a bulk segment that lives only in the source resolves to
+            // nothing in the target, and the resulting backup boots, serves
+            // its content tree and passes a consistency check that does not
+            // read binaries, while having silently left the binaries behind.
+            if source_block.segment.is_bulk_segment() && sharing == BulkBlockSharing::WithinOneStore
+            {
                 block_identifiers.push(source_block);
                 continue;
             }
