@@ -265,7 +265,7 @@ fn populate(directory: &std::path::Path) {
         .expect("super root");
     writer.finish().expect("finish");
     let previous = store.head();
-    assert!(store.set_head(previous, head));
+    assert!(store.compare_and_set_head(previous, head));
     store.close().expect("close");
 }
 
@@ -1212,7 +1212,7 @@ fn revise(directory: &std::path::Path) {
         .expect("super root");
     writer.finish().expect("finish");
     let previous = store.head();
-    assert!(store.set_head(previous, head));
+    assert!(store.compare_and_set_head(previous, head));
     store.close().expect("close");
 }
 
@@ -1513,7 +1513,7 @@ fn a_removed_export_root_fails_like_a_missing_path() {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.close().expect("close");
     }
 

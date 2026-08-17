@@ -4102,7 +4102,7 @@ fn apply_compaction_phase(
     )?;
     writer.finish()?;
 
-    if !store.set_head(plan.current_head, new_head) {
+    if !store.compare_and_set_head(plan.current_head, new_head) {
         return Err(Error::InvalidFormat {
             details: "the head moved during the compaction phase".to_owned(),
         });
@@ -5728,7 +5728,7 @@ mod tests {
             )
             .expect("write cross-segment head");
         head_writer.finish().expect("finish head segment");
-        assert!(store.set_head(store.head(), new_head));
+        assert!(store.compare_and_set_head(store.head(), new_head));
         store.close().expect("close fixture writer");
 
         let repository = Repository::open(&directory.path).expect("open healthy fixture");
@@ -5793,7 +5793,7 @@ mod tests {
                 )
                 .expect("write new head");
             writer.finish().expect("finish new head segment");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close head writer");
         }
         let repository = Repository::open(&directory.path).expect("open healthy fixture");
@@ -5987,7 +5987,7 @@ mod tests {
             )
             .expect("write unrelated current head");
         head_writer.finish().expect("finish current head segment");
-        assert!(store.set_head(store.head(), head));
+        assert!(store.compare_and_set_head(store.head(), head));
         store.close().expect("close fixture writer");
         let before = file_bytes(&directory.path);
 
@@ -6351,7 +6351,7 @@ mod tests {
                 )
                 .expect("write current head");
             writer.finish().expect("finish current head segment");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close head writer");
             head
         };
@@ -7337,7 +7337,7 @@ mod tests {
             )
             .expect("malformed super-root");
         writer.finish().expect("finish");
-        assert!(store.set_head(store.head(), malformed_head));
+        assert!(store.compare_and_set_head(store.head(), malformed_head));
         store.close().expect("close");
 
         let result = plan_compaction(
@@ -8653,7 +8653,7 @@ mod tests {
                 )
                 .expect("new super root");
             writer.finish().expect("finish new head");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close new head writer");
             head
         };
@@ -8724,7 +8724,7 @@ mod tests {
                 )
                 .expect("new super root");
             writer.finish().expect("finish new head");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close new head writer");
             head
         };
@@ -8803,7 +8803,7 @@ mod tests {
                 )
                 .expect("super root");
             writer.finish().expect("finish head");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close mixed writer");
             head
         };
@@ -8908,7 +8908,7 @@ mod tests {
                 )
                 .expect("binary super root");
             writer.finish().expect("finish binary segments");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close binary writer");
         }
         // An independent generation-two head that reaches none of it.
@@ -8934,7 +8934,7 @@ mod tests {
                 )
                 .expect("new super root");
             writer.finish().expect("finish new head");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close new head writer");
         }
 
@@ -9149,7 +9149,7 @@ mod tests {
                 )
                 .expect("super root");
             writer.finish().expect("finish head segment");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.close().expect("close writer");
             head
         };
@@ -9346,7 +9346,7 @@ mod tests {
             )
             .expect("new super root");
         writer.finish().expect("finish");
-        assert!(store.set_head(store.head(), new_head));
+        assert!(store.compare_and_set_head(store.head(), new_head));
         store.close().expect("close");
         let before = file_bytes(&directory.path);
         let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);

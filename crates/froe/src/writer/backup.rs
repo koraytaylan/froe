@@ -396,7 +396,7 @@ fn is_fully_consistent(
     let Ok(Some(content_root)) = super_root.child_node("root") else {
         return false;
     };
-    if !probe_corrupt_paths(provider, &content_root, corrupt_memory) {
+    if !every_corrupt_path_verifies(provider, &content_root, corrupt_memory) {
         return false;
     }
     if let Err(corrupt_path) = verify_tree(provider, content_root.record_identifier(), &mut visited)
@@ -415,7 +415,7 @@ fn is_fully_consistent(
         let Ok(Some(snapshot_root)) = checkpoint.child_node("root") else {
             return false;
         };
-        if !probe_corrupt_paths(provider, &snapshot_root, corrupt_memory) {
+        if !every_corrupt_path_verifies(provider, &snapshot_root, corrupt_memory) {
             return false;
         }
         if let Err(corrupt_path) =
@@ -432,7 +432,7 @@ fn is_fully_consistent(
 /// insertion order: each must exist and pass a shallow check — a missing
 /// path counts as still corrupt (this candidate may simply predate the
 /// corrupted node), exactly like Java.
-fn probe_corrupt_paths(
+fn every_corrupt_path_verifies(
     provider: &dyn SegmentProvider,
     tree_root: &NodeState<'_>,
     corrupt_memory: &[String],
@@ -762,7 +762,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         create_checkpoint(&store, 10_000_000, &[]).expect("checkpoint");
         store.close().expect("close");
     }
@@ -829,7 +829,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         create_checkpoint(&store, 10_000_000, &[]).expect("checkpoint");
         store.close().expect("close");
     }
@@ -945,7 +945,10 @@ mod tests {
             .expect("write the super-root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, super_root), "advance the head");
+        assert!(
+            store.compare_and_set_head(previous, super_root),
+            "advance the head"
+        );
         store.close().expect("close");
         content
     }

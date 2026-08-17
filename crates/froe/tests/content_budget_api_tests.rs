@@ -12,7 +12,7 @@ fn bounded_content_budget_producers_are_publicly_callable() {
         let _ = traversal.next_node_with_scheduling_limits(1, 1, 1, 1);
     }
 
-    fn classify_budget_error(error: &froe::Error) -> bool {
+    fn is_budget_error(error: &froe::Error) -> bool {
         matches!(
             error,
             froe::Error::StringMaterializationBudgetExceeded { .. }
@@ -27,5 +27,5 @@ fn bounded_content_budget_producers_are_publicly_callable() {
     }
 
     let _ = call_bounded_readers;
-    let _ = classify_budget_error;
+    let _ = is_budget_error;
 }

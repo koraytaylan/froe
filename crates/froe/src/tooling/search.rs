@@ -295,7 +295,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.close().expect("close");
     }
 

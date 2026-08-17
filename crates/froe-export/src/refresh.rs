@@ -1356,7 +1356,7 @@ mod tests {
         let head = writer.child("root", root, &[]);
         writer.writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.close().expect("close");
     }
 
@@ -1371,9 +1371,9 @@ mod tests {
             let name = writer.property("name", PropertyType::String, "leaf");
             let leaf = writer.leaf(&[name]);
             let kept = writer.child("leaf", leaf, &[]);
-            let x = writer.leaf(&[]);
+            let x_node = writer.leaf(&[]);
             let flag = writer.property("flag", PropertyType::Boolean, "true");
-            let subtree = writer.child("x", x, &[flag]);
+            let subtree = writer.child("x", x_node, &[flag]);
             let title = writer.property("title", PropertyType::String, "Hello");
             let count = writer.property("count", PropertyType::Long, "42");
             let data = writer.binary("data", &[1, 2, 3]);
@@ -1395,8 +1395,8 @@ mod tests {
     /// byte-identical under a fresh record.
     fn populate_second(directory: &Path) {
         revise(directory, |writer| {
-            let x = writer.leaf(&[]);
-            let deep = writer.child("x", x, &[]);
+            let x_node = writer.leaf(&[]);
+            let deep = writer.child("x", x_node, &[]);
             let added = writer.child("deep", deep, &[]);
             let ratio = writer.property("ratio", PropertyType::Double, "2.5");
             let extra = writer.property("extra", PropertyType::String, "new");
@@ -1888,9 +1888,9 @@ mod tests {
             let ratio = writer.property("ratio", PropertyType::Double, "2.5");
             let jcr_content = writer.leaf(&[ratio]);
             let kept = writer.leaf(&[]);
-            let x = writer.leaf(&[]);
+            let x_node = writer.leaf(&[]);
             let flag = writer.property("flag", PropertyType::Boolean, "true");
-            let subtree = writer.child("x", x, &[flag]);
+            let subtree = writer.child("x", x_node, &[flag]);
             let title = writer.property("title", PropertyType::String, "Hello");
             let count = writer.property("count", PropertyType::Long, "42");
             let data = writer.binary("data", &[1, 2, 3]);

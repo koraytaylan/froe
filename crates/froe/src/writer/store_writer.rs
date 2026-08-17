@@ -610,7 +610,11 @@ impl WritableRepository {
     }
 
     /// Compare-and-set of the head. Returns whether the head moved.
-    pub fn set_head(&self, expected: RecordIdentifier, new_head: RecordIdentifier) -> bool {
+    pub fn compare_and_set_head(
+        &self,
+        expected: RecordIdentifier,
+        new_head: RecordIdentifier,
+    ) -> bool {
         let mut state = self.lock_write_state();
         if state.head == expected {
             state.head = new_head;
@@ -3406,7 +3410,7 @@ struct ArchiveCertificationPass<'pass> {
 impl ArchiveCertificationPass<'_> {
     /// Claims and certifies one archive. Returns `false` when nothing is
     /// left to claim, or when the pass has already failed.
-    fn certify_one(&self) -> bool {
+    fn certify_next_archive(&self) -> bool {
         use std::sync::atomic::Ordering;
 
         if self.failed.load(Ordering::Relaxed) {
@@ -3506,11 +3510,11 @@ fn certify_archives_in_parallel(
         |observer| {
             std::thread::scope(|scope| {
                 for _ in 1..workers {
-                    scope.spawn(|| while pass.certify_one() {});
+                    scope.spawn(|| while pass.certify_next_archive() {});
                 }
                 // This thread is the last worker, and the only one that may
                 // touch the observer.
-                while pass.certify_one() {
+                while pass.certify_next_archive() {
                     observer.step_advanced(crate::progress::count(
                         pass.certified.load(Ordering::Relaxed),
                     ));
@@ -7358,7 +7362,7 @@ mod tests {
             let previous = store.head();
             let write_generation = store.writing_generation().expect("write generation");
             let (head, child) = write_session_semantic_fixture(&store, write_generation);
-            assert!(store.set_head(previous, head));
+            assert!(store.compare_and_set_head(previous, head));
             store.close().expect("close blob-bearing source");
             child.segment
         };
@@ -7552,7 +7556,7 @@ mod tests {
             )
             .expect("write the super root");
         writer.finish().expect("finish the live segment");
-        assert!(store.set_head(store.head(), head));
+        assert!(store.compare_and_set_head(store.head(), head));
         store.flush().expect("flush");
         store.close().expect("close the fixture writer");
         (directory, live)
@@ -8032,7 +8036,7 @@ mod tests {
             .expect("node");
         writer.finish().expect("persist node");
         let invalid_head = RecordIdentifier::new(valid_node.segment, u32::MAX);
-        assert!(store.set_head(durable_head, invalid_head));
+        assert!(store.compare_and_set_head(durable_head, invalid_head));
 
         let error = store
             .flush()
@@ -8125,7 +8129,7 @@ mod tests {
         let generation = store.writing_generation().expect("generation");
         let (head, child) = write_session_semantic_fixture(&store, generation);
         rewrite_session_archive_with_foreign_payload(&store, child.segment);
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
 
         let error = store
             .flush()
@@ -8170,7 +8174,7 @@ mod tests {
             OmittedSessionTrailer::BinaryReferences => child.segment,
         };
         rewrite_session_archive_omitting_trailer(&store, target, omitted);
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
 
         let error = store
             .flush()
@@ -8259,7 +8263,7 @@ mod tests {
             "the fixture must put both segments in one archive in child-before-head order"
         );
         rewrite_session_archive_in_order(&store, &file_name, &[head.segment, child.segment]);
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
 
         let error = store
             .flush()
@@ -8322,7 +8326,7 @@ mod tests {
         std::fs::rename(&first, &temporary).expect("move first archive aside");
         std::fs::rename(&second, &first).expect("move second into first boundary");
         std::fs::rename(&temporary, &second).expect("move first into second boundary");
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
 
         let error = store
             .flush()
@@ -8400,7 +8404,7 @@ mod tests {
         );
         drop(fresh);
 
-        assert!(store.set_head(durable_head, head));
+        assert!(store.compare_and_set_head(durable_head, head));
         store
             .flush()
             .expect("lazy session certification ignores unreachable malformed base segments");
@@ -8433,7 +8437,7 @@ mod tests {
         let previous = store.head();
         let reference = generation(2, 2, true);
         let (head, child) = write_session_semantic_fixture(&store, reference);
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.flush().expect("commit compacted fixture head");
         let journal_before = std::fs::read(&journal_path).expect("committed journal");
         let target = match omitted {
@@ -8493,7 +8497,7 @@ mod tests {
         let reference = generation(2, 2, true);
         let previous = store.head();
         let (head, _) = write_session_semantic_fixture(&store, reference);
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.flush().expect("commit compacted fixture head");
         store
             .finalized_session_semantic_validations
@@ -8526,7 +8530,7 @@ mod tests {
         let previous = store.head();
         let generation = store.writing_generation().expect("write generation");
         let (head, _) = write_session_semantic_fixture(&store, generation);
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store
             .finalized_session_semantic_validations
             .store(0, Ordering::Relaxed);
@@ -8591,7 +8595,7 @@ mod tests {
             store.lock_write_state().tar_writer.is_none(),
             "the tiny threshold exercises the rotation close path"
         );
-        assert!(store.set_head(previous_head, new_head));
+        assert!(store.compare_and_set_head(previous_head, new_head));
         store.flush().expect("validate then commit prepared head");
 
         let created_metadata =
@@ -8757,7 +8761,7 @@ mod tests {
             .expect("compacted node");
         writer.finish().expect("persist compacted node");
         let invalid_head = RecordIdentifier::new(valid_node.segment, u32::MAX);
-        assert!(store.set_head(store.head(), invalid_head));
+        assert!(store.compare_and_set_head(store.head(), invalid_head));
         store
             .flush()
             .expect("normal commit exposes the deliberately invalid test head");
@@ -9122,7 +9126,10 @@ mod tests {
                 .expect("super root");
             writer.finish().expect("finish");
             let previous = store.head();
-            assert!(store.set_head(previous, head), "compare and set succeeds");
+            assert!(
+                store.compare_and_set_head(previous, head),
+                "compare and set succeeds"
+            );
             store.close().expect("close");
         }
         let repository = Repository::open(&directory.path).expect("reader opens");

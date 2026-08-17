@@ -324,7 +324,7 @@ fn write_wide_production_fixture(directory: &std::path::Path, property_count: us
         )
         .expect("super root");
     writer.finish().expect("finish writer");
-    assert!(store.set_head(store.head(), head));
+    assert!(store.compare_and_set_head(store.head(), head));
     store.close().expect("close writer");
 }
 
@@ -356,7 +356,7 @@ fn write_deep_wide_production_fixture(directory: &std::path::Path) {
             .expect("branch");
     }
     writer.finish().expect("finish writer");
-    assert!(store.set_head(store.head(), chain));
+    assert!(store.compare_and_set_head(store.head(), chain));
     store.close().expect("close writer");
 }
 
@@ -381,7 +381,7 @@ fn write_deep_shared_name_production_fixture(directory: &std::path::Path) {
             .expect("chain node");
     }
     writer.finish().expect("finish writer");
-    assert!(store.set_head(store.head(), chain));
+    assert!(store.compare_and_set_head(store.head(), chain));
     store.close().expect("close writer");
 }
 
@@ -427,7 +427,7 @@ fn write_long_scalar_production_fixture(directory: &std::path::Path) {
         )
         .expect("super root");
     writer.finish().expect("finish writer");
-    assert!(store.set_head(store.head(), head));
+    assert!(store.compare_and_set_head(store.head(), head));
     store.close().expect("close writer");
 }
 
@@ -492,7 +492,7 @@ fn write_rendering_production_fixture(directory: &std::path::Path, array_size: u
         )
         .expect("super root");
     writer.finish().expect("finish writer");
-    assert!(store.set_head(store.head(), head));
+    assert!(store.compare_and_set_head(store.head(), head));
     store.close().expect("close writer");
 }
 

@@ -169,7 +169,7 @@ fn write_binary_heavy_churned_store(directory: &Path) -> RecordIdentifier {
     }
     writer.finish().expect("finish the writer");
     let head = last_head.expect("at least one revision was written");
-    assert!(store.set_head(store.head(), head));
+    assert!(store.compare_and_set_head(store.head(), head));
     store.flush().expect("flush the store");
     store.close().expect("close the store");
     head
@@ -445,7 +445,7 @@ fn a_dry_run_plan_predicts_exactly_the_archives_the_run_sweeps() {
             )
             .expect("write the super root");
         writer.finish().expect("finish");
-        assert!(store.set_head(store.head(), head));
+        assert!(store.compare_and_set_head(store.head(), head));
         store.flush().expect("flush");
         store.close().expect("close");
     }
@@ -519,7 +519,7 @@ fn an_interrupted_compaction_is_retired_by_the_next_run() {
     write_binary_heavy_churned_store(&directory.path);
     let archives_before = archive_file_names(&directory.path);
 
-    // Exactly the state a kill after `writer.finish()` and before `set_head`
+    // Exactly the state a kill after `writer.finish()` and before `compare_and_set_head`
     // produces: a complete compacted generation on disk that no head names.
     {
         let store = WritableRepository::open(&directory.path).expect("open for the abandoned copy");
@@ -533,7 +533,7 @@ fn an_interrupted_compaction_is_retired_by_the_next_run() {
         froe::writer::deep_copy_tree(&store, &mut writer, head)
             .expect("copy the head into the abandoned generation");
         writer.finish().expect("finish the abandoned copy");
-        // Deliberately no set_head: this is the interruption.
+        // Deliberately no compare_and_set_head: this is the interruption.
         store.close().expect("close after the abandoned copy");
     }
     let archives_with_residue = archive_file_names(&directory.path);
@@ -615,7 +615,7 @@ fn a_head_reaching_a_reclaimable_generation_is_refused_without_mutation() {
             )
             .expect("write the super root");
         newer.finish().expect("finish the newer generation");
-        assert!(store.set_head(store.head(), head));
+        assert!(store.compare_and_set_head(store.head(), head));
         store.flush().expect("flush");
         store.close().expect("close");
     }

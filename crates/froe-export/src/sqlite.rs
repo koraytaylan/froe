@@ -415,8 +415,8 @@ impl SqliteSink {
     /// row referencing them, so the foreign keys stay valid even under
     /// `PRAGMA foreign_key_check`.
     fn intern(&mut self, text: &str) -> froe::Result<i64> {
-        if let Some(id) = self.strings.get(text) {
-            return Ok(id);
+        if let Some(string_identifier) = self.strings.get(text) {
+            return Ok(string_identifier);
         }
         // A miss asks the table, which is the authority. `INSERT OR IGNORE`
         // then `SELECT` is two statements rather than one, but both are
@@ -427,12 +427,12 @@ impl SqliteSink {
             .prepare_cached("INSERT OR IGNORE INTO strings (value) VALUES (?)")
             .and_then(|mut statement| statement.execute(params![text]))
             .map_err(sqlite_error)?;
-        let id: i64 = connection
+        let string_identifier: i64 = connection
             .prepare_cached("SELECT id FROM strings WHERE value = ?")
             .and_then(|mut statement| statement.query_row(params![text], |row| row.get(0)))
             .map_err(sqlite_error)?;
-        self.strings.insert(text.to_owned(), id);
-        Ok(id)
+        self.strings.insert(text.to_owned(), string_identifier);
+        Ok(string_identifier)
     }
 
     /// Appends one row to the properties table. `position` is the
@@ -821,7 +821,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.close().expect("close");
     }
 

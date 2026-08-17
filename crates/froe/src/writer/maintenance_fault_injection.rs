@@ -730,7 +730,7 @@ mod tests {
             )
             .expect("write current super-root");
         writer.finish().expect("finish current head segment");
-        assert!(store.set_head(old_head, new_head));
+        assert!(store.compare_and_set_head(old_head, new_head));
         store.close().expect("close sweep fixture writer");
 
         let options = scenario_options(SWEEP_SCENARIO);
@@ -776,7 +776,7 @@ mod tests {
                 )
                 .expect("write current super-root");
             writer.finish().expect("finish current head segment");
-            assert!(store.set_head(old_head, new_head));
+            assert!(store.compare_and_set_head(old_head, new_head));
             store.close().expect("close head writer");
         }
         {

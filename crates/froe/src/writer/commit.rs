@@ -310,7 +310,7 @@ pub fn create_checkpoint(
         rewrite_node_with_child_edits(store, &mut writer, Some(head), &super_root_edits)?;
     writer.finish()?;
 
-    if !store.set_head(head, new_head) {
+    if !store.compare_and_set_head(head, new_head) {
         return Err(Error::InvalidFormat {
             details: "the head moved while creating the checkpoint".to_owned(),
         });
@@ -391,7 +391,7 @@ fn remove_checkpoints_with_head_move_error(
         rewrite_node_with_child_edits(store, &mut writer, Some(head), &super_root_edits)?;
     writer.finish()?;
 
-    if !store.set_head(head, new_head) {
+    if !store.compare_and_set_head(head, new_head) {
         return Err(Error::InvalidFormat {
             details: head_move_error.to_owned(),
         });
@@ -458,7 +458,7 @@ pub fn replace_content_root(store: &WritableRepository, new_root: RecordIdentifi
     edits.insert("root".to_owned(), Some(new_root));
     let new_head = rewrite_node_with_child_edits(store, &mut writer, Some(head), &edits)?;
     writer.finish()?;
-    if !store.set_head(head, new_head) {
+    if !store.compare_and_set_head(head, new_head) {
         return Err(Error::InvalidFormat {
             details: "the head moved while replacing the content root".to_owned(),
         });

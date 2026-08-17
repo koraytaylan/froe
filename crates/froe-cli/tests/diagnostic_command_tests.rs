@@ -209,7 +209,7 @@ fn populate_hostile_debug_fixture(directory: &std::path::Path) -> HostileDebugFi
         )
         .expect("super root");
     writer.finish().expect("finish");
-    assert!(store.set_head(store.head(), head));
+    assert!(store.compare_and_set_head(store.head(), head));
     store.close().expect("close");
     HostileDebugFixture {
         head,
@@ -314,7 +314,7 @@ fn populate(directory: &std::path::Path) {
         )
         .expect("super root");
     writer.finish().expect("finish");
-    assert!(store.set_head(store.head(), head));
+    assert!(store.compare_and_set_head(store.head(), head));
     store.close().expect("close");
 }
 

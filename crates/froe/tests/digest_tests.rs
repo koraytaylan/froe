@@ -155,7 +155,10 @@ fn build_repository(directory: &Path, async_reference: Option<&str>) {
 
     writer.finish().expect("finish the writer");
     let previous = store.head();
-    assert!(store.set_head(previous, super_root), "advance the head");
+    assert!(
+        store.compare_and_set_head(previous, super_root),
+        "advance the head"
+    );
     store.close().expect("close the store");
 }
 

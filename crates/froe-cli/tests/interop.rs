@@ -1207,7 +1207,7 @@ fn write_orphan_nodes(store_path: &Path) -> PathBuf {
             written += 1;
         }
         writer.finish().expect("finish orphan segments");
-        // Deliberately no set_head: nothing reaches these records.
+        // Deliberately no compare_and_set_head: nothing reaches these records.
         store.close().expect("close orphan writer");
         written
     };
@@ -1877,7 +1877,7 @@ fn commit() {
 
     writer.finish().expect("finish writer");
     assert!(
-        writable.set_head(head, new_super_root),
+        writable.compare_and_set_head(head, new_super_root),
         "head CAS succeeded (single-writer, no contention)"
     );
     writable.flush().expect("flush");

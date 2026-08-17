@@ -209,7 +209,10 @@ fn write_sharing_super_root(
         .expect("write the sharing super-root");
     writer.finish().expect("finish the writer");
     let previous = store.head();
-    assert!(store.set_head(previous, super_root), "advance the head");
+    assert!(
+        store.compare_and_set_head(previous, super_root),
+        "advance the head"
+    );
     store.close().expect("close the store");
     super_root
 }
@@ -261,7 +264,10 @@ fn build_repository(directory: &std::path::Path, children: usize) {
         .expect("write the super-root");
     writer.finish().expect("finish the writer");
     let previous = store.head();
-    assert!(store.set_head(previous, super_root), "advance the head");
+    assert!(
+        store.compare_and_set_head(previous, super_root),
+        "advance the head"
+    );
     store.close().expect("close the store");
 }
 

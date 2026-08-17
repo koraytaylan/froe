@@ -666,7 +666,7 @@ pub(crate) fn compact_with_progress(
     )?;
     writer.finish()?;
 
-    if !store.set_head(head, new_head) {
+    if !store.compare_and_set_head(head, new_head) {
         return Err(Error::InvalidFormat {
             details: "the head moved during compaction".to_owned(),
         });
@@ -930,7 +930,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         create_checkpoint(
             &store,
             10_000_000,
@@ -1034,7 +1034,7 @@ mod tests {
             )
             .expect("copy while omitting one checkpoint");
             writer.finish().expect("finish");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.flush().expect("flush");
             store.close().expect("close the omitting store");
             (head, nodes)
@@ -1054,7 +1054,7 @@ mod tests {
             )
             .expect("copy the already-reduced head");
             writer.finish().expect("finish");
-            assert!(store.set_head(store.head(), head));
+            assert!(store.compare_and_set_head(store.head(), head));
             store.flush().expect("flush");
             store.close().expect("close the removing store");
             (head, nodes)
@@ -1175,7 +1175,7 @@ mod tests {
         )
         .expect("copy while omitting one checkpoint");
         writer.finish().expect("finish");
-        assert!(store.set_head(store.head(), head));
+        assert!(store.compare_and_set_head(store.head(), head));
         store.flush().expect("flush");
         store.close().expect("close");
 
@@ -1253,7 +1253,7 @@ mod tests {
             .expect("deep copy");
             let distinct = distinct_reachable_nodes(&store, head);
             writer.finish().expect("finish");
-            assert!(store.set_head(head, root));
+            assert!(store.compare_and_set_head(head, root));
             store.close().expect("close");
             (copied, distinct)
         };
@@ -1324,7 +1324,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.close().expect("close");
     }
 
@@ -1432,7 +1432,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.close().expect("close");
     }
 
@@ -1711,7 +1711,7 @@ mod tests {
             .expect("super root");
         writer.finish().expect("finish");
         let previous = store.head();
-        assert!(store.set_head(previous, head));
+        assert!(store.compare_and_set_head(previous, head));
         store.close().expect("close");
     }
 
@@ -1956,7 +1956,7 @@ mod tests {
                 .expect("super root");
             writer.finish().expect("finish");
             let previous = store.head();
-            assert!(store.set_head(previous, head));
+            assert!(store.compare_and_set_head(previous, head));
             store.close().expect("close");
         }
         {
@@ -2039,7 +2039,7 @@ mod tests {
                 .expect("super root");
             writer.finish().expect("finish");
             let previous = store.head();
-            assert!(store.set_head(previous, head));
+            assert!(store.compare_and_set_head(previous, head));
             store.close().expect("close");
         }
         {
@@ -2165,7 +2165,7 @@ mod tests {
                     .expect("super root");
                 writer.finish().expect("finish");
                 let previous = store.head();
-                assert!(store.set_head(previous, head));
+                assert!(store.compare_and_set_head(previous, head));
                 store.flush().expect("flush");
             }
             store.close().expect("close");
@@ -2337,7 +2337,7 @@ mod tests {
                 .expect("super root");
             writer.finish().expect("finish");
             let previous = store.head();
-            assert!(store.set_head(previous, head));
+            assert!(store.compare_and_set_head(previous, head));
             store.close().expect("close");
         }
 
