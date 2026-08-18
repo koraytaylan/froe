@@ -1,7 +1,7 @@
 # The full quality gate from CONTRIBUTING.md, on every push and pull
-# request: formatting, both test profiles, pedantic clippy, and warning-
-# free documentation — on Linux and macOS, at the stable and minimum
-# supported Rust versions. Windows builds are checked but not tested:
+# request: formatting, file length, both test profiles, pedantic clippy,
+# and warning-free documentation — on Linux and macOS, at the stable and
+# minimum supported Rust versions. Windows builds are checked but not tested:
 # the writable store requires an operating system entropy source that
 # froe only reads on Unix, so writer tests cannot pass there yet.
 name: ci
@@ -34,6 +34,9 @@ jobs:
         with:
           shared-key: gate-${{ matrix.os }}-${{ matrix.rust }}
       - run: cargo fmt --all -- --check
+      # clippy has no file-length lint, so the thousand-line rule in
+      # CONTRIBUTING.md is enforced by a script rather than by the compiler.
+      - run: scripts/oversized-files.sh
       - run: cargo test --workspace
       - run: cargo test --workspace --release
       - run: cargo clippy --workspace --all-targets

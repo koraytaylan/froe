@@ -9,6 +9,7 @@
 //! stops after a bounded prefix. Worker threads share the provider's
 //! existing byte-budgeted caches; they do not clone them.
 
+use crate::parallel::worker_count;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -128,7 +129,7 @@ pub fn search_nodes_visiting(
         &Step::new("searching segments", WorkUnit::Segments)
             .with_total(crate::progress::count(identifiers.len())),
     );
-    let window_size = parallel_worker_count(identifiers.len());
+    let window_size = worker_count(identifiers.len());
     let mut searched_segments = 0usize;
     for window in identifiers.chunks(window_size.max(1)) {
         observer.step_advanced(crate::progress::count(searched_segments));
@@ -150,12 +151,6 @@ pub fn search_nodes_visiting(
     Ok(unreadable_nodes)
 }
 
-fn parallel_worker_count(work_items: usize) -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(work_items.max(1))
-}
-
 struct SegmentSearchHits {
     matches: Vec<NodeMatch>,
     unreadable_nodes: u64,
@@ -166,7 +161,7 @@ fn search_segment_window(
     identifiers: &[SegmentIdentifier],
     query: &SearchQuery,
 ) -> Vec<SegmentSearchHits> {
-    let workers = parallel_worker_count(identifiers.len());
+    let workers = worker_count(identifiers.len());
     let next = AtomicUsize::new(0);
     let slots: Vec<Mutex<Option<SegmentSearchHits>>> =
         identifiers.iter().map(|_| Mutex::new(None)).collect();

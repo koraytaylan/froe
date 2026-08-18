@@ -2,8 +2,8 @@
 //! mutation transaction whose adjacency is the safety argument.
 
 use super::file_removal::{
-    PlannedFileRemovalFailureMode, archive_file_bytes, read_optional_regular_file,
-    recovery_backup_file_bytes, remove_planned_files,
+    PlannedFileRemovalFailureMode, read_optional_regular_file, recovery_backup_file_bytes,
+    remove_planned_files,
 };
 use super::journal::analyze_journal;
 use super::manifest::upgrade_manifest_atomically;
@@ -25,6 +25,7 @@ use crate::writer::maintenance::journal::{
 };
 use crate::writer::repository_lock::RepositoryLock;
 use crate::writer::segment_builder::GarbageCollectionGeneration;
+use crate::writer::store_writer::archive_file_bytes;
 use crate::writer::store_writer::{
     ArchiveRewritePolicy, ReclaimRule, StandaloneSegmentCompactionOutcome, WritableRepository,
     apply_standalone_segment_cleanup, certify_active_archives_with_progress, sync_directory_strict,

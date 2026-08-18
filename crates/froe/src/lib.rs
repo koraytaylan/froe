@@ -84,6 +84,7 @@ pub mod hashing;
 mod java;
 pub mod journal;
 pub(crate) mod packed_records;
+pub(crate) mod parallel;
 pub mod progress;
 pub mod segment;
 pub mod store;

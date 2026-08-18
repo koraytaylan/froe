@@ -7,7 +7,7 @@ use crate::writer::tar_writer::TarArchiveWriter;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-pub(super) fn archive_file_bytes(directory: &Path) -> Result<u64> {
+pub(crate) fn archive_file_bytes(directory: &Path) -> Result<u64> {
     let mut total = 0u64;
     for file_name in crate::store::list_archive_file_names(directory)? {
         if ArchiveFileName::parse(&file_name).is_some() {

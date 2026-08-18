@@ -6,7 +6,6 @@ use super::planning::{FileFingerprint, PlannedFileRemoval, add_estimate, file_fi
 use super::recovery_backups::recovery_backup_target;
 use crate::error::{Error, Result};
 use crate::progress::ProgressObserver;
-use crate::tar_archive::file_name::ArchiveFileName;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -266,24 +265,6 @@ pub(super) fn remove_planned_files_core(
         }
     }
     Ok((removed, failures))
-}
-
-pub(super) fn archive_file_bytes(directory: &Path) -> Result<u64> {
-    let mut bytes = 0u64;
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if ArchiveFileName::parse(&name).is_some() {
-            bytes = bytes
-                .checked_add(std::fs::symlink_metadata(entry.path())?.len())
-                .ok_or_else(|| Error::InvalidFormat {
-                    details: "archive byte accounting overflow".to_owned(),
-                })?;
-        }
-    }
-    Ok(bytes)
 }
 
 /// Bytes held by every recognized recovery backup in the directory.

@@ -197,9 +197,23 @@ format win.
   distance implies unrelatedness, so distance between two things that
   must change together is a defect. A module that has grown past the
   point where related things can stay close is a module to split.
+* **A thousand lines is the limit for a file.** `scripts/oversized-files.sh`
+  enforces it and CI runs it, because clippy has no lint for this —
+  `too_many_lines` measures a function's body, not a module. Split at the
+  seams the file already has, and move each test to the module it now
+  belongs with. A directory module (`foo/mod.rs` plus submodules) is the
+  usual shape; an inherent `impl` may be divided across them, so a large
+  type does not force a large file.
 * **One reason to change per module and per type.** A type that
   models a format structure does not also own I/O scheduling or
   progress reporting.
+* **Ask which way the dependency points before moving a module.** A name
+  like `maintenance_fault_injection` looks like it wants to live under
+  `maintenance/`, but its cutpoints are called from the tar writer and the
+  store writer too — modules `maintenance` is built on. Moving it in would
+  have made them reach into a private module above them. `journal_maintenance`
+  was the opposite: every caller was already inside `maintenance/`, so
+  moving it in only removed reach nobody was using.
 * **DRY, with two deliberate exceptions.** Duplication is the default
   maintenance hazard, and shared logic belongs in one place. But the
   independent encoder in `crates/froe/tests/support/` duplicates

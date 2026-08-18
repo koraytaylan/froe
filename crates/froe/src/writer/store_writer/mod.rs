@@ -47,7 +47,9 @@ pub(crate) use self::archive_certificate::{
 };
 pub(crate) use self::archive_numbering::next_cleanup_archive_number;
 pub(crate) use self::cleanup_apply::apply_standalone_segment_cleanup;
-pub(crate) use self::file_identity::{preserve_file_metadata, sync_directory_strict};
+pub(crate) use self::file_identity::{
+    archive_file_bytes, preserve_file_metadata, sync_directory_strict,
+};
 pub use self::reclaim::ArchiveRewritePolicy;
 pub(crate) use self::reclaim::{ReclaimRule, predict_post_compaction_reclamation};
 pub(crate) use self::repair::{

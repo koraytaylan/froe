@@ -6,11 +6,12 @@ use super::{
     Arc, ArchiveRewritePolicy, CompactionKind, CompactionPlan, Error, GarbageCollectionGeneration,
     MaintenanceTask, Path, ProgressObserver, ReclaimRule, RecordIdentifier, Repository,
     RepositoryLock, Result, Step, WorkUnit, WritableRepository, analyze_journal,
-    archive_file_bytes, compaction_target_generation, final_expected_retained_lines,
-    inject_final_retained_root_fault, read_optional_regular_file, remove_checkpoints,
-    retained_compacted_head_line, scan_raw_journal, sync_directory_strict, verify_exact_super_root,
-    verify_retained_journal_lines, verify_retained_journal_roots,
+    compaction_target_generation, final_expected_retained_lines, inject_final_retained_root_fault,
+    read_optional_regular_file, remove_checkpoints, retained_compacted_head_line, scan_raw_journal,
+    sync_directory_strict, verify_exact_super_root, verify_retained_journal_lines,
+    verify_retained_journal_roots,
 };
+use crate::writer::store_writer::archive_file_bytes;
 
 /// What the compaction phase of a merged run did.
 #[derive(Clone, Debug)]

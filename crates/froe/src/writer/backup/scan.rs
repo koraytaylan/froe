@@ -5,17 +5,12 @@ use super::{
     ArchiveSet, AtomicUsize, Mutex, NodeState, Ordering, ProgressObserver, RecordIdentifier,
     SegmentIdentifier, SegmentProvider, Step, WorkUnit,
 };
+use crate::parallel::worker_count;
 
 /// A candidate head discovered during recovery.
 pub(crate) struct Candidate {
     pub(crate) record: RecordIdentifier,
     pub(crate) timestamp_milliseconds: i64,
-}
-
-pub(crate) fn parallel_worker_count(work_items: usize) -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(work_items.max(1))
 }
 
 /// Distinct data segments, not every archive occurrence. A segment's record
@@ -31,7 +26,7 @@ pub(crate) fn collect_super_root_candidates(
         &Step::new("scanning segments for super-roots", WorkUnit::Segments)
             .with_total(crate::progress::count(identifiers.len())),
     );
-    let workers = parallel_worker_count(identifiers.len());
+    let workers = worker_count(identifiers.len());
     let next = AtomicUsize::new(0);
     let slots: Vec<Mutex<Vec<Candidate>>> =
         identifiers.iter().map(|_| Mutex::new(Vec::new())).collect();
