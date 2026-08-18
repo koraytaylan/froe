@@ -74,14 +74,14 @@ $ scripts/interop-fixture.sh compact
 
 # Re-run one phase against a fixture an earlier run already built, without
 # regenerating it — this is the debugging loop after a failure:
-$ cargo test -p froe-cli --features interop -- --ignored --nocapture interop::compact
+$ cargo test -p froe-cli --features interop -- --ignored --nocapture phase_maintenance::compact
 
 # Direct cargo invocation — `interop_full` is the whole chain, and naming it
 # is required: an unfiltered `--ignored` run collides with itself as above.
-$ cargo test -p froe-cli --features interop -- --ignored --test-threads=1 interop_full
+$ cargo test -p froe-cli --features interop -- --ignored --test-threads=1 phase_recovery::interop_full
 
 # A single phase via cargo:
-$ cargo test -p froe-cli --features interop -- --ignored interop::read
+$ cargo test -p froe-cli --features interop -- --ignored phase_baseline::read
 ```
 
 Tests are `#[ignore]`d by default so they don't run in the normal
