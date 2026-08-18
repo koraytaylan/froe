@@ -81,6 +81,7 @@ pub mod content;
 pub mod error;
 pub mod gc_journal;
 pub mod hashing;
+mod java;
 pub mod journal;
 pub(crate) mod packed_records;
 pub mod progress;

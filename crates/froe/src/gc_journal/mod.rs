@@ -17,6 +17,7 @@
 //! Format evidence: `docs/analysis/filestore-layer.md` section 7, extracted
 //! from Oak's `GCJournal.java` and `LocalGCJournalFile.java`.
 
+use crate::java::{parse_i32_field, parse_i64_field, split_like_java};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -25,12 +26,10 @@ use std::path::Path;
 use crate::journal::parse_record_identifier_text;
 use crate::segment::{GarbageCollectionGeneration, RecordIdentifier};
 
-mod java;
 mod limits;
 #[cfg(test)]
 mod test_support;
 
-pub(crate) use java::*;
 pub use limits::*;
 
 /// Oak's textual representation of its null record identifier.
@@ -687,5 +686,89 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn matches_java_trailing_empty_and_surplus_field_layout_selection() {
+        let delimiter_only = parse_gc_journal_entry(",,,,,,");
+        assert_eq!(delimiter_only.repository_size, -1);
+        assert_eq!(delimiter_only.generation.generation, -1);
+        assert_eq!(
+            delimiter_only.root_record_identifier_text,
+            NULL_RECORD_IDENTIFIER_TEXT
+        );
+
+        let leading_empty = parse_gc_journal_entry(",2,3,4,5,6,root");
+        assert_eq!(leading_empty.repository_size, -1);
+        assert_eq!(leading_empty.reclaimed_size, 2);
+        assert_eq!(leading_empty.generation.generation, 4);
+        assert_eq!(leading_empty.generation.full_generation, 5);
+        assert_eq!(leading_empty.compacted_nodes, 6);
+        assert_eq!(leading_empty.root_record_identifier_text, "root");
+
+        let trailing_empty = parse_gc_journal_entry("1,2,3,4,5,6,");
+        assert_eq!(trailing_empty.generation.full_generation, 4);
+        assert_eq!(trailing_empty.compacted_nodes, 5);
+        assert_eq!(trailing_empty.root_record_identifier_text, "6");
+
+        let current_with_trailing_delimiter = parse_gc_journal_entry("1,2,3,4,5,6,root,");
+        assert_eq!(
+            current_with_trailing_delimiter.generation.full_generation,
+            5
+        );
+        assert_eq!(current_with_trailing_delimiter.compacted_nodes, 6);
+        assert_eq!(
+            current_with_trailing_delimiter.root_record_identifier_text,
+            "root"
+        );
+
+        let surplus = parse_gc_journal_entry("1,2,3,4,5,6,root,surplus");
+        assert_eq!(surplus.generation.full_generation, 4);
+        assert_eq!(surplus.compacted_nodes, 5);
+        assert_eq!(surplus.root_record_identifier_text, "6");
+    }
+
+    #[test]
+    fn comma_heavy_lines_preserve_java_trailing_field_semantics() {
+        let directory = TestDirectory::new("comma-heavy");
+        let path = directory.path.join("gc.log");
+        let mut current_entry = b"1,2,3,4,5,6,root".to_vec();
+        current_entry.resize(200_000, b',');
+        current_entry.push(b'\n');
+        let mut delimiter_only = vec![b','; 200_000];
+        delimiter_only.push(b'\n');
+        current_entry.extend_from_slice(&delimiter_only);
+        std::fs::write(&path, current_entry).expect("write comma-heavy fixture");
+
+        let entries = read_all_gc_journal(&path).expect("read comma-heavy fixture");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].generation.generation, 4);
+        assert_eq!(entries[0].generation.full_generation, 5);
+        assert_eq!(entries[0].root_record_identifier_text, "root");
+        assert_eq!(entries[1], parse_gc_journal_entry(""));
+    }
+
+    #[test]
+    fn numeric_fields_match_java_unicode_decimal_and_overflow_rules() {
+        let unicode = parse_gc_journal_entry("١٢,３४,-٥,६,７,+٨,root");
+        assert_eq!(unicode.repository_size, 12);
+        assert_eq!(unicode.reclaimed_size, 34);
+        assert_eq!(unicode.timestamp_milliseconds, -5);
+        assert_eq!(unicode.generation.generation, 6);
+        assert_eq!(unicode.generation.full_generation, 7);
+        assert_eq!(unicode.compacted_nodes, 8);
+
+        let overflow = parse_gc_journal_entry("٩٢٢٣٣٧٢٠٣٦٨٥٤٧٧٥٨٠٨,٠,٠,٢١٤٧٤٨٣٦٤٨,٠,٠,root");
+        assert_eq!(overflow.repository_size, -1, "i64 overflow falls back");
+        assert_eq!(
+            overflow.generation.generation, -1,
+            "i32 overflow falls back"
+        );
+
+        let supplementary_digit = parse_gc_journal_entry("𞥑,0,0,0,0,0,root");
+        assert_eq!(
+            supplementary_digit.repository_size, -1,
+            "Java examines a supplementary digit as two invalid surrogate code units"
+        );
     }
 }
