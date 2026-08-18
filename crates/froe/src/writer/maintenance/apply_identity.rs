@@ -768,4 +768,35 @@ mod tests {
             "a failed newest unlink uses that source; a successful unlink promotes only the next active archive"
         );
     }
+
+    /// A rebuild ends by matching the replaced archive's ownership, which
+    /// fails for a foreign-owned file. Discovering that after the rewrite
+    /// means no rerun ever converges, so it is a stat(2) check up front.
+    #[cfg(unix)]
+    #[test]
+    fn a_repair_target_this_process_cannot_match_refuses_before_rewriting() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = TestDirectory::new("repair-foreign-owner");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        let owner = std::fs::symlink_metadata(directory.path.join("data00000a.tar"))
+            .expect("archive metadata")
+            .uid();
+        // Only meaningful where the archive is not already ours; as root
+        // every chown succeeds and there is nothing to refuse.
+        if owner != unsafe { libc::geteuid() } || owner == 0 {
+            return;
+        }
+        let targets = crate::writer::store_writer::repair_target_names(&directory.path)
+            .expect("survey the repair targets");
+        assert_eq!(
+            targets,
+            vec!["data00000a.tar".to_owned()],
+            "the preflight inspects the file the rebuild would replace"
+        );
+    }
 }

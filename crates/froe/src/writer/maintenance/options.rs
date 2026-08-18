@@ -277,6 +277,8 @@ impl CompactionOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::num::NonZeroUsize;
 
     use crate::writer::maintenance::plan::*;
 
@@ -386,5 +388,66 @@ mod tests {
             .collect();
 
         assert_eq!(removals, ["journal.log.bak.003"]);
+    }
+
+    #[test]
+    fn recovery_backup_task_requires_an_explicit_policy_without_writing() {
+        let directory = TestDirectory::repository("backup-policy-required");
+        let before = file_bytes(&directory.path);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::RecoveryBackups]);
+
+        let error = plan_compaction(&directory.path, &options)
+            .expect_err("recovery backup cleanup without retention must be rejected");
+
+        let crate::error::Error::InvalidFormat { details } = error else {
+            panic!("unexpected options error: {error}");
+        };
+        assert_eq!(
+            details,
+            "recovery-backups requires an explicit age/count retention policy"
+        );
+        assert_eq!(file_bytes(&directory.path), before);
+    }
+
+    #[test]
+    fn a_retention_bound_without_the_journal_task_is_refused() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-task-guard");
+        // Un-rooting without pruning would leave the line in the journal for
+        // the prospective-plan check to verify as retained history, and the
+        // run would refuse itself with a far less actionable message.
+        let options = CompactionOptions::default()
+            .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"))
+            .with_tasks([MaintenanceTask::Segments]);
+        let error = plan_compaction(&directory.path, &options).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("requires the journal task"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn non_journal_task_hides_internal_journal_removal_candidates() {
+        let directory = TestDirectory::repository("non-journal-removal-visibility");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.path.join("journal.log"))
+            .expect("open journal")
+            .write_all(b"parser-skipped\n")
+            .expect("append parser-skipped line");
+
+        let plan = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+        )
+        .expect("segment-only plan");
+
+        assert_eq!(plan.tasks(), &[MaintenanceTask::Segments]);
+        assert!(plan.journal_line_removals().is_empty());
+        assert!(
+            !plan
+                .actions()
+                .iter()
+                .any(|action| matches!(action, CompactionAction::PruneJournal { .. }))
+        );
     }
 }

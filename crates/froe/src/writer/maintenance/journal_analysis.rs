@@ -317,3 +317,103 @@ fn revision_is_readable(
     validity.insert(identifier, readable);
     readable
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment::identifier::SegmentIdentifier;
+    use crate::store::Repository;
+    use crate::writer::maintenance::options::*;
+    use crate::writer::maintenance::plan::*;
+    use crate::writer::maintenance::prepared::*;
+    use crate::writer::maintenance::test_support::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn journal_removal_preview_is_an_exact_bounded_byte_prefix() {
+        let directory = TestDirectory::repository("bounded-journal-preview");
+        let mut hostile = vec![0xff];
+        hostile.extend(std::iter::repeat_n(b'x', JOURNAL_LINE_PREVIEW_LIMIT + 20));
+        hostile.push(b'\n');
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.path.join("journal.log"))
+            .expect("open journal")
+            .write_all(&hostile)
+            .expect("append long invalid line");
+
+        let plan = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Journal]),
+        )
+        .expect("plan long invalid line");
+        let removal = plan
+            .journal_line_removals()
+            .last()
+            .expect("invalid line removal");
+        assert_eq!(
+            removal.preview_bytes(),
+            &hostile[..JOURNAL_LINE_PREVIEW_LIMIT]
+        );
+        assert!(removal.preview_truncated());
+        assert_eq!(removal.reason(), JournalRemovalReason::ParserSkippedNoSpace);
+    }
+
+    #[test]
+    fn exhausted_journal_replacement_namespace_fails_during_read_only_planning() {
+        let directory = TestDirectory::repository("journal-namespace-exhausted");
+        let missing = SegmentIdentifier::new(17, 0xA000_0000_0000_0017);
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(directory.path.join("journal.log"))
+                .expect("open journal"),
+            "{missing}:0 root 123"
+        )
+        .expect("append dangling line");
+        for counter in 0..1000u16 {
+            std::fs::write(
+                directory.path.join(format!("journal.log.bak.{counter:03}")),
+                [],
+            )
+            .expect("occupy backup name");
+        }
+        let before = file_bytes(&directory.path);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Journal]);
+
+        let error = plan_compaction(&directory.path, &options)
+            .expect_err("planning must discover exhausted backup names before apply");
+        assert!(error.to_string().contains("journal.log.bak"));
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "planning remains read-only"
+        );
+        Repository::open(&directory.path).expect("repository remains healthy");
+    }
+
+    #[test]
+    fn corrupt_record_in_the_selected_head_segment_never_rolls_back_silently() {
+        let directory = TestDirectory::repository("corrupt-current-record");
+        let head = Repository::open(&directory.path)
+            .expect("repository")
+            .head_record_identifier();
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.path.join("journal.log"))
+            .expect("open journal");
+        writeln!(journal, "{}:2147483647 root 123", head.segment)
+            .expect("append corrupt current revision");
+        drop(journal);
+        let before = file_bytes(&directory.path);
+
+        let error = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Journal]),
+        )
+        .expect_err("the exact selected head record is corrupt");
+
+        assert!(error.to_string().contains("current journal head"));
+        assert_eq!(file_bytes(&directory.path), before);
+    }
+}

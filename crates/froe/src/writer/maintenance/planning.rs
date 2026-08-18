@@ -1698,6 +1698,10 @@ pub(super) fn verify_exact_super_root_with_verifier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Repository;
+    use crate::writer::maintenance::options::*;
+    use crate::writer::maintenance::prepared::*;
+    use crate::writer::maintenance::test_support::*;
 
     #[test]
     fn planning_warnings_survive_a_refusal_and_stay_bounded() {
@@ -1753,5 +1757,147 @@ mod tests {
 
         let hostile = std::ffi::OsStr::from_bytes(b"data00000a.tar.\xff.ro.bak");
         assert!(!is_managed_name(hostile));
+    }
+
+    #[test]
+    fn empty_directory_is_refused_without_bootstrapping_anything() {
+        let directory = TestDirectory::new("empty");
+        let error = plan_compaction(&directory.path, &CompactionOptions::default())
+            .expect_err("an empty directory is not a repository");
+        let crate::error::Error::InvalidFormat { details } = error else {
+            panic!("unexpected repository-shape error: {error}");
+        };
+        assert_eq!(
+            details,
+            format!(
+                "{} is not an existing segment-tar repository (manifest and journal.log are required)",
+                canonical_fixture_directory(&directory.path).display()
+            )
+        );
+        assert!(file_bytes(&directory.path).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_symlink_is_rejected_without_following_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::repository("managed-symlink");
+        let victim = directory.path.join("victim");
+        std::fs::write(&victim, b"do not touch").expect("victim");
+        let staging = directory.path.join("journal.log.compacting");
+        symlink("victim", &staging).expect("staging symlink");
+        let before = file_bytes(&directory.path);
+
+        let error = plan_compaction(&directory.path, &CompactionOptions::default())
+            .expect_err("managed symlink must be rejected");
+        let crate::error::Error::InvalidFormat { details } = error else {
+            panic!("unexpected managed-file-type error: {error}");
+        };
+        assert_eq!(
+            details,
+            format!(
+                "managed repository path {} is not a regular file",
+                canonical_fixture_directory(&directory.path)
+                    .join("journal.log.compacting")
+                    .display()
+            )
+        );
+        assert_eq!(file_bytes(&directory.path), before);
+        assert_eq!(std::fs::read(victim).expect("victim"), b"do not touch");
+    }
+
+    #[test]
+    fn foreign_tar_and_unknown_files_are_never_cleanup_targets() {
+        let directory = TestDirectory::repository("foreign-files");
+        std::fs::write(directory.path.join("notes.tar"), b"foreign tar").expect("foreign tar");
+        std::fs::write(directory.path.join("operator-notes.txt"), b"keep me").expect("notes");
+
+        let plan = plan_compaction(&directory.path, &CompactionOptions::default()).expect("plan");
+        assert!(plan.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path.join("notes.tar")).expect("foreign tar"),
+            b"foreign tar"
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("operator-notes.txt")).expect("notes"),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn non_regular_numbered_read_only_backup_is_refused_even_during_preview() {
+        let directory = TestDirectory::repository("non-regular-numbered-ro-backup");
+        let backup = directory.path.join("data00000a.tar.2.ro.bak");
+        std::fs::create_dir(&backup).expect("create hostile managed-name directory");
+
+        let error = plan_compaction(&directory.path, &CompactionOptions::default())
+            .expect_err("managed backup names must remain regular files in dry-run");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid segment-tar data: managed repository path {} is not a regular file",
+                canonical_fixture_directory(&directory.path)
+                    .join("data00000a.tar.2.ro.bak")
+                    .display()
+            )
+        );
+    }
+
+    #[test]
+    fn prepared_plan_rejects_same_length_inode_replacement() {
+        let directory = TestDirectory::repository("stale-plan");
+        let options = CompactionOptions::default().with_tasks([]);
+        let prepared = PreparedCompaction::prepare(&directory.path, options).expect("prepare");
+        let journal_path = directory.path.join("journal.log");
+        let bytes = std::fs::read(&journal_path).expect("journal");
+        let replacement = directory.path.join("replacement");
+        std::fs::write(&replacement, &bytes).expect("write replacement");
+        std::fs::rename(&replacement, &journal_path).expect("replace same-size journal");
+
+        assert!(prepared.apply().is_err());
+        Repository::open(&directory.path).expect("replacement bytes remain healthy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_plan_rejects_in_place_change_with_restored_mtime() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = TestDirectory::repository("stale-plan-ctime");
+        let staging = directory.path.join("journal.log.compacting");
+        std::fs::copy(directory.path.join("journal.log"), &staging)
+            .expect("create redundant staging journal");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
+        let prepared = PreparedCompaction::prepare(&directory.path, options).expect("prepare");
+        let metadata = std::fs::metadata(&staging).expect("staging metadata");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let changed = vec![b'x'; metadata.len() as usize];
+        std::fs::write(&staging, changed).expect("same-inode same-size overwrite");
+        let path = CString::new(staging.as_os_str().as_bytes()).expect("path without NUL");
+        let times = [
+            libc::timespec {
+                tv_sec: checked_timespec_field(metadata.atime()),
+                tv_nsec: checked_timespec_field(metadata.atime_nsec()),
+            },
+            libc::timespec {
+                tv_sec: checked_timespec_field(metadata.mtime()),
+                tv_nsec: checked_timespec_field(metadata.mtime_nsec()),
+            },
+        ];
+        // SAFETY: the path is NUL-terminated and `times` contains two valid
+        // timespec values copied from stat(2).
+        let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(result, 0, "restore fixture mtime");
+
+        assert!(prepared.apply().is_err());
+        assert!(
+            staging.exists(),
+            "stale proof must not delete changed evidence"
+        );
+        Repository::open(&directory.path).expect("repository remains healthy");
     }
 }

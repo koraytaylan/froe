@@ -596,4 +596,101 @@ mod tests {
             observer.names
         );
     }
+
+    #[test]
+    fn dry_run_is_byte_exact_and_never_creates_the_lock_file() {
+        let directory = TestDirectory::repository("dry-run");
+        std::fs::remove_file(directory.path.join("repo.lock")).expect("remove old lock inode");
+        let before = file_bytes(&directory.path);
+        let mtimes_before = file_mtimes(&directory.path);
+
+        let plan = plan_compaction(&directory.path, &CompactionOptions::default()).expect("plan");
+
+        assert!(plan.is_empty());
+        assert_eq!(file_bytes(&directory.path), before);
+        assert_eq!(file_mtimes(&directory.path), mtimes_before);
+        assert!(!directory.path.join("repo.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_cleanup_is_bound_to_an_ancestor_symlinks_resolved_target() {
+        use std::os::unix::fs::symlink;
+
+        let first_parent = TestDirectory::new("ancestor-alias-first");
+        let second_parent = TestDirectory::new("ancestor-alias-second");
+        let first_repository = first_parent.path.join("segmentstore");
+        let second_repository = second_parent.path.join("segmentstore");
+        for repository in [&first_repository, &second_repository] {
+            std::fs::create_dir(repository).expect("create repository directory");
+            WritableRepository::open(repository)
+                .expect("bootstrap repository")
+                .close()
+                .expect("close repository");
+            std::fs::copy(
+                repository.join("journal.log"),
+                repository.join("journal.log.compacting"),
+            )
+            .expect("create removable staging file");
+        }
+        let alias = first_parent.path.with_extension("ancestor-alias");
+        let _ = std::fs::remove_file(&alias);
+        symlink(&first_parent.path, &alias).expect("create ancestor alias");
+        let aliased_repository = alias.join("segmentstore");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
+
+        let prepared = PreparedCompaction::prepare(&aliased_repository, options)
+            .expect("prepare first target");
+        assert_eq!(
+            prepared.plan().directory(),
+            std::fs::canonicalize(&first_repository).expect("canonical first repository")
+        );
+        std::fs::remove_file(&alias).expect("remove first alias");
+        symlink(&second_parent.path, &alias).expect("retarget ancestor alias");
+
+        prepared.apply().expect("apply captured first target");
+        assert!(!first_repository.join("journal.log.compacting").exists());
+        assert!(second_repository.join("journal.log.compacting").exists());
+        Repository::open(&first_repository).expect("first repository remains healthy");
+        Repository::open(&second_repository).expect("second repository remains healthy");
+        std::fs::remove_file(alias).expect("remove ancestor alias");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_repository_path_is_stored_as_an_absolute_canonical_target() {
+        let directory = TestDirectory::repository("relative-canonical-target");
+        let current = std::fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical current directory");
+        let target = std::fs::canonicalize(&directory.path).expect("canonical repository");
+        let relative = relative_path_from(&current, &target);
+        assert!(!relative.is_absolute());
+
+        let plan =
+            plan_compaction(&relative, &CompactionOptions::default()).expect("relative plan");
+
+        assert_eq!(plan.directory(), target);
+        assert!(plan.directory().is_absolute());
+    }
+
+    #[test]
+    fn prepared_cleanup_refuses_a_replaced_lock_inode() {
+        let directory = TestDirectory::repository("replaced-lock");
+        let staging = directory.path.join("journal.log.compacting");
+        std::fs::copy(directory.path.join("journal.log"), &staging)
+            .expect("create removable staging file");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
+        let prepared = PreparedCompaction::prepare(&directory.path, options).expect("prepare");
+        let lock_path = directory.path.join("repo.lock");
+        std::fs::remove_file(&lock_path).expect("unlink held lock pathname");
+        std::fs::write(&lock_path, b"replacement inode").expect("replace lock inode");
+
+        let error = prepared
+            .apply()
+            .expect_err("replacement lock must abort apply");
+
+        assert!(error.to_string().contains("lock inode"));
+        assert!(staging.exists());
+        Repository::open(&directory.path).expect("repository remains healthy");
+    }
 }

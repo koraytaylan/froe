@@ -346,6 +346,8 @@ impl Drop for UncommittedFile {
 mod tests {
     use super::*;
     use crate::store::Repository;
+    use crate::writer::commit::create_checkpoint;
+    use crate::writer::store_writer::WritableRepository;
 
     use crate::writer::maintenance::options::*;
     use crate::writer::maintenance::plan::*;
@@ -506,5 +508,143 @@ mod tests {
             canonical
         );
         Repository::open(&directory.path).expect("healthy repository");
+    }
+
+    /// The repair used to run before any store-version gate, so froe would
+    /// rewrite the archives of a store it then declared itself unable to
+    /// read. The library API reaches `prepare` without the lockless preview
+    /// that would otherwise have refused.
+    #[test]
+    fn a_store_from_a_newer_oak_is_refused_before_any_repair() {
+        let directory = TestDirectory::new("repair-newer-store");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        std::fs::write(
+            directory.path.join("manifest"),
+            "#from a newer Oak\nstore.version=3\n",
+        )
+        .expect("v3 manifest");
+        let before = file_bytes(&directory.path);
+
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
+        match PreparedCompaction::prepare(&directory.path, options) {
+            Ok(_) => panic!("a store version this reader does not support must be refused"),
+            Err(error) => assert!(
+                error.to_string().contains("newer"),
+                "the refusal names the store version: {error}"
+            ),
+        }
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "and it is refused before a single archive is rewritten"
+        );
+    }
+
+    /// The one-way v1 to v2 transition is charged when a rebuilt archive is
+    /// about to become visible, not when one is merely predicted. A repair
+    /// can still fail per archive for reasons no survey models, and paying an
+    /// irreversible format change for a run that rebuilds nothing would leave
+    /// the store damaged AND closed to an older Oak.
+    #[test]
+    fn a_repair_that_installs_nothing_does_not_upgrade_the_manifest() {
+        let directory = TestDirectory::new("repair-v1-no-install");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        // Repairable by the survey, but the rebuild refuses: a staging
+        // residue is found per number, after the survey has had its say.
+        std::fs::write(
+            directory.path.join("data00000a.tar.recovering"),
+            b"an interrupted rebuild",
+        )
+        .expect("staging residue");
+        std::fs::write(
+            directory.path.join("manifest"),
+            "#a version one store\nstore.version=1\n",
+        )
+        .expect("v1 manifest");
+        let before = file_bytes(&directory.path);
+
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
+        assert!(
+            PreparedCompaction::prepare(&directory.path, options).is_err(),
+            "the residue must refuse the run"
+        );
+        assert_eq!(
+            crate::store::read_manifest_store_version(&directory.path.join("manifest"))
+                .expect("read manifest"),
+            1,
+            "a run that installed no rebuilt archive must not have raised the store version"
+        );
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "and nothing else moved either"
+        );
+    }
+
+    #[test]
+    fn a_head_moving_cleanup_upgrades_a_version_one_manifest_atomically() {
+        let directory = TestDirectory::repository("manifest-upgrade");
+        let store = WritableRepository::open(&directory.path).expect("open writer");
+        create_checkpoint(&store, 1, &[]).expect("checkpoint");
+        store.close().expect("close writer");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(
+            directory.path.join("manifest"),
+            b"custom.property=kept\nstore.version=\\\n 1\n",
+        )
+        .expect("install Java-continuation version-one manifest");
+        #[cfg(unix)]
+        let source_identity = {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            std::fs::set_permissions(
+                directory.path.join("manifest"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .expect("set manifest permissions");
+            let metadata = std::fs::metadata(directory.path.join("manifest"))
+                .expect("source manifest metadata");
+            (metadata.uid(), metadata.gid())
+        };
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
+        assert!(
+            plan.actions()
+                .iter()
+                .any(|action| matches!(action, CompactionAction::UpgradeManifest))
+        );
+
+        compact(&directory.path, options).expect("cleanup");
+
+        let manifest = std::fs::read_to_string(directory.path.join("manifest"))
+            .expect("read upgraded manifest");
+        assert!(manifest.contains("custom.property=kept"));
+        assert!(manifest.ends_with("store.version=2\n"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = std::fs::metadata(directory.path.join("manifest"))
+                .expect("upgraded manifest metadata");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+            assert_eq!((metadata.uid(), metadata.gid()), source_identity);
+        }
+        assert!(
+            !std::fs::read_dir(&directory.path)
+                .expect("read directory")
+                .any(|entry| entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("manifest.cleaning."))
+        );
+        Repository::open(&directory.path).expect("healthy v2 repository");
     }
 }

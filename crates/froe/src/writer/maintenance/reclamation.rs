@@ -506,3 +506,424 @@ pub(super) fn prospective_retained_roots<'roots>(
     let _ = (directory, repository, plan);
     Cow::Borrowed(retained_roots)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Repository;
+    use crate::writer::maintenance::options::*;
+    use crate::writer::maintenance::plan::*;
+    use crate::writer::maintenance::prepared::*;
+    use crate::writer::maintenance::test_support::*;
+    use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::segment_builder::GarbageCollectionGeneration;
+    use crate::writer::store_writer::WritableRepository;
+
+    #[test]
+    fn prospective_plan_refuses_a_survivor_that_references_a_planned_removal() {
+        let directory = TestDirectory::repository("prospective-survivor-reference");
+        let old_generation = GarbageCollectionGeneration {
+            generation: 0,
+            full_generation: 0,
+            is_compacted: false,
+        };
+        let target = {
+            let store = WritableRepository::open(&directory.path).expect("open old-target writer");
+            let target = write_empty_node_segment(&store, old_generation);
+            store.close().expect("close old-target archive");
+            target
+        };
+        let store = WritableRepository::open(&directory.path).expect("open survivor writer");
+        let current_generation = GarbageCollectionGeneration {
+            generation: 2,
+            full_generation: 2,
+            is_compacted: false,
+        };
+        let mut survivor_writer = store.record_writer(current_generation);
+        let survivor = survivor_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "old-target".to_owned(),
+                    node: target,
+                },
+                &[],
+            )
+            .expect("write unjournaled newer-generation survivor");
+        survivor_writer.finish().expect("finish survivor segment");
+        let content_root = write_empty_node_segment(&store, current_generation);
+        let mut head_writer = store.record_writer(current_generation);
+        let head = head_writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: content_root,
+                },
+                &[],
+            )
+            .expect("write unrelated current head");
+        head_writer.finish().expect("finish current head segment");
+        assert!(store.compare_and_set_head(store.head(), head));
+        store.close().expect("close fixture writer");
+        let before = file_bytes(&directory.path);
+
+        let error = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+        )
+        .expect_err("prospective deletion must reject a surviving cross-reference");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid segment-tar data: surviving data segment {} references segment {}, which the cleanup plan would remove",
+                survivor.segment, target.segment
+            )
+        );
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "prospective validation remains read-only"
+        );
+        Repository::open(&directory.path).expect("refused fixture remains readable");
+    }
+
+    #[test]
+    fn current_head_reaching_a_one_generation_old_segment_fails_closed() {
+        let directory = TestDirectory::repository("generation-invariant");
+        let store = WritableRepository::open(&directory.path).expect("open writer");
+        // Exactly one generation behind the head: the boundary the retention
+        // value moved. At two retained generations the arithmetic spared this
+        // child, so the run proceeded on the predicate alone; at one it is
+        // reclaimable and only the reference guard keeps the head's own data.
+        let mut root_writer = store.record_writer(GarbageCollectionGeneration {
+            generation: 1,
+            full_generation: 1,
+            is_compacted: false,
+        });
+        let old_root = root_writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("one-generation-old content root");
+        root_writer.finish().expect("finish the older generation");
+        let mut writer = store.record_writer(GarbageCollectionGeneration {
+            generation: 2,
+            full_generation: 2,
+            is_compacted: false,
+        });
+        let new_head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: old_root,
+                },
+                &[],
+            )
+            .expect("new super root");
+        writer.finish().expect("finish");
+        assert!(store.compare_and_set_head(store.head(), new_head));
+        store.close().expect("close");
+        let before = file_bytes(&directory.path);
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+
+        let error = plan_compaction(&directory.path, &options)
+            .expect_err("a live one-generation-old child is unsafe at one retained generation");
+        assert!(
+            error
+                .to_string()
+                .contains("current head reaches data segment")
+        );
+        assert_eq!(file_bytes(&directory.path), before);
+        Repository::open(&directory.path).expect("refusal leaves repository healthy");
+    }
+
+    #[test]
+    fn gate_deferred_garbage_is_counted_rather_than_reported_as_nothing() {
+        let (directory, new_head) = sub_gate_garbage_fixture("retained-reclaimable");
+
+        let options = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments])
+            .with_oak_savings_gate();
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
+        assert_eq!(plan.current_head(), new_head);
+        let deferred = plan
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("25% rewrite gate"));
+        assert!(
+            deferred,
+            "expected a savings deferral: {:?}",
+            plan.warnings()
+        );
+        assert!(
+            plan.retained_reclaimable_segments() != 0,
+            "declined garbage must be counted, not silently dropped"
+        );
+        assert!(plan.retained_reclaimable_bytes() != 0);
+        // The distinction the old output could not express: nothing is
+        // reclaimable *by this run*, yet the store is not clean.
+        assert_eq!(plan.estimated_reclaimable_bytes(), 0);
+    }
+
+    #[test]
+    fn the_default_policy_reclaims_what_the_oak_gate_declines() {
+        let (directory, new_head) = sub_gate_garbage_fixture("default-policy-reclaims");
+
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
+        assert_eq!(plan.current_head(), new_head);
+        assert!(
+            !plan
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("rewrite gate")),
+            "the default policy never defers for savings: {:?}",
+            plan.warnings()
+        );
+        assert_eq!(
+            plan.retained_reclaimable_segments(),
+            0,
+            "nothing identified may be left behind on an archive with letters to spare"
+        );
+        assert_eq!(plan.retained_reclaimable_bytes(), 0);
+        assert!(
+            plan.estimated_reclaimable_bytes() != 0,
+            "the garbage the gate declined is now actually reclaimed"
+        );
+        assert!(
+            plan.actions().iter().any(|action| matches!(
+                action,
+                CompactionAction::RewriteArchive { file_name, replacement_name, .. }
+                    if file_name == "data00001a.tar" && replacement_name == "data00001b.tar"
+            )),
+            "the sub-gate archive is rewritten to its next generation: {:?}",
+            plan.actions()
+        );
+    }
+
+    #[test]
+    fn the_plan_prices_the_history_veto_against_oaks_own_predicate() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-price");
+
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
+
+        // The bootstrap revision's segments are reachable from the old
+        // journal line and from nothing else.
+        assert!(
+            plan.history_protected_segments() != 0,
+            "the bootstrap revision must be counted as history-only"
+        );
+        // And they are two full generations behind the head, so Oak would
+        // have reclaimed them. That difference is the veto's price, and
+        // reporting it is the whole point: it is what turns "reclaimed
+        // nothing" into a number the operator can act on.
+        let (reclaimable_segments, reclaimable_bytes) = plan.history_protected_reclaimable();
+        assert!(
+            reclaimable_segments != 0,
+            "generation-zero history must be priced as reclaimable-but-protected"
+        );
+        assert!(reclaimable_bytes != 0);
+        assert!(reclaimable_segments <= plan.history_protected_segments());
+    }
+
+    #[test]
+    fn segment_cleanup_removes_old_unjournaled_archive_but_preserves_history() {
+        let directory = TestDirectory::repository("orphan-segment-history");
+        let old_head = Repository::open(&directory.path)
+            .expect("old repository")
+            .head_record_identifier();
+
+        // A separate, unjournaled generation-zero archive: representative of
+        // a failed write/CAS whose records never became repository state.
+        {
+            let store = WritableRepository::open(&directory.path).expect("open orphan writer");
+            let mut writer = store.record_writer(GarbageCollectionGeneration {
+                generation: 0,
+                full_generation: 0,
+                is_compacted: false,
+            });
+            writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("orphan node");
+            writer.finish().expect("finish orphan segment");
+            store.close().expect("close orphan writer");
+        }
+        assert!(directory.path.join("data00001a.tar").is_file());
+
+        // Publish a completely independent generation-two head. It does not
+        // reference generation zero; only the older journal line roots the
+        // original bootstrap revision.
+        let new_head = {
+            let store = WritableRepository::open(&directory.path).expect("open new head writer");
+            let generation = GarbageCollectionGeneration {
+                generation: 2,
+                full_generation: 2,
+                is_compacted: false,
+            };
+            let mut writer = store.record_writer(generation);
+            let root = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("new content root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("new super root");
+            writer.finish().expect("finish new head");
+            assert!(store.compare_and_set_head(store.head(), head));
+            store.close().expect("close new head writer");
+            head
+        };
+        assert!(directory.path.join("data00002a.tar").is_file());
+
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("segment plan");
+        assert!(plan.actions().iter().any(|action| matches!(
+            action,
+            CompactionAction::RemoveReclaimableArchive { file_name, .. }
+                if file_name == "data00001a.tar"
+        )));
+        assert!(!plan.actions().iter().any(|action| matches!(
+            action,
+            CompactionAction::RemoveReclaimableArchive { file_name, .. }
+                if file_name == "data00000a.tar"
+        )));
+        let planned_removed_segments: usize = plan
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                CompactionAction::RemoveReclaimableArchive { segments, .. }
+                | CompactionAction::RewriteArchive { segments, .. } => Some(*segments),
+                _ => None,
+            })
+            .sum();
+        assert!(planned_removed_segments != 0);
+
+        let outcome = compact(&directory.path, options).expect("segment cleanup");
+        assert_eq!(outcome.head_after, new_head);
+        assert_eq!(outcome.removed_segments(), planned_removed_segments);
+        assert!(!directory.path.join("data00001a.tar").exists());
+        let repository = Repository::open(&directory.path).expect("healthy final repository");
+        assert_eq!(repository.head_record_identifier(), new_head);
+        crate::tooling::verify_node_tree(&repository, old_head)
+            .expect("historical root remains readable");
+    }
+
+    /// The shape a real store has once reclamation actually starts removing
+    /// things: dead segments that survive only because their archive failed
+    /// the rewrite gate, still pointing at dead segments in an archive that
+    /// goes away entirely.
+    #[test]
+    fn a_dead_survivor_pointing_at_a_removed_segment_is_handled() {
+        let directory = TestDirectory::repository("dead-survivor-reference");
+        let dead_generation = GarbageCollectionGeneration {
+            generation: 0,
+            full_generation: 0,
+            is_compacted: false,
+        };
+        let live_generation = GarbageCollectionGeneration {
+            generation: 2,
+            full_generation: 2,
+            is_compacted: false,
+        };
+
+        // An archive of nothing but dead segments: fully reclaimable, so the
+        // sweep unlinks it whole.
+        let target = {
+            let store = WritableRepository::open(&directory.path).expect("open target writer");
+            let mut writer = store.record_writer(dead_generation);
+            let node = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("dead target node");
+            writer.finish().expect("finish target");
+            store.close().expect("close target writer");
+            node
+        };
+
+        // An archive that keeps one dead segment referencing that target,
+        // beside enough live segments that removing the dead one cannot
+        // repay a rewrite — so the dead segment stays on disk.
+        let new_head = {
+            let store = WritableRepository::open(&directory.path).expect("open mixed writer");
+            let mut referencing = store.record_writer(dead_generation);
+            referencing
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "target".to_owned(),
+                        node: target,
+                    },
+                    &[],
+                )
+                .expect("dead referencing node");
+            referencing.finish().expect("finish referencing");
+            for _ in 0..8 {
+                let mut filler = store.record_writer(live_generation);
+                filler
+                    .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                    .expect("live filler");
+                filler.finish().expect("finish filler");
+            }
+            let mut writer = store.record_writer(live_generation);
+            let root = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("content root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("super root");
+            writer.finish().expect("finish head");
+            assert!(store.compare_and_set_head(store.head(), head));
+            store.close().expect("close mixed writer");
+            head
+        };
+
+        // The default task set, with no retention bound: the loosened check
+        // lives on this path, so this is where it must be pinned.
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+
+        // Unconditional. Restoring the stricter check must fail this, so the
+        // plan is required to exist rather than merely be well-explained if
+        // it does not.
+        let plan = plan_compaction(&directory.path, &options)
+            .expect("a dead survivor pointing at removed garbage must not refuse the plan");
+        let removed: usize = plan
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                CompactionAction::RemoveReclaimableArchive { segments, .. }
+                | CompactionAction::RewriteArchive { segments, .. } => Some(*segments),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            removed != 0,
+            "the fixture must actually remove something, or it proves nothing"
+        );
+
+        let outcome = compact(&directory.path, options).expect("apply the plan");
+        assert_eq!(outcome.head_after, new_head);
+        assert!(outcome.removed_segments() != 0);
+        let repository = Repository::open(&directory.path).expect("healthy store");
+        assert_eq!(repository.head_record_identifier(), new_head);
+        crate::tooling::verify_node_tree(&repository, new_head).expect("head verifies");
+    }
+}

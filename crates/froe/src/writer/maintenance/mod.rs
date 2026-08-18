@@ -6,11 +6,13 @@
 //! the manifest). A prepared session takes the repository lock, rebuilds the
 //! plan from disk, fingerprints every directory entry, and holds the lock
 //! until application and fresh post-operation verification complete.
+//!
+//! Every test lives with the stage it exercises, including the end-to-end
+//! ones: a claim about what the apply phase refuses belongs beside the
+//! apply phase even when it is made through `plan_compaction`.
 
 #[cfg(test)]
 mod test_support;
-#[cfg(test)]
-mod tests;
 
 mod apply;
 mod apply_identity;

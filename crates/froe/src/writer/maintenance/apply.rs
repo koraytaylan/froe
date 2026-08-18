@@ -929,3 +929,99 @@ pub(super) fn retained_raw_line_matches(expected: &[u8], actual: &[u8]) -> bool 
         && actual.starts_with(expected)
         && actual.last() == Some(&b'\n')
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Repository;
+    use crate::writer::maintenance::options::*;
+    use crate::writer::maintenance::plan::*;
+    use crate::writer::maintenance::prepared::*;
+    use crate::writer::maintenance::test_support::*;
+
+    #[test]
+    fn archive_staging_requires_complete_byte_identity_before_removal() {
+        let directory = TestDirectory::repository("archive-staging-proof");
+        let exact = directory.path.join("data00000b.tar.cleaning.000");
+        std::fs::copy(directory.path.join("data00000a.tar"), &exact)
+            .expect("copy exact staging archive");
+        let ambiguous = directory.path.join("data00001a.tar.recovering");
+        std::fs::write(&ambiguous, b"nonempty recovery evidence")
+            .expect("write ambiguous staging archive");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
+
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
+        assert!(plan.actions().iter().any(|action| matches!(
+            action,
+            CompactionAction::RemoveTemporary { file_name, .. }
+                if file_name == "data00000b.tar.cleaning.000"
+        )));
+        assert!(!plan.actions().iter().any(|action| matches!(
+            action,
+            CompactionAction::RemoveTemporary { file_name, .. }
+                if file_name == "data00001a.tar.recovering"
+        )));
+
+        compact(&directory.path, options).expect("cleanup");
+        assert!(!exact.exists());
+        assert!(ambiguous.exists());
+        Repository::open(&directory.path).expect("healthy repository");
+    }
+
+    #[test]
+    fn segment_source_certificate_rejects_a_survivor_payload_crc_mismatch() {
+        let (directory, source_name, replacement_name, survivor) =
+            rewrite_certificate_fixture("source-certificate-survivor-crc");
+        corrupt_segment_payload_crc(&directory.path.join(&source_name), survivor);
+
+        assert_source_certificate_refusal(
+            &directory,
+            &source_name,
+            Some(&replacement_name),
+            "payload CRC",
+        );
+    }
+
+    #[test]
+    fn segment_source_certificate_rejects_exact_graph_or_brf_omissions() {
+        for (name, omitted, expected_error) in [
+            (
+                "source-certificate-omitted-graph",
+                OmittedArchiveMetadata::Graph,
+                "segment graph differs",
+            ),
+            (
+                "source-certificate-omitted-brf",
+                OmittedArchiveMetadata::BinaryReferences,
+                "binary-reference catalog differs",
+            ),
+        ] {
+            let (directory, source_name, replacement_name, _) = rewrite_certificate_fixture(name);
+            repack_omitting_archive_metadata(&directory.path, &source_name, omitted);
+
+            assert_source_certificate_refusal(
+                &directory,
+                &source_name,
+                Some(&replacement_name),
+                expected_error,
+            );
+        }
+    }
+
+    #[test]
+    fn segment_source_certificate_precedes_a_whole_archive_removal() {
+        let (directory, source_name, orphan) =
+            whole_removal_certificate_fixture("source-certificate-whole-removal");
+        change_index_generation(&directory.path.join(&source_name), orphan, -1);
+
+        assert_source_certificate_refusal(
+            &directory,
+            &source_name,
+            None,
+            "index/header generation disagreement",
+        );
+        assert!(
+            directory.path.join(source_name).exists(),
+            "the whole-removal source must survive a failed certificate"
+        );
+    }
+}

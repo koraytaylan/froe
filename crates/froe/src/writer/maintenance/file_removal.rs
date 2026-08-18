@@ -317,3 +317,231 @@ pub(super) fn read_optional_regular_file(path: &Path) -> Result<Option<Vec<u8>>>
         Err(error) => Err(error.into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::maintenance::planning::*;
+    use crate::writer::maintenance::test_support::*;
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs::OpenOptions;
+
+    #[test]
+    fn deferred_removal_rechecks_the_exact_planned_file_identity() {
+        let directory = TestDirectory::new("deferred-removal-identity");
+        let removable_name = "journal.log.bak.998";
+        let removable_path = directory.path.join(removable_name);
+        std::fs::write(&removable_path, b"independent old recovery copy")
+            .expect("write independently removable backup");
+        let removable_metadata =
+            std::fs::symlink_metadata(&removable_path).expect("removable metadata");
+        let removable = PlannedFileRemoval {
+            file_name: removable_name.to_owned(),
+            bytes: removable_metadata.len(),
+            fingerprint: file_fingerprint(
+                std::ffi::OsString::from(removable_name),
+                &removable_metadata,
+            ),
+        };
+        let name = "journal.log.bak.999";
+        let path = directory.path.join(name);
+        std::fs::write(&path, b"first recovery copy").expect("write planned backup");
+        let metadata = std::fs::symlink_metadata(&path).expect("planned metadata");
+        let planned = PlannedFileRemoval {
+            file_name: name.to_owned(),
+            bytes: metadata.len(),
+            fingerprint: file_fingerprint(std::ffi::OsString::from(name), &metadata),
+        };
+        std::fs::remove_file(&path).expect("remove original backup");
+        std::fs::write(&path, b"new recovery material").expect("replace backup");
+
+        let (removed, failures) = remove_planned_files(
+            &directory.path,
+            [removable, planned],
+            PlannedFileRemovalFailureMode::Partial,
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect("late deletion refusals are a partial outcome");
+
+        assert_eq!(removed, 1);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].file_name(), name);
+        assert!(failures[0].error().contains("changed after"));
+        assert!(
+            !removable_path.exists(),
+            "a late identity refusal must not discard an earlier successful deletion"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("replacement remains"),
+            b"new recovery material"
+        );
+    }
+
+    #[test]
+    fn strict_stale_removal_reports_an_already_absent_file_without_losing_the_outcome() {
+        let directory = TestDirectory::new("strict-removal-already-absent");
+        let name = "data00001a.tar";
+        let path = directory.path.join(name);
+        std::fs::write(&path, b"certified stale archive").expect("write planned source");
+        let metadata = std::fs::symlink_metadata(&path).expect("planned metadata");
+        let planned = PlannedFileRemoval {
+            file_name: name.to_owned(),
+            bytes: metadata.len(),
+            fingerprint: file_fingerprint(OsString::from(name), &metadata),
+        };
+        std::fs::remove_file(path).expect("another actor won the unlink race");
+
+        let (removed, failures) = remove_planned_files(
+            &directory.path,
+            [planned],
+            PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect("absence is a reportable partial result, not a lost cleanup outcome");
+
+        assert_eq!(removed, 0);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].file_name(), name);
+        assert!(failures[0].target_was_already_absent());
+        assert_eq!(
+            failures[0].error(),
+            "file was already absent when deletion was attempted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_stale_removal_treats_disappearance_at_each_recertification_as_partial() {
+        for disappearance_before_verification in 0..=1 {
+            let directory = TestDirectory::new(&format!(
+                "strict-removal-post-open-absence-{disappearance_before_verification}"
+            ));
+            let name = "data00001a.tar";
+            let path = directory.path.join(name);
+            std::fs::write(&path, b"certified stale archive").expect("write planned source");
+            let metadata = std::fs::symlink_metadata(&path).expect("planned metadata");
+            let planned = PlannedFileRemoval {
+                file_name: name.to_owned(),
+                bytes: metadata.len(),
+                fingerprint: file_fingerprint(OsString::from(name), &metadata),
+            };
+
+            let (removed, failures) = remove_planned_files_with_after_open(
+                &directory.path,
+                [planned],
+                PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+                |path, verification| {
+                    if verification == disappearance_before_verification {
+                        std::fs::remove_file(path)
+                            .expect("another actor removes the held pathname");
+                    } else if disappearance_before_verification == 0 && verification == 1 {
+                        // Reached only if the first production recertification
+                        // has been removed or neutralized. Make the second one
+                        // reject instead of accidentally preserving the same
+                        // partial outcome, so each call remains load-bearing.
+                        std::fs::write(path, b"replacement recovery material")
+                            .expect("install a replacement pathname");
+                    }
+                },
+                |_| panic!("an absent pathname must never reach unlink"),
+            )
+            .expect("strict mode keeps an already achieved deletion as partial");
+
+            assert_eq!(removed, 0);
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].file_name(), name);
+            assert!(failures[0].target_was_already_absent());
+            assert_eq!(
+                failures[0].error(),
+                "file was already absent when deletion was attempted"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_stale_removal_reports_an_exact_source_unlink_error_as_partial() {
+        let directory = TestDirectory::new("strict-removal-unlink-error");
+        let name = "data00001a.tar";
+        let path = directory.path.join(name);
+        std::fs::write(&path, b"certified stale archive").expect("write planned source");
+        let metadata = std::fs::symlink_metadata(&path).expect("planned metadata");
+        let planned = PlannedFileRemoval {
+            file_name: name.to_owned(),
+            bytes: metadata.len(),
+            fingerprint: file_fingerprint(OsString::from(name), &metadata),
+        };
+
+        let (removed, failures) = remove_planned_files_with(
+            &directory.path,
+            [planned],
+            PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected exact-source unlink refusal",
+                ))
+            },
+        )
+        .expect("a certified source left in place is a reportable partial result");
+
+        assert_eq!(removed, 0);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].file_name(), name);
+        assert!(!failures[0].target_was_already_absent());
+        assert_eq!(failures[0].error(), "injected exact-source unlink refusal");
+        assert_eq!(
+            std::fs::read(path).expect("certified source remains"),
+            b"certified stale archive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_removal_reports_a_non_not_found_open_error_as_partial() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("deferred-removal-open-error");
+        let name = "journal.log.bak.999";
+        let path = directory.path.join(name);
+        std::fs::write(&path, b"planned recovery copy").expect("write planned backup");
+        let metadata = std::fs::symlink_metadata(&path).expect("planned metadata");
+        let planned = PlannedFileRemoval {
+            file_name: name.to_owned(),
+            bytes: metadata.len(),
+            fingerprint: file_fingerprint(std::ffi::OsString::from(name), &metadata),
+        };
+        let victim = directory.path.join("recovery-evidence");
+        std::fs::write(&victim, b"do not follow").expect("write symlink target");
+        std::fs::remove_file(&path).expect("remove planned inode");
+        symlink("recovery-evidence", &path).expect("install non-followable replacement");
+        let expected_open_error = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut options = OpenOptions::new();
+            options.read(true).custom_flags(libc::O_NOFOLLOW);
+            let error = options
+                .open(&path)
+                .expect_err("O_NOFOLLOW must reject the substituted symlink");
+            assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+            error.to_string()
+        };
+
+        let (removed, failures) = remove_planned_files(
+            &directory.path,
+            [planned],
+            PlannedFileRemovalFailureMode::Partial,
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect("late open refusal is a partial outcome");
+
+        assert_eq!(removed, 0);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].file_name(), name);
+        assert_eq!(failures[0].error(), expected_open_error);
+        assert_eq!(
+            std::fs::read(&victim).expect("symlink target remains"),
+            b"do not follow"
+        );
+        assert!(path.is_symlink());
+    }
+}
