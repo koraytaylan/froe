@@ -17,6 +17,10 @@ use support::{
     record_identifier_bytes, string_record, write_repository,
 };
 
+/// Builds one node record: its own stable identifier, its template, and
+/// whatever extra slots that template declares.
+type NodeRecordWriter<'writer> = dyn Fn(u32, u32, &[Vec<u8>]) -> Vec<u8> + 'writer;
+
 /// The number of children under `/content`; above 32 so the child map is
 /// stored as a branch record with leaf buckets.
 const CONTENT_CHILD_COUNT: usize = 40;
@@ -65,26 +69,8 @@ struct SyntheticRepository {
     journal_line: String,
 }
 
-/// Builds a repository with this content tree:
-///
-/// ```text
-/// (super-root)
-/// ├─ root
-/// │   ├─ content        properties: title, count, active; 40 children
-/// │   │   └─ child-00 … child-39
-/// │   └─ empty
-/// └─ checkpoints
-///     └─ cp-one         created/timestamp properties, root → shared with /
-/// ```
-#[allow(
-    clippy::too_many_lines,
-    reason = "one linear fixture description reads better unsplit"
-)]
-fn build_synthetic_repository() -> SyntheticRepository {
-    let values_uuid = data_segment_uuid(0x0002);
-    let tree_uuid = data_segment_uuid(0x0001);
-
-    // --- The values segment: every string used by the tree. ---
+/// Every string the tree refers to, in one segment of its own.
+fn build_values_segment(values_uuid: support::SegmentUuid) -> (SegmentBuilder, Vec<String>) {
     let mut values = SegmentBuilder::new(values_uuid);
     let strings = [
         (value_records::ROOT_NAME, "root"),
@@ -118,20 +104,19 @@ fn build_synthetic_repository() -> SyntheticRepository {
         );
     }
 
-    // --- The tree segment: templates, maps, and nodes. ---
-    let mut tree = SegmentBuilder::new(tree_uuid);
-    let values_reference = tree.add_referenced_segment(values_uuid);
-    let value_identifier =
-        |record_number: u32| record_identifier_bytes(values_reference, record_number);
-    let own_identifier = |record_number: u32| record_identifier_bytes(0, record_number);
+    (values, child_names)
+}
 
-    let mut next_dynamic = tree_records::DYNAMIC_START;
-    let mut allocate = move || {
-        let allocated = next_dynamic;
-        next_dynamic += 1;
-        allocated
-    };
-
+/// Every template the synthetic tree's nodes point at.
+///
+/// Property names sit in the mandatory on-disk order — sorted by signed
+/// Java `String.hashCode` — which is what makes this fixture a valid
+/// stand-in for one Oak wrote.
+fn add_tree_templates(
+    tree: &mut SegmentBuilder,
+    value_identifier: &dyn Fn(u32) -> Vec<u8>,
+    own_identifier: &dyn Fn(u32) -> Vec<u8>,
+) {
     // Template of the empty leaf nodes: primary type, zero children.
     let mut template_empty = ((1u32 << 31) | (1 << 29)).to_be_bytes().to_vec();
     template_empty.extend(value_identifier(value_records::PRIMARY_TYPE_VALUE));
@@ -205,17 +190,18 @@ fn build_synthetic_repository() -> SyntheticRepository {
         TYPE_TEMPLATE,
         template_checkpoints_parent,
     );
+}
 
-    // A node record: stable identifier (self), template, extra slots.
-    let node_record = |own_record_number: u32, template: u32, slots: &[Vec<u8>]| {
-        let mut bytes = record_identifier_bytes(0, own_record_number);
-        bytes.extend(record_identifier_bytes(0, template));
-        for slot in slots {
-            bytes.extend_from_slice(slot);
-        }
-        bytes
-    };
-
+/// The forty child nodes under /content and the branch map that indexes
+/// them — above 32 entries, so the map is a branch with leaf buckets.
+fn add_content_children(
+    tree: &mut SegmentBuilder,
+    child_names: &[String],
+    value_identifier: &dyn Fn(u32) -> Vec<u8>,
+    own_identifier: &dyn Fn(u32) -> Vec<u8>,
+    node_record: &NodeRecordWriter<'_>,
+    allocate: &mut impl FnMut() -> u32,
+) -> (Vec<u32>, u32) {
     // The empty child nodes.
     let mut child_node_records = Vec::with_capacity(CONTENT_CHILD_COUNT);
     for _ in 0..CONTENT_CHILD_COUNT {
@@ -240,8 +226,70 @@ fn build_synthetic_repository() -> SyntheticRepository {
             )
         })
         .collect();
-    let content_child_map = build_child_map(&mut tree, &mut allocate, &map_entries);
+    let content_child_map = build_child_map(tree, allocate, &map_entries);
+    (child_node_records, content_child_map)
+}
 
+/// The checkpoints container and the one checkpoint under it.
+///
+/// Its root child shares the live content root record, which is what
+/// makes a checkpoint cheap in Oak and what the reader must not mistake
+/// for two separate trees.
+fn add_checkpoint_subtree(
+    tree: &mut SegmentBuilder,
+    root_node: u32,
+    value_identifier: &dyn Fn(u32) -> Vec<u8>,
+    own_identifier: &dyn Fn(u32) -> Vec<u8>,
+    node_record: &NodeRecordWriter<'_>,
+    allocate: &mut impl FnMut() -> u32,
+) -> u32 {
+    // The checkpoint: its root child SHARES the content root record.
+    let mut checkpoint_values_bucket = Vec::new();
+    checkpoint_values_bucket.extend(value_identifier(value_records::TIMESTAMP_VALUE));
+    checkpoint_values_bucket.extend(value_identifier(value_records::CREATED_VALUE));
+    let checkpoint_values_record = allocate();
+    tree.add_record(
+        checkpoint_values_record,
+        TYPE_LIST_BUCKET,
+        checkpoint_values_bucket,
+    );
+    let checkpoint_node = allocate();
+    tree.add_record(
+        checkpoint_node,
+        TYPE_NODE,
+        node_record(
+            checkpoint_node,
+            tree_records::TEMPLATE_CHECKPOINT,
+            &[
+                own_identifier(root_node),
+                own_identifier(checkpoint_values_record),
+            ],
+        ),
+    );
+    let checkpoints_parent_node = allocate();
+    tree.add_record(
+        checkpoints_parent_node,
+        TYPE_NODE,
+        node_record(
+            checkpoints_parent_node,
+            tree_records::TEMPLATE_CHECKPOINTS_PARENT,
+            &[own_identifier(checkpoint_node)],
+        ),
+    );
+
+    checkpoints_parent_node
+}
+
+/// /content with its properties and children, /empty beside it, and the
+/// content root that holds both.
+fn add_content_root(
+    tree: &mut SegmentBuilder,
+    content_child_map: u32,
+    value_identifier: &dyn Fn(u32) -> Vec<u8>,
+    own_identifier: &dyn Fn(u32) -> Vec<u8>,
+    node_record: &NodeRecordWriter<'_>,
+    allocate: &mut impl FnMut() -> u32,
+) -> u32 {
     // /content: property values bucket, then the node.
     let mut content_values_bucket = Vec::new();
     content_values_bucket.extend(value_identifier(value_records::ACTIVE_VALUE));
@@ -277,8 +325,8 @@ fn build_synthetic_repository() -> SyntheticRepository {
 
     // The content root with children content and empty.
     let root_map = build_child_map(
-        &mut tree,
-        &mut allocate,
+        tree,
+        allocate,
         &[
             (
                 "content".to_owned(),
@@ -303,38 +351,77 @@ fn build_synthetic_repository() -> SyntheticRepository {
         ),
     );
 
-    // The checkpoint: its root child SHARES the content root record.
-    let mut checkpoint_values_bucket = Vec::new();
-    checkpoint_values_bucket.extend(value_identifier(value_records::TIMESTAMP_VALUE));
-    checkpoint_values_bucket.extend(value_identifier(value_records::CREATED_VALUE));
-    let checkpoint_values_record = allocate();
-    tree.add_record(
-        checkpoint_values_record,
-        TYPE_LIST_BUCKET,
-        checkpoint_values_bucket,
+    root_node
+}
+
+/// Builds a repository with this content tree:
+///
+/// ```text
+/// (super-root)
+/// ├─ root
+/// │   ├─ content        properties: title, count, active; 40 children
+/// │   │   └─ child-00 … child-39
+/// │   └─ empty
+/// └─ checkpoints
+///     └─ cp-one         created/timestamp properties, root → shared with /
+/// ```
+fn build_synthetic_repository() -> SyntheticRepository {
+    let values_uuid = data_segment_uuid(0x0002);
+    let tree_uuid = data_segment_uuid(0x0001);
+
+    let (values, child_names) = build_values_segment(values_uuid);
+
+    // --- The tree segment: templates, maps, and nodes. ---
+    let mut tree = SegmentBuilder::new(tree_uuid);
+    let values_reference = tree.add_referenced_segment(values_uuid);
+    let value_identifier =
+        |record_number: u32| record_identifier_bytes(values_reference, record_number);
+    let own_identifier = |record_number: u32| record_identifier_bytes(0, record_number);
+
+    let mut next_dynamic = tree_records::DYNAMIC_START;
+    let mut allocate = move || {
+        let allocated = next_dynamic;
+        next_dynamic += 1;
+        allocated
+    };
+
+    add_tree_templates(&mut tree, &value_identifier, &own_identifier);
+
+    // A node record: stable identifier (self), template, extra slots.
+    let node_record = |own_record_number: u32, template: u32, slots: &[Vec<u8>]| {
+        let mut bytes = record_identifier_bytes(0, own_record_number);
+        bytes.extend(record_identifier_bytes(0, template));
+        for slot in slots {
+            bytes.extend_from_slice(slot);
+        }
+        bytes
+    };
+
+    let (_, content_child_map) = add_content_children(
+        &mut tree,
+        &child_names,
+        &value_identifier,
+        &own_identifier,
+        &node_record,
+        &mut allocate,
     );
-    let checkpoint_node = allocate();
-    tree.add_record(
-        checkpoint_node,
-        TYPE_NODE,
-        node_record(
-            checkpoint_node,
-            tree_records::TEMPLATE_CHECKPOINT,
-            &[
-                own_identifier(root_node),
-                own_identifier(checkpoint_values_record),
-            ],
-        ),
+
+    let root_node = add_content_root(
+        &mut tree,
+        content_child_map,
+        &value_identifier,
+        &own_identifier,
+        &node_record,
+        &mut allocate,
     );
-    let checkpoints_parent_node = allocate();
-    tree.add_record(
-        checkpoints_parent_node,
-        TYPE_NODE,
-        node_record(
-            checkpoints_parent_node,
-            tree_records::TEMPLATE_CHECKPOINTS_PARENT,
-            &[own_identifier(checkpoint_node)],
-        ),
+
+    let checkpoints_parent_node = add_checkpoint_subtree(
+        &mut tree,
+        root_node,
+        &value_identifier,
+        &own_identifier,
+        &node_record,
+        &mut allocate,
     );
 
     // The super-root with children root and checkpoints.
