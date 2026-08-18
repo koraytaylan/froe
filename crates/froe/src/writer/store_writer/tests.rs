@@ -13,6 +13,7 @@ use super::test_support::*;
 use crate::cache::BoundedCache;
 #[cfg(unix)]
 use crate::content::provider::SegmentProvider;
+use crate::segment::identifier::SegmentIdentifier;
 #[cfg(unix)]
 use crate::segment::parsed_segment::ParsedSegment;
 use crate::segment::record::{RecordIdentifier, RecordType};
@@ -27,6 +28,7 @@ use crate::writer::segment_builder::{GarbageCollectionGeneration, SegmentBufferB
 use crate::writer::tar_writer::TarArchiveWriter;
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 /// The boundary the retention value actually moves, and the store shape
@@ -891,11 +893,108 @@ fn bootstraps_a_fresh_store_that_the_reader_opens() {
     assert_eq!(content_root.child_node_count().expect("count"), 0);
     assert!(content_root.properties().expect("properties").is_empty());
 }
+/// Rebuilds `source` under `swap_name` as a byte-valid archive with the
+/// same UUIDs, index layout, generations, graph, and stale binary-reference
+/// catalog. Only the inline blob identifier changes, at equal length, so the
+/// sweep plan remains unchanged while the segment-entry CRC is recomputed by
+/// the writer. Returns the bytes of the archive it wrote.
 #[cfg(unix)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the regression must build a same-layout valid-CRC source swap and exercise the complete pre-publication sweep path"
-)]
+fn rebuild_source_with_swapped_blob(
+    directory: &Path,
+    source: &TarArchiveReader,
+    swap_name: &str,
+    source_name: &str,
+    blob_segment: SegmentIdentifier,
+    original_blob: &[u8],
+    swapped_blob: &[u8],
+) -> Vec<u8> {
+    let mut swapped_writer =
+        TarArchiveWriter::new_exclusive_staged(directory, swap_name, source_name);
+    copy_binary_reference_catalog(&mut swapped_writer, source);
+    let mut entries = source.index().expect("source index").entries().to_vec();
+    entries.sort_by_key(|entry| entry.position);
+    let mut changed_blob = false;
+    for entry in &entries {
+        let identifier = entry.segment_identifier;
+        let mut bytes = source
+            .segment_data(identifier)
+            .expect("indexed source payload")
+            .to_vec();
+        let structure = ParsedSegment::parse(identifier, &bytes).expect("source segment");
+        if identifier == blob_segment {
+            swap_inline_blob_identifier(&mut bytes, &structure, original_blob, swapped_blob);
+            changed_blob = true;
+        }
+        let changed_structure =
+            ParsedSegment::parse(identifier, &bytes).expect("same-layout changed segment");
+        swapped_writer
+            .write_segment(
+                identifier,
+                &bytes,
+                GarbageCollectionGeneration {
+                    generation: entry.generation,
+                    full_generation: entry.full_generation,
+                    is_compacted: entry.is_compacted,
+                },
+                &changed_structure.referenced_segments,
+                &[],
+            )
+            .expect("write changed source entry");
+    }
+    assert!(changed_blob, "the fixture must change one blob identifier");
+    swapped_writer.close().expect("close changed source");
+    std::fs::read(directory.join(swap_name)).expect("read changed source")
+}
+
+/// Reproduces `source`'s binary-reference catalog in `writer` verbatim, so
+/// the rebuilt archive carries the same stale entries the original did.
+#[cfg(unix)]
+fn copy_binary_reference_catalog(writer: &mut TarArchiveWriter, source: &TarArchiveReader) {
+    for catalog_generation in source
+        .binary_references()
+        .expect("source binary-reference catalog")
+        .generations
+    {
+        let catalog_gc_generation = GarbageCollectionGeneration {
+            generation: catalog_generation.generation,
+            full_generation: catalog_generation.full_generation,
+            is_compacted: catalog_generation.is_compacted,
+        };
+        for (identifier, references) in catalog_generation.segments {
+            writer.add_binary_references(catalog_gc_generation, identifier, references);
+        }
+    }
+}
+
+/// Overwrites the one inline (`0xE0`-class) external-blob identifier in
+/// `bytes` with `swapped_blob`, asserting the record is the shape the
+/// fixture depends on and that the replacement is the same length.
+#[cfg(unix)]
+fn swap_inline_blob_identifier(
+    bytes: &mut [u8],
+    structure: &ParsedSegment,
+    original_blob: &[u8],
+    swapped_blob: &[u8],
+) {
+    let external = structure
+        .record_table()
+        .iter()
+        .find(|record| record.record_type() == Some(RecordType::ExternalBlobIdentifier))
+        .expect("inline external-blob record");
+    let position = structure
+        .buffer_position(external.offset)
+        .expect("external-blob record position");
+    let encoded_length = u16::from_be_bytes([bytes[position], bytes[position + 1]]);
+    assert_eq!(encoded_length & 0xF000, 0xE000);
+    assert_eq!(usize::from(encoded_length & 0x0FFF), original_blob.len());
+    assert_eq!(
+        &bytes[position + 2..position + 2 + original_blob.len()],
+        original_blob
+    );
+    bytes[position + 2..position + 2 + swapped_blob.len()].copy_from_slice(swapped_blob);
+}
+
+#[cfg(unix)]
 #[test]
 fn immediate_source_certificate_uses_the_reopened_blob_payload() {
     const ORIGINAL_BLOB: &[u8] = b"live-external-blob";
@@ -927,74 +1026,15 @@ fn immediate_source_certificate_uses_the_reopened_blob_payload() {
     let swap_name = format!("{source_name}.swapped");
     let swap_path = directory.path.join(&swap_name);
 
-    // Rebuild a byte-valid archive with the same UUIDs, index layout,
-    // generations, graph, and stale BRF. Only the inline blob identifier
-    // changes, at equal length, so the sweep plan remains unchanged while
-    // the segment-entry CRC is recomputed by the writer.
-    let mut swapped_writer =
-        TarArchiveWriter::new_exclusive_staged(&directory.path, &swap_name, &source_name);
-    for catalog_generation in source
-        .binary_references()
-        .expect("source binary-reference catalog")
-        .generations
-    {
-        let catalog_gc_generation = GarbageCollectionGeneration {
-            generation: catalog_generation.generation,
-            full_generation: catalog_generation.full_generation,
-            is_compacted: catalog_generation.is_compacted,
-        };
-        for (identifier, references) in catalog_generation.segments {
-            swapped_writer.add_binary_references(catalog_gc_generation, identifier, references);
-        }
-    }
-    let mut entries = source.index().expect("source index").entries().to_vec();
-    entries.sort_by_key(|entry| entry.position);
-    let mut changed_blob = false;
-    for entry in &entries {
-        let identifier = entry.segment_identifier;
-        let mut bytes = source
-            .segment_data(identifier)
-            .expect("indexed source payload")
-            .to_vec();
-        let structure = ParsedSegment::parse(identifier, &bytes).expect("source segment");
-        if identifier == blob_segment {
-            let external = structure
-                .record_table()
-                .iter()
-                .find(|record| record.record_type() == Some(RecordType::ExternalBlobIdentifier))
-                .expect("inline external-blob record");
-            let position = structure
-                .buffer_position(external.offset)
-                .expect("external-blob record position");
-            let encoded_length = u16::from_be_bytes([bytes[position], bytes[position + 1]]);
-            assert_eq!(encoded_length & 0xF000, 0xE000);
-            assert_eq!(usize::from(encoded_length & 0x0FFF), ORIGINAL_BLOB.len());
-            assert_eq!(
-                &bytes[position + 2..position + 2 + ORIGINAL_BLOB.len()],
-                ORIGINAL_BLOB
-            );
-            bytes[position + 2..position + 2 + SWAPPED_BLOB.len()].copy_from_slice(SWAPPED_BLOB);
-            changed_blob = true;
-        }
-        let changed_structure =
-            ParsedSegment::parse(identifier, &bytes).expect("same-layout changed segment");
-        swapped_writer
-            .write_segment(
-                identifier,
-                &bytes,
-                GarbageCollectionGeneration {
-                    generation: entry.generation,
-                    full_generation: entry.full_generation,
-                    is_compacted: entry.is_compacted,
-                },
-                &changed_structure.referenced_segments,
-                &[],
-            )
-            .expect("write changed source entry");
-    }
-    assert!(changed_blob, "the fixture must change one blob identifier");
-    swapped_writer.close().expect("close changed source");
-    let swapped_bytes = std::fs::read(&swap_path).expect("read changed source");
+    let swapped_bytes = rebuild_source_with_swapped_blob(
+        &directory.path,
+        source,
+        &swap_name,
+        &source_name,
+        blob_segment,
+        ORIGINAL_BLOB,
+        SWAPPED_BLOB,
+    );
     std::fs::rename(&swap_path, &source_path).expect("replace source pathname");
 
     let reopened = TarArchiveReader::open(&source_path).expect("reopen changed source");
@@ -2113,13 +2153,18 @@ fn the_lock_excludes_concurrent_writers() {
     store.close().expect("close");
 }
 
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one fixture, two sequenced sweeps, and the assertions that separate their outcomes belong in one place"
-)]
-fn rewrite_replan_noop_reports_no_unavailable_graph_targets() {
-    let directory = TestDirectory::new("rewrite-replan-noop-graph-target");
+/// The two-archive store the rewrite-replan cases sweep. Each source holds
+/// segments the sweep may reclaim, and the second holds a root whose graph
+/// edge points at the first archive's reclaimable target — the edge whose
+/// survival distinguishes a blocked replan from a published one.
+struct ReplanFixture {
+    target: SegmentIdentifier,
+    old_one: SegmentIdentifier,
+    old_two: SegmentIdentifier,
+    root: SegmentIdentifier,
+}
+
+fn build_replan_fixture(directory: &TestDirectory) -> ReplanFixture {
     let target = data_identifier(83);
     let retained = data_identifier(84);
     let old_one = data_identifier(85);
@@ -2127,7 +2172,7 @@ fn rewrite_replan_noop_reports_no_unavailable_graph_targets() {
     let root = data_identifier(87);
     let reference = generation(5, 5, false);
     write_test_archive(
-        &directory,
+        directory,
         "data00000a.tar",
         &[
             TestArchiveEntry::new(target, 1, generation(0, 0, false)),
@@ -2135,7 +2180,7 @@ fn rewrite_replan_noop_reports_no_unavailable_graph_targets() {
         ],
     );
     write_test_archive(
-        &directory,
+        directory,
         "data00001a.tar",
         &[
             TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
@@ -2143,36 +2188,53 @@ fn rewrite_replan_noop_reports_no_unavailable_graph_targets() {
             TestArchiveEntry::new(root, 1, reference).referencing(&[target]),
         ],
     );
+    ReplanFixture {
+        target,
+        old_one,
+        old_two,
+        root,
+    }
+}
+
+/// Every source must be an actionable rewrite before the sweeps run, or the
+/// outcomes they report would prove nothing about the replan.
+fn assert_both_sources_plan_rewrites(
+    directory: &Path,
+    sources: [&TarArchiveReader; 2],
+    reclaimable: &HashSet<SegmentIdentifier>,
+) {
+    for source in sources {
+        assert!(matches!(
+            plan_archive_sweep(
+                directory,
+                source,
+                reclaimable,
+                ArchiveRewritePolicy::default(),
+                &HashSet::new(),
+            )
+            .expect("initial plan")
+            .expect("archive is initially actionable"),
+            PlannedArchiveSweep::Rewrite { .. }
+        ));
+    }
+}
+
+#[test]
+fn rewrite_replan_noop_reports_no_unavailable_graph_targets() {
+    let directory = TestDirectory::new("rewrite-replan-noop-graph-target");
+    let ReplanFixture {
+        target,
+        old_one,
+        old_two,
+        root,
+    } = build_replan_fixture(&directory);
 
     let first = TarArchiveReader::open(&directory.path.join("data00000a.tar"))
         .expect("open first rewrite source");
     let second = TarArchiveReader::open(&directory.path.join("data00001a.tar"))
         .expect("open second rewrite source");
     let reclaimable = HashSet::from([target, old_one, old_two]);
-    assert!(matches!(
-        plan_archive_sweep(
-            &directory.path,
-            &first,
-            &reclaimable,
-            ArchiveRewritePolicy::default(),
-            &std::collections::HashSet::new(),
-        )
-        .expect("initial first plan")
-        .expect("first archive is initially actionable"),
-        PlannedArchiveSweep::Rewrite { .. }
-    ));
-    assert!(matches!(
-        plan_archive_sweep(
-            &directory.path,
-            &second,
-            &reclaimable,
-            ArchiveRewritePolicy::default(),
-            &std::collections::HashSet::new(),
-        )
-        .expect("initial second plan")
-        .expect("second archive is actionable"),
-        PlannedArchiveSweep::Rewrite { .. }
-    ));
+    assert_both_sources_plan_rewrites(&directory.path, [&first, &second], &reclaimable);
 
     // Model a pathname appearing after the outer plan but before the
     // immediate per-archive replan. The first sweep must return a proven

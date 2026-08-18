@@ -1125,12 +1125,50 @@ mod tests {
             1
         ));
     }
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one fixture exercises graph, BRF, ordering, logical-name, and non-active-residue validation together"
-    )]
-    #[test]
-    fn staged_rewrite_validation_requires_exact_trailers_and_physical_order() {
+    /// A failed staging leaves bytes on disk that no archive selection can
+    /// reach, and leaves the healthy source exactly as it was.
+    fn assert_staging_is_non_active_residue(
+        directory: &TestDirectory,
+        missing_graph: &str,
+        source_path: &std::path::Path,
+        source_before: &[u8],
+    ) {
+        let staged_bytes = std::fs::read(directory.path.join(missing_graph)).expect("read stage");
+        for suffix in ["brf", "gph", "idx"] {
+            let logical = format!("data00000b.tar.{suffix}");
+            assert!(
+                staged_bytes
+                    .windows(logical.len())
+                    .any(|window| window == logical.as_bytes()),
+                "staged trailers must carry the final logical basename"
+            );
+        }
+
+        write_manifest(directory);
+        let selected = crate::store::open_all_archives(&directory.path)
+            .expect("non-active staging residue is ignored");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name(), "data00000a.tar");
+        assert_eq!(
+            std::fs::read(source_path).expect("healthy source remains"),
+            source_before
+        );
+        assert!(!directory.path.join("data00000b.tar").exists());
+    }
+
+    /// The two-segment source archive every staged-rewrite validation case
+    /// starts from.
+    struct StagedRewriteFixture {
+        directory: TestDirectory,
+        first: SegmentIdentifier,
+        second: SegmentIdentifier,
+        generation: GarbageCollectionGeneration,
+        first_bytes: Vec<u8>,
+        second_bytes: Vec<u8>,
+        live_blob: String,
+    }
+
+    fn build_staged_rewrite_fixture() -> StagedRewriteFixture {
         let directory = TestDirectory::new("staged-semantic-validation");
         let first = data_identifier(83);
         let second = data_identifier(84);
@@ -1153,6 +1191,28 @@ mod tests {
             .write_segment(second, &second_bytes, generation, &[], &[])
             .expect("write source second");
         source_writer.close().expect("close source");
+        StagedRewriteFixture {
+            directory,
+            first,
+            second,
+            generation,
+            first_bytes,
+            second_bytes,
+            live_blob,
+        }
+    }
+
+    #[test]
+    fn staged_rewrite_validation_requires_exact_trailers_and_physical_order() {
+        let StagedRewriteFixture {
+            directory,
+            first,
+            second,
+            generation,
+            first_bytes,
+            second_bytes,
+            live_blob,
+        } = build_staged_rewrite_fixture();
         let source_path = directory.path.join("data00000a.tar");
         let source_before = std::fs::read(&source_path).expect("read source");
         let source = TarArchiveReader::open(&source_path).expect("open source");
@@ -1241,26 +1301,11 @@ mod tests {
         .expect_err("a semantically equal rewrite may not reorder physical segments");
         assert!(order_error.to_string().contains("physical order"));
 
-        let staged_bytes = std::fs::read(directory.path.join(missing_graph)).expect("read stage");
-        for suffix in ["brf", "gph", "idx"] {
-            let logical = format!("data00000b.tar.{suffix}");
-            assert!(
-                staged_bytes
-                    .windows(logical.len())
-                    .any(|window| window == logical.as_bytes()),
-                "staged trailers must carry the final logical basename"
-            );
-        }
-
-        write_manifest(&directory);
-        let selected = crate::store::open_all_archives(&directory.path)
-            .expect("non-active staging residue is ignored");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].file_name(), "data00000a.tar");
-        assert_eq!(
-            std::fs::read(source_path).expect("healthy source remains"),
-            source_before
+        assert_staging_is_non_active_residue(
+            &directory,
+            missing_graph,
+            &source_path,
+            &source_before,
         );
-        assert!(!directory.path.join("data00000b.tar").exists());
     }
 }

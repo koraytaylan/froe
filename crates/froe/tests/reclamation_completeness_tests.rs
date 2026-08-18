@@ -368,27 +368,9 @@ fn one_merged_run_compacts_and_reclaims_in_a_single_pass() {
     );
 }
 
-/// A run killed between finishing its copy and committing the head leaves
-/// archives stamped ahead of the head. Nothing in the ordinary rules removes
-/// them — compaction's own mark disables the dangling-future rule, and the
-/// generation predicate spares a segment newer than its reference — so without
-/// an explicit retirement each killed run would leave one more orphan
-/// generation behind forever.
-/// The plan states which archives the run will remove and which it will
-/// rewrite. That claim is only worth making if it is exact, and it is exact
-/// only while `predict_shared_bulk_segments` agrees with `copy_binary_value`
-/// about which binary content the copy shares in place.
-///
-/// The fixture carries both shapes, because they diverge in opposite
-/// directions: a long `Binary` property, whose bulk segments the copy
-/// references where they lie and which therefore survive, and a long `String`
-/// property, whose blocks are re-encoded so its old bulk segments die.
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the fixture, the predicted dispositions and the performed ones belong in one place: the assertion is that they match"
-)]
-fn a_dry_run_plan_predicts_exactly_the_archives_the_run_sweeps() {
+/// A store whose archives a full compaction will visibly rewrite and
+/// remove, so a predicted plan has something to be wrong about.
+fn build_multi_archive_store() -> TestDirectory {
     let directory = TestDirectory::new("predicted-sweep");
     {
         let store = WritableRepository::open(&directory.path).expect("bootstrap");
@@ -450,6 +432,27 @@ fn a_dry_run_plan_predicts_exactly_the_archives_the_run_sweeps() {
         store.close().expect("close");
     }
 
+    directory
+}
+
+/// A run killed between finishing its copy and committing the head leaves
+/// archives stamped ahead of the head. Nothing in the ordinary rules removes
+/// them — compaction's own mark disables the dangling-future rule, and the
+/// generation predicate spares a segment newer than its reference — so without
+/// an explicit retirement each killed run would leave one more orphan
+/// generation behind forever.
+/// The plan states which archives the run will remove and which it will
+/// rewrite. That claim is only worth making if it is exact, and it is exact
+/// only while `predict_shared_bulk_segments` agrees with `copy_binary_value`
+/// about which binary content the copy shares in place.
+///
+/// The fixture carries both shapes, because they diverge in opposite
+/// directions: a long `Binary` property, whose bulk segments the copy
+/// references where they lie and which therefore survive, and a long `String`
+/// property, whose blocks are re-encoded so its old bulk segments die.
+#[test]
+fn a_dry_run_plan_predicts_exactly_the_archives_the_run_sweeps() {
+    let directory = build_multi_archive_store();
     let options = CompactionOptions::default().with_compaction(CompactionKind::Full);
     let plan = plan_compaction(&directory.path, &options).expect("plan the run");
 

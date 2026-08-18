@@ -861,11 +861,72 @@ fn write_independent_rendering_fixture(test_name: &str) -> TestDirectory {
     directory
 }
 
+/// The bulk archive and the archive holding the binary blocks each
+/// attribute the same property, one through its graph and one through
+/// Oak's block-segment set.
+fn assert_bulk_and_block_attribution(repository: &Repository, fixture: &DiagnosticFixture) {
+    let bulk_report = debug_archive(repository, BULK_ARCHIVE).expect("bulk attribution");
+    let bulk_graph = bulk_report.graph.as_ref().expect("active bulk graph");
+    assert_eq!(bulk_graph.origin, ArchiveGraphOrigin::Stored);
+    assert_eq!(bulk_graph.rows.len(), 3);
+    assert!(bulk_graph.rows.iter().all(|row| matches!(
+        row.references,
+        ArchiveGraphReferences::Available(ref references) if references.is_empty()
+    )));
+    let matched_through_block_segment =
+        bulk_report
+            .references
+            .iter()
+            .any(|reference| match reference {
+                ArchivePathReference::Property {
+                    path,
+                    name,
+                    record_is_in_archive,
+                    ..
+                } if path == "/root/content/" && name == "data" => {
+                    assert!(!record_is_in_archive);
+                    true
+                }
+                _ => false,
+            });
+    assert!(
+        matched_through_block_segment,
+        "binary property is attributed through a matching block segment"
+    );
+    assert!(
+        fixture.bulk_identifiers[3].is_data_segment(),
+        "the match includes a cross-archive data-kind BLOCK segment"
+    );
+    assert_eq!(
+        bulk_report.work.inspected_binary_blocks,
+        u64::from(BINARY_BLOCK_COUNT),
+        "Oak validates every block-list entry before testing set membership"
+    );
+
+    let data_block_report =
+        debug_archive(repository, DATA_BLOCK_ARCHIVE).expect("data-kind block attribution");
+    assert!(
+        data_block_report
+            .references
+            .iter()
+            .any(|reference| matches!(
+                reference,
+                ArchivePathReference::Property {
+                    name,
+                    record_is_in_archive: false,
+                    display: ArchivePropertyDisplay::Other(display),
+                    ..
+                } if name == "data" && display == "[1 binaries]"
+            ))
+    );
+    assert_eq!(
+        data_block_report.work.inspected_binary_blocks,
+        u64::from(BINARY_BLOCK_COUNT),
+        "all block segment IDs count, including a data-kind BLOCK segment"
+    );
+}
+
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one end-to-end assertion ties archive attribution, graph, and read-only state together"
-)]
 fn segment_dump_and_archive_attribution_are_read_only_end_to_end() {
     let fixture = write_diagnostic_fixture("segment-and-archive-debug", GraphFixture::ValidEmpty);
     let before = directory_snapshot(&fixture.directory.path);
@@ -939,65 +1000,7 @@ fn segment_dump_and_archive_attribution_are_read_only_end_to_end() {
         "the 255/256 fan-out is traversed and the same-segment first ID is excluded"
     );
 
-    let bulk_report = debug_archive(&repository, BULK_ARCHIVE).expect("bulk attribution");
-    let bulk_graph = bulk_report.graph.as_ref().expect("active bulk graph");
-    assert_eq!(bulk_graph.origin, ArchiveGraphOrigin::Stored);
-    assert_eq!(bulk_graph.rows.len(), 3);
-    assert!(bulk_graph.rows.iter().all(|row| matches!(
-        row.references,
-        ArchiveGraphReferences::Available(ref references) if references.is_empty()
-    )));
-    let matched_through_block_segment =
-        bulk_report
-            .references
-            .iter()
-            .any(|reference| match reference {
-                ArchivePathReference::Property {
-                    path,
-                    name,
-                    record_is_in_archive,
-                    ..
-                } if path == "/root/content/" && name == "data" => {
-                    assert!(!record_is_in_archive);
-                    true
-                }
-                _ => false,
-            });
-    assert!(
-        matched_through_block_segment,
-        "binary property is attributed through a matching block segment"
-    );
-    assert!(
-        fixture.bulk_identifiers[3].is_data_segment(),
-        "the match includes a cross-archive data-kind BLOCK segment"
-    );
-    assert_eq!(
-        bulk_report.work.inspected_binary_blocks,
-        u64::from(BINARY_BLOCK_COUNT),
-        "Oak validates every block-list entry before testing set membership"
-    );
-
-    let data_block_report =
-        debug_archive(&repository, DATA_BLOCK_ARCHIVE).expect("data-kind block attribution");
-    assert!(
-        data_block_report
-            .references
-            .iter()
-            .any(|reference| matches!(
-                reference,
-                ArchivePathReference::Property {
-                    name,
-                    record_is_in_archive: false,
-                    display: ArchivePropertyDisplay::Other(display),
-                    ..
-                } if name == "data" && display == "[1 binaries]"
-            ))
-    );
-    assert_eq!(
-        data_block_report.work.inspected_binary_blocks,
-        u64::from(BINARY_BLOCK_COUNT),
-        "all block segment IDs count, including a data-kind BLOCK segment"
-    );
+    assert_bulk_and_block_attribution(&repository, &fixture);
 
     drop(repository);
     assert_eq!(directory_snapshot(&fixture.directory.path), before);

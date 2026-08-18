@@ -84,8 +84,11 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use froe::content::PropertyType;
+use froe::segment::record::RecordIdentifier;
 use froe::writer::commit::rewrite_node_with_child_edits;
-use froe::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
+use froe::writer::record_writer::{
+    ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
+};
 use froe::writer::store_writer::WritableRepository;
 
 /// The Sling image, pinned by manifest digest. Apache-2.0; boots Oak with
@@ -1735,33 +1738,12 @@ fn checkpoint() {
     eprintln!("  checkpoint phase passed ({name})");
 }
 
-/// Phase 3: froe adds nodes with typed properties to the content tree.
-///
-/// Uses the library's commit API (`rewrite_node_with_child_edits`) to
-/// add a subtree under `/content/interop/froe-written` with string, long,
-/// and boolean properties. Then boots Sling against the modified store
-/// and verifies Oak reads the froe-written nodes back correctly.
-///
-/// If this fails, froe cannot write content that Oak reads — the core
-/// interop claim. There is no point testing checkpoint, compact, cleanup,
-/// backup, or recover if the writer cannot produce content Oak reads.
-/// Depends on `read` (to verify).
-#[test]
-#[allow(clippy::too_many_lines, reason = "an end-to-end interop test")]
-#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
-fn commit() {
-    let store = oak_store();
-    let commit_store = work_root().join("commit-store");
-    eprintln!("  copying store to {}", commit_store.display());
-    copy_store(&store, &commit_store);
-    let digest_before = digest_store(&commit_store);
-
-    eprintln!("  opening store for writing");
-    let writable = WritableRepository::open(&commit_store).expect("open writable");
-    let generation = writable.writing_generation().expect("generation");
-    let mut writer = writable.record_writer(generation);
-
-    // Build a leaf node with typed properties.
+/// The node froe writes into the Oak store: a folder holding one `node`
+/// child that carries a string, a long, and a boolean property. Returns the
+/// folder's record, ready to be attached under `/content/interop`.
+fn build_froe_written_folder<Sink: SegmentSink>(
+    writer: &mut RecordWriter<Sink>,
+) -> RecordIdentifier {
     let title_value = writer
         .write_string("Froe-Written Node")
         .expect("title value");
@@ -1791,9 +1773,7 @@ fn commit() {
             ],
         )
         .expect("write leaf node");
-
-    // Build a parent folder containing the leaf.
-    let folder = writer
+    writer
         .write_node(
             Some("nt:unstructured"),
             &[],
@@ -1803,89 +1783,81 @@ fn commit() {
             },
             &[],
         )
-        .expect("write folder node");
+        .expect("write folder node")
+}
 
-    // Commit: add the new folder as a child of /content/interop.
-    //
-    // The Oak super-root has children `root` (the content tree root, `/`)
-    // and `checkpoints`. We need to rewrite the spine:
-    //
-    //   super-root → root (/) → content → interop → [froe-written]
-    //
-    // 1. Rewrite /content/interop to add the froe-written child.
-    // 2. Rewrite /content to point at the new /content/interop.
-    // 3. Rewrite / (root) to point its content child at the new /content.
-    // 4. Rewrite the super-root to point its root child at the new root.
-    let head = writable.head();
+/// The ancestors between the super-root and the node froe is about to add,
+/// as they stand before the commit.
+struct CommitSpine {
+    interop: RecordIdentifier,
+    content: RecordIdentifier,
+    root: RecordIdentifier,
+}
+
+fn resolve_commit_spine(commit_store: &Path) -> CommitSpine {
     let interop_path = froe::content::path::normalized_path("/content/interop");
     let content_path = froe::content::path::normalized_path("/content");
     let root_path = froe::content::path::normalized_path("/");
+    let repository = froe::store::Repository::open(commit_store).expect("open reader");
+    let interop_node = repository
+        .node_at_path(&interop_path)
+        .expect("resolve /content/interop")
+        .expect("/content/interop exists");
+    let content_node = repository
+        .node_at_path(&content_path)
+        .expect("resolve /content")
+        .expect("/content exists");
+    let root_node = repository
+        .node_at_path(&root_path)
+        .expect("resolve /")
+        .expect("/ exists");
+    CommitSpine {
+        interop: interop_node.record_identifier(),
+        content: content_node.record_identifier(),
+        root: root_node.record_identifier(),
+    }
+}
 
-    // Resolve the record identifiers of the three ancestor nodes.
-    let (interop_record, content_record, root_record) = {
-        let repository = froe::store::Repository::open(&commit_store).expect("open reader");
-        let interop_node = repository
-            .node_at_path(&interop_path)
-            .expect("resolve /content/interop")
-            .expect("/content/interop exists");
-        let content_node = repository
-            .node_at_path(&content_path)
-            .expect("resolve /content")
-            .expect("/content exists");
-        let root_node = repository
-            .node_at_path(&root_path)
-            .expect("resolve /")
-            .expect("/ exists");
-        (
-            interop_node.record_identifier(),
-            content_node.record_identifier(),
-            root_node.record_identifier(),
-        )
-    };
-
+/// Rewrites the spine from `/content/interop` up to the super-root so the
+/// new `folder` is reachable, and returns the new super-root. Each step
+/// feeds the next: a rewritten node has a new record, so its parent must be
+/// rewritten to point at it.
+fn rewrite_commit_spine<Sink: SegmentSink>(
+    writable: &WritableRepository,
+    writer: &mut RecordWriter<Sink>,
+    head: RecordIdentifier,
+    spine: &CommitSpine,
+    folder: RecordIdentifier,
+) -> RecordIdentifier {
     // 1. Rewrite /content/interop to add the new child.
     let mut edits = froe::writer::commit::ChildEdits::new();
     edits.insert("froe-written".to_owned(), Some(folder));
-    let new_interop =
-        rewrite_node_with_child_edits(&writable, &mut writer, Some(interop_record), &edits)
-            .expect("rewrite interop node");
+    let new_interop = rewrite_node_with_child_edits(writable, writer, Some(spine.interop), &edits)
+        .expect("rewrite interop node");
 
     // 2. Rewrite /content to point at the new /content/interop.
     let mut content_edits = froe::writer::commit::ChildEdits::new();
     content_edits.insert("interop".to_owned(), Some(new_interop));
     let new_content =
-        rewrite_node_with_child_edits(&writable, &mut writer, Some(content_record), &content_edits)
+        rewrite_node_with_child_edits(writable, writer, Some(spine.content), &content_edits)
             .expect("rewrite /content");
 
     // 3. Rewrite / (root) to point its content child at the new /content.
     let mut root_content_edits = froe::writer::commit::ChildEdits::new();
     root_content_edits.insert("content".to_owned(), Some(new_content));
-    let new_root = rewrite_node_with_child_edits(
-        &writable,
-        &mut writer,
-        Some(root_record),
-        &root_content_edits,
-    )
-    .expect("rewrite root");
+    let new_root =
+        rewrite_node_with_child_edits(writable, writer, Some(spine.root), &root_content_edits)
+            .expect("rewrite root");
 
     // 4. Rewrite the super-root to point its `root` child at the new root.
     let mut super_root_edits = froe::writer::commit::ChildEdits::new();
     super_root_edits.insert("root".to_owned(), Some(new_root));
-    let new_super_root =
-        rewrite_node_with_child_edits(&writable, &mut writer, Some(head), &super_root_edits)
-            .expect("rewrite super-root");
+    rewrite_node_with_child_edits(writable, writer, Some(head), &super_root_edits)
+        .expect("rewrite super-root")
+}
 
-    writer.finish().expect("finish writer");
-    assert!(
-        writable.compare_and_set_head(head, new_super_root),
-        "head CAS succeeded (single-writer, no contention)"
-    );
-    writable.flush().expect("flush");
-    writable.close().expect("close");
-
-    eprintln!("  froe-written nodes committed");
-
-    // Verify froe can read its own writes.
+/// froe reads back the subtree it just wrote, through its own CLI.
+fn assert_froe_reads_its_own_writes(commit_store: &Path) {
     eprintln!("  froe tree /content/interop/froe-written (depth 2)");
     let tree = froe(&[
         "tree",
@@ -1917,18 +1889,20 @@ fn commit() {
         node.contains("active") && node.contains("Boolean"),
         "froe reads the boolean property: {node}"
     );
+}
 
-    // A commit is the one operation that is *supposed* to change content,
-    // which makes "did it change anything else?" the question worth
-    // asking. A node record rewritten on the path from the root to the new
-    // subtree that lost a property, or a re-rendered value, would be
-    // invisible to every other assertion in this phase.
-    //
-    // Only added paths are expected: a digest line carries a node's own
-    // properties, so an ancestor gaining a child does not change its line.
+/// A commit is the one operation that is *supposed* to change content,
+/// which makes "did it change anything else?" the question worth asking. A
+/// node record rewritten on the path from the root to the new subtree that
+/// lost a property, or a re-rendered value, would be invisible to every
+/// other assertion in this phase.
+///
+/// Only added paths are expected: a digest line carries a node's own
+/// properties, so an ancestor gaining a child does not change its line.
+fn assert_commit_only_added_nodes(digest_before: &str, commit_store: &Path) {
     eprintln!("  content digest after the commit");
-    let before_nodes = digest_nodes(&digest_before);
-    let after_digest = digest_store(&commit_store);
+    let before_nodes = digest_nodes(digest_before);
+    let after_digest = digest_store(commit_store);
     let after_nodes = digest_nodes(&after_digest);
     let unexpected: Vec<&str> = before_nodes
         .iter()
@@ -1963,6 +1937,56 @@ fn commit() {
         "  commit added {} nodes and changed nothing else",
         added.len()
     );
+}
+
+/// Phase 3: froe adds nodes with typed properties to the content tree.
+///
+/// Uses the library's commit API (`rewrite_node_with_child_edits`) to
+/// add a subtree under `/content/interop/froe-written` with string, long,
+/// and boolean properties. Then boots Sling against the modified store
+/// and verifies Oak reads the froe-written nodes back correctly.
+///
+/// If this fails, froe cannot write content that Oak reads — the core
+/// interop claim. There is no point testing checkpoint, compact, cleanup,
+/// backup, or recover if the writer cannot produce content Oak reads.
+/// Depends on `read` (to verify).
+#[test]
+#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
+fn commit() {
+    let store = oak_store();
+    let commit_store = work_root().join("commit-store");
+    eprintln!("  copying store to {}", commit_store.display());
+    copy_store(&store, &commit_store);
+    let digest_before = digest_store(&commit_store);
+
+    eprintln!("  opening store for writing");
+    let writable = WritableRepository::open(&commit_store).expect("open writable");
+    let generation = writable.writing_generation().expect("generation");
+    let mut writer = writable.record_writer(generation);
+
+    let folder = build_froe_written_folder(&mut writer);
+
+    // Commit: add the new folder as a child of /content/interop. The Oak
+    // super-root has children `root` (the content tree root, `/`) and
+    // `checkpoints`, so the spine to rewrite is
+    //
+    //   super-root → root (/) → content → interop → [froe-written]
+    let head = writable.head();
+    let spine = resolve_commit_spine(&commit_store);
+    let new_super_root = rewrite_commit_spine(&writable, &mut writer, head, &spine, folder);
+
+    writer.finish().expect("finish writer");
+    assert!(
+        writable.compare_and_set_head(head, new_super_root),
+        "head CAS succeeded (single-writer, no contention)"
+    );
+    writable.flush().expect("flush");
+    writable.close().expect("close");
+
+    eprintln!("  froe-written nodes committed");
+
+    assert_froe_reads_its_own_writes(&commit_store);
+    assert_commit_only_added_nodes(&digest_before, &commit_store);
 
     // Boot Sling against the froe-written store and verify Oak reads the
     // froe-written nodes.
