@@ -1,5 +1,16 @@
 # Safety case: bounded memory and `--retain-journal-revisions`
 
+> **Superseded in two places, and historical in a third.** This document is
+> the frozen evidence for its own range, ending at `v0.9.0`. The range after
+> it — see
+> [`merged-maintenance-command-safety-case.md`](merged-maintenance-command-safety-case.md)
+> — inverted two of its conclusions: journal history is no longer retained by
+> default but retired on every run, and one generation is retained rather than
+> two. The CLI surface named throughout (`--task`, `--retain-journal-revisions`)
+> was accurate when this was written and no longer exists; the library's
+> `with_journal_revision_retention` does. Read the statements below as evidence
+> about the code as it stood, not as a description of the shipped command.
+
 The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for the
 range `bdcbe55..HEAD`, extended after `v0.8.0` by record reuse in the writer,
 binary value sharing in compaction, an exact compaction sharing memo replacing
@@ -34,8 +45,12 @@ revisions that actually resolve and removes the rest. The removed history is
 **not recoverable**: the segment sweep runs before the journal rewrite in the
 same run, so by the time `journal.log.bak.NNN` exists it names revisions whose
 segments are already unlinked. The backup restores the journal *file*, not the
-history. Retirement is now unconditional rather than flag-selected, because the retired lines
-must leave the journal in the same run — see Guards.
+history. Selecting the bound also selects the journal task, because the lines
+it un-roots must leave the journal in the same run — see Guards.
+
+*(The successor range made this unconditional and removed the flag from the
+CLI. The mechanism, and the fact that the history is unrecoverable, are
+unchanged.)*
 
 **Deliberately not retained.** Payload bytes of segments this session wrote,
 once they are durable in an archive. They were retained before; they are the

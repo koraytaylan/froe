@@ -8,6 +8,10 @@ head does not reach — orphan segments, whole archives, safe archive leftovers,
 expired checkpoints, and staging files it can prove redundant. It never creates
 or bootstraps a repository.
 
+Its safety case — scope, mutation ordering, guards, fault coverage, resource
+bounds, and known gaps — is
+[`plans/merged-maintenance-command-safety-case.md`](plans/merged-maintenance-command-safety-case.md).
+
 Compaction and reclamation are one command because they are one decision. A
 sweep alone works at *segment* granularity, so a segment holding one live
 record is wholly live however much dead content sits beside it; only a rewrite
