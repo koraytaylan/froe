@@ -339,9 +339,7 @@ impl WritableRepository {
             #[cfg(test)]
             certificate.substitute_first_path_if_armed("checkpoint.tar-durable-before-journal")?;
             #[cfg(test)]
-            crate::writer::maintenance_fault_injection::crash_if_armed(
-                "checkpoint.tar-durable-before-journal",
-            );
+            crate::writer::fault_injection::crash_if_armed("checkpoint.tar-durable-before-journal");
             Some(certificate)
         } else if let Some(tar_writer) = &mut state.tar_writer {
             tar_writer.flush()?;

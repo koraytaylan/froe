@@ -178,10 +178,7 @@ impl FinalizedSessionCertificate {
     #[cfg(test)]
     pub(super) fn substitute_first_path_if_armed(&self, cutpoint: &str) -> Result<()> {
         if let Some(archive) = self.archives.first() {
-            crate::writer::maintenance_fault_injection::substitute_path_if_armed(
-                cutpoint,
-                &archive.path,
-            )?;
+            crate::writer::fault_injection::substitute_path_if_armed(cutpoint, &archive.path)?;
         }
         Ok(())
     }

@@ -132,9 +132,9 @@ pub(crate) fn stage_journal_replacement(
         "staged journal replacement",
     )?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("journal.temporary-durable")?;
+    crate::writer::fault_injection::fail_if_armed("journal.temporary-durable")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed("journal.temporary-durable");
+    crate::writer::fault_injection::crash_if_armed("journal.temporary-durable");
 
     // Preparing the replacement before reserving a backup name means an
     // exhausted temporary namespace cannot leave an unnecessary backup.
@@ -242,31 +242,23 @@ pub(crate) fn publish_journal_replacement(
     let recertify_staged_replacement = || proofs.staged_replacement_holds();
     let recertify_installed_replacement = || proofs.installed_replacement_holds();
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("journal.backup-file-durable")?;
+    crate::writer::fault_injection::fail_if_armed("journal.backup-file-durable")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed("journal.backup-file-durable");
+    crate::writer::fault_injection::crash_if_armed("journal.backup-file-durable");
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "journal.before-pre-rename-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("journal.before-pre-rename-directory-sync")?;
     sync_directory_strict(directory)?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "journal.after-pre-rename-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("journal.after-pre-rename-directory-sync")?;
     recertify_staged_replacement()?;
     backup_guard.commit();
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "journal.pre-rename-directory-durable",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("journal.pre-rename-directory-durable")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed(
-        "journal.pre-rename-directory-durable",
-    );
+    crate::writer::fault_injection::crash_if_armed("journal.pre-rename-directory-durable");
 
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("journal.before-rename")?;
+    crate::writer::fault_injection::fail_if_armed("journal.before-rename")?;
     source_certificate.recertify(
         &snapshot.path,
         &snapshot.source_bytes,
@@ -278,26 +270,20 @@ pub(crate) fn publish_journal_replacement(
     recertify_installed_replacement()?;
     drop(source_certificate);
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("journal.after-rename")?;
+    crate::writer::fault_injection::fail_if_armed("journal.after-rename")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed(
-        "journal.renamed-before-directory-sync",
-    );
+    crate::writer::fault_injection::crash_if_armed("journal.renamed-before-directory-sync");
     temporary_guard.commit();
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "journal.before-post-rename-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("journal.before-post-rename-directory-sync")?;
     recertify_installed_replacement()?;
     sync_directory_strict(directory)?;
     recertify_installed_replacement()?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "journal.after-post-rename-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("journal.after-post-rename-directory-sync")?;
     recertify_installed_replacement()?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed("journal.rename-durable");
+    crate::writer::fault_injection::crash_if_armed("journal.rename-durable");
 
     Ok(JournalRewriteOutcome {
         changed: true,

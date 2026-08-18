@@ -5,7 +5,7 @@
 mod tests {
     use crate::tar_archive::archive::TarArchiveReader;
     use crate::writer::commit::create_checkpoint;
-    use crate::writer::maintenance_fault_injection::test_support::{
+    use crate::writer::fault_injection::test_support::{
         CHECKPOINT_SCENARIO, TestDirectory, archive_file_names, assert_exact_snapshot_reopens,
         run_crash_child, run_substitution_child, snapshot_repository,
     };

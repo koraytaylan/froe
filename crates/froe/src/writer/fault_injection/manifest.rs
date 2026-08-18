@@ -4,7 +4,7 @@
 #[cfg(test)]
 mod tests {
     use crate::writer::commit::create_checkpoint;
-    use crate::writer::maintenance_fault_injection::test_support::{
+    use crate::writer::fault_injection::test_support::{
         MANIFEST_SCENARIO, RepositorySnapshot, TestDirectory, assert_exact_snapshot_reopens,
         run_crash_child, run_error_child, snapshot_repository,
     };

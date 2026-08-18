@@ -73,7 +73,7 @@ pub(crate) fn publish_swept_archive(
     // cannot overwrite a final path created after planning. Both names refer
     // to the already-synced, validated inode until staging cleanup.
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-publish-link")?;
+    crate::writer::fault_injection::fail_if_armed("sweep.before-publish-link")?;
     std::fs::hard_link(staging_path, replacement_path)?;
 
     let replacement_file = certify_published_replacement(&PublishedReplacement {
@@ -88,20 +88,14 @@ pub(crate) fn publish_swept_archive(
         expected_binary_references,
     })?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-publish-link")?;
+    crate::writer::fault_injection::fail_if_armed("sweep.after-publish-link")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "sweep.before-publish-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("sweep.before-publish-directory-sync")?;
     sync_directory_strict(directory)?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "sweep.after-publish-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("sweep.after-publish-directory-sync")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed(
-        "sweep.published-before-source-unlink",
-    );
+    crate::writer::fault_injection::crash_if_armed("sweep.published-before-source-unlink");
     retire_swept_source(RetiredSource {
         directory,
         replacement_path,
@@ -243,7 +237,7 @@ pub(crate) fn retire_swept_source(retired: RetiredSource<'_>) -> Result<ArchiveS
     } = retired;
     let mut deletion_failures = Vec::new();
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-staging-unlink")?;
+    crate::writer::fault_injection::fail_if_armed("sweep.before-staging-unlink")?;
     if let Err(error) = std::fs::remove_file(staging_path) {
         deletion_failures.push(DeferredFileDeletion {
             file_name: staging_name.to_owned(),
@@ -252,15 +246,13 @@ pub(crate) fn retire_swept_source(retired: RetiredSource<'_>) -> Result<ArchiveS
         });
     }
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-staging-unlink")?;
+    crate::writer::fault_injection::fail_if_armed("sweep.after-staging-unlink")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed(
-        "sweep.staging-unlinked-before-source-unlink",
-    );
+    crate::writer::fault_injection::crash_if_armed("sweep.staging-unlinked-before-source-unlink");
     // Deletion failures are consistency-safe: the published higher letter
     // wins and preserves every survivor; the old source is reported later.
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-source-unlink")?;
+    crate::writer::fault_injection::fail_if_armed("sweep.before-source-unlink")?;
     let pre_source_unlink_identity = (|| {
         require_held_file_identity(
             replacement_file,
@@ -292,9 +284,9 @@ pub(crate) fn retire_swept_source(retired: RetiredSource<'_>) -> Result<ArchiveS
         });
     }
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-source-unlink")?;
+    crate::writer::fault_injection::fail_if_armed("sweep.after-source-unlink")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed("sweep.source-unlinked");
+    crate::writer::fault_injection::crash_if_armed("sweep.source-unlinked");
     Ok(ArchiveSweepOutcome {
         disposition: ArchiveSweepDisposition::Rewritten,
         deletion_failures,

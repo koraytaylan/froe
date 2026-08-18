@@ -37,9 +37,7 @@ pub(crate) fn validate_staged_replacement(
         source_metadata,
     } = validation;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "sweep.staging-before-validation-open",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("sweep.staging-before-validation-open")?;
     let staging_file = open_regular_file_no_follow(staging_path, FileAccess::ReadWrite)?;
     preserve_file_metadata(&staging_file, source_metadata)?;
     let staging_identity = held_file_identity(&staging_file)?;
@@ -61,7 +59,7 @@ pub(crate) fn validate_staged_replacement(
         });
     }
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::substitute_path_if_armed(
+    crate::writer::fault_injection::substitute_path_if_armed(
         "sweep.staging-validated-before-publish",
         staging_path,
     )?;

@@ -239,14 +239,14 @@ pub(crate) fn remove_swept_archive(
         .as_ref()
         .expect("an archive removal always has an actionable reopened source");
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::substitute_path_if_armed(
+    crate::writer::fault_injection::substitute_path_if_armed(
         "sweep.remove-before-source-identity",
         path,
     )?;
     require_held_file_identity(source_file, *source_identity, "certified removal source")?;
     require_path_file_identity(path, *source_identity, "certified removal source")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::remove_path_if_armed(
+    crate::writer::fault_injection::remove_path_if_armed(
         "sweep.remove-before-source-unlink-not-found",
         path,
     )?;
@@ -370,8 +370,8 @@ pub(crate) fn is_reclaimable(
 
 #[cfg(test)]
 pub(super) fn probe_archive_sweep_phase_boundary(cutpoint: &str) -> Result<()> {
-    crate::writer::maintenance_fault_injection::fail_if_armed(cutpoint)?;
-    crate::writer::maintenance_fault_injection::crash_if_armed(cutpoint);
+    crate::writer::fault_injection::fail_if_armed(cutpoint)?;
+    crate::writer::fault_injection::crash_if_armed(cutpoint);
     Ok(())
 }
 

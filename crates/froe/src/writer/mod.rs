@@ -13,14 +13,18 @@
 pub mod backup;
 pub mod commit;
 pub mod compaction;
+/// Cutpoints the write path calls at its durability boundaries, and the
+/// probes that arm them. The cutpoints sit wherever a run touches disk —
+/// the tar writer, the sweep, the journal rewrite, the maintenance apply —
+/// so this belongs to the write path rather than to any one of them.
+#[cfg(test)]
+mod fault_injection;
 pub mod identifier_generator;
 pub(crate) mod journal_maintenance;
 /// The one maintenance pipeline: plan, confirm, and apply a compaction and
 /// everything it reclaims. Its surface is re-exported below, so callers name
 /// the operation rather than the module it happens to live in.
 mod maintenance;
-#[cfg(test)]
-mod maintenance_fault_injection;
 pub mod record_writer;
 pub mod repository_lock;
 pub mod segment_builder;

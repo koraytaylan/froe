@@ -7,13 +7,13 @@ mod tests {
     use crate::store::Repository;
     use crate::tar_archive::archive::TarArchiveReader;
     use crate::writer::commit::create_checkpoint;
-    use crate::writer::maintenance::{CompactionAction, plan_compaction};
-    use crate::writer::maintenance_fault_injection::test_support::{
+    use crate::writer::fault_injection::test_support::{
         POSTCOMPACTION_SWEEP_SCENARIO, REMOVAL_SCENARIO, RepositorySnapshot,
         STALE_ARCHIVE_SCENARIO, SWEEP_SCENARIO, TestDirectory, assert_exact_snapshot_reopens,
         readable_journal_roots, run_absence_child, run_crash_child, run_error_child,
         run_substitution_child, scenario_options, snapshot_repository,
     };
+    use crate::writer::maintenance::{CompactionAction, plan_compaction};
     use crate::writer::record_writer::ChildNodesToWrite;
     use crate::writer::repository_lock::RepositoryLock;
     use crate::writer::segment_builder::GarbageCollectionGeneration;

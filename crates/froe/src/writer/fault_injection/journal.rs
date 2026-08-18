@@ -5,7 +5,7 @@
 mod tests {
     use crate::segment::identifier::SegmentIdentifier;
     use crate::writer::commit::create_checkpoint;
-    use crate::writer::maintenance_fault_injection::test_support::{
+    use crate::writer::fault_injection::test_support::{
         JOURNAL_SCENARIO, REMOVAL_SCENARIO, RepositorySnapshot, TestDirectory,
         assert_exact_snapshot_reopens, run_crash_child, run_error_child, run_substitution_child,
         snapshot_repository,

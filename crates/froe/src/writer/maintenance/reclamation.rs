@@ -481,7 +481,7 @@ pub(super) fn prospective_retained_roots<'roots>(
     retained_roots: &'roots [RecordIdentifier],
 ) -> Cow<'roots, [RecordIdentifier]> {
     #[cfg(test)]
-    if crate::writer::maintenance_fault_injection::is_substitution_armed(
+    if crate::writer::fault_injection::is_substitution_armed(
         "cleanup.before-prospective-retained-root-verification",
     ) {
         let unavailable = planned_unavailable_segments(directory, plan)

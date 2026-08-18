@@ -216,7 +216,7 @@ pub(super) fn remove_planned_files_core(
             continue;
         }
         #[cfg(test)]
-        if let Err(error) = crate::writer::maintenance_fault_injection::substitute_path_if_armed(
+        if let Err(error) = crate::writer::fault_injection::substitute_path_if_armed(
             "remove-planned-file.before-final-identity",
             &path,
         ) {

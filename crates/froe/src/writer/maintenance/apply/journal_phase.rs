@@ -148,7 +148,7 @@ pub(in crate::writer::maintenance) fn inject_final_retained_root_fault(
     actual: &mut Vec<RecordIdentifier>,
 ) {
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::omit_last_if_armed(
+    crate::writer::fault_injection::omit_last_if_armed(
         "cleanup.before-final-retained-root-verification",
         actual,
     );
@@ -162,7 +162,7 @@ pub(in crate::writer::maintenance) fn final_expected_retained_lines(
     #[cfg(test)]
     {
         let mut injected = expected.to_vec();
-        crate::writer::maintenance_fault_injection::append_missing_journal_line_if_armed(
+        crate::writer::fault_injection::append_missing_journal_line_if_armed(
             "cleanup.before-final-retained-line-verification",
             &mut injected,
         );

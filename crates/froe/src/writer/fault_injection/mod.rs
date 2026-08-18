@@ -1,4 +1,11 @@
-//! Process-crash probes for cleanup durability boundaries.
+//! Process-crash probes for the write path's durability boundaries.
+//!
+//! A cutpoint sits at each point a run has committed to something on disk.
+//! They span the write path rather than one module of it: the tar writer,
+//! the archive sweep under a live session, the journal rewrite, and the
+//! maintenance apply all carry them. A probe arms one, runs a child
+//! process into it, and asserts the store the child left behind is exactly
+//! one of the outcomes that boundary permits.
 //!
 //! This entire module exists only in unit-test builds. Production binaries do
 //! not contain the environment checks or the cutpoint calls.

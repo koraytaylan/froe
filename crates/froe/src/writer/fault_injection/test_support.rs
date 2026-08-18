@@ -58,7 +58,7 @@ pub(crate) const SCENARIO_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_SCENARIO";
 /// [`cleanup_fault_child`] asserts the marker it was passed rather than
 /// silently succeeding.
 pub(crate) const CHILD_TEST_NAME: &str =
-    "writer::maintenance_fault_injection::test_support::cleanup_fault_child";
+    "writer::fault_injection::test_support::cleanup_fault_child";
 
 pub(crate) static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 

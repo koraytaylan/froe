@@ -112,13 +112,13 @@ fn publish_manifest_upgrade(
     };
 
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("manifest.temporary-durable")?;
+    crate::writer::fault_injection::fail_if_armed("manifest.temporary-durable")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed("manifest.temporary-durable");
+    crate::writer::fault_injection::crash_if_armed("manifest.temporary-durable");
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("manifest.before-rename")?;
+    crate::writer::fault_injection::fail_if_armed("manifest.before-rename")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed("manifest.before-rename");
+    crate::writer::fault_injection::crash_if_armed("manifest.before-rename");
     source_certificate.recertify(
         manifest_path,
         &source,
@@ -135,29 +135,21 @@ fn publish_manifest_upgrade(
     recertify_installed()?;
     drop(source_certificate);
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "manifest.renamed-before-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("manifest.renamed-before-directory-sync")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed(
-        "manifest.renamed-before-directory-sync",
-    );
+    crate::writer::fault_injection::crash_if_armed("manifest.renamed-before-directory-sync");
     guard.commit();
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "manifest.before-post-rename-directory-sync",
-    )?;
+    crate::writer::fault_injection::fail_if_armed("manifest.before-post-rename-directory-sync")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed(
-        "manifest.before-post-rename-directory-sync",
-    );
+    crate::writer::fault_injection::crash_if_armed("manifest.before-post-rename-directory-sync");
     recertify_installed()?;
     sync_directory_strict(directory)?;
     recertify_installed()?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("manifest.rename-durable")?;
+    crate::writer::fault_injection::fail_if_armed("manifest.rename-durable")?;
     #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed("manifest.rename-durable");
+    crate::writer::fault_injection::crash_if_armed("manifest.rename-durable");
     recertify_installed()?;
     if crate::store::read_manifest_store_version(manifest_path)? != 2 {
         return Err(Error::InvalidFormat {
