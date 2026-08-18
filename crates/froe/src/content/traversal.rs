@@ -27,7 +27,7 @@
 //! }
 //! ```
 
-use crate::content::node::NodeState;
+use crate::content::node::{ChildNodeEntry, NodeState};
 use crate::content::path::normalized_path;
 use crate::error::{Error, Result};
 use crate::segment::record::RecordIdentifier;
@@ -64,6 +64,98 @@ struct SchedulingLimits {
     child_name_bytes: u64,
     work: u64,
     pending_nodes: u64,
+}
+
+/// Enumerates a node's children while charging every budget the caller
+/// declared, translating each map-layer refusal into the traversal-level
+/// error that names the limit the caller actually set.
+///
+/// Returns the entries with the counts the scheduler must charge: how many
+/// children, how many stored name bytes, and how many map records reading
+/// them cost.
+fn enumerate_children_within_limits<'provider>(
+    node: &NodeState<'provider>,
+    limits: SchedulingLimits,
+) -> Result<(Vec<ChildNodeEntry<'provider>>, u64, u64, u64)> {
+    let (child_count, count_map_records) = node
+        .child_node_count_with_maximum_work(limits.work)
+        .map_err(|error| match error {
+            Error::MapTraversalWorkBudgetExceeded {
+                attempted_work_units,
+                ..
+            } => Error::TraversalSchedulingWorkBudgetExceeded {
+                maximum_scheduling_work: limits.work,
+                attempted_scheduling_work: attempted_work_units,
+            },
+            other => other,
+        })?;
+    if child_count > limits.children {
+        return Err(Error::TraversalSchedulingBudgetExceeded {
+            maximum_scheduled_children: limits.children,
+            attempted_scheduled_children: child_count,
+        });
+    }
+    let reserved_work = child_count.saturating_add(count_map_records);
+    if reserved_work > limits.work {
+        return Err(Error::TraversalSchedulingWorkBudgetExceeded {
+            maximum_scheduling_work: limits.work,
+            attempted_scheduling_work: reserved_work,
+        });
+    }
+    let remaining_work = limits.work - reserved_work;
+    let (entries, name_bytes, enumeration_map_records) = node
+        .child_node_entries_with_limits(child_count, limits.child_name_bytes, remaining_work)
+        .map_err(|error| match error {
+            Error::StringMaterializationBudgetExceeded {
+                attempted_stored_bytes,
+                ..
+            } if attempted_stored_bytes > limits.child_name_bytes => {
+                Error::TraversalChildNameBudgetExceeded {
+                    maximum_stored_child_name_bytes: limits.child_name_bytes,
+                    attempted_stored_child_name_bytes: attempted_stored_bytes,
+                    scheduled_children: child_count,
+                }
+            }
+            Error::StringMaterializationBudgetExceeded {
+                attempted_stored_bytes,
+                ..
+            } => Error::TraversalSchedulingWorkBudgetExceeded {
+                maximum_scheduling_work: limits.work,
+                attempted_scheduling_work: reserved_work.saturating_add(attempted_stored_bytes),
+            },
+            Error::MapTraversalWorkBudgetExceeded {
+                attempted_work_units,
+                ..
+            } => Error::TraversalSchedulingWorkBudgetExceeded {
+                maximum_scheduling_work: limits.work,
+                attempted_scheduling_work: reserved_work.saturating_add(attempted_work_units),
+            },
+            Error::MapEntryBudgetExceeded {
+                maximum_entries,
+                attempted_entries,
+            } => Error::InvalidFormat {
+                details: format!(
+                    "child map declared {maximum_entries} entries but \
+                     enumerated at least {attempted_entries}"
+                ),
+            },
+            other => other,
+        })?;
+    let enumerated_children = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    if enumerated_children != child_count {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "child map declared {child_count} entries but enumerated \
+                 {enumerated_children}"
+            ),
+        });
+    }
+    Ok((
+        entries,
+        child_count,
+        name_bytes,
+        count_map_records.saturating_add(enumeration_map_records),
+    ))
 }
 
 /// One visited node, valid until the traversal advances.
@@ -167,10 +259,6 @@ impl<'provider> DepthFirstTraversal<'provider> {
         }))
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the traversal step keeps path restoration and bounded child scheduling in one state transition"
-    )]
     fn next_node_internal(
         &mut self,
         limits: Option<SchedulingLimits>,
@@ -236,94 +324,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
                 if descend {
                     let (child_entries, child_count, child_name_bytes, child_map_records) =
                         if let Some(limits) = limits {
-                            let (child_count, count_map_records) = node
-                                .child_node_count_with_maximum_work(limits.work)
-                                .map_err(|error| match error {
-                                    Error::MapTraversalWorkBudgetExceeded {
-                                        attempted_work_units,
-                                        ..
-                                    } => Error::TraversalSchedulingWorkBudgetExceeded {
-                                        maximum_scheduling_work: limits.work,
-                                        attempted_scheduling_work: attempted_work_units,
-                                    },
-                                    other => other,
-                                })?;
-                            if child_count > limits.children {
-                                return Err(Error::TraversalSchedulingBudgetExceeded {
-                                    maximum_scheduled_children: limits.children,
-                                    attempted_scheduled_children: child_count,
-                                });
-                            }
-                            let reserved_work = child_count.saturating_add(count_map_records);
-                            if reserved_work > limits.work {
-                                return Err(Error::TraversalSchedulingWorkBudgetExceeded {
-                                    maximum_scheduling_work: limits.work,
-                                    attempted_scheduling_work: reserved_work,
-                                });
-                            }
-                            let remaining_work = limits.work - reserved_work;
-                            let (entries, name_bytes, enumeration_map_records) = node
-                                .child_node_entries_with_limits(
-                                    child_count,
-                                    limits.child_name_bytes,
-                                    remaining_work,
-                                )
-                                .map_err(|error| match error {
-                                    Error::StringMaterializationBudgetExceeded {
-                                        attempted_stored_bytes,
-                                        ..
-                                    } if attempted_stored_bytes > limits.child_name_bytes => {
-                                        Error::TraversalChildNameBudgetExceeded {
-                                            maximum_stored_child_name_bytes: limits
-                                                .child_name_bytes,
-                                            attempted_stored_child_name_bytes:
-                                                attempted_stored_bytes,
-                                            scheduled_children: child_count,
-                                        }
-                                    }
-                                    Error::StringMaterializationBudgetExceeded {
-                                        attempted_stored_bytes,
-                                        ..
-                                    } => Error::TraversalSchedulingWorkBudgetExceeded {
-                                        maximum_scheduling_work: limits.work,
-                                        attempted_scheduling_work: reserved_work
-                                            .saturating_add(attempted_stored_bytes),
-                                    },
-                                    Error::MapTraversalWorkBudgetExceeded {
-                                        attempted_work_units,
-                                        ..
-                                    } => Error::TraversalSchedulingWorkBudgetExceeded {
-                                        maximum_scheduling_work: limits.work,
-                                        attempted_scheduling_work: reserved_work
-                                            .saturating_add(attempted_work_units),
-                                    },
-                                    Error::MapEntryBudgetExceeded {
-                                        maximum_entries,
-                                        attempted_entries,
-                                    } => Error::InvalidFormat {
-                                        details: format!(
-                                            "child map declared {maximum_entries} entries but \
-                                             enumerated at least {attempted_entries}"
-                                        ),
-                                    },
-                                    other => other,
-                                })?;
-                            let enumerated_children =
-                                u64::try_from(entries.len()).unwrap_or(u64::MAX);
-                            if enumerated_children != child_count {
-                                return Err(Error::InvalidFormat {
-                                    details: format!(
-                                        "child map declared {child_count} entries but enumerated \
-                                         {enumerated_children}"
-                                    ),
-                                });
-                            }
-                            (
-                                entries,
-                                child_count,
-                                name_bytes,
-                                count_map_records.saturating_add(enumeration_map_records),
-                            )
+                            enumerate_children_within_limits(&node, limits)?
                         } else {
                             let entries = node.child_node_entries()?;
                             let child_count = u64::try_from(entries.len()).unwrap_or(u64::MAX);

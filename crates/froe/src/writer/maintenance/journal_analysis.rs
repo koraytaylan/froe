@@ -110,11 +110,20 @@ pub(super) fn journal_retention_boundary(
     None
 }
 
+/// What one pass over the journal found: which lines survive, which go,
+/// and why each one goes.
+#[derive(Default)]
+struct JournalTally {
+    parser_ignored: usize,
+    missing_segments: usize,
+    unreadable_revisions: usize,
+    beyond_retention: usize,
+    removals: Vec<JournalLineRemoval>,
+    retained_indexes: Vec<usize>,
+    retained_record_ids: Vec<RecordIdentifier>,
+}
+
 /// The journal pass itself; [`analyze_journal`] owns the step around it.
-#[allow(
-    clippy::too_many_lines,
-    reason = "classification, exact retained-line evidence, and removal diagnostics form one auditable journal pass"
-)]
 pub(super) fn analyze_journal_lines(
     repository: &Repository,
     raw: &RawJournal,
@@ -122,6 +131,65 @@ pub(super) fn analyze_journal_lines(
     retention: Option<NonZeroUsize>,
     observer: &mut dyn ProgressObserver,
 ) -> Result<JournalAnalysis> {
+    reject_head_disagreement(repository, raw, current_head)?;
+
+    let mut validity: HashMap<RecordIdentifier, bool> = HashMap::new();
+    validity.insert(current_head, true);
+    let mut verifier = NodeTreeVerifier::new(repository);
+    let retention_boundary = retention.and_then(|bound| {
+        journal_retention_boundary(repository, raw, bound, &mut validity, &mut verifier)
+    });
+
+    let tally = classify_journal_lines(
+        repository,
+        raw,
+        retention_boundary,
+        &mut validity,
+        &mut verifier,
+        observer,
+    );
+
+    if !tally.retained_record_ids.contains(&current_head) {
+        return Err(Error::InvalidFormat {
+            details: "journal analysis would not retain the exact current head".to_owned(),
+        });
+    }
+    let removed_lines = tally
+        .parser_ignored
+        .checked_add(tally.missing_segments)
+        .and_then(|count| count.checked_add(tally.unreadable_revisions))
+        .and_then(|count| count.checked_add(tally.beyond_retention))
+        .ok_or_else(|| Error::InvalidFormat {
+            details: "journal line accounting overflow".to_owned(),
+        })?;
+    Ok(JournalAnalysis {
+        plan: JournalPlan {
+            retained_record_ids: tally.retained_record_ids.clone(),
+            retained_raw_lines: tally
+                .retained_indexes
+                .iter()
+                .map(|&index| raw.lines()[index].raw_bytes().to_vec())
+                .collect(),
+            removals: tally.removals,
+            removed_lines,
+            parser_ignored: tally.parser_ignored,
+            missing_segments: tally.missing_segments,
+            unreadable_revisions: tally.unreadable_revisions,
+            beyond_retention: tally.beyond_retention,
+        },
+        retained_indexes: tally.retained_indexes,
+        retained_record_ids: tally.retained_record_ids,
+    })
+}
+
+/// The raw journal's own newest resolvable record must be the head the
+/// repository reader selected; disagreement means one of the two is
+/// reading a store the other is not.
+fn reject_head_disagreement(
+    repository: &Repository,
+    raw: &RawJournal,
+    current_head: RecordIdentifier,
+) -> Result<()> {
     let selected = raw
         .lines()
         .iter()
@@ -144,27 +212,26 @@ pub(super) fn analyze_journal_lines(
             ),
         });
     }
+    Ok(())
+}
 
-    let mut parser_ignored = 0usize;
-    let mut missing_segments = 0usize;
-    let mut unreadable_revisions = 0usize;
-    let mut beyond_retention = 0usize;
-    let mut removals = Vec::new();
-    let mut retained_indexes = Vec::new();
-    let mut retained_record_ids = Vec::new();
-    let mut validity: HashMap<RecordIdentifier, bool> = HashMap::new();
-    validity.insert(current_head, true);
-    let mut verifier = NodeTreeVerifier::new(repository);
-    let retention_boundary = retention.and_then(|bound| {
-        journal_retention_boundary(repository, raw, bound, &mut validity, &mut verifier)
-    });
-
+/// Sorts every line into retained or removed, verifying each distinct
+/// revision's tree at most once.
+fn classify_journal_lines(
+    repository: &Repository,
+    raw: &RawJournal,
+    retention_boundary: Option<usize>,
+    validity: &mut HashMap<RecordIdentifier, bool>,
+    verifier: &mut NodeTreeVerifier<'_>,
+    observer: &mut dyn ProgressObserver,
+) -> JournalTally {
+    let mut tally = JournalTally::default();
     for (index, line) in raw.lines().iter().enumerate() {
         observer.step_advanced(crate::progress::count(index));
         match line.classification() {
             RawJournalLineClassification::ParserSkippedNoSpace => {
-                parser_ignored += 1;
-                removals.push(journal_line_removal(
+                tally.parser_ignored += 1;
+                tally.removals.push(journal_line_removal(
                     index,
                     line,
                     None,
@@ -172,8 +239,8 @@ pub(super) fn analyze_journal_lines(
                 ));
             }
             RawJournalLineClassification::InvalidRecordIdentifier { .. } => {
-                parser_ignored += 1;
-                removals.push(journal_line_removal(
+                tally.parser_ignored += 1;
+                tally.removals.push(journal_line_removal(
                     index,
                     line,
                     None,
@@ -183,8 +250,8 @@ pub(super) fn analyze_journal_lines(
             RawJournalLineClassification::Record(record) => {
                 let identifier = record.record_identifier;
                 if !repository.contains_segment(identifier.segment) {
-                    missing_segments += 1;
-                    removals.push(journal_line_removal(
+                    tally.missing_segments += 1;
+                    tally.removals.push(journal_line_removal(
                         index,
                         line,
                         Some(identifier),
@@ -197,8 +264,8 @@ pub(super) fn analyze_journal_lines(
                 // proving readability first would be work spent on a line
                 // already destined for removal.
                 if retention_boundary.is_some_and(|boundary| index < boundary) {
-                    beyond_retention += 1;
-                    removals.push(journal_line_removal(
+                    tally.beyond_retention += 1;
+                    tally.removals.push(journal_line_removal(
                         index,
                         line,
                         Some(identifier),
@@ -206,29 +273,12 @@ pub(super) fn analyze_journal_lines(
                     ));
                     continue;
                 }
-                let readable = if let Some(readable) = validity.get(&identifier) {
-                    *readable
+                if revision_is_readable(repository, identifier, validity, verifier) {
+                    tally.retained_indexes.push(index);
+                    tally.retained_record_ids.push(identifier);
                 } else {
-                    // The historical revision's own node walk shares this
-                    // step's journal-line counter rather than reporting
-                    // nodes: a step counts one unit, and the line index is
-                    // the one the reader can act on.
-                    let readable = verify_exact_super_root_with_verifier(
-                        repository,
-                        identifier,
-                        &mut verifier,
-                        &mut DiscardedProgress,
-                    )
-                    .is_ok();
-                    validity.insert(identifier, readable);
-                    readable
-                };
-                if readable {
-                    retained_indexes.push(index);
-                    retained_record_ids.push(identifier);
-                } else {
-                    unreadable_revisions += 1;
-                    removals.push(journal_line_removal(
+                    tally.unreadable_revisions += 1;
+                    tally.removals.push(journal_line_removal(
                         index,
                         line,
                         Some(identifier),
@@ -239,33 +289,31 @@ pub(super) fn analyze_journal_lines(
         }
     }
     observer.step_advanced(crate::progress::count(raw.lines().len()));
-    if !retained_record_ids.contains(&current_head) {
-        return Err(Error::InvalidFormat {
-            details: "journal analysis would not retain the exact current head".to_owned(),
-        });
+    tally
+}
+
+/// Whether a revision's whole tree reads, memoized: the same revision
+/// appears on many journal lines and is walked only once.
+///
+/// The historical revision's own node walk shares the caller's journal-line
+/// counter rather than reporting nodes: a step counts one unit, and the
+/// line index is the one the reader can act on.
+fn revision_is_readable(
+    repository: &Repository,
+    identifier: RecordIdentifier,
+    validity: &mut HashMap<RecordIdentifier, bool>,
+    verifier: &mut NodeTreeVerifier<'_>,
+) -> bool {
+    if let Some(readable) = validity.get(&identifier) {
+        return *readable;
     }
-    let removed_lines = parser_ignored
-        .checked_add(missing_segments)
-        .and_then(|count| count.checked_add(unreadable_revisions))
-        .and_then(|count| count.checked_add(beyond_retention))
-        .ok_or_else(|| Error::InvalidFormat {
-            details: "journal line accounting overflow".to_owned(),
-        })?;
-    Ok(JournalAnalysis {
-        plan: JournalPlan {
-            retained_record_ids: retained_record_ids.clone(),
-            retained_raw_lines: retained_indexes
-                .iter()
-                .map(|&index| raw.lines()[index].raw_bytes().to_vec())
-                .collect(),
-            removals,
-            removed_lines,
-            parser_ignored,
-            missing_segments,
-            unreadable_revisions,
-            beyond_retention,
-        },
-        retained_indexes,
-        retained_record_ids,
-    })
+    let readable = verify_exact_super_root_with_verifier(
+        repository,
+        identifier,
+        verifier,
+        &mut DiscardedProgress,
+    )
+    .is_ok();
+    validity.insert(identifier, readable);
+    readable
 }

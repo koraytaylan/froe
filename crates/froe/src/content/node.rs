@@ -55,7 +55,7 @@ pub struct NodeState<'provider> {
     record_identifier: RecordIdentifier,
 }
 
-type ChildNodeEntry<'provider> = (String, NodeState<'provider>);
+pub(crate) type ChildNodeEntry<'provider> = (String, NodeState<'provider>);
 
 impl<'provider> NodeState<'provider> {
     /// Creates a node state for the node record at `record_identifier`.

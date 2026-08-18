@@ -164,10 +164,6 @@ pub(crate) fn scan_raw_journal_file(path: &Path) -> Result<RawJournal> {
 /// record receives one `LF`; existing `LF`, `CRLF`, and bare-`CR` terminators
 /// remain byte-exact. Before replacement, the original bytes are copied to the
 /// first unused numbered backup, and both files are durably synced.
-#[allow(
-    clippy::too_many_lines,
-    reason = "source, staging, backup, rename, and durability recertification form one ordered publication protocol"
-)]
 pub(crate) fn rewrite_journal_atomically(
     snapshot: &RawJournal,
     retained_record_line_indexes: &[usize],
@@ -197,19 +193,55 @@ pub(crate) fn rewrite_journal_atomically(
         });
     }
 
+    let staged = stage_journal_replacement(snapshot, &output)?;
+    publish_journal_replacement(
+        snapshot,
+        &output,
+        source_certificate,
+        staged,
+        JournalRewriteCounts {
+            retained_record_count: retained.len(),
+            removed_line_count,
+        },
+    )
+}
+
+/// What the caller already counted, carried through publication into the
+/// outcome it reports.
+#[derive(Clone, Copy)]
+struct JournalRewriteCounts {
+    retained_record_count: usize,
+    removed_line_count: usize,
+}
+
+/// The replacement and the recovery backup, written and certified but not
+/// yet published.
+struct StagedJournal {
+    directory: PathBuf,
+    temporary_path: PathBuf,
+    temporary_certificate: JournalFileCertificate,
+    temporary_guard: UncommittedFile,
+    backup_path: PathBuf,
+    backup_certificate: JournalFileCertificate,
+    backup_guard: UncommittedFile,
+}
+
+/// Writes the replacement and the recovery backup beside the journal,
+/// certifying each, without touching the journal itself.
+fn stage_journal_replacement(snapshot: &RawJournal, output: &[u8]) -> Result<StagedJournal> {
     let directory = snapshot.path.parent().ok_or_else(|| Error::InvalidFormat {
         details: format!("journal path {} has no parent", snapshot.path.display()),
     })?;
-    let (temporary_path, mut temporary, mut temporary_guard) =
+    let (temporary_path, mut temporary, temporary_guard) =
         create_numbered_file(directory, "journal.log.cleaning")?;
-    temporary.write_all(&output)?;
+    temporary.write_all(output)?;
     preserve_file_metadata(&temporary, &snapshot.metadata)?;
     let temporary_identity = temporary.metadata()?;
     drop(temporary);
     let temporary_certificate = certify_journal_file(
         &temporary_path,
         &temporary_identity,
-        &output,
+        output,
         StagingAccess::ReadAppend,
         "staged journal replacement",
     )?;
@@ -220,7 +252,7 @@ pub(crate) fn rewrite_journal_atomically(
 
     // Preparing the replacement before reserving a backup name means an
     // exhausted temporary namespace cannot leave an unnecessary backup.
-    let (backup_path, mut backup, mut backup_guard) =
+    let (backup_path, mut backup, backup_guard) =
         create_numbered_file(directory, "journal.log.bak")?;
     backup.write_all(&snapshot.source_bytes)?;
     preserve_file_metadata(&backup, &snapshot.metadata)?;
@@ -233,38 +265,96 @@ pub(crate) fn rewrite_journal_atomically(
         StagingAccess::Read,
         "journal recovery backup",
     )?;
-    // The staged replacement and the recovery backup are re-proven at every
-    // fault boundary below. Naming the two shapes keeps five occurrences from
-    // drifting apart, and keeps the pre-rename path (the temporary) visibly
-    // distinct from the post-rename one (the journal itself).
-    let recertify_staged_replacement = || -> Result<()> {
-        temporary_certificate.recertify(
-            &temporary_path,
-            &output,
+    Ok(StagedJournal {
+        directory: directory.to_path_buf(),
+        temporary_path,
+        temporary_certificate,
+        temporary_guard,
+        backup_path,
+        backup_certificate,
+        backup_guard,
+    })
+}
+
+/// Renames the staged replacement over the journal and makes that durable.
+///
+/// The order below is the safety argument and reads straight down: every
+/// fault boundary is bracketed by a proof that the staged bytes and the
+/// backup are still exactly what staging certified.
+/// The two certificates publication re-proves at every fault boundary.
+///
+/// Named as a pair because the proof must not drift: the pre-rename path is
+/// the temporary and the post-rename path is the journal itself, and the
+/// recovery backup is checked alongside both.
+struct PublicationProofs<'proof> {
+    snapshot: &'proof RawJournal,
+    output: &'proof [u8],
+    temporary_path: &'proof Path,
+    temporary_certificate: &'proof JournalFileCertificate,
+    backup_path: &'proof Path,
+    backup_certificate: &'proof JournalFileCertificate,
+}
+
+impl PublicationProofs<'_> {
+    /// Before the rename: the replacement is still at the temporary.
+    fn staged_replacement_holds(&self) -> Result<()> {
+        self.temporary_certificate.recertify(
+            self.temporary_path,
+            self.output,
             StagingAccess::ReadAppend,
             "staged journal replacement",
         )?;
-        backup_certificate.recertify(
-            &backup_path,
-            &snapshot.source_bytes,
-            StagingAccess::Read,
-            "journal recovery backup",
-        )
-    };
-    let recertify_installed_replacement = || -> Result<()> {
-        temporary_certificate.recertify(
-            &snapshot.path,
-            &output,
+        self.recovery_backup_holds()
+    }
+
+    /// After the rename: the replacement is the journal.
+    fn installed_replacement_holds(&self) -> Result<()> {
+        self.temporary_certificate.recertify(
+            &self.snapshot.path,
+            self.output,
             StagingAccess::ReadAppend,
             "installed journal replacement",
         )?;
-        backup_certificate.recertify(
-            &backup_path,
-            &snapshot.source_bytes,
+        self.recovery_backup_holds()
+    }
+
+    fn recovery_backup_holds(&self) -> Result<()> {
+        self.backup_certificate.recertify(
+            self.backup_path,
+            &self.snapshot.source_bytes,
             StagingAccess::Read,
             "journal recovery backup",
         )
+    }
+}
+
+fn publish_journal_replacement(
+    snapshot: &RawJournal,
+    output: &[u8],
+    source_certificate: JournalFileCertificate,
+    staged: StagedJournal,
+    counts: JournalRewriteCounts,
+) -> Result<JournalRewriteOutcome> {
+    let StagedJournal {
+        directory,
+        temporary_path,
+        temporary_certificate,
+        mut temporary_guard,
+        backup_path,
+        backup_certificate,
+        mut backup_guard,
+    } = staged;
+    let directory = directory.as_path();
+    let proofs = PublicationProofs {
+        snapshot,
+        output,
+        temporary_path: &temporary_path,
+        temporary_certificate: &temporary_certificate,
+        backup_path: &backup_path,
+        backup_certificate: &backup_certificate,
     };
+    let recertify_staged_replacement = || proofs.staged_replacement_holds();
+    let recertify_installed_replacement = || proofs.installed_replacement_holds();
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed("journal.backup-file-durable")?;
     #[cfg(test)]
@@ -326,8 +416,8 @@ pub(crate) fn rewrite_journal_atomically(
     Ok(JournalRewriteOutcome {
         changed: true,
         backup_path: Some(backup_path),
-        retained_record_count: retained.len(),
-        removed_line_count,
+        retained_record_count: counts.retained_record_count,
+        removed_line_count: counts.removed_line_count,
         bytes_written: output.len(),
     })
 }
