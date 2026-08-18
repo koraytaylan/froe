@@ -5,9 +5,10 @@ use super::archive_certificate::{
     ExpectedBinaryReferences, ExpectedGraph, validate_exact_archive_trailers,
 };
 use super::file_identity::{
-    FileAccess, UncommittedArchiveStaging, held_file_identity, open_regular_file_no_follow,
-    path_object_identity, preserve_file_metadata, remove_published_link_if_same,
-    require_held_file_identity, require_path_file_identity, sync_directory_strict,
+    FileAccess, RegularFileIdentity, UncommittedArchiveStaging, held_file_identity,
+    open_regular_file_no_follow, path_object_identity, preserve_file_metadata,
+    remove_published_link_if_same, require_held_file_identity, require_path_file_identity,
+    sync_directory_strict,
 };
 use super::providers::{
     ArchiveSegmentsProvider, FilteredTrailers, archive_segments_provider,
@@ -44,192 +45,32 @@ pub(super) fn next_archive_staging_name(
     })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "staging, semantic validation, atomic publication, and source unlinking form one deliberately linear safety sequence, and each parameter names one input that sequence must not re-derive"
-)]
-pub(super) fn sweep_one_archive<'archives>(
-    directory: &Path,
-    reader: &'archives TarArchiveReader,
-    reclaimable: &std::collections::HashSet<SegmentIdentifier>,
-    previously_unavailable_graph_targets: &std::collections::HashSet<SegmentIdentifier>,
-    all_archives: &[&'archives TarArchiveReader],
-    fallback_provider: &mut Option<ArchiveSegmentsProvider<'archives>>,
-    source_certificate_provider: Option<&dyn SegmentProvider>,
-    rewrite_policy: ArchiveRewritePolicy,
-) -> Result<ArchiveSweepOutcome> {
-    let path = directory.join(reader.file_name());
-    let Some(planned) = plan_archive_sweep(
-        directory,
+/// Everything the survivor copy reads to rebuild each surviving
+/// segment's graph and binary-reference entries.
+#[derive(Clone, Copy)]
+struct SurvivorSources<'sources> {
+    reader: &'sources TarArchiveReader,
+    trailers: &'sources FilteredTrailers,
+    previously_unavailable_graph_targets: &'sources std::collections::HashSet<SegmentIdentifier>,
+    current_rewrite_targets: &'sources std::collections::HashSet<SegmentIdentifier>,
+    scan_provider: Option<&'sources ArchiveSegmentsProvider<'sources>>,
+}
+
+/// Copies every survivor into the staged replacement, rebuilding the
+/// trailers it must carry and returning what validation will hold it to.
+fn copy_survivors(
+    sources: SurvivorSources<'_>,
+    survivors: &[crate::tar_archive::index::SegmentIndexEntry],
+    writer: &mut TarArchiveWriter,
+    uncommitted_staging: &mut UncommittedArchiveStaging,
+) -> Result<(ExpectedGraph, ExpectedBinaryReferences)> {
+    let SurvivorSources {
         reader,
-        reclaimable,
-        rewrite_policy,
-        &std::collections::HashSet::new(),
-    )?
-    else {
-        return Ok(ArchiveSweepOutcome::default());
-    };
-
-    // Bind every actionable source to a no-follow descriptor and retain its
-    // inode identity through the destructive syscall. Standalone cleanup and
-    // ordinary post-compaction cleanup additionally repeat the complete source
-    // certificate through this exact descriptor-backed mapping. Replanning
-    // prevents a semantically different but still well-formed source from
-    // silently proceeding after the locked plan.
-    let reopened_source = if planned.changes_disk() {
-        let source_file = open_regular_file_no_follow(&path, FileAccess::ReadOnly)?;
-        let source_identity = held_file_identity(&source_file)?;
-        let reopened = TarArchiveReader::open_file(&path, &source_file)?;
-        if let Some(provider) = source_certificate_provider {
-            certify_reopened_active_archive(provider, &reopened)?;
-        }
-        if plan_archive_sweep(
-            directory,
-            &reopened,
-            reclaimable,
-            rewrite_policy,
-            &std::collections::HashSet::new(),
-        )?
-        .as_ref()
-            != Some(&planned)
-        {
-            return Err(Error::InvalidFormat {
-                details: format!(
-                    "the actionable source archive {} changed before its immediate cleanup certificate",
-                    reader.file_name()
-                ),
-            });
-        }
-        Some((reopened, source_file, source_identity))
-    } else {
-        None
-    };
-    let reader = reopened_source
-        .as_ref()
-        .map_or(reader, |(reopened, _, _)| reopened);
-    let Some(index) = reader.index() else {
-        // Post-compaction cleanup retains Oak's conservative treatment of
-        // recovered base archives. Standalone cleanup cannot reach this branch
-        // because its source certificate rejects an indexless archive.
-        return Ok(ArchiveSweepOutcome::default());
-    };
-    let planned_unavailable: std::collections::HashSet<_> = index
-        .entries()
-        .iter()
-        .map(|entry| entry.segment_identifier)
-        .filter(|identifier| reclaimable.contains(identifier))
-        .collect();
-
-    let (replacement_name, planned_reclaimable_count) = match planned {
-        PlannedArchiveSweep::Remove { .. } => {
-            let (_, source_file, source_identity) = reopened_source
-                .as_ref()
-                .expect("an archive removal always has an actionable reopened source");
-            #[cfg(test)]
-            crate::writer::maintenance_fault_injection::substitute_path_if_armed(
-                "sweep.remove-before-source-identity",
-                &path,
-            )?;
-            require_held_file_identity(source_file, *source_identity, "certified removal source")?;
-            require_path_file_identity(&path, *source_identity, "certified removal source")?;
-            #[cfg(test)]
-            crate::writer::maintenance_fault_injection::remove_path_if_armed(
-                "sweep.remove-before-source-unlink-not-found",
-                &path,
-            )?;
-            // Deletion failures are consistency-safe: ordinarily the old
-            // archive remains authoritative for retry; `NotFound` records
-            // that another actor already achieved this exact unlink.
-            return Ok(match std::fs::remove_file(&path) {
-                Ok(()) => ArchiveSweepOutcome {
-                    disposition: ArchiveSweepDisposition::Removed,
-                    deletion_failures: Vec::new(),
-                    newly_unavailable: planned_unavailable,
-                },
-                Err(error) => ArchiveSweepOutcome {
-                    disposition: ArchiveSweepDisposition::Unchanged,
-                    deletion_failures: vec![DeferredFileDeletion {
-                        file_name: reader.file_name().to_owned(),
-                        error: error.to_string(),
-                        target_was_already_absent: error.kind() == std::io::ErrorKind::NotFound,
-                    }],
-                    newly_unavailable: std::collections::HashSet::new(),
-                },
-            });
-        }
-        PlannedArchiveSweep::Rewrite {
-            replacement_name,
-            segment_count,
-            ..
-        } => (replacement_name, segment_count),
-        PlannedArchiveSweep::DeferredBySavings { .. }
-        | PlannedArchiveSweep::DeferredAtLastGeneration { .. }
-        | PlannedArchiveSweep::BlockedByOccupiedGeneration { .. } => {
-            return Ok(ArchiveSweepOutcome::default());
-        }
-    };
-
-    // Partition the entries in file-position order, accumulating Oak's
-    // sweep arithmetic (`i64` cannot wrap where Java's `int` could not
-    // either: entries are position-bounded below 2 GiB).
-    let mut entries: Vec<_> = index.entries().to_vec();
-    entries.sort_by_key(|entry| entry.position);
-    let mut survivors = Vec::new();
-    for entry in entries {
-        if !reclaimable.contains(&entry.segment_identifier) {
-            survivors.push(entry);
-        }
-    }
-    debug_assert_eq!(
-        index.entries().len() - survivors.len(),
-        planned_reclaimable_count
-    );
-    let current_rewrite_targets = planned_unavailable;
-
-    // These two proofs deliberately have different graph scopes. Production
-    // active-source certification above reconstructs the complete, unfiltered
-    // graph from payloads before mutation. A replacement `.gph` is derived
-    // subtractively: source entries not copied by this rewrite are left out,
-    // while targets are filtered against both identifiers this run previously
-    // made unavailable and identifiers belonging to those omitted entries.
-    // Staged and published validation below compare it with that exact view.
-    let trailers = FilteredTrailers::from_archive(
-        reader,
-        reclaimable,
+        trailers,
         previously_unavailable_graph_targets,
-        &current_rewrite_targets,
-    );
-    // When the original archive has no readable catalog, survivor
-    // references are reconstructed by a strict scan resolving across
-    // every segment of every base archive — and the sweep fails closed
-    // on an unresolvable identifier rather than publish an incomplete
-    // catalog that could let blob garbage collection delete referenced
-    // binaries. (Java would publish an *empty* catalog here; the scan is
-    // a strict superset of that.)
-    let scan_provider = if trailers.catalog.is_none() {
-        if fallback_provider.is_none() {
-            *fallback_provider = Some(archive_segments_provider(all_archives)?);
-        }
-        fallback_provider.as_ref()
-    } else {
-        None
-    };
-
-    // Build under a name that cannot participate in archive selection. A
-    // crash or validation failure can therefore leave only non-active
-    // residue; the healthy source remains the selected generation. Trailer
-    // entry names still use the final logical basename.
-    let staging_name = next_archive_staging_name(directory, &replacement_name)?;
-    let staging_path = directory.join(&staging_name);
-    let replacement_path = directory.join(&replacement_name);
-    let mut uncommitted_staging = UncommittedArchiveStaging::new(directory, staging_path.clone());
-    let (_, source_file, source_identity) = reopened_source
-        .as_ref()
-        .expect("an archive rewrite always has an actionable reopened source");
-    let source_metadata = source_file.metadata()?;
-    let mut writer =
-        TarArchiveWriter::new_exclusive_staged(directory, &staging_name, &replacement_name);
+        current_rewrite_targets,
+        scan_provider,
+    } = sources;
     let mut expected_graph = ExpectedGraph::new();
     let mut expected_binary_references = ExpectedBinaryReferences::new();
     if let Some(catalog_entries) = &trailers.catalog {
@@ -247,7 +88,7 @@ pub(super) fn sweep_one_archive<'archives>(
                 .extend(references.iter().cloned());
         }
     }
-    for entry in &survivors {
+    for entry in survivors {
         let identifier = entry.segment_identifier;
         let Some(bytes) = reader.segment_data(identifier) else {
             return Err(Error::SegmentNotFound {
@@ -264,7 +105,7 @@ pub(super) fn sweep_one_archive<'archives>(
                 identifier,
                 bytes,
                 previously_unavailable_graph_targets,
-                &current_rewrite_targets,
+                current_rewrite_targets,
                 scan_provider,
             )?
         } else {
@@ -298,25 +139,72 @@ pub(super) fn sweep_one_archive<'archives>(
         // `TarArchiveWriter` creates lazily. Capture the descriptor before
         // propagating the write result so a first-write ENOSPC-style failure
         // cannot strand an unowned `.cleaning` pathname.
-        uncommitted_staging.capture_created_file(&writer)?;
+        uncommitted_staging.capture_created_file(writer)?;
         write_result?;
     }
-    writer.close()?;
+    Ok((expected_graph, expected_binary_references))
+}
+
+/// Everything the publication phase reads to prove the staged archive
+/// and swap it in for the source.
+struct SweepPublication<'publication> {
+    directory: &'publication Path,
+    source_path: &'publication Path,
+    reader: &'publication TarArchiveReader,
+    source_file: &'publication std::fs::File,
+    source_identity: RegularFileIdentity,
+    staging_name: &'publication str,
+    staging_path: &'publication Path,
+    replacement_name: &'publication str,
+    replacement_path: &'publication Path,
+    survivors: &'publication [crate::tar_archive::index::SegmentIndexEntry],
+    expected_graph: &'publication ExpectedGraph,
+    expected_binary_references: &'publication ExpectedBinaryReferences,
+    source_metadata: &'publication std::fs::Metadata,
+    current_rewrite_targets: std::collections::HashSet<SegmentIdentifier>,
+}
+
+/// What the staged archive is proved against before publication.
+struct StagedValidation<'validation> {
+    reader: &'validation TarArchiveReader,
+    staging_path: &'validation Path,
+    replacement_name: &'validation str,
+    survivors: &'validation [crate::tar_archive::index::SegmentIndexEntry],
+    expected_graph: &'validation ExpectedGraph,
+    expected_binary_references: &'validation ExpectedBinaryReferences,
+    source_metadata: &'validation std::fs::Metadata,
+}
+
+/// Reopens the staged archive through its own no-follow descriptor and
+/// holds it to every survivor and trailer the copy was meant to write.
+///
+/// Returns the validated inode's identity, which publication then
+/// requires the linked names to agree with.
+fn validate_staged_replacement(validation: &StagedValidation<'_>) -> Result<RegularFileIdentity> {
+    let &StagedValidation {
+        reader,
+        staging_path,
+        replacement_name,
+        survivors,
+        expected_graph,
+        expected_binary_references,
+        source_metadata,
+    } = validation;
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed(
         "sweep.staging-before-validation-open",
     )?;
-    let staging_file = open_regular_file_no_follow(&staging_path, FileAccess::ReadWrite)?;
-    preserve_file_metadata(&staging_file, &source_metadata)?;
+    let staging_file = open_regular_file_no_follow(staging_path, FileAccess::ReadWrite)?;
+    preserve_file_metadata(&staging_file, source_metadata)?;
     let staging_identity = held_file_identity(&staging_file)?;
-    let staged_reader = TarArchiveReader::open_file(&staging_path, &staging_file)?;
+    let staged_reader = TarArchiveReader::open_file(staging_path, &staging_file)?;
     if let Err(error) = validate_open_swept_archive(
         reader,
         &staged_reader,
-        &staging_path,
-        &survivors,
-        &expected_graph,
-        &expected_binary_references,
+        staging_path,
+        survivors,
+        expected_graph,
+        expected_binary_references,
     ) {
         return Err(Error::InvalidFormat {
             details: format!(
@@ -329,7 +217,7 @@ pub(super) fn sweep_one_archive<'archives>(
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::substitute_path_if_armed(
         "sweep.staging-validated-before-publish",
-        &staging_path,
+        staging_path,
     )?;
     require_held_file_identity(
         &staging_file,
@@ -337,104 +225,53 @@ pub(super) fn sweep_one_archive<'archives>(
         "validated archive staging file",
     )?;
     require_path_file_identity(
-        &staging_path,
+        staging_path,
         staging_identity,
         "validated archive staging file",
     )?;
-    // From this point onward the complete validated staging file is useful
-    // crash evidence. Publication failures retain it intentionally; ordinary
-    // success removes it explicitly below.
-    uncommitted_staging.disarm();
+    Ok(staging_identity)
+}
 
-    // `hard_link` is an atomic absent-only publication: unlike rename it
-    // cannot overwrite a final path created after planning. Both names refer
-    // to the already-synced, validated inode until staging cleanup.
-    #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-publish-link")?;
-    std::fs::hard_link(&staging_path, &replacement_path)?;
+/// The source archive a published rewrite supersedes.
+struct RetiredSource<'retired> {
+    directory: &'retired Path,
+    replacement_path: &'retired Path,
+    replacement_file: &'retired std::fs::File,
+    staging_identity: RegularFileIdentity,
+    path: &'retired Path,
+    reader: &'retired TarArchiveReader,
+    source_file: &'retired std::fs::File,
+    source_identity: RegularFileIdentity,
+    staging_name: &'retired str,
+    staging_path: &'retired Path,
+    current_rewrite_targets: std::collections::HashSet<SegmentIdentifier>,
+}
 
-    // A pathname substitution in the narrow interval between the pre-link
-    // identity check and `hard_link` must not turn an arbitrary inode into the
-    // higher active archive generation. Capture the two names immediately; if
-    // they agree with each other but not the validated descriptor, they still
-    // identify the link this process just published and can be removed safely.
-    let linked_stage_identity = path_object_identity(&staging_path).ok();
-    let linked_replacement_identity = path_object_identity(&replacement_path).ok();
-    let just_published_identity =
-        linked_stage_identity.filter(|identity| Some(*identity) == linked_replacement_identity);
-    if linked_stage_identity != Some(staging_identity)
-        || linked_replacement_identity != Some(staging_identity)
-    {
-        remove_published_link_if_same(directory, &replacement_path, just_published_identity)?;
-        return Err(Error::InvalidFormat {
-            details: format!(
-                "archive staging or published path changed identity while publishing {replacement_name}; the source was left untouched"
-            ),
-        });
-    }
-
-    let replacement_file =
-        match open_regular_file_no_follow(&replacement_path, FileAccess::ReadOnly) {
-            Ok(file) => file,
-            Err(error) => {
-                remove_published_link_if_same(
-                    directory,
-                    &replacement_path,
-                    Some(staging_identity),
-                )?;
-                return Err(error);
-            }
-        };
-    let replacement_validation = (|| {
-        require_held_file_identity(
-            &replacement_file,
-            staging_identity,
-            "published archive replacement",
-        )?;
-        require_path_file_identity(
-            &replacement_path,
-            staging_identity,
-            "published archive replacement",
-        )?;
-        let replacement_reader = TarArchiveReader::open_file(&replacement_path, &replacement_file)?;
-        validate_open_swept_archive(
-            reader,
-            &replacement_reader,
-            &replacement_path,
-            &survivors,
-            &expected_graph,
-            &expected_binary_references,
-        )
-    })();
-    if let Err(error) = replacement_validation {
-        remove_published_link_if_same(directory, &replacement_path, Some(staging_identity))?;
-        return Err(Error::InvalidFormat {
-            details: format!(
-                "published rewrite {replacement_name} failed descriptor-bound validation ({error}); the source was left untouched"
-            ),
-        });
-    }
-    #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-publish-link")?;
-    #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "sweep.before-publish-directory-sync",
-    )?;
-    sync_directory_strict(directory)?;
-    #[cfg(test)]
-    crate::writer::maintenance_fault_injection::fail_if_armed(
-        "sweep.after-publish-directory-sync",
-    )?;
-    #[cfg(test)]
-    crate::writer::maintenance_fault_injection::crash_if_armed(
-        "sweep.published-before-source-unlink",
-    );
+/// Removes the staging alias and then the source, once the replacement
+/// is published and durable.
+///
+/// Each unlink is guarded by the identity the source was certified with,
+/// so a path substituted underneath this run removes nothing.
+fn retire_swept_source(retired: RetiredSource<'_>) -> Result<ArchiveSweepOutcome> {
+    let RetiredSource {
+        directory,
+        replacement_path,
+        replacement_file,
+        staging_identity,
+        path,
+        reader,
+        source_file,
+        source_identity,
+        staging_name,
+        staging_path,
+        current_rewrite_targets,
+    } = retired;
     let mut deletion_failures = Vec::new();
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-staging-unlink")?;
-    if let Err(error) = std::fs::remove_file(&staging_path) {
+    if let Err(error) = std::fs::remove_file(staging_path) {
         deletion_failures.push(DeferredFileDeletion {
-            file_name: staging_name,
+            file_name: staging_name.to_owned(),
             error: error.to_string(),
             target_was_already_absent: error.kind() == std::io::ErrorKind::NotFound,
         });
@@ -451,20 +288,20 @@ pub(super) fn sweep_one_archive<'archives>(
     crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-source-unlink")?;
     let pre_source_unlink_identity = (|| {
         require_held_file_identity(
-            &replacement_file,
+            replacement_file,
             staging_identity,
             "published archive replacement",
         )?;
         require_path_file_identity(
-            &replacement_path,
+            replacement_path,
             staging_identity,
             "published archive replacement",
         )?;
-        require_held_file_identity(source_file, *source_identity, "certified archive source")?;
-        require_path_file_identity(&path, *source_identity, "certified archive source")
+        require_held_file_identity(source_file, source_identity, "certified archive source")?;
+        require_path_file_identity(path, source_identity, "certified archive source")
     })();
     if let Err(error) = pre_source_unlink_identity {
-        remove_published_link_if_same(directory, &replacement_path, Some(staging_identity))?;
+        remove_published_link_if_same(directory, replacement_path, Some(staging_identity))?;
         return Err(Error::InvalidFormat {
             details: format!(
                 "archive identity changed immediately before removing {} ({error}); the source pathname was left untouched",
@@ -472,7 +309,7 @@ pub(super) fn sweep_one_archive<'archives>(
             ),
         });
     }
-    if let Err(error) = std::fs::remove_file(&path) {
+    if let Err(error) = std::fs::remove_file(path) {
         deletion_failures.push(DeferredFileDeletion {
             file_name: reader.file_name().to_owned(),
             error: error.to_string(),
@@ -488,6 +325,491 @@ pub(super) fn sweep_one_archive<'archives>(
         deletion_failures,
         newly_unavailable: current_rewrite_targets,
     })
+}
+
+/// The replacement, once the hard link that published it exists.
+struct PublishedReplacement<'published> {
+    directory: &'published Path,
+    replacement_path: &'published Path,
+    replacement_name: &'published str,
+    staging_path: &'published Path,
+    staging_identity: RegularFileIdentity,
+    reader: &'published TarArchiveReader,
+    survivors: &'published [crate::tar_archive::index::SegmentIndexEntry],
+    expected_graph: &'published ExpectedGraph,
+    expected_binary_references: &'published ExpectedBinaryReferences,
+}
+
+/// Proves the two names the publication linked still identify the inode
+/// validation certified.
+///
+/// A pathname substitution in the narrow interval between the pre-link
+/// identity check and `hard_link` must not turn an arbitrary inode into
+/// the higher active archive generation. If the two names agree with each
+/// other but not the validated descriptor, they still identify the link
+/// this process just published and can be removed safely.
+fn certify_published_replacement(published: &PublishedReplacement<'_>) -> Result<std::fs::File> {
+    let &PublishedReplacement {
+        directory,
+        replacement_path,
+        replacement_name,
+        staging_path,
+        staging_identity,
+        reader,
+        survivors,
+        expected_graph,
+        expected_binary_references,
+    } = published;
+    let linked_stage_identity = path_object_identity(staging_path).ok();
+    let linked_replacement_identity = path_object_identity(replacement_path).ok();
+    let just_published_identity =
+        linked_stage_identity.filter(|identity| Some(*identity) == linked_replacement_identity);
+    if linked_stage_identity != Some(staging_identity)
+        || linked_replacement_identity != Some(staging_identity)
+    {
+        remove_published_link_if_same(directory, replacement_path, just_published_identity)?;
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "archive staging or published path changed identity while publishing {replacement_name}; the source was left untouched"
+            ),
+        });
+    }
+
+    let replacement_file = match open_regular_file_no_follow(replacement_path, FileAccess::ReadOnly)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            remove_published_link_if_same(directory, replacement_path, Some(staging_identity))?;
+            return Err(error);
+        }
+    };
+    let replacement_validation = (|| {
+        require_held_file_identity(
+            &replacement_file,
+            staging_identity,
+            "published archive replacement",
+        )?;
+        require_path_file_identity(
+            replacement_path,
+            staging_identity,
+            "published archive replacement",
+        )?;
+        let replacement_reader = TarArchiveReader::open_file(replacement_path, &replacement_file)?;
+        validate_open_swept_archive(
+            reader,
+            &replacement_reader,
+            replacement_path,
+            survivors,
+            expected_graph,
+            expected_binary_references,
+        )
+    })();
+    if let Err(error) = replacement_validation {
+        remove_published_link_if_same(directory, replacement_path, Some(staging_identity))?;
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "published rewrite {replacement_name} failed descriptor-bound validation ({error}); the source was left untouched"
+            ),
+        });
+    }
+    Ok(replacement_file)
+}
+
+/// Validates the staged archive, publishes it under the replacement
+/// name, and only then unlinks the source.
+///
+/// The order is the safety argument: nothing the source holds is removed
+/// until a complete, independently reopened copy of every survivor is
+/// durable under its final name.
+fn publish_swept_archive(
+    publication: SweepPublication<'_>,
+    uncommitted_staging: &mut UncommittedArchiveStaging,
+) -> Result<ArchiveSweepOutcome> {
+    let SweepPublication {
+        directory,
+        source_path: path,
+        reader,
+        source_file,
+        source_identity,
+        staging_name,
+        staging_path,
+        replacement_name,
+        replacement_path,
+        survivors,
+        expected_graph,
+        expected_binary_references,
+        source_metadata,
+        current_rewrite_targets,
+    } = publication;
+    let staging_identity = validate_staged_replacement(&StagedValidation {
+        reader,
+        staging_path,
+        replacement_name,
+        survivors,
+        expected_graph,
+        expected_binary_references,
+        source_metadata,
+    })?;
+    // From this point onward the complete validated staging file is useful
+    // crash evidence. Publication failures retain it intentionally; ordinary
+    // success removes it explicitly below.
+    uncommitted_staging.disarm();
+
+    // `hard_link` is an atomic absent-only publication: unlike rename it
+    // cannot overwrite a final path created after planning. Both names refer
+    // to the already-synced, validated inode until staging cleanup.
+    #[cfg(test)]
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.before-publish-link")?;
+    std::fs::hard_link(staging_path, replacement_path)?;
+
+    let replacement_file = certify_published_replacement(&PublishedReplacement {
+        directory,
+        replacement_path,
+        replacement_name,
+        staging_path,
+        staging_identity,
+        reader,
+        survivors,
+        expected_graph,
+        expected_binary_references,
+    })?;
+    #[cfg(test)]
+    crate::writer::maintenance_fault_injection::fail_if_armed("sweep.after-publish-link")?;
+    #[cfg(test)]
+    crate::writer::maintenance_fault_injection::fail_if_armed(
+        "sweep.before-publish-directory-sync",
+    )?;
+    sync_directory_strict(directory)?;
+    #[cfg(test)]
+    crate::writer::maintenance_fault_injection::fail_if_armed(
+        "sweep.after-publish-directory-sync",
+    )?;
+    #[cfg(test)]
+    crate::writer::maintenance_fault_injection::crash_if_armed(
+        "sweep.published-before-source-unlink",
+    );
+    retire_swept_source(RetiredSource {
+        directory,
+        replacement_path,
+        replacement_file: &replacement_file,
+        staging_identity,
+        path,
+        reader,
+        source_file,
+        source_identity,
+        staging_name,
+        staging_path,
+        current_rewrite_targets,
+    })
+}
+
+/// Binds an actionable source to a no-follow descriptor and retains its
+/// inode identity through the destructive syscall.
+///
+/// Standalone cleanup and ordinary post-compaction cleanup additionally
+/// repeat the complete source certificate through this exact
+/// descriptor-backed mapping. Replanning prevents a semantically
+/// different but still well-formed source from silently proceeding after
+/// the locked plan.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the re-certification repeats every input the original plan was derived from"
+)]
+fn reopen_actionable_source(
+    directory: &Path,
+    path: &Path,
+    reader: &TarArchiveReader,
+    reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+    planned: &PlannedArchiveSweep,
+    source_certificate_provider: Option<&dyn SegmentProvider>,
+    rewrite_policy: ArchiveRewritePolicy,
+) -> Result<Option<(TarArchiveReader, std::fs::File, RegularFileIdentity)>> {
+    let reopened_source = if planned.changes_disk() {
+        let source_file = open_regular_file_no_follow(path, FileAccess::ReadOnly)?;
+        let source_identity = held_file_identity(&source_file)?;
+        let reopened = TarArchiveReader::open_file(path, &source_file)?;
+        if let Some(provider) = source_certificate_provider {
+            certify_reopened_active_archive(provider, &reopened)?;
+        }
+        if plan_archive_sweep(
+            directory,
+            &reopened,
+            reclaimable,
+            rewrite_policy,
+            &std::collections::HashSet::new(),
+        )?
+        .as_ref()
+            != Some(planned)
+        {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "the actionable source archive {} changed before its immediate cleanup certificate",
+                    reader.file_name()
+                ),
+            });
+        }
+        Some((reopened, source_file, source_identity))
+    } else {
+        None
+    };
+    Ok(reopened_source)
+}
+
+/// Splits an archive's index entries into survivors and reclaimed, in
+/// file-position order.
+///
+/// Accumulates Oak's sweep arithmetic as it goes: `i64` cannot wrap where
+/// Java's `int` could not either, because entries are position-bounded
+/// below 2 GiB.
+fn partition_entries(
+    index: &crate::tar_archive::index::SegmentIndex,
+    reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+    planned_reclaimable_count: usize,
+) -> Vec<crate::tar_archive::index::SegmentIndexEntry> {
+    let mut entries: Vec<_> = index.entries().to_vec();
+    entries.sort_by_key(|entry| entry.position);
+    let mut survivors = Vec::new();
+    for entry in entries {
+        if !reclaimable.contains(&entry.segment_identifier) {
+            survivors.push(entry);
+        }
+    }
+    debug_assert_eq!(
+        index.entries().len() - survivors.len(),
+        planned_reclaimable_count
+    );
+    survivors
+}
+
+/// Unlinks an archive whose segments all reclaim, after proving the file
+/// is still the one certification bound.
+///
+/// Deletion failures are consistency-safe: ordinarily the old archive
+/// remains authoritative for retry, and `NotFound` records that another
+/// actor already achieved this exact unlink.
+fn remove_swept_archive(
+    path: &Path,
+    reader: &TarArchiveReader,
+    reopened_source: Option<&(TarArchiveReader, std::fs::File, RegularFileIdentity)>,
+    planned_unavailable: std::collections::HashSet<SegmentIdentifier>,
+) -> Result<ArchiveSweepOutcome> {
+    let (_, source_file, source_identity) = reopened_source
+        .as_ref()
+        .expect("an archive removal always has an actionable reopened source");
+    #[cfg(test)]
+    crate::writer::maintenance_fault_injection::substitute_path_if_armed(
+        "sweep.remove-before-source-identity",
+        path,
+    )?;
+    require_held_file_identity(source_file, *source_identity, "certified removal source")?;
+    require_path_file_identity(path, *source_identity, "certified removal source")?;
+    #[cfg(test)]
+    crate::writer::maintenance_fault_injection::remove_path_if_armed(
+        "sweep.remove-before-source-unlink-not-found",
+        path,
+    )?;
+    // Deletion failures are consistency-safe: ordinarily the old
+    // archive remains authoritative for retry; `NotFound` records
+    // that another actor already achieved this exact unlink.
+    Ok(match std::fs::remove_file(path) {
+        Ok(()) => ArchiveSweepOutcome {
+            disposition: ArchiveSweepDisposition::Removed,
+            deletion_failures: Vec::new(),
+            newly_unavailable: planned_unavailable,
+        },
+        Err(error) => ArchiveSweepOutcome {
+            disposition: ArchiveSweepDisposition::Unchanged,
+            deletion_failures: vec![DeferredFileDeletion {
+                file_name: reader.file_name().to_owned(),
+                error: error.to_string(),
+                target_was_already_absent: error.kind() == std::io::ErrorKind::NotFound,
+            }],
+            newly_unavailable: std::collections::HashSet::new(),
+        },
+    })
+}
+
+/// The source archive's graph and binary-reference trailers, filtered to
+/// what the replacement will carry.
+///
+/// These two proofs deliberately have different graph scopes. Production
+/// active-source certification reconstructs the complete, unfiltered graph
+/// from payloads before mutation. A replacement `.gph` is derived
+/// subtractively: source entries not copied by this rewrite are left out,
+/// while targets are filtered against both identifiers this run previously
+/// made unavailable and identifiers belonging to those omitted entries.
+/// Staged and published validation compare it with that exact view.
+fn source_trailers(
+    reader: &TarArchiveReader,
+    reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+    previously_unavailable_graph_targets: &std::collections::HashSet<SegmentIdentifier>,
+    current_rewrite_targets: &std::collections::HashSet<SegmentIdentifier>,
+) -> FilteredTrailers {
+    FilteredTrailers::from_archive(
+        reader,
+        reclaimable,
+        previously_unavailable_graph_targets,
+        current_rewrite_targets,
+    )
+}
+
+/// The provider that resolves survivor references when the source has no
+/// readable catalog.
+///
+/// The scan resolves across every segment of every base archive, and the
+/// sweep fails closed on an unresolvable identifier rather than publish an
+/// incomplete catalog that could let blob garbage collection delete
+/// referenced binaries. (Java would publish an *empty* catalog here; the
+/// scan is a strict superset of that.)
+fn scan_provider_for<'fallback, 'archives>(
+    trailers: &FilteredTrailers,
+    all_archives: &[&'archives TarArchiveReader],
+    fallback_provider: &'fallback mut Option<ArchiveSegmentsProvider<'archives>>,
+) -> Result<Option<&'fallback ArchiveSegmentsProvider<'archives>>> {
+    if trailers.catalog.is_some() {
+        return Ok(None);
+    }
+    if fallback_provider.is_none() {
+        *fallback_provider = Some(archive_segments_provider(all_archives)?);
+    }
+    Ok(fallback_provider.as_ref())
+}
+
+/// The segments this archive holds that the mark phase found reclaimable.
+fn reclaimable_in_archive(
+    index: &crate::tar_archive::index::SegmentIndex,
+    reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+) -> std::collections::HashSet<SegmentIdentifier> {
+    index
+        .entries()
+        .iter()
+        .map(|entry| entry.segment_identifier)
+        .filter(|identifier| reclaimable.contains(identifier))
+        .collect()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "staging, semantic validation, atomic publication, and source unlinking form one deliberately linear safety sequence, and each parameter names one input that sequence must not re-derive"
+)]
+pub(super) fn sweep_one_archive<'archives>(
+    directory: &Path,
+    reader: &'archives TarArchiveReader,
+    reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+    previously_unavailable_graph_targets: &std::collections::HashSet<SegmentIdentifier>,
+    all_archives: &[&'archives TarArchiveReader],
+    fallback_provider: &mut Option<ArchiveSegmentsProvider<'archives>>,
+    source_certificate_provider: Option<&dyn SegmentProvider>,
+    rewrite_policy: ArchiveRewritePolicy,
+) -> Result<ArchiveSweepOutcome> {
+    let path = directory.join(reader.file_name());
+    let Some(planned) = plan_archive_sweep(
+        directory,
+        reader,
+        reclaimable,
+        rewrite_policy,
+        &std::collections::HashSet::new(),
+    )?
+    else {
+        return Ok(ArchiveSweepOutcome::default());
+    };
+
+    let reopened_source = reopen_actionable_source(
+        directory,
+        &path,
+        reader,
+        reclaimable,
+        &planned,
+        source_certificate_provider,
+        rewrite_policy,
+    )?;
+    let reader = reopened_source
+        .as_ref()
+        .map_or(reader, |(reopened, _, _)| reopened);
+    let Some(index) = reader.index() else {
+        // Post-compaction cleanup retains Oak's conservative treatment of
+        // recovered base archives. Standalone cleanup cannot reach this branch
+        // because its source certificate rejects an indexless archive.
+        return Ok(ArchiveSweepOutcome::default());
+    };
+    let planned_unavailable = reclaimable_in_archive(index, reclaimable);
+    let (replacement_name, planned_reclaimable_count) = match planned {
+        PlannedArchiveSweep::Remove { .. } => {
+            return remove_swept_archive(
+                &path,
+                reader,
+                reopened_source.as_ref(),
+                planned_unavailable,
+            );
+        }
+        PlannedArchiveSweep::Rewrite {
+            replacement_name,
+            segment_count,
+            ..
+        } => (replacement_name, segment_count),
+        PlannedArchiveSweep::DeferredBySavings { .. }
+        | PlannedArchiveSweep::DeferredAtLastGeneration { .. }
+        | PlannedArchiveSweep::BlockedByOccupiedGeneration { .. } => {
+            return Ok(ArchiveSweepOutcome::default());
+        }
+    };
+
+    let survivors = partition_entries(index, reclaimable, planned_reclaimable_count);
+    let current_rewrite_targets = planned_unavailable;
+
+    let trailers = source_trailers(
+        reader,
+        reclaimable,
+        previously_unavailable_graph_targets,
+        &current_rewrite_targets,
+    );
+    let scan_provider = scan_provider_for(&trailers, all_archives, fallback_provider)?;
+    // Build under a name that cannot participate in archive selection. A
+    // crash or validation failure can therefore leave only non-active
+    // residue; the healthy source remains the selected generation. Trailer
+    // entry names still use the final logical basename.
+    let staging_name = next_archive_staging_name(directory, &replacement_name)?;
+    let staging_path = directory.join(&staging_name);
+    let replacement_path = directory.join(&replacement_name);
+    let mut uncommitted_staging = UncommittedArchiveStaging::new(directory, staging_path.clone());
+    let (_, source_file, source_identity) = reopened_source
+        .as_ref()
+        .expect("an archive rewrite always has an actionable reopened source");
+    let source_metadata = source_file.metadata()?;
+    let mut writer =
+        TarArchiveWriter::new_exclusive_staged(directory, &staging_name, &replacement_name);
+    let (expected_graph, expected_binary_references) = copy_survivors(
+        SurvivorSources {
+            reader,
+            trailers: &trailers,
+            previously_unavailable_graph_targets,
+            current_rewrite_targets: &current_rewrite_targets,
+            scan_provider,
+        },
+        &survivors,
+        &mut writer,
+        &mut uncommitted_staging,
+    )?;
+    writer.close()?;
+    publish_swept_archive(
+        SweepPublication {
+            directory,
+            source_path: &path,
+            reader,
+            source_file,
+            source_identity: *source_identity,
+            staging_name: &staging_name,
+            staging_path: &staging_path,
+            replacement_name: &replacement_name,
+            replacement_path: &replacement_path,
+            survivors: &survivors,
+            expected_graph: &expected_graph,
+            expected_binary_references: &expected_binary_references,
+            source_metadata: &source_metadata,
+            current_rewrite_targets,
+        },
+        &mut uncommitted_staging,
+    )
 }
 
 #[cfg(test)]
