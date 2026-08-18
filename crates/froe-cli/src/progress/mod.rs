@@ -39,32 +39,27 @@ use froe::progress::{ProgressObserver, Step, WorkUnit};
 
 use crate::output::sanitize_terminal_text;
 
+mod export_sink;
+mod render;
+#[cfg(test)]
+mod test_support;
+
+pub(crate) use export_sink::*;
+pub(crate) use render::*;
+
 /// How long a step must run before it is reported at all. Below this, a
 /// command that simply did its job stays silent.
-const ANNOUNCE_DELAY: Duration = Duration::from_millis(300);
+pub(crate) const ANNOUNCE_DELAY: Duration = Duration::from_millis(300);
 
 /// How often the animated line is redrawn.
-const ANIMATED_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const ANIMATED_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How often a plain-style report is written.
-const PLAIN_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const PLAIN_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often the ticker wakes to redraw a step that is not reporting
 /// counts of its own, so elapsed time keeps moving.
-const TICK_INTERVAL: Duration = Duration::from_millis(100);
-
-/// The width assumed when the terminal's own width cannot be determined.
-const ASSUMED_TERMINAL_WIDTH: usize = 80;
-
-/// The narrowest bar worth drawing; below this the bar is dropped and the
-/// counts alone are shown.
-const MINIMUM_BAR_WIDTH: usize = 8;
-
-/// The widest bar drawn, however wide the terminal is.
-const MAXIMUM_BAR_WIDTH: usize = 32;
-
-/// How long a step must run before its average rate means anything.
-const MINIMUM_RATE_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// When progress is reported.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
@@ -81,7 +76,7 @@ pub(crate) enum ProgressWhen {
 
 /// How reports are rendered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Style {
+pub(crate) enum Style {
     /// A live line rewritten in place.
     Animated,
     /// Whole lines, throttled.
@@ -98,77 +93,27 @@ enum Style {
 /// the last clone is dropped.
 #[derive(Clone)]
 pub(crate) struct Reporter {
-    inner: Arc<ReporterInner>,
+    pub(crate) inner: Arc<ReporterInner>,
     /// Kept alive by every clone; dropping the last one stops the ticker.
-    _ticker: Option<Arc<Ticker>>,
+    pub(crate) _ticker: Option<Arc<Ticker>>,
 }
 
 /// The reporter's shared state.
-struct ReporterInner {
-    style: Style,
+pub(crate) struct ReporterInner {
+    pub(crate) style: Style,
     /// How long a step must run before it is announced.
-    announce_delay: Duration,
+    pub(crate) announce_delay: Duration,
     /// The shortest interval between two reports of the same step.
-    redraw_interval: Duration,
+    pub(crate) redraw_interval: Duration,
     /// Whether the bar is drawn with block characters or ASCII.
-    unicode_bar: bool,
+    pub(crate) unicode_bar: bool,
     /// The width to lay lines out in. `None` re-queries the terminal on
     /// every render, so the live line keeps following a window the
     /// operator resizes mid-run; a fixed width is for tests, which must
     /// not read `COLUMNS` — it is process global and would race the
     /// ticker thread's own reads of it.
-    width: Option<usize>,
-    state: Mutex<RenderState>,
-}
-
-/// Everything the renderer mutates, behind one lock so the ticker thread
-/// and the command thread can never interleave a line.
-struct RenderState {
-    out: Box<dyn Write + Send>,
-    active: Option<ActiveStep>,
-    /// The width of the live line currently on screen, so it can be erased
-    /// with exactly as many spaces.
-    live_line_width: usize,
-    /// Set while a prompt or another writer owns the stream.
-    suspended: bool,
-    /// Set once the stream's reader has gone. Reporting then stops for
-    /// good rather than retrying a write that can never succeed.
-    stream_closed: bool,
-    /// When the operation's first step began, so a long run of short
-    /// steps is not silenced by a deferral that only ever measures one.
-    first_step_at: Option<Instant>,
-    /// When a whole line was last written, throttling the plain style
-    /// across steps as well as within one.
-    last_line_at: Option<Instant>,
-}
-
-impl RenderState {
-    /// The reporter's only way onto the stream.
-    ///
-    /// Writing progress must never change what a command does. Standard
-    /// error is a pipe often enough — `froe cleanup --yes 2>&1 | less`,
-    /// quit early — and `main` restores SIGPIPE to its terminating
-    /// disposition so that piping *data* into `head` ends quietly. Those
-    /// two facts together once let a progress line kill a destructive
-    /// cleanup between its mutations. So the reporter's writes, and only
-    /// the reporter's writes, run with SIGPIPE blocked: a closed stream
-    /// returns `EPIPE` here instead of felling the process, and the
-    /// reporter falls silent for the rest of the run.
-    fn write_line(&mut self, text: &str) {
-        if self.stream_closed {
-            return;
-        }
-        let written = without_sigpipe(|| {
-            self.out
-                .write_all(text.as_bytes())
-                .and_then(|()| self.out.flush())
-        });
-        if let Err(error) = written
-            && error.kind() == std::io::ErrorKind::BrokenPipe
-        {
-            self.stream_closed = true;
-        }
-    }
+    pub(crate) width: Option<usize>,
+    pub(crate) state: Mutex<RenderState>,
 }
 
 /// Suppresses the write-generated SIGPIPE for the duration of `work`, so
@@ -190,7 +135,7 @@ impl RenderState {
 /// unwind, so the conventional terminate-on-closed-*stdout* behaviour the
 /// CLI deliberately keeps is untouched.
 #[cfg(unix)]
-fn without_sigpipe<Value>(work: impl FnOnce() -> Value) -> Value {
+pub(crate) fn without_sigpipe<Value>(work: impl FnOnce() -> Value) -> Value {
     #[cfg(target_vendor = "apple")]
     {
         /// Darwin's per-file-description SIGPIPE disposition, from
@@ -249,7 +194,7 @@ fn without_sigpipe<Value>(work: impl FnOnce() -> Value) -> Value {
 /// raised while it was blocked before the previous mask is restored — it
 /// would otherwise simply fire a moment later.
 #[cfg(unix)]
-fn without_sigpipe_masked<Value>(work: impl FnOnce() -> Value) -> Value {
+pub(crate) fn without_sigpipe_masked<Value>(work: impl FnOnce() -> Value) -> Value {
     /// Restores the thread's signal mask however the guarded section
     /// leaves — return or unwind. A mask that outlived a panic would
     /// leave SIGPIPE blocked for the rest of the thread's life, and the
@@ -306,32 +251,22 @@ fn without_sigpipe_masked<Value>(work: impl FnOnce() -> Value) -> Value {
 /// Non-Unix targets do not raise SIGPIPE; a closed stream already
 /// surfaces as an ordinary write error.
 #[cfg(not(unix))]
-fn without_sigpipe<Value>(work: impl FnOnce() -> Value) -> Value {
+pub(crate) fn without_sigpipe<Value>(work: impl FnOnce() -> Value) -> Value {
     work()
 }
 
 /// The step being reported.
-struct ActiveStep {
-    description: String,
-    unit: WorkUnit,
-    total: Option<u64>,
-    completed: u64,
-    started: Instant,
+pub(crate) struct ActiveStep {
+    pub(crate) description: String,
+    pub(crate) unit: WorkUnit,
+    pub(crate) total: Option<u64>,
+    pub(crate) completed: u64,
+    pub(crate) started: Instant,
     /// When the last report was written, or `None` before the first.
-    last_report: Option<Instant>,
+    pub(crate) last_report: Option<Instant>,
     /// Whether the step has been mentioned on the stream at all. A step
     /// that was never announced prints no completion line either.
-    announced: bool,
-}
-
-/// Whether ending a step also writes its completion line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CompletionLine {
-    /// Write it, for any step that had announced itself.
-    Write,
-    /// Erase the live line only, because the caller reports the outcome
-    /// itself and the completion line would say the same thing twice.
-    Suppress,
+    pub(crate) announced: bool,
 }
 
 impl Reporter {
@@ -365,7 +300,7 @@ impl Reporter {
     /// A reporter writing to `out` in `style`. Tests pass a zero redraw
     /// interval so every report is observable without waiting for one,
     /// and an explicit width so no test touches the environment.
-    fn with_output(
+    pub(super) fn with_output(
         style: Style,
         announce_delay: Duration,
         redraw_interval: Duration,
@@ -466,7 +401,7 @@ impl Reporter {
         self.step_ended_locked(CompletionLine::Suppress);
     }
 
-    fn step_ended_locked(&self, completion_line: CompletionLine) {
+    pub(super) fn step_ended_locked(&self, completion_line: CompletionLine) {
         let mut state = self.inner.state.lock().unwrap_or_else(|error| {
             self.inner.state.clear_poison();
             error.into_inner()
@@ -549,7 +484,7 @@ impl ProgressObserver for Reporter {
 impl ReporterInner {
     /// Draws the active step if one is due. Every path into the stream
     /// that is not a completion line goes through here.
-    fn render(&self, state: &mut RenderState) {
+    pub(super) fn render(&self, state: &mut RenderState) {
         if self.style == Style::Silent || state.suspended {
             return;
         }
@@ -610,7 +545,7 @@ impl ReporterInner {
     }
 
     /// Erases the live line, leaving the cursor at the start of it.
-    fn erase_live_line(state: &mut RenderState) {
+    pub(super) fn erase_live_line(state: &mut RenderState) {
         if state.live_line_width == 0 {
             return;
         }
@@ -621,7 +556,7 @@ impl ReporterInner {
 
     /// The live report for a step: `froe: <what> [bar] 48% 23/48 0:12 eta
     /// 0:13`, trimmed to the terminal from the right-hand side inward.
-    fn progress_line(&self, step: &ActiveStep, elapsed: Duration) -> String {
+    pub(super) fn progress_line(&self, step: &ActiveStep, elapsed: Duration) -> String {
         // Re-queried per render unless a test fixed it: an operator who
         // resizes the window mid-run must not leave the live line laid
         // out for the old width, which would wrap and defeat both the
@@ -672,7 +607,7 @@ impl ReporterInner {
     /// The completion line a reported step leaves behind. A step that
     /// stopped early — a search that reached its limit — reports what it
     /// did, never the total it was planning for.
-    fn completion_line(step: &ActiveStep) -> String {
+    pub(super) fn completion_line(step: &ActiveStep) -> String {
         let elapsed = step.started.elapsed();
         // A step that counted nothing is not a step that did nothing: a
         // phase without a counter of its own reports the time it took
@@ -705,7 +640,7 @@ impl ReporterInner {
 
     /// A `[####----]` bar, in block characters where the terminal is known
     /// to speak UTF-8 and in ASCII everywhere else.
-    fn bar(&self, completed: u64, total: u64, width: usize) -> String {
+    pub(super) fn bar(&self, completed: u64, total: u64, width: usize) -> String {
         let inner_width = width.saturating_sub(2);
         let filled = filled_cells(completed, total, inner_width);
         let (full, empty) = if self.unicode_bar {
@@ -726,16 +661,16 @@ impl ReporterInner {
 /// Redraws the animated line while a step reports nothing of its own, so
 /// a long silent phase still shows time passing rather than a frozen
 /// terminal.
-struct Ticker {
+pub(crate) struct Ticker {
     /// Dropping the sender wakes the thread's `recv_timeout` with a
     /// disconnect, which is how it learns to stop.
-    _stop: mpsc::Sender<()>,
-    stopped: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) _stop: mpsc::Sender<()>,
+    pub(crate) stopped: Arc<AtomicBool>,
+    pub(crate) thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Ticker {
-    fn start(inner: &Arc<ReporterInner>) -> Self {
+    pub(super) fn start(inner: &Arc<ReporterInner>) -> Self {
         let (sender, receiver) = mpsc::channel::<()>();
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_inner = Arc::clone(inner);
@@ -779,291 +714,13 @@ impl Drop for Ticker {
     }
 }
 
-/// How many cells of `inner_width` are filled at `completed`/`total`.
-fn filled_cells(completed: u64, total: u64, inner_width: usize) -> usize {
-    if total == 0 || inner_width == 0 {
-        return 0;
-    }
-    let completed = u128::from(completed.min(total));
-    let cells = completed * (inner_width as u128) / u128::from(total);
-    usize::try_from(cells)
-        .unwrap_or(inner_width)
-        .min(inner_width)
-}
-
-/// `completed` as a whole percentage of `total`, capped at 100.
-fn percentage(completed: u64, total: u64) -> u64 {
-    if total == 0 {
-        return 0;
-    }
-    let percentage = u128::from(completed.min(total)) * 100 / u128::from(total);
-    u64::try_from(percentage).unwrap_or(100).min(100)
-}
-
-/// How much longer the step is expected to run, extrapolating the rate so
-/// far. This is an estimate from an average, not a promise.
-fn estimate_remaining(elapsed: Duration, completed: u64, total: u64) -> Duration {
-    if completed == 0 {
-        return Duration::ZERO;
-    }
-    let remaining = u128::from(total.saturating_sub(completed));
-    let nanoseconds = elapsed.as_nanos().saturating_mul(remaining) / u128::from(completed);
-    u64::try_from(nanoseconds).map_or(Duration::MAX, Duration::from_nanos)
-}
-
-/// Items per second, or `None` when the step was too brief to have a
-/// meaningful rate. A handful of items in a few milliseconds extrapolates
-/// to a number that says nothing about throughput, so it is not reported
-/// at all rather than reported misleadingly.
-fn rate_per_second(completed: u64, elapsed: Duration) -> Option<u64> {
-    if completed < 2 || elapsed < MINIMUM_RATE_INTERVAL {
-        return None;
-    }
-    let nanoseconds = elapsed.as_nanos();
-    if nanoseconds == 0 {
-        return None;
-    }
-    let rate = u128::from(completed) * 1_000_000_000 / nanoseconds;
-    u64::try_from(rate).ok()
-}
-
-/// A parenthesised rate suffix — `" (73,486 nodes/s)"` — or the empty
-/// string when the run was too brief for the average to mean anything.
-/// The caller concatenates it, so a summary carries a rate exactly when a
-/// step's completion line would.
-pub(crate) fn format_rate(completed: u64, elapsed: Duration) -> String {
-    match rate_per_second(completed, elapsed) {
-        Some(rate) => format!(" ({} nodes/s)", format_count(rate)),
-        None => String::new(),
-    }
-}
-
-/// A count with thousands separators: `1234567` becomes `1,234,567`.
-pub(crate) fn format_count(count: u64) -> String {
-    let digits = count.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (position, digit) in digits.chars().enumerate() {
-        if position != 0 && (digits.len() - position).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
-}
-
-/// A running clock: `0:07`, `4:31`, `1:04:31`.
-fn format_clock(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    let (hours, minutes, seconds) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
-    if hours == 0 {
-        format!("{minutes}:{seconds:02}")
-    } else {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    }
-}
-
-/// A finished duration, for a completion line: `0.4s`, `12.4s`, `4m 31s`,
-/// `1h 04m`.
-pub(crate) fn format_duration(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    if seconds < 60 {
-        return format!("{:.1}s", elapsed.as_secs_f64());
-    }
-    if seconds < 3600 {
-        return format!("{}m {:02}s", seconds / 60, seconds % 60);
-    }
-    format!("{}h {:02}m", seconds / 3600, (seconds / 60) % 60)
-}
-
-/// The width of `text` in terminal cells, counted as characters. Every
-/// character the reporter renders is a single-cell one: descriptions are
-/// sanitized, and the only non-ASCII characters are the bar's blocks.
-fn display_width(text: &str) -> usize {
-    text.chars().count()
-}
-
-/// Truncates to `width` cells, marking the cut with an ellipsis so a
-/// clipped line does not read as a complete one.
-fn truncate_to_width(text: &str, width: usize) -> String {
-    if display_width(text) <= width {
-        return text.to_owned();
-    }
-    if width <= 1 {
-        return text.chars().take(width).collect();
-    }
-    let mut truncated: String = text.chars().take(width - 1).collect();
-    truncated.push('\u{2026}');
-    truncated
-}
-
-/// The terminal's width in columns, or [`ASSUMED_TERMINAL_WIDTH`].
-fn terminal_width() -> usize {
-    if let Ok(columns) = std::env::var("COLUMNS")
-        && let Ok(columns) = columns.parse::<usize>()
-        && columns > 1
-    {
-        return columns;
-    }
-    #[cfg(unix)]
-    {
-        if let Some(columns) = terminal_width_from_ioctl() {
-            return columns;
-        }
-    }
-    ASSUMED_TERMINAL_WIDTH
-}
-
-/// The terminal width standard error is attached to, from the kernel.
-#[cfg(unix)]
-fn terminal_width_from_ioctl() -> Option<usize> {
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: TIOCGWINSZ writes exactly one `winsize` through the pointer
-    // and reads nothing else; `size` is a live, fully initialized local of
-    // that type. The call only queries the terminal attached to standard
-    // error and never changes it.
-    let queried = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &raw mut size) };
-    if queried != 0 || size.ws_col == 0 {
-        return None;
-    }
-    Some(usize::from(size.ws_col))
-}
-
-/// Whether the block-drawing bar is safe to emit. A terminal whose locale
-/// does not declare UTF-8 gets the ASCII bar rather than mojibake.
-fn supports_unicode_bar() -> bool {
-    #[cfg(unix)]
-    {
-        for name in ["LC_ALL", "LC_CTYPE", "LANG"] {
-            let Ok(value) = std::env::var(name) else {
-                continue;
-            };
-            if value.is_empty() {
-                continue;
-            }
-            let value = value.to_ascii_uppercase();
-            return value.contains("UTF-8") || value.contains("UTF8");
-        }
-        false
-    }
-    #[cfg(not(unix))]
-    {
-        // Rust writes to a Windows console through `WriteConsoleW`, so the
-        // console's code page cannot mangle these characters.
-        true
-    }
-}
-
-/// Wraps an export sink and advances the reporter's step per written node.
-pub(crate) struct ProgressSink<Sink> {
-    inner: Sink,
-    written: u64,
-    reporter: Reporter,
-    started: Instant,
-}
-
-impl<Sink> ProgressSink<Sink> {
-    /// Wraps `inner`, reporting to `reporter`. The caller has already
-    /// begun the step this sink advances.
-    pub(crate) fn new(inner: Sink, reporter: Reporter) -> Self {
-        Self {
-            inner,
-            written: 0,
-            reporter,
-            started: Instant::now(),
-        }
-    }
-
-    /// The number of nodes written so far.
-    #[cfg(test)]
-    pub(crate) fn written(&self) -> u64 {
-        self.written
-    }
-
-    /// The elapsed time since the export started.
-    pub(crate) fn elapsed(&self) -> Duration {
-        self.started.elapsed()
-    }
-}
-
-impl<Sink: froe_export::ExportSink> froe_export::ExportSink for ProgressSink<Sink> {
-    fn write_node(&mut self, node: &froe_export::ExportedNode<'_>) -> froe::Result<()> {
-        self.inner.write_node(node)?;
-        self.written += 1;
-        self.reporter.step_advanced(self.written);
-        Ok(())
-    }
-
-    fn finish(&mut self) -> froe::Result<()> {
-        self.inner.finish()?;
-        self.reporter.step_advanced(self.written);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::io::Write;
-    use std::rc::Rc;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
+    use super::{ANNOUNCE_DELAY, Reporter, Style};
+    use crate::progress::test_support::{SharedBuffer, reporter};
     use froe::progress::{ProgressObserver, Step, WorkUnit};
-    use froe_export::{ExportSink, ExportedNode};
-
-    use super::{
-        ANNOUNCE_DELAY, ProgressSink, Reporter, Style, estimate_remaining, filled_cells,
-        format_clock, format_count, format_duration, percentage, rate_per_second,
-        truncate_to_width,
-    };
-
-    /// A `Write` the test can read back from another thread.
-    #[derive(Clone)]
-    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl SharedBuffer {
-        fn new() -> Self {
-            Self(Arc::new(Mutex::new(Vec::new())))
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("captured output")).into_owned()
-        }
-    }
-
-    impl Write for SharedBuffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("captured output")
-                .extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A reporter with no deferral and no throttle, laid out in a fixed
-    /// 100 columns. The width is a parameter rather than `COLUMNS`
-    /// because libtest runs these on several threads while the ticker
-    /// thread reads the environment, and `set_var` alongside a
-    /// concurrent `getenv` is undefined behaviour.
-    fn reporter(style: Style, captured: &SharedBuffer) -> Reporter {
-        Reporter::with_output(
-            style,
-            Duration::ZERO,
-            Duration::ZERO,
-            Some(100),
-            Box::new(captured.clone()),
-        )
-    }
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_silent_reporter_writes_nothing_at_all() {
@@ -1352,159 +1009,6 @@ mod tests {
         reporter.step_advanced(4);
         reporter.step_ended();
         assert!(captured.text().contains("50%"), "{}", captured.text());
-    }
-
-    #[test]
-    fn percentages_and_bars_stay_within_their_bounds() {
-        assert_eq!(percentage(0, 10), 0);
-        assert_eq!(percentage(5, 10), 50);
-        assert_eq!(percentage(10, 10), 100);
-        assert_eq!(percentage(99, 0), 0, "a zero total is not a division");
-        assert_eq!(
-            percentage(u64::MAX, 3),
-            100,
-            "an overshooting count is capped, never wrapped"
-        );
-        assert_eq!(filled_cells(0, 10, 8), 0);
-        assert_eq!(filled_cells(10, 10, 8), 8);
-        assert_eq!(filled_cells(u64::MAX, 10, 8), 8);
-        assert_eq!(filled_cells(5, 0, 8), 0);
-        assert_eq!(filled_cells(u64::MAX, u64::MAX, 8), 8);
-    }
-
-    #[test]
-    fn estimates_and_rates_survive_extreme_inputs() {
-        assert_eq!(
-            estimate_remaining(Duration::from_secs(1), 0, 10),
-            Duration::ZERO
-        );
-        assert_eq!(
-            estimate_remaining(Duration::from_secs(10), 5, 10),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            estimate_remaining(Duration::from_secs(10), 10, 10),
-            Duration::ZERO
-        );
-        assert_eq!(rate_per_second(0, Duration::from_secs(1)), None);
-        assert_eq!(rate_per_second(10, Duration::ZERO), None);
-        assert_eq!(rate_per_second(10, Duration::from_secs(2)), Some(5));
-        assert_eq!(
-            rate_per_second(1, Duration::from_secs(2)),
-            None,
-            "one item is not a throughput measurement"
-        );
-        assert_eq!(
-            rate_per_second(4, Duration::from_millis(1)),
-            None,
-            "a millisecond is too short to extrapolate a rate from"
-        );
-    }
-
-    #[test]
-    fn counts_clocks_and_durations_are_formatted_for_reading() {
-        assert_eq!(format_count(0), "0");
-        assert_eq!(format_count(999), "999");
-        assert_eq!(format_count(1_000), "1,000");
-        assert_eq!(format_count(1_234_567), "1,234,567");
-        assert_eq!(format_clock(Duration::from_secs(7)), "0:07");
-        assert_eq!(format_clock(Duration::from_secs(271)), "4:31");
-        assert_eq!(format_clock(Duration::from_secs(3871)), "1:04:31");
-        assert_eq!(format_duration(Duration::from_millis(412)), "0.4s");
-        assert_eq!(format_duration(Duration::from_secs(271)), "4m 31s");
-        assert_eq!(format_duration(Duration::from_secs(3871)), "1h 04m");
-    }
-
-    #[test]
-    fn long_lines_are_truncated_with_an_ellipsis() {
-        assert_eq!(truncate_to_width("froe: short", 40), "froe: short");
-        assert_eq!(
-            truncate_to_width("froe: quite long", 10),
-            "froe: qui\u{2026}"
-        );
-        assert_eq!(truncate_to_width("froe", 1), "f");
-        assert_eq!(truncate_to_width("froe", 0), "");
-    }
-
-    /// A sink that records every node and finish call.
-    struct RecordingSink {
-        nodes: RefCell<Vec<String>>,
-        finished: RefCell<bool>,
-    }
-
-    impl ExportSink for RecordingSink {
-        fn write_node(&mut self, node: &ExportedNode<'_>) -> froe::Result<()> {
-            self.nodes.borrow_mut().push(node.path.to_owned());
-            Ok(())
-        }
-
-        fn finish(&mut self) -> froe::Result<()> {
-            *self.finished.borrow_mut() = true;
-            Ok(())
-        }
-    }
-
-    fn node(path: &str) -> ExportedNode<'_> {
-        ExportedNode {
-            path,
-            depth: 0,
-            properties: &[],
-        }
-    }
-
-    #[test]
-    fn nodes_reach_the_inner_sink_and_the_reporter() {
-        let captured = SharedBuffer::new();
-        let mut reporter = reporter(Style::Plain, &captured);
-        reporter.step_began(&Step::new("exporting nodes", WorkUnit::Nodes));
-        let inner = RecordingSink {
-            nodes: RefCell::new(Vec::new()),
-            finished: RefCell::new(false),
-        };
-        let mut sink = ProgressSink::new(inner, reporter.clone());
-        sink.write_node(&node("/a")).expect("write");
-        sink.write_node(&node("/b")).expect("write");
-        sink.finish().expect("finish");
-        assert_eq!(sink.written(), 2);
-        assert_eq!(
-            *sink.inner.nodes.borrow(),
-            vec!["/a".to_owned(), "/b".to_owned()]
-        );
-        assert!(*sink.inner.finished.borrow());
-        reporter.step_ended();
-        assert!(
-            captured.text().contains("2 nodes in"),
-            "{}",
-            captured.text()
-        );
-    }
-
-    #[test]
-    fn a_silent_export_reports_nothing_but_still_writes_every_node() {
-        let reporter = Reporter::silent();
-        let inner = RecordingSink {
-            nodes: RefCell::new(Vec::new()),
-            finished: RefCell::new(false),
-        };
-        let mut sink = ProgressSink::new(inner, reporter);
-        sink.write_node(&node("/a")).expect("write");
-        sink.finish().expect("finish");
-        assert_eq!(sink.written(), 1);
-        assert_eq!(*sink.inner.nodes.borrow(), vec!["/a".to_owned()]);
-    }
-
-    #[test]
-    fn the_export_sink_measures_its_own_elapsed_time() {
-        let mut sink = ProgressSink::new(
-            RecordingSink {
-                nodes: RefCell::new(Vec::new()),
-                finished: RefCell::new(false),
-            },
-            Reporter::silent(),
-        );
-        std::thread::sleep(Duration::from_millis(5));
-        sink.write_node(&node("/a")).expect("write");
-        assert!(sink.elapsed() >= Duration::from_millis(5));
     }
 
     #[test]
