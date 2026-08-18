@@ -57,9 +57,6 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
-      - name: Install podman
-        run: sudo apt-get update && sudo apt-get install -y podman
-
       - name: Run the interop suite
         run: scripts/interop-fixture.sh
         env:

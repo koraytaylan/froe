@@ -89,7 +89,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
-      - run: sudo apt-get update && sudo apt-get install -y podman
       - name: Run the interop suite
         run: scripts/interop-fixture.sh
         env:
@@ -148,9 +147,11 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
+            container: ghcr.io/rust-cross/rust-musl-cross:x86_64-musl
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             archive: tar.gz
+            container: ghcr.io/rust-cross/rust-musl-cross:aarch64-musl
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -158,11 +159,12 @@ jobs:
             os: windows-latest
             archive: zip
     runs-on: ${{ matrix.os }}
+    # The musl entries run inside the rust-musl-cross image, which ships
+    # musl-gcc and the target's std preinstalled; the macOS and Windows
+    # entries have no container set, so they run directly on the runner.
+    container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install musl toolchain
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - run: rustup toolchain install stable --profile minimal
       - run: rustup target add ${{ matrix.target }}
       # Warms same-tag re-runs; first runs per target stay cold builds
