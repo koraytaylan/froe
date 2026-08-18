@@ -24,6 +24,7 @@ use super::startup::{check_and_update_manifest, initialize_archives_for_writing}
 #[cfg(test)]
 use super::sweep::probe_archive_sweep_phase_boundary;
 use super::sweep::sweep_one_archive;
+use super::sweep_plan::ArchiveSweepOutcome;
 use super::sweep_plan::{
     ArchiveSweepDisposition, GenerationReclaimRequest, PlannedArchiveSweep, RETAINED_GENERATIONS,
     SegmentSweepOutcome, sorted_sweep_plan,
@@ -274,6 +275,74 @@ fn certify_session_archives<'archives>(
         )?;
     }
     Ok((seen, seen_archives))
+}
+
+/// Oak's mark phase (§3 of the cleanup specification).
+///
+/// Archives are walked newest first and entries within each archive in
+/// reverse file order, with one references set shared across all archives
+/// so a kept data segment in a newer archive protects bulk segments in
+/// older ones. The seed set is otherwise empty — sanctioned for an offline
+/// tool on a quiescent store, which the exclusive repository lock
+/// guarantees — and the dangling-future rule runs with a null compacted
+/// root, i.e. disabled, which the specification calls always safe.
+fn mark_reclaimable_segments(
+    session_archives: &[TarArchiveReader],
+    base_archives: &[TarArchiveReader],
+    rule: ReclaimRule,
+) -> Result<std::collections::HashSet<SegmentIdentifier>> {
+    // Oak's mark phase (§3 of the cleanup specification): archives
+    // newest first, entries within each archive in reverse file
+    // order, one references set shared across all archives so a kept
+    // data segment in a newer archive protects bulk segments in
+    // older ones. The seed set is otherwise empty — sanctioned for an
+    // offline tool on a quiescent store, which the exclusive
+    // repository lock guarantees — and the dangling-future rule runs
+    // with a null compacted root, i.e. disabled, which the
+    // specification calls always safe.
+    let mut references: std::collections::HashSet<SegmentIdentifier> =
+        std::collections::HashSet::new();
+    for archive in session_archives {
+        seed_references_from_archive(archive, &mut references)?;
+    }
+    let protected_data_segments = std::collections::HashSet::new();
+    let mut reclaimable = std::collections::HashSet::new();
+    // Post-compaction cleanup has no dangling-future root: the caller
+    // just committed the newly compacted head, so every compacted
+    // segment written by that run belongs at or before that head.
+    let mut ahead_of_root = None;
+    for archive in base_archives {
+        mark_one_archive(
+            archive,
+            ReclaimPolicy {
+                rule,
+                protected_data_segments: &protected_data_segments,
+            },
+            &mut references,
+            &mut reclaimable,
+            &mut ahead_of_root,
+        )?;
+    }
+
+    Ok(reclaimable)
+}
+
+impl SegmentSweepOutcome {
+    /// Folds one archive's sweep into the run's totals, returning the
+    /// segments that sweep made unavailable.
+    fn record_swept_archive(
+        &mut self,
+        outcome: ArchiveSweepOutcome,
+    ) -> std::collections::HashSet<SegmentIdentifier> {
+        match outcome.disposition {
+            ArchiveSweepDisposition::Removed => self.removed_archives += 1,
+            ArchiveSweepDisposition::Rewritten => self.rewritten_archives += 1,
+            ArchiveSweepDisposition::Unchanged => {}
+        }
+        self.removed_segments += outcome.newly_unavailable.len();
+        self.deletion_failures.extend(outcome.deletion_failures);
+        outcome.newly_unavailable
+    }
 }
 
 impl WritableRepository {
@@ -673,13 +742,177 @@ impl WritableRepository {
         .map(|_| ())
     }
 
+    /// Refuses a store in which a segment this session wrote also occurs in
+    /// an active base archive.
+    ///
+    /// The mark result is one store-wide UUID set, so an old-generation
+    /// occurrence could put that UUID in the set even though a newer
+    /// occurrence must stay, and sweep or trailer filtering would then
+    /// remove the authoritative copy. Refusing here — before the current
+    /// writer is closed or any base reader is taken — keeps the preflight
+    /// fail-closed and non-mutating.
+    ///
+    /// The location map is scoped, not held: it is a store-wide identifier
+    /// map built for a preflight that ends in milliseconds, and leaving it
+    /// bound for the rest of the reclaim pinned hundreds of megabytes
+    /// across the expensive phase for no reader.
+    fn reject_session_segments_already_in_base_archives(&self) -> Result<()> {
+        let base_locations = unique_active_segment_locations(&self.base_archives)?;
+        let session_segments = self
+            .session_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((identifier, previous)) = session_segments.keys().find_map(|identifier| {
+            base_locations
+                .get(identifier)
+                .map(|name| (*identifier, *name))
+        }) {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "segment {identifier} occurs in active base archive {previous} and the current write session; refusing global reclamation"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Opens the archives this session wrote: everything active that is not
+    /// a base archive.
+    ///
+    /// Sorted newest number first, because the mark phase walks archives in
+    /// that order. Only names matching the Oak archive pattern participate;
+    /// unrelated files are ignored exactly as the write open ignores them.
+    fn open_session_archives(
+        &self,
+        base_names: &std::collections::HashSet<String>,
+    ) -> Result<Vec<TarArchiveReader>> {
+        let mut session_archives = Vec::new();
+        for file_name in crate::store::list_archive_file_names(&self.directory)? {
+            if ArchiveFileName::parse(&file_name).is_none() || base_names.contains(&file_name) {
+                continue;
+            }
+            let path = self.directory.join(&file_name);
+            // A zero-length archive is not something this session wrote: it
+            // is the residue of a writer killed inside its own lazy
+            // next-archive creation, which the write open deliberately
+            // serves no archive for. Opening it would fail outright, so the
+            // skip has to hold here too or compaction inherits the failure
+            // that opening was fixed to avoid.
+            if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
+                continue;
+            }
+            session_archives.push(TarArchiveReader::open(&path)?);
+        }
+        session_archives.sort_by_key(|archive| {
+            std::cmp::Reverse(
+                ArchiveFileName::parse(archive.file_name())
+                    .map_or(0, |parsed| parsed.archive_number),
+            )
+        });
+
+        Ok(session_archives)
+    }
+
+    /// Plans the sweep of every base archive against what the mark phase
+    /// found reclaimable.
+    ///
+    /// Compaction has already paid for a full deep copy of the live tree.
+    /// Declining to move the survivors of an archive whose data segments all
+    /// died would hand the operator a store the very next maintenance run
+    /// reports as dirty and equally cannot clean, which is the field report
+    /// this default policy fixes.
+    fn plan_base_archive_sweeps(
+        &self,
+        reclaimable: &std::collections::HashSet<SegmentIdentifier>,
+        rewrite_policy: ArchiveRewritePolicy,
+    ) -> Result<HashMap<String, PlannedArchiveSweep>> {
+        let mut planned_base_sweeps = HashMap::new();
+        for archive in &self.base_archives {
+            // Compaction has already paid for a full deep copy of the live
+            // tree. Declining to move the survivors of an archive whose data
+            // segments all died would hand the operator a store the very next
+            // maintenance run reports as dirty and equally cannot clean, which
+            // is the field report this default policy fixes.
+            if let Some(planned) = plan_archive_sweep(
+                &self.directory,
+                archive,
+                reclaimable,
+                rewrite_policy,
+                &std::collections::HashSet::new(),
+            )? {
+                planned_base_sweeps.insert(archive.file_name().to_owned(), planned);
+            }
+        }
+        Ok(planned_base_sweeps)
+    }
+
+    /// Closes this session's archive, makes it durable, and certifies what
+    /// it wrote before any base archive may be removed.
+    ///
+    /// The compacted head is already journal-visible at this point, so its
+    /// finalized TAR link and trailers must be durable and independently
+    /// traversable before deleting any base archive it may replace.
+    fn finalize_and_certify_session(&mut self) -> Result<FinalizedSessionCertificate> {
+        // Finalize the session archive so its new-generation segments are
+        // complete on disk before old archives are removed.
+        {
+            let mut state = self.lock_write_state();
+            if let Some(tar_writer) = state.tar_writer.take() {
+                drop(state);
+                self.close_archive_writer(tar_writer)?;
+            }
+        }
+        // The compacted head is already journal-visible at this point. Its
+        // finalized TAR link and trailers must be durable and independently
+        // traversable before deleting any base archive it may replace.
+        sync_directory_strict(&self.directory)?;
+        let head = self.head();
+        let head_is_in_session = self
+            .session_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&head.segment);
+        let finalized_session_certificate =
+            self.validate_finalized_session(head_is_in_session.then_some(head))?;
+
+        Ok(finalized_session_certificate)
+    }
+
+    /// Releases the base archives and their parsed segments.
+    ///
+    /// Called only after every immediate source certificate and sweep has
+    /// completed: keeping `self` intact until here lets the mark and sweep
+    /// phases retain their original immutable source views.
+    #[cfg_attr(not(test), allow(clippy::unnecessary_wraps))]
+    fn retire_base_archives(
+        &mut self,
+        #[cfg(test)] parsed_cache_entries_before_reclaim: usize,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .parsed_segment_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            > parsed_cache_entries_before_reclaim
+        {
+            return Err(Error::InvalidFormat {
+                details: "post-compaction certification and sweeping grew the writable base-segment cache"
+                    .to_owned(),
+            });
+        }
+        let base_archives = std::mem::take(&mut self.base_archives);
+        self.parsed_segment_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        drop(base_archives);
+        Ok(())
+    }
+
     /// Reclaims exactly like [`Self::reclaim_old_generations`], accepting a
     /// proof that the caller already certified these sources under the
     /// currently held lock.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "session validation, source certification, global marking, and ordered sweeping form one safety sequence"
-    )]
     pub(crate) fn reclaim_old_generations_with(
         &mut self,
         request: GenerationReclaimRequest<'_>,
@@ -708,46 +941,9 @@ impl WritableRepository {
         // preflight that ends in milliseconds, and leaving it bound for the
         // rest of the reclaim pinned hundreds of megabytes across the
         // expensive phase for no reader.
-        {
-            let base_locations = unique_active_segment_locations(&self.base_archives)?;
-            let session_segments = self
-                .session_segments
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((identifier, previous)) = session_segments.keys().find_map(|identifier| {
-                base_locations
-                    .get(identifier)
-                    .map(|name| (*identifier, *name))
-            }) {
-                return Err(Error::InvalidFormat {
-                    details: format!(
-                        "segment {identifier} occurs in active base archive {previous} and the current write session; refusing global reclamation"
-                    ),
-                });
-            }
-        }
+        self.reject_session_segments_already_in_base_archives()?;
 
-        // Finalize the session archive so its new-generation segments are
-        // complete on disk before old archives are removed.
-        {
-            let mut state = self.lock_write_state();
-            if let Some(tar_writer) = state.tar_writer.take() {
-                drop(state);
-                self.close_archive_writer(tar_writer)?;
-            }
-        }
-        // The compacted head is already journal-visible at this point. Its
-        // finalized TAR link and trailers must be durable and independently
-        // traversable before deleting any base archive it may replace.
-        sync_directory_strict(&self.directory)?;
-        let head = self.head();
-        let head_is_in_session = self
-            .session_segments
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&head.segment);
-        let finalized_session_certificate =
-            self.validate_finalized_session(head_is_in_session.then_some(head))?;
+        let finalized_session_certificate = self.finalize_and_certify_session()?;
 
         // Use one fresh read-only repository for every base-source
         // certificate in this reclaim pass. Its parsed-segment cache is
@@ -788,62 +984,9 @@ impl WritableRepository {
         // names matching the Oak archive pattern participate; unrelated
         // `*.tar` files in the directory are ignored, exactly as the
         // write open ignores them.
-        let mut session_archives = Vec::new();
-        for file_name in crate::store::list_archive_file_names(&self.directory)? {
-            if ArchiveFileName::parse(&file_name).is_none() || base_names.contains(&file_name) {
-                continue;
-            }
-            let path = self.directory.join(&file_name);
-            // A zero-length archive is not something this session wrote: it
-            // is the residue of a writer killed inside its own lazy
-            // next-archive creation, which the write open deliberately
-            // serves no archive for. Opening it would fail outright, so the
-            // skip has to hold here too or compaction inherits the failure
-            // that opening was fixed to avoid.
-            if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 0) {
-                continue;
-            }
-            session_archives.push(TarArchiveReader::open(&path)?);
-        }
-        session_archives.sort_by_key(|archive| {
-            std::cmp::Reverse(
-                ArchiveFileName::parse(archive.file_name())
-                    .map_or(0, |parsed| parsed.archive_number),
-            )
-        });
+        let session_archives = self.open_session_archives(&base_names)?;
 
-        // Oak's mark phase (§3 of the cleanup specification): archives
-        // newest first, entries within each archive in reverse file
-        // order, one references set shared across all archives so a kept
-        // data segment in a newer archive protects bulk segments in
-        // older ones. The seed set is otherwise empty — sanctioned for an
-        // offline tool on a quiescent store, which the exclusive
-        // repository lock guarantees — and the dangling-future rule runs
-        // with a null compacted root, i.e. disabled, which the
-        // specification calls always safe.
-        let mut references: std::collections::HashSet<SegmentIdentifier> =
-            std::collections::HashSet::new();
-        for archive in &session_archives {
-            seed_references_from_archive(archive, &mut references)?;
-        }
-        let protected_data_segments = std::collections::HashSet::new();
-        let mut reclaimable = std::collections::HashSet::new();
-        // Post-compaction cleanup has no dangling-future root: the caller
-        // just committed the newly compacted head, so every compacted
-        // segment written by that run belongs at or before that head.
-        let mut ahead_of_root = None;
-        for archive in &self.base_archives {
-            mark_one_archive(
-                archive,
-                ReclaimPolicy {
-                    rule,
-                    protected_data_segments: &protected_data_segments,
-                },
-                &mut references,
-                &mut reclaimable,
-                &mut ahead_of_root,
-            )?;
-        }
+        let reclaimable = mark_reclaimable_segments(&session_archives, &self.base_archives, rule)?;
 
         // Store-wide fallback provider for catalog reconstruction, built
         // only if some swept archive turns out to have no readable
@@ -855,23 +998,7 @@ impl WritableRepository {
             .chain(self.base_archives.iter())
             .collect();
         let mut fallback_provider: Option<ArchiveSegmentsProvider<'_>> = None;
-        let mut planned_base_sweeps = HashMap::new();
-        for archive in &self.base_archives {
-            // Compaction has already paid for a full deep copy of the live
-            // tree. Declining to move the survivors of an archive whose data
-            // segments all died would hand the operator a store the very next
-            // maintenance run reports as dirty and equally cannot clean, which
-            // is the field report this default policy fixes.
-            if let Some(planned) = plan_archive_sweep(
-                &self.directory,
-                archive,
-                &reclaimable,
-                rewrite_policy,
-                &std::collections::HashSet::new(),
-            )? {
-                planned_base_sweeps.insert(archive.file_name().to_owned(), planned);
-            }
-        }
+        let planned_base_sweeps = self.plan_base_archive_sweeps(&reclaimable, rewrite_policy)?;
         // Nothing has been unlinked yet. This is the last instant at which a
         // disagreement between what the operator confirmed and what the store
         // now says can be answered by refusing rather than by explaining, so
@@ -916,16 +1043,7 @@ impl WritableRepository {
                     rewrite_policy,
                 )?;
                 finalized_session_certificate.recertify()?;
-                match outcome.disposition {
-                    ArchiveSweepDisposition::Removed => sweep_outcome.removed_archives += 1,
-                    ArchiveSweepDisposition::Rewritten => sweep_outcome.rewritten_archives += 1,
-                    ArchiveSweepDisposition::Unchanged => {}
-                }
-                sweep_outcome.removed_segments += outcome.newly_unavailable.len();
-                sweep_outcome
-                    .deletion_failures
-                    .extend(outcome.deletion_failures);
-                actually_unavailable.extend(outcome.newly_unavailable);
+                actually_unavailable.extend(sweep_outcome.record_swept_archive(outcome));
             }
             #[cfg(test)]
             if !rewrite_phase
@@ -942,28 +1060,10 @@ impl WritableRepository {
         drop(provider_order);
         drop(session_archives);
         drop(certification_repository);
-        // Retire stale mappings only after every immediate source certificate
-        // and sweep has completed. Keeping `self` intact until here lets the
-        // mark and sweep phases retain their original immutable source views.
-        #[cfg(test)]
-        if self
-            .parsed_segment_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-            > parsed_cache_entries_before_reclaim
-        {
-            return Err(Error::InvalidFormat {
-                details: "post-compaction certification and sweeping grew the writable base-segment cache"
-                    .to_owned(),
-            });
-        }
-        let base_archives = std::mem::take(&mut self.base_archives);
-        self.parsed_segment_cache
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        drop(base_archives);
+        self.retire_base_archives(
+            #[cfg(test)]
+            parsed_cache_entries_before_reclaim,
+        )?;
         finalized_session_certificate.recertify()?;
         // Make the archive deletions and any swept replacements durable
         // before the caller proceeds to the journal rewrite.
