@@ -1,7 +1,7 @@
 # Safety case: the merged maintenance command
 
-For the range `52fa39d..ec8d2ec` — `v0.9.0` through the version bump and the
-two fixes that follow it — under the rules in [`high-risk-changes.md`](../high-risk-changes.md).
+For the range `52fa39d..e109662` — `v0.9.0` through the version bump and the
+fixes that follow it — under the rules in [`high-risk-changes.md`](../high-risk-changes.md).
 It succeeds
 [`bounded-memory-and-journal-retention-safety-case.md`](bounded-memory-and-journal-retention-safety-case.md),
 which remains the case for the write session, the caches, and the walks, and
@@ -216,7 +216,8 @@ delta the phase declares.
 
 Each claim binds to one command and that command's own exit status. Linux
 x86-64 host; stable `1.97.1`; MSRV `1.89.0` from `Cargo.toml`. Run against the
-tree at `ec8d2ec`.
+tree at `e109662`. Windows is CI's column, for the reason in the third result
+below.
 
 | Command | Status |
 | --- | --- |
@@ -261,6 +262,20 @@ after. It is recorded here because a flaky test in a release gate is an
 evidence defect, not a nuisance: it teaches a maintainer to re-run rather than
 to read.
 
+The third is the largest, and it is procedural. `windows-build` is the only job
+that compiles this crate for a non-Unix target, and it had not run since
+`v0.9.0`, because the fifty-odd module splits sat unpushed. Its first run on
+this range failed with 31 errors, nine of them in the froe library itself — so
+the release workflow's `x86_64-pc-windows-msvc` binary could not have built,
+and the `release` job that depends on it would never have run. Every error was
+one shape: splitting a module left a child importing through `super::`, and the
+`#[cfg(unix)]` on an item stopped agreeing with the `#[cfg(unix)]` on the
+import that reaches it — in both directions, an import gated where the item is
+not and an import not gated where the item is. Fixed in `5dd93dc` and
+`e109662`. A local gate covering two of the three released platforms cannot
+stand in for the matrix, and fifty commits is far too long to leave it
+unpushed.
+
 ## Known gaps
 
 1. **A journal retention bound is accepted and ignored under a compaction.**
@@ -292,8 +307,13 @@ to read.
    identical renderings before and after. Only the Oak-side content snapshot
    in the interop suite covers that axis, and it covers 21 entries rather than
    the whole tree.
-6. **macOS is untested locally.** Only CI covers it, and the maintenance path
-   is Unix-specific, so it is a first-class target rather than an afterthought.
+6. **macOS and Windows are untested locally.** CI is the authority for both.
+   macOS matters because the maintenance path is Unix-specific and it is a
+   released platform rather than an afterthought. Windows can be
+   cross-*checked* from Linux for the froe library, and was, but not for
+   froe-export's C-backed features or for froe-cli, whose build scripts need a
+   Windows linker — exactly the gap that let the break above reach CI rather
+   than the host gate.
 7. **No RSS measurement**, unchanged from the previous case: budgets are
    asserted against `cache_weight`, an approximation.
 8. **Unchanged from the previous case and still open:** the reopen boundary
@@ -307,7 +327,7 @@ to read.
 ## Review
 
 **An automated adversarial pass, not a second person.** Performed 2026-08-18
-over `52fa39d..ec8d2ec` with a clean worktree, by an assistant that did not
+over `52fa39d..e109662` with a clean worktree, by an assistant that did not
 author the range's behavioral changes. The range reviewed is the one this
 document covers, including `abf2104`, which the pass produced and which was
 re-verified after it landed. Recorded as the
@@ -365,8 +385,10 @@ fifty are refactors that moved code without changing behavior. Those were not
 read line by line; they were judged by outcome — both gates green, the
 file-length rule holding, and the interoperability suite passing on the
 resulting tree. A behavioral change hidden inside a commit labelled `refactor:`
-would not have been caught by this pass. The five commits dated 2026-08-18 —
-the clippy fix, the documentation repair, the `copy_binary_value` change, the
-version bump, and the SIGPIPE fixture fix — were authored by the same
+would not have been caught by this pass, and the Windows break proves it: it
+lived in exactly those commits and was found by CI after the push rather than
+by this review. The seven commits dated 2026-08-18 — the clippy fix, the
+documentation repair, the `copy_binary_value` change, the version bump, the
+SIGPIPE fixture fix, and the two Windows repairs — were authored by the same
 assistant that performed this pass, so for those it is a self-review and not
 independent evidence.
