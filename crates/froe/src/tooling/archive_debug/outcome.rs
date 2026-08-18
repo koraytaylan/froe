@@ -189,7 +189,7 @@ pub enum ArchiveDebugState {
 #[non_exhaustive]
 pub struct ArchiveDebugWork {
     /// Logical work units consumed under
-    /// [`ArchiveDebugOptions::maximum_work_units`].
+    /// [`crate::tooling::archive_debug::options::ArchiveDebugOptions::maximum_work_units`].
     pub consumed_work_units: u64,
     /// Content paths visited from the super-root.
     pub visited_nodes: u64,

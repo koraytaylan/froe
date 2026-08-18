@@ -47,7 +47,7 @@ pub const DEFAULT_MAXIMUM_ARCHIVE_GRAPH_ROWS: usize = 250_000;
 /// Default maximum number of edges parsed and retained in an archive graph.
 pub const DEFAULT_MAXIMUM_ARCHIVE_GRAPH_EDGES: usize = 1_000_000;
 
-/// Resource limits for [`debug_archive_with_options`].
+/// Resource limits for [`crate::tooling::archive_debug::debug_archive_with_options`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub struct ArchiveDebugOptions {

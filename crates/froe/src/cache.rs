@@ -327,12 +327,12 @@ mod long_lived_state_tests {
             ),
             (
                 "Repository",
-                include_str!("store.rs"),
+                include_str!("store/mod.rs"),
                 "pub struct Repository {",
             ),
             (
                 "ArchiveSet",
-                include_str!("store.rs"),
+                include_str!("store/archives.rs"),
                 "pub struct ArchiveSet {",
             ),
         ];

@@ -23,7 +23,7 @@ pub const DEFAULT_MAXIMUM_GC_JOURNAL_LINE_BYTES: usize = 1024 * 1024;
 /// Default maximum number of entries read from one `gc.log` file.
 ///
 /// The limit bounds both parsing work and the fixed-size portion of the vector
-/// returned by [`read_all_gc_journal_with_options`].
+/// returned by [`crate::gc_journal::read_all_gc_journal_with_options`].
 pub const DEFAULT_MAXIMUM_GC_JOURNAL_ENTRIES: usize = 250_000;
 
 /// Resource limits for reading a garbage-collection journal.

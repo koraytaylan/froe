@@ -240,7 +240,7 @@ pub enum ExportAssessment {
 
 /// Assesses the export directory's contents ahead of a full export.
 /// Callers replacing files should hold the export directory lock
-/// ([`lock_export_directory`]) across the assessment and the
+/// ([`crate::lock_export_directory`]) across the assessment and the
 /// replacement, so the verdict cannot go stale.
 #[must_use]
 pub fn assess_export(
