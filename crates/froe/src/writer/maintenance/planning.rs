@@ -1131,3 +1131,64 @@ pub(super) fn verify_exact_super_root_with_verifier(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planning_warnings_survive_a_refusal_and_stay_bounded() {
+        let untouched = attach_planning_warnings(
+            crate::error::Error::InvalidFormat {
+                details: "refused".to_owned(),
+            },
+            &[],
+        );
+        let crate::error::Error::InvalidFormat { details } = untouched else {
+            panic!("variant must be preserved");
+        };
+        assert_eq!(details, "refused", "no warnings means no tail");
+
+        let warnings: Vec<String> = (0..5).map(|index| format!("warning {index}")).collect();
+        let attached = attach_planning_warnings(
+            crate::error::Error::InvalidFormat {
+                details: "refused.".to_owned(),
+            },
+            &warnings,
+        );
+        let crate::error::Error::InvalidFormat { details } = attached else {
+            panic!("variant must be preserved");
+        };
+        assert!(
+            details.contains("warning 0") && details.contains("warning 2"),
+            "established warnings reach the operator: {details}"
+        );
+        assert!(
+            !details.contains("warning 3"),
+            "the tail is bounded so it cannot bury the refusal: {details}"
+        );
+        assert!(
+            details.contains("and 2 further warnings"),
+            "the omitted warnings are counted: {details}"
+        );
+
+        // A non-format error keeps its variant: a caller matching on it for
+        // an input/output failure must still be able to.
+        let input_output = attach_planning_warnings(
+            crate::error::Error::InputOutput(std::io::Error::other("disk")),
+            &warnings,
+        );
+        assert!(
+            matches!(input_output, crate::error::Error::InputOutput(_)),
+            "only format refusals carry the tail"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_backup_like_name_is_not_promoted_into_the_managed_allowlist() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let hostile = std::ffi::OsStr::from_bytes(b"data00000a.tar.\xff.ro.bak");
+        assert!(!is_managed_name(hostile));
+    }
+}

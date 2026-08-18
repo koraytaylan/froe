@@ -360,3 +360,412 @@ pub(super) fn append_apply_identity_preview_warning_for_credentials(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Repository;
+
+    use crate::writer::maintenance::options::*;
+    use crate::writer::maintenance::plan::*;
+
+    use crate::writer::maintenance::prepared::*;
+
+    use crate::writer::maintenance::test_support::*;
+    use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::segment_builder::GarbageCollectionGeneration;
+    use crate::writer::store_writer::WritableRepository;
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_identity_mismatch_is_detected_before_lock_creation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = TestDirectory::repository("wrong-service-user");
+        std::fs::remove_file(directory.path.join("repo.lock")).expect("remove old lock inode");
+        let owner = std::fs::metadata(directory.path.join("journal.log"))
+            .expect("journal metadata")
+            .uid();
+        let different_uid = if owner == u32::MAX {
+            owner - 1
+        } else {
+            owner + 1
+        };
+
+        let error = validate_apply_identity_for_uid(&directory.path, different_uid)
+            .expect_err("different service uid must be rejected");
+
+        assert!(error.to_string().contains("service user"));
+        assert!(!directory.path.join("repo.lock").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn authoritative_plan_rejects_a_foreign_owned_archive_rewrite_before_mutation() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, source_name, _, _) =
+            rewrite_certificate_fixture("foreign-owned-rewrite-preflight");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Segments]);
+        let plan = plan_compaction(&directory.path, &options).expect("healthy rewrite plan");
+        let owner = std::fs::metadata(directory.path.join(&source_name))
+            .expect("source metadata")
+            .uid();
+        let source_gid = std::fs::metadata(directory.path.join(&source_name))
+            .expect("source metadata")
+            .gid();
+        let different_uid = if owner == u32::MAX {
+            owner - 1
+        } else {
+            owner + 1
+        };
+        let credentials = ApplyCredentials {
+            effective_uid: different_uid,
+            effective_gid: source_gid,
+            group_ids: BTreeSet::from([source_gid]),
+        };
+        let before = file_bytes(&directory.path);
+
+        let error =
+            validate_plan_apply_identity_for_credentials(&directory.path, &plan, &credentials)
+                .expect_err("foreign-owned rewrite source must fail preflight");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid segment-tar data: cleanup cannot safely replace {} while preserving its metadata: it is owned by uid {owner}, but the effective uid is {different_uid}; conservatively refusing before planned repository mutations",
+                directory.path.join(source_name).display()
+            )
+        );
+        assert_eq!(file_bytes(&directory.path), before);
+        Repository::open(&directory.path).expect("preflight refusal leaves repository healthy");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn planned_identity_preflight_uses_the_real_repository_directory_gid_and_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = TestDirectory::repository("planned-identity-directory-metadata");
+        let plan = plan_compaction(&directory.path, &CompactionOptions::new().with_tasks([]))
+            .expect("plan health-only cleanup");
+        let mut permissions = std::fs::symlink_metadata(&directory.path)
+            .expect("repository metadata before mode change")
+            .permissions();
+        permissions.set_mode(0o731);
+        std::fs::set_permissions(&directory.path, permissions)
+            .expect("install a distinctive repository mode");
+        let metadata = std::fs::symlink_metadata(&directory.path).expect("repository metadata");
+        let synthetic_gid = if metadata.gid() == u32::MAX {
+            metadata.gid() - 1
+        } else {
+            metadata.gid() + 1
+        };
+        let credentials = ApplyCredentials {
+            effective_uid: 42_424,
+            effective_gid: synthetic_gid,
+            group_ids: BTreeSet::from([synthetic_gid]),
+        };
+        let _ = take_possible_created_group_ids_input();
+
+        let issue = planned_apply_identity_issue(&directory.path, &plan, &credentials)
+            .expect("analyze planned metadata identity");
+
+        assert_eq!(issue, None, "a health-only plan has no metadata sources");
+        assert_eq!(
+            take_possible_created_group_ids_input(),
+            Some((metadata.gid(), metadata.permissions().mode())),
+            "the group model must receive the repository directory's real gid and mode"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ownership_preview_emits_a_known_mismatch_and_matches_the_apply_gate() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = TestDirectory::repository("preview-service-user-warning");
+        let mut plan = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+        )
+        .expect("read-only plan");
+        let journal_owner = std::fs::symlink_metadata(directory.path.join("journal.log"))
+            .expect("journal metadata")
+            .uid();
+        let other_uid = if journal_owner == u32::MAX {
+            journal_owner - 1
+        } else {
+            journal_owner + 1
+        };
+        let credentials = ApplyCredentials {
+            effective_uid: other_uid,
+            effective_gid: 0,
+            group_ids: BTreeSet::from([0]),
+        };
+
+        let issue = preview_apply_identity_issue(&directory.path, &plan, &credentials)
+            .expect("preview identity analysis")
+            .expect("foreign service user must produce a preview warning");
+        let shared_issue = journal_service_user_issue(&directory.path, other_uid)
+            .expect("shared journal ownership analysis")
+            .expect("foreign service user must fail the shared gate");
+
+        assert_eq!(issue, shared_issue);
+        let apply_error = validate_apply_identity_for_uid(&directory.path, other_uid)
+            .expect_err("authoritative apply rejects the same mismatch")
+            .to_string();
+        assert!(apply_error.contains(&shared_issue), "{apply_error}");
+
+        let warnings_before = plan.warnings.len();
+        append_apply_identity_preview_warning_for_credentials(
+            &directory.path,
+            &mut plan,
+            Ok(credentials),
+        );
+        assert_eq!(plan.warnings.len(), warnings_before + 1);
+        let warning = plan.warnings.last().expect("known-mismatch warning");
+        assert!(
+            warning.contains("apply ownership preflight warning"),
+            "{warning}"
+        );
+        assert!(warning.contains(&shared_issue), "{warning}");
+        assert!(warning.contains("authoritative apply"), "{warning}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ownership_preview_emits_a_warning_when_analysis_is_unprovable() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, source_name, _, _) =
+            rewrite_certificate_fixture("preview-unprovable-warning");
+        let mut plan = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+        )
+        .expect("read-only rewrite plan");
+        let journal_metadata = std::fs::symlink_metadata(directory.path.join("journal.log"))
+            .expect("journal metadata");
+        let credentials = ApplyCredentials {
+            effective_uid: journal_metadata.uid(),
+            effective_gid: journal_metadata.gid(),
+            group_ids: BTreeSet::from([journal_metadata.gid()]),
+        };
+        std::fs::rename(
+            directory.path.join(&source_name),
+            directory
+                .path
+                .join(format!("{source_name}.removed-after-plan")),
+        )
+        .expect("make the planned metadata source unavailable");
+        assert!(
+            preview_apply_identity_issue(&directory.path, &plan, &credentials).is_err(),
+            "the fixture must exercise the analysis-error arm"
+        );
+
+        let warnings_before = plan.warnings.len();
+        append_apply_identity_preview_warning_for_credentials(
+            &directory.path,
+            &mut plan,
+            Ok(credentials),
+        );
+
+        assert_eq!(plan.warnings.len(), warnings_before + 1);
+        let warning = plan.warnings.last().expect("unprovable-analysis warning");
+        assert!(
+            warning.contains("apply ownership could not be proved"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("authoritative apply will retry"),
+            "{warning}"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn metadata_preflight_models_inherited_gid_and_setgid_mode_conservatively() {
+        const SYNTHETIC_NON_ROOT_UID: u32 = 42_424;
+        const ARCHIVE_GROUP: u32 = 27_182;
+        const UNRELATED_GROUP: u32 = 31_415;
+
+        let credentials = ApplyCredentials {
+            effective_uid: SYNTHETIC_NON_ROOT_UID,
+            effective_gid: UNRELATED_GROUP,
+            group_ids: BTreeSet::from([UNRELATED_GROUP]),
+        };
+        let possible_created_gids =
+            possible_created_group_ids(ARCHIVE_GROUP, SETGID_MODE | 0o750, &credentials);
+        let source_path = std::path::Path::new("data00000a.tar");
+        let source_mode = 0o640;
+
+        assert_eq!(
+            possible_created_gids,
+            BTreeSet::from([ARCHIVE_GROUP]),
+            "a setgid directory fixes the staging-file group"
+        );
+        assert_eq!(
+            metadata_source_apply_identity_issue(
+                source_path,
+                SYNTHETIC_NON_ROOT_UID,
+                ARCHIVE_GROUP,
+                source_mode,
+                &possible_created_gids,
+                &credentials,
+            ),
+            None,
+            "an already inherited source gid needs neither fchown nor group membership when no setgid bit is requested"
+        );
+
+        let issue = metadata_source_apply_identity_issue(
+            source_path,
+            SYNTHETIC_NON_ROOT_UID,
+            ARCHIVE_GROUP,
+            source_mode | SETGID_MODE,
+            &possible_created_gids,
+            &credentials,
+        )
+        .expect("setgid preservation outside caller groups must refuse conservatively");
+        assert!(issue.contains(&format!("gid {ARCHIVE_GROUP}")), "{issue}");
+        assert!(issue.contains("setgid-mode"), "{issue}");
+        assert!(issue.contains("cannot be guaranteed read-only"), "{issue}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn metadata_preflight_models_both_permitted_non_setgid_creation_groups() {
+        const SYNTHETIC_NON_ROOT_UID: u32 = 42_424;
+        const SOURCE_GROUP: u32 = 27_182;
+        const EFFECTIVE_GROUP: u32 = 31_415;
+
+        let credentials = ApplyCredentials {
+            effective_uid: SYNTHETIC_NON_ROOT_UID,
+            effective_gid: EFFECTIVE_GROUP,
+            group_ids: BTreeSet::from([EFFECTIVE_GROUP]),
+        };
+        let possible_gids = possible_created_group_ids(SOURCE_GROUP, 0o750, &credentials);
+
+        let issue = metadata_source_apply_identity_issue(
+            std::path::Path::new("data00000a.tar"),
+            SYNTHETIC_NON_ROOT_UID,
+            SOURCE_GROUP,
+            0o640,
+            &possible_gids,
+            &credentials,
+        )
+        .expect("a possible System V group outcome must be treated conservatively");
+
+        assert_eq!(
+            possible_gids,
+            BTreeSet::from([SOURCE_GROUP, EFFECTIVE_GROUP])
+        );
+        assert!(
+            issue.contains(&format!("may have gid {possible_gids:?}")),
+            "the diagnostic must record both POSIX-permitted creation groups: {issue}"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_metadata_preflight_checks_only_the_newest_possible_template() {
+        let directory = TestDirectory::repository("checkpoint-template-prefix");
+        std::fs::copy(
+            directory.path.join("data00000a.tar"),
+            directory.path.join("data00001a.tar"),
+        )
+        .expect("create a second readable archive number");
+
+        let sources = planned_metadata_sources(
+            &directory.path,
+            PlannedRewrites {
+                upgrades_manifest: false,
+                segment_plan: None,
+                moves_checkpoint_head: true,
+                rewrites_journal: false,
+            },
+        )
+        .expect("derive checkpoint metadata sources");
+
+        assert_eq!(sources, BTreeSet::from(["data00001a.tar".to_owned()]));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_metadata_preflight_includes_the_leading_removal_outcome_prefix() {
+        let directory = TestDirectory::repository("checkpoint-template-removal-prefix");
+        let current_generation = GarbageCollectionGeneration {
+            generation: 2,
+            full_generation: 2,
+            is_compacted: false,
+        };
+        let current_head = {
+            let store = WritableRepository::open(&directory.path).expect("open head writer");
+            let content_root = write_empty_node_segment(&store, current_generation);
+            let mut writer = store.record_writer(current_generation);
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: content_root,
+                    },
+                    &[],
+                )
+                .expect("write current head");
+            writer.finish().expect("finish current head segment");
+            assert!(store.compare_and_set_head(store.head(), head));
+            store.close().expect("close head writer");
+            head
+        };
+        let orphan = {
+            let store = WritableRepository::open(&directory.path).expect("open orphan writer");
+            let orphan = write_empty_node_segment(
+                &store,
+                GarbageCollectionGeneration {
+                    generation: 0,
+                    full_generation: 0,
+                    is_compacted: false,
+                },
+            );
+            store.close().expect("close unjournaled orphan writer");
+            orphan
+        };
+        let repository = Repository::open(&directory.path).expect("open prefix fixture");
+        let current_archive = repository
+            .archives()
+            .iter()
+            .find(|archive| archive.contains_segment(current_head.segment))
+            .expect("current head archive")
+            .file_name()
+            .to_owned();
+        let orphan_archive = repository
+            .archives()
+            .iter()
+            .find(|archive| archive.contains_segment(orphan.segment))
+            .expect("newest orphan archive")
+            .file_name()
+            .to_owned();
+        drop(repository);
+        let plan = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+        )
+        .expect("plan newest whole removal");
+        assert!(plan.actions().iter().any(|action| matches!(
+            action,
+            CompactionAction::RemoveReclaimableArchive { file_name, .. }
+                if file_name == &orphan_archive
+        )));
+
+        let sources = planned_metadata_sources(
+            &directory.path,
+            PlannedRewrites {
+                upgrades_manifest: false,
+                segment_plan: plan.segment_plan.as_ref(),
+                moves_checkpoint_head: true,
+                rewrites_journal: false,
+            },
+        )
+        .expect("derive possible checkpoint templates");
+
+        assert_eq!(
+            sources,
+            BTreeSet::from([orphan_archive, current_archive]),
+            "a failed newest unlink uses that source; a successful unlink promotes only the next active archive"
+        );
+    }
+}

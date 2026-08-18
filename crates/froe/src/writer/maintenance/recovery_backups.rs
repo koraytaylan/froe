@@ -116,3 +116,44 @@ pub(super) fn plan_recovery_backups(
     planned.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     Ok(planned)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_backup_target_accepts_only_exact_oak_and_journal_counter_forms() {
+        for (name, target) in [
+            ("journal.log.bak.000", "journal.log"),
+            ("journal.log.bak.999", "journal.log"),
+            ("data00000a.tar.bak", "data00000a.tar"),
+            ("data00000a.tar.2.bak", "data00000a.tar"),
+            ("data00000a.tar.2147483647.bak", "data00000a.tar"),
+            ("data00000a.tar.ro.bak", "data00000a.tar"),
+            ("data00000a.tar.2.ro.bak", "data00000a.tar"),
+        ] {
+            assert_eq!(
+                recovery_backup_target(name).as_deref(),
+                Some(target),
+                "{name}"
+            );
+        }
+
+        for hostile in [
+            "journal.log.bak.",
+            "journal.log.bak.00",
+            "journal.log.bak.0000",
+            "journal.log.bak.+00",
+            "data00000a.tar.0.bak",
+            "data00000a.tar.1.bak",
+            "data00000a.tar.02.bak",
+            "data00000a.tar.007.ro.bak",
+            "data00000a.tar.2147483648.bak",
+            "data00000a.tar.-2.ro.bak",
+            "data00000a.tar..2.ro.bak",
+            "data00000a.tar.2.ro.bak.extra",
+        ] {
+            assert_eq!(recovery_backup_target(hostile), None, "{hostile}");
+        }
+    }
+}

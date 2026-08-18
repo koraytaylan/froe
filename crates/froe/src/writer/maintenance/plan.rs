@@ -574,3 +574,227 @@ impl CompactionOutcome {
         self.deletion_failures.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Repository;
+
+    use crate::writer::maintenance::options::*;
+
+    use crate::writer::maintenance::prepared::*;
+
+    use crate::writer::maintenance::test_support::*;
+    use std::io::Write as _;
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn dangling_journal_line_is_pruned_with_backup_and_archives_untouched() {
+        let directory = TestDirectory::repository("dangling-journal");
+        let missing = SegmentIdentifier::new(7, 0xA000_0000_0000_0007);
+        let journal_path = directory.path.join("journal.log");
+        let retained_journal = std::fs::read(&journal_path).expect("read retained journal");
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .expect("open journal");
+        writeln!(journal, "{missing}:0 root 123").expect("append dangling line");
+        drop(journal);
+        let archive_before =
+            std::fs::read(directory.path.join("data00000a.tar")).expect("read archive");
+        std::fs::write(
+            directory.path.join("manifest"),
+            b"custom.property=untouched\nstore.version=1\n",
+        )
+        .expect("version-one manifest");
+        let manifest_before = std::fs::read(directory.path.join("manifest")).expect("manifest");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Journal]);
+
+        let plan = plan_compaction(&directory.path, &options).expect("plan");
+        assert_eq!(plan.tasks(), &[MaintenanceTask::Journal]);
+        assert_eq!(plan.journal_line_removals().len(), 1);
+        let removal = &plan.journal_line_removals()[0];
+        assert_eq!(
+            removal.record_identifier().map(|record| record.segment),
+            Some(missing)
+        );
+        assert_eq!(removal.reason(), JournalRemovalReason::MissingSegment);
+        assert!(
+            removal
+                .preview_bytes()
+                .starts_with(missing.to_string().as_bytes())
+        );
+        assert!(!removal.preview_truncated());
+        assert!(plan.actions().iter().any(|action| matches!(
+            action,
+            CompactionAction::PruneJournal {
+                missing_segments: 1,
+                ..
+            }
+        )));
+        let outcome = compact(&directory.path, options).expect("apply");
+
+        assert_eq!(outcome.removed_journal_lines, 1);
+        let expected_backup =
+            canonical_fixture_directory(&directory.path).join("journal.log.bak.000");
+        assert_eq!(
+            outcome.journal_backup_path(),
+            Some(expected_backup.as_path())
+        );
+        assert!(outcome.is_complete());
+        assert!(directory.path.join("journal.log.bak.000").is_file());
+        assert!(
+            !std::fs::read_to_string(&journal_path)
+                .expect("journal")
+                .contains(&missing.to_string())
+        );
+        assert_eq!(
+            std::fs::read(&journal_path).expect("rewritten journal"),
+            retained_journal,
+            "the retained physical journal line must be byte-exact"
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("data00000a.tar")).expect("archive"),
+            archive_before
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("manifest")).expect("manifest"),
+            manifest_before
+        );
+        Repository::open(&directory.path).expect("healthy repository");
+    }
+    #[test]
+    fn deletion_absence_state_does_not_depend_on_diagnostic_text() {
+        let retained = super::FileDeletionFailure::retained(
+            "data00000a.tar".to_owned(),
+            ALREADY_ABSENT_DELETION_DETAIL,
+        );
+        let absent = super::FileDeletionFailure::already_absent(
+            "data00001a.tar".to_owned(),
+            "a deliberately different ENOENT diagnostic",
+        );
+
+        assert!(!retained.target_was_already_absent());
+        assert!(absent.target_was_already_absent());
+    }
+    #[test]
+    fn a_journal_retention_bound_retires_the_history_the_veto_protects() {
+        let (directory, old_head, new_head) = history_veto_fixture("history-veto-retention");
+        let protected = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+        )
+        .expect("unbounded plan");
+        assert!(protected.history_protected_reclaimable().0 != 0);
+        assert!(
+            !protected.actions().iter().any(|action| matches!(
+                action,
+                CompactionAction::RemoveReclaimableArchive { file_name, .. }
+                    if file_name == "data00000a.tar"
+            )),
+            "without a bound the veto must keep the bootstrap archive"
+        );
+
+        let bounded = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision"));
+        let plan = plan_compaction(&directory.path, &bounded).expect("bounded plan");
+
+        // The older line is pruned for the retention reason, not for damage.
+        assert!(
+            plan.journal_line_removals().iter().any(|removal| {
+                removal.reason() == JournalRemovalReason::BeyondRetention
+                    && removal.record_identifier() == Some(old_head)
+            }),
+            "the superseded revision must be removed as beyond retention"
+        );
+        // Releasing that root is what makes the archive eligible.
+        assert!(
+            plan.actions().iter().any(|action| matches!(
+                action,
+                CompactionAction::RemoveReclaimableArchive { file_name, .. }
+                    if file_name == "data00000a.tar"
+            )),
+            "the bound must release the bootstrap archive to Oak's predicate"
+        );
+        assert!(plan.estimated_reclaimable_bytes() != 0);
+
+        let outcome = compact(&directory.path, bounded).expect("bounded cleanup");
+        assert_eq!(outcome.head_after, new_head);
+        assert!(!directory.path.join("data00000a.tar").exists());
+        let repository = Repository::open(&directory.path).expect("healthy final repository");
+        assert_eq!(repository.head_record_identifier(), new_head);
+        // The journal keeps exactly the bound's worth of revisions, and the
+        // retired history is genuinely gone rather than merely unrooted.
+        let journal =
+            std::fs::read_to_string(directory.path.join("journal.log")).expect("read journal");
+        assert_eq!(
+            journal.lines().count(),
+            1,
+            "a bound of one leaves one journal line"
+        );
+        assert!(
+            crate::tooling::verify_node_tree(&repository, old_head).is_err(),
+            "the retired revision must no longer resolve"
+        );
+    }
+    #[test]
+    fn a_bound_counts_only_revisions_that_actually_resolve() {
+        // A line whose segment exists but whose tree does not verify used to
+        // fill a slot in the bound and then be removed as unreadable anyway,
+        // so `N = 2` kept one revision and irreversibly retired a readable
+        // one to make room for it. Every earlier retention test used N = 1,
+        // which cannot expose this: the head is always the newest resolvable
+        // line and always verifies.
+        let (directory, old_head, new_head) = history_veto_fixture("retention-counts-readable");
+
+        // A journal line naming a record that resolves to a segment but not
+        // to a readable node tree: the head's own segment, at a record
+        // number that is not a node record.
+        let unreadable = RecordIdentifier::new(new_head.segment, new_head.record_number + 1);
+        // Second newest, not newest: the newest line is the head, and a
+        // head that is not a node record is refused long before any bound.
+        let journal_path = directory.path.join("journal.log");
+        let journal = std::fs::read_to_string(&journal_path).expect("read journal");
+        let mut lines: Vec<&str> = journal.lines().collect();
+        let head_line = lines.pop().expect("a head line");
+        let unreadable_line = format!("{unreadable} root 0");
+        lines.push(&unreadable_line);
+        lines.push(head_line);
+        std::fs::write(&journal_path, format!("{}\n", lines.join("\n")))
+            .expect("insert unreadable line");
+
+        let options = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(2).expect("two revisions"));
+        let plan = plan_compaction(&directory.path, &options).expect("bounded plan");
+
+        // The unreadable line goes, as it always did. What must not happen is
+        // the older *readable* revision going with it to satisfy a bound the
+        // unreadable line was counted against.
+        assert!(
+            !plan.journal_line_removals().iter().any(|removal| {
+                removal.reason() == JournalRemovalReason::BeyondRetention
+                    && removal.record_identifier() == Some(old_head)
+            }),
+            "a readable revision was retired to make room for an unreadable one: {:?}",
+            plan.journal_line_removals()
+        );
+    }
+    #[test]
+    fn a_bound_larger_than_the_journal_removes_nothing() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("history-veto-wide-bound");
+        let options = CompactionOptions::default()
+            .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
+            .with_journal_revision_retention(NonZeroUsize::new(64).expect("wide bound"));
+        let plan = plan_compaction(&directory.path, &options).expect("wide plan");
+        assert!(
+            !plan
+                .journal_line_removals()
+                .iter()
+                .any(|removal| { removal.reason() == JournalRemovalReason::BeyondRetention }),
+            "a bound wider than the journal must retire nothing"
+        );
+        assert!(plan.history_protected_reclaimable().0 != 0);
+    }
+}

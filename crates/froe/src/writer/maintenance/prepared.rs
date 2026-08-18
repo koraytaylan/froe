@@ -265,3 +265,335 @@ pub fn compact_with_progress(
     PreparedCompaction::prepare_with_progress(directory, options, observer)?
         .apply_with_progress(observer)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Repository;
+    use crate::tar_archive::file_name::ArchiveFileName;
+    use crate::writer::commit::create_checkpoint;
+
+    use crate::writer::maintenance::options::*;
+
+    use crate::writer::maintenance::test_support::*;
+    use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::record_writer::PropertyToWrite;
+    use crate::writer::record_writer::PropertyValuesToWrite;
+    use crate::writer::segment_builder::GarbageCollectionGeneration;
+    use crate::writer::store_writer::WritableRepository;
+    use std::num::NonZeroUsize;
+
+    /// An archive number that cannot be rebuilt dooms the run however it is
+    /// retried, so it is refused where nothing has been touched — not after
+    /// paying a durable rewrite of every repairable archive to discover it.
+    #[test]
+    fn an_unrepairable_archive_refuses_before_anything_is_rewritten() {
+        let directory = TestDirectory::new("repair-unrepairable");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            writer
+                .write_string("forces a second archive")
+                .expect("string");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+        }
+        // A repairable archive, and — at a higher number, so the repair loop
+        // would have reached it second — bytes no scan can recover.
+        break_index_magic(&directory.path.join("data00000a.tar"));
+        std::fs::write(directory.path.join("data00500a.tar"), vec![0x5au8; 4096])
+            .expect("unrecoverable residue");
+        let before = file_bytes(&directory.path);
+
+        let options = CompactionOptions::default().with_task(MaintenanceTask::RepairArchives);
+
+        // The read-only preview says so, before any authorization.
+        let preview = plan_compaction(&directory.path, &options)
+            .expect_err("the preview must refuse an unrepairable archive");
+        assert!(
+            preview.to_string().contains("data00500a.tar"),
+            "the preview names the archive that dooms the run: {preview}"
+        );
+
+        // And a library caller skipping the preview pays no rewrite either.
+        match PreparedCompaction::prepare(&directory.path, options) {
+            Ok(_) => panic!("prepare must refuse too"),
+            Err(error) => assert!(
+                error.to_string().contains("data00500a.tar"),
+                "prepare names it as well: {error}"
+            ),
+        }
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "and neither path rewrote a single archive"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn repository_root_symlink_is_resolved_to_the_canonical_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::repository("root-symlink-target");
+        let link = directory.path.with_extension("repository-link");
+        let _ = std::fs::remove_file(&link);
+        symlink(&directory.path, &link).expect("create repository root symlink");
+
+        let expected = std::fs::canonicalize(&directory.path).expect("canonical target");
+        let plan =
+            plan_compaction(&link, &CompactionOptions::default()).expect("plan through alias");
+        assert_eq!(plan.directory(), expected);
+        let prepared = PreparedCompaction::prepare(
+            &link,
+            CompactionOptions::default().with_tasks(std::iter::empty()),
+        )
+        .expect("prepare through alias");
+        assert_eq!(prepared.plan().directory(), expected);
+        drop(prepared);
+        std::fs::remove_file(link).expect("remove repository link");
+    }
+    #[test]
+    fn journal_cleanup_preserves_mixed_physical_terminators_exactly() {
+        let directory = TestDirectory::repository("mixed-journal-terminators");
+        let head = Repository::open(&directory.path)
+            .expect("repository")
+            .head_record_identifier();
+        let retained = format!("{head} tag-lf 1\n{head} tag-crlf 2\r\n{head} tag-cr 3\r");
+        let source = format!("{retained}parser-skipped\n");
+        std::fs::write(directory.path.join("journal.log"), source.as_bytes())
+            .expect("write mixed journal fixture");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::Journal]);
+
+        let plan = plan_compaction(&directory.path, &options).expect("plan mixed cleanup");
+        assert_eq!(plan.journal_line_removals().len(), 1);
+        assert_eq!(plan.journal_line_removals()[0].line_number(), 4);
+        compact(&directory.path, options).expect("apply mixed cleanup");
+
+        assert_eq!(
+            std::fs::read(directory.path.join("journal.log")).expect("read rewritten journal"),
+            retained.as_bytes(),
+            "LF, CRLF, and bare-CR terminators must remain byte-exact"
+        );
+        Repository::open(&directory.path).expect("mixed-terminator repository remains healthy");
+    }
+    #[test]
+    fn prepared_cleanup_is_excluded_by_an_existing_writer_lock() {
+        let directory = TestDirectory::repository("lock-exclusion");
+        let writer = WritableRepository::open(&directory.path).expect("hold writer lock");
+        plan_compaction(&directory.path, &CompactionOptions::default())
+            .expect("lock-free preview remains read-only");
+
+        assert!(
+            PreparedCompaction::prepare(&directory.path, CompactionOptions::default()).is_err()
+        );
+        writer.close().expect("close writer");
+        Repository::open(&directory.path).expect("repository healthy");
+    }
+    #[test]
+    fn redundant_journal_staging_is_removed_and_second_run_is_a_true_noop() {
+        let directory = TestDirectory::repository("temporary-idempotence");
+        let staging = directory.path.join("journal.log.compacting");
+        std::fs::copy(directory.path.join("journal.log"), &staging).expect("copy staging");
+        let forensic_staging = directory.path.join("journal.log.recovered");
+        std::fs::write(&forensic_staging, b"unterminated recovery evidence")
+            .expect("write ambiguous staging journal");
+        std::fs::write(directory.path.join("gc.log"), b"operator gc state\n").expect("seed gc log");
+
+        compact(&directory.path, CompactionOptions::default()).expect("first cleanup");
+        assert!(!staging.exists());
+        assert!(forensic_staging.exists());
+        assert_eq!(
+            std::fs::read(directory.path.join("gc.log")).expect("gc log"),
+            b"operator gc state\n"
+        );
+        let before = file_bytes(&directory.path);
+        let second =
+            plan_compaction(&directory.path, &CompactionOptions::default()).expect("second plan");
+        assert!(second.is_empty(), "second plan: {:?}", second.actions());
+        let outcome = PreparedCompaction::prepare(&directory.path, CompactionOptions::default())
+            .expect("prepare no-op")
+            .apply()
+            .expect("apply no-op");
+        assert_eq!(outcome.head_before, outcome.head_after);
+        assert_eq!(file_bytes(&directory.path), before);
+    }
+    #[test]
+    fn checkpoint_cleanup_allocates_after_zero_byte_next_archive_residue() {
+        let directory = TestDirectory::repository("checkpoint-zero-byte-next-archive");
+        let store = WritableRepository::open(&directory.path).expect("open writer");
+        create_checkpoint(&store, 1, &[]).expect("checkpoint");
+        store.close().expect("close writer");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let repository = Repository::open(&directory.path).expect("open checkpoint repository");
+        let active_maximum = repository
+            .archives()
+            .iter()
+            .filter_map(|archive| ArchiveFileName::parse(archive.file_name()))
+            .map(|name| name.archive_number)
+            .max()
+            .expect("fixture has an active archive");
+        drop(repository);
+        let occupied_number = active_maximum.checked_add(1).expect("fixture namespace");
+        let certified_number = occupied_number.checked_add(1).expect("fixture namespace");
+        let occupied_name = format!("data{occupied_number:05}a.tar");
+        std::fs::write(directory.path.join(&occupied_name), b"")
+            .expect("install zero-byte otherwise-next residue");
+        let options =
+            CompactionOptions::default().with_tasks([MaintenanceTask::ExpiredCheckpoints]);
+
+        let plan = plan_compaction(&directory.path, &options).expect("plan checkpoint cleanup");
+        assert_eq!(plan.checkpoint_archive_number, Some(certified_number));
+        let outcome = compact(&directory.path, options).expect("apply checkpoint cleanup");
+
+        assert_eq!(outcome.removed_checkpoints, 1);
+        assert_eq!(
+            std::fs::read(directory.path.join(&occupied_name)).expect("read zero-byte residue"),
+            b"",
+            "cleanup must neither truncate nor reuse physical residue"
+        );
+        assert!(
+            directory
+                .path
+                .join(format!("data{certified_number:05}a.tar"))
+                .exists()
+        );
+        let repository = Repository::open(&directory.path).expect("healthy repository");
+        assert!(repository.checkpoints().expect("checkpoints").is_empty());
+    }
+    #[test]
+    fn the_history_price_counts_the_bulk_segments_held_behind_the_data_ones() {
+        // The veto holds bulk segments only indirectly: a vetoed data segment
+        // keeps seeding its references, so its binary content stays too.
+        // Counting protected *data* segments alone therefore prices a store
+        // full of inline binaries at a rounding error, and an operator
+        // reading that figure would decline a run worth most of the store.
+        let directory = TestDirectory::repository("history-price-bulk");
+        {
+            let store = WritableRepository::open(&directory.path).expect("open binary writer");
+            let mut writer = store.record_writer(GarbageCollectionGeneration {
+                generation: 0,
+                full_generation: 0,
+                is_compacted: false,
+            });
+            // Comfortably past the 256 KiB segment limit, so the content
+            // lands in bulk segments rather than inline in the data segment.
+            let content: Vec<u8> = (0..1024 * 1024).map(|index| (index % 251) as u8).collect();
+            let binary = writer.write_binary_content(&content).expect("binary");
+            let file = writer
+                .write_node(
+                    Some("nt:file"),
+                    &[],
+                    &ChildNodesToWrite::Zero,
+                    &[PropertyToWrite {
+                        name: "data".to_owned(),
+                        property_type: crate::content::property::PropertyType::Binary,
+                        values: PropertyValuesToWrite::Single(binary),
+                    }],
+                )
+                .expect("file node");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: file,
+                    },
+                    &[],
+                )
+                .expect("binary super root");
+            writer.finish().expect("finish binary segments");
+            assert!(store.compare_and_set_head(store.head(), head));
+            store.close().expect("close binary writer");
+        }
+        // An independent generation-two head that reaches none of it.
+        {
+            let store = WritableRepository::open(&directory.path).expect("open new head writer");
+            let mut writer = store.record_writer(GarbageCollectionGeneration {
+                generation: 2,
+                full_generation: 2,
+                is_compacted: false,
+            });
+            let root = writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("new content root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("new super root");
+            writer.finish().expect("finish new head");
+            assert!(store.compare_and_set_head(store.head(), head));
+            store.close().expect("close new head writer");
+        }
+
+        let priced = plan_compaction(
+            &directory.path,
+            &CompactionOptions::default().with_tasks([MaintenanceTask::Segments]),
+        )
+        .expect("priced plan");
+        let (_priced_segments, priced_bytes) = priced.history_protected_reclaimable();
+
+        // Now actually retire the history and compare. The quoted price must
+        // be what the operation delivers, not the data-segment fraction of it.
+        let outcome = compact(
+            &directory.path,
+            CompactionOptions::default()
+                .with_tasks([MaintenanceTask::Segments, MaintenanceTask::Journal])
+                .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
+        )
+        .expect("bounded cleanup");
+        let freed = outcome.archive_bytes_before - outcome.archive_bytes_after;
+        assert!(
+            freed > 1024 * 1024,
+            "retiring the history must free the binary content: {freed}"
+        );
+        assert_eq!(
+            priced_bytes, freed,
+            "the quoted price must be what retiring the history delivers"
+        );
+    }
+    #[test]
+    fn an_unselected_task_reports_no_step_of_its_own() {
+        let (directory, _old_head, _new_head) = history_veto_fixture("unselected-task-step");
+        let mut observer = StepNameObserver { names: Vec::new() };
+        // recovery-backups is not among the defaults, so announcing its
+        // removal step told the operator froe had considered backups it was
+        // never asked to touch.
+        compact_with_progress(
+            &directory.path,
+            CompactionOptions::default()
+                .with_tasks([
+                    MaintenanceTask::Segments,
+                    MaintenanceTask::Journal,
+                    MaintenanceTask::StaleTemporaries,
+                ])
+                .with_journal_revision_retention(NonZeroUsize::new(1).expect("one revision")),
+            &mut observer,
+        )
+        .expect("bounded cleanup");
+        for unselected in ["removing old recovery backups", "removing stale archives"] {
+            assert!(
+                !observer.names.iter().any(|name| name == unselected),
+                "unselected task reported {unselected:?}: {:?}",
+                observer.names
+            );
+        }
+        assert!(
+            observer
+                .names
+                .iter()
+                .any(|name| name == "removing stale temporary files"),
+            "a selected task still reports its step: {:?}",
+            observer.names
+        );
+    }
+}

@@ -273,3 +273,118 @@ impl CompactionOptions {
         self.tasks.contains(&task)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::writer::maintenance::plan::*;
+
+    use crate::writer::maintenance::prepared::*;
+
+    use crate::writer::maintenance::test_support::*;
+    use std::fs::File;
+    use std::time::SystemTime;
+
+    /// Repair makes the `.bak` that the backup policy retires. Doing both in
+    /// one run can delete the only copy of what the rebuild could not read.
+    #[test]
+    fn repair_archives_and_recovery_backups_cannot_run_together() {
+        let options = CompactionOptions::default()
+            .with_task(MaintenanceTask::RepairArchives)
+            .with_recovery_backup_policy(RecoveryBackupPolicy::new(Duration::ZERO, 0));
+        let directory = TestDirectory::repository("repair-and-backups");
+        let error = plan_compaction(&directory.path, &options)
+            .expect_err("the combination must be refused before anything is read");
+        let crate::error::Error::InvalidFormat { details } = error else {
+            panic!("unexpected refusal variant");
+        };
+        assert!(
+            details.contains("cannot run together"),
+            "the refusal explains the conflict: {details}"
+        );
+        assert!(
+            details.contains("repair first"),
+            "the refusal states the safe sequence: {details}"
+        );
+    }
+    #[test]
+    fn all_archive_backup_spellings_share_one_keep_latest_slot() {
+        let directory = TestDirectory::repository("archive-backup-shared-retention-slot");
+        let now = SystemTime::now();
+        for (name, age_hours) in [
+            ("data00000a.tar.ro.bak", 1),
+            ("data00000a.tar.2.ro.bak", 2),
+            ("data00000a.tar.bak", 3),
+            ("data00000a.tar.2.bak", 4),
+        ] {
+            let file = File::create(directory.path.join(name)).expect("create recovery backup");
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(now - Duration::from_secs(age_hours * 3600)),
+            )
+            .expect("set distinct backup time");
+        }
+        let options = CompactionOptions::default()
+            .with_tasks([])
+            .with_recovery_backup_policy(RecoveryBackupPolicy::new(Duration::ZERO, 1));
+
+        let plan = plan_compaction(&directory.path, &options).expect("plan grouped backups");
+        let removals: Vec<_> = plan
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                CompactionAction::RemoveRecoveryBackup { file_name, .. } => {
+                    Some(file_name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            removals,
+            [
+                "data00000a.tar.2.bak",
+                "data00000a.tar.2.ro.bak",
+                "data00000a.tar.bak",
+            ]
+        );
+        assert!(
+            !removals.contains(&"data00000a.tar.ro.bak"),
+            "the newest spelling consumes the one shared target slot"
+        );
+    }
+    #[test]
+    fn backup_count_retains_every_file_tied_at_the_newest_cutoff() {
+        let directory = TestDirectory::repository("backup-retention-mtime-tie");
+        let now = std::time::SystemTime::now();
+        let tied = now - std::time::Duration::from_secs(7200);
+        let older = now - std::time::Duration::from_secs(10_800);
+        for (name, modified) in [
+            ("journal.log.bak.000", tied),
+            ("journal.log.bak.001", tied),
+            ("journal.log.bak.002", tied),
+            ("journal.log.bak.003", older),
+        ] {
+            let file = std::fs::File::create(directory.path.join(name)).expect("create backup");
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .expect("set exact backup mtime");
+        }
+        let options = CompactionOptions::default()
+            .with_tasks([])
+            .with_recovery_backup_policy(RecoveryBackupPolicy::new(std::time::Duration::ZERO, 1));
+
+        let plan = plan_compaction(&directory.path, &options).expect("plan tied backups");
+        let removals: Vec<_> = plan
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                CompactionAction::RemoveRecoveryBackup { file_name, .. } => {
+                    Some(file_name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(removals, ["journal.log.bak.003"]);
+    }
+}

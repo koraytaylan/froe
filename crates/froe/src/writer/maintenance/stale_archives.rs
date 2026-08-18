@@ -407,3 +407,139 @@ pub(super) fn planned_archive_repairs(repository: &Repository) -> Vec<Compaction
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::writer::maintenance::test_support::*;
+
+    #[test]
+    fn a_refusal_names_the_offenders_and_agrees_in_number() {
+        let one = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 43,
+            indexless_numbers: 1,
+            offenders: &[("data00042a.tar", MAGIC_REASON)],
+            newest_is_indexless: true,
+            any_scan_is_empty: false,
+        });
+        assert!(
+            one.contains("1 of 43 active archive numbers has no index metadata (data00042a.tar)"),
+            "singular subject names the archive and the total: {one}"
+        );
+        assert!(
+            one.contains(MAGIC_REASON),
+            "the reason the index was rejected reaches the operator: {one}"
+        );
+        assert!(
+            one.contains("no archive, journal, or checkpoint has been changed"),
+            "the refusal states precisely what is untouched: {one}"
+        );
+
+        let two = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 3,
+            indexless_numbers: 2,
+            offenders: &[
+                ("data00001a.tar", CHECKSUM_REASON),
+                ("data00000a.tar", CHECKSUM_REASON),
+            ],
+            newest_is_indexless: false,
+            any_scan_is_empty: false,
+        });
+        assert!(
+            two.contains("2 of 3 active archive numbers have no index metadata"),
+            "plural subject agrees: {two}"
+        );
+        assert_eq!(
+            two.matches(CHECKSUM_REASON).count(),
+            1,
+            "one shared reason is stated once, not repeated per archive: {two}"
+        );
+    }
+    /// The census counts every offender even though only five are named,
+    /// so an operator cannot read the shown list as the whole damage.
+    #[test]
+    fn a_refusal_counts_the_offenders_it_does_not_name() {
+        let many: Vec<String> = (0..8)
+            .map(|index| format!("data0000{index}a.tar"))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = many.iter().map(|n| (n.as_str(), MAGIC_REASON)).collect();
+
+        let truncated = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 40,
+            indexless_numbers: 8,
+            offenders: &borrowed,
+            newest_is_indexless: true,
+            any_scan_is_empty: false,
+        });
+
+        assert!(
+            truncated.contains("8 of 40 active archive numbers"),
+            "the count is the whole census, not the shown names: {truncated}"
+        );
+        assert!(
+            truncated.contains("and 3 more"),
+            "the omitted names are counted rather than silently dropped: {truncated}"
+        );
+    }
+    /// The remedy is the branch an operator acts on, and the three shapes
+    /// need different advice: a killed writer can be repaired, mid-store
+    /// damage should be inspected first, and an archive whose scan reads
+    /// nothing cannot be repaired at all.
+    #[test]
+    fn a_refusal_advises_the_remedy_that_fits_the_damage() {
+        let killed_writer = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 43,
+            indexless_numbers: 1,
+            offenders: &[("data00042a.tar", MAGIC_REASON)],
+            newest_is_indexless: true,
+            any_scan_is_empty: false,
+        });
+        assert!(
+            killed_writer.contains("the newest active archive is among them"),
+            "a killed writer is distinguishable from damage: {killed_writer}"
+        );
+        assert!(
+            killed_writer.contains("--repair-archive-indexes"),
+            "a killed writer is pointed at the task that repairs it: {killed_writer}"
+        );
+
+        let mid_store = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 3,
+            indexless_numbers: 2,
+            offenders: &[
+                ("data00001a.tar", CHECKSUM_REASON),
+                ("data00000a.tar", CHECKSUM_REASON),
+            ],
+            newest_is_indexless: false,
+            any_scan_is_empty: false,
+        });
+        assert!(
+            mid_store.contains("the newest active archive is not among them"),
+            "mid-store damage is not reported as a killed writer: {mid_store}"
+        );
+        assert!(
+            mid_store.contains("inspect before repairing"),
+            "mid-store damage does not get the unconditional repair advice: {mid_store}"
+        );
+
+        // An archive whose scan read nothing cannot be rebuilt, and the
+        // write open refuses it. Advising a write command would be circular.
+        let unrecoverable = indexless_archive_refusal(IndexlessCensus {
+            total_numbers: 2,
+            indexless_numbers: 1,
+            offenders: &[("data00009a.tar", MAGIC_REASON)],
+            newest_is_indexless: true,
+            any_scan_is_empty: true,
+        });
+        assert!(
+            !unrecoverable.contains("--repair-archive-indexes"),
+            "an unrecoverable archive must not be sent to a command that will refuse it: \
+             {unrecoverable}"
+        );
+        assert!(
+            unrecoverable.contains("move that file aside"),
+            "an unrecoverable archive gets the remedy that actually works: {unrecoverable}"
+        );
+    }
+}

@@ -304,3 +304,170 @@ impl Drop for UncommittedFile {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Repository;
+
+    use crate::writer::maintenance::options::*;
+    use crate::writer::maintenance::plan::*;
+
+    use crate::writer::maintenance::prepared::*;
+
+    use crate::writer::maintenance::test_support::*;
+
+    #[test]
+    fn manifest_upgrade_separates_a_trailing_properties_continuation() {
+        let suffix = b"# upgraded atomically by froe cleanup\nstore.version=2\n";
+        for (source, expected_prefix) in [
+            (
+                &b"custom.property=kept\\"[..],
+                &b"custom.property=kept\\\n\n"[..],
+            ),
+            (
+                &b"custom.property=kept\\\n"[..],
+                &b"custom.property=kept\\\n\n"[..],
+            ),
+            (
+                &b"custom.property=kept\\\r"[..],
+                &b"custom.property=kept\\\r\n\n"[..],
+            ),
+        ] {
+            let upgraded = manifest_upgrade_bytes(source);
+            assert!(upgraded.starts_with(expected_prefix), "{upgraded:?}");
+            assert!(upgraded.ends_with(suffix), "{upgraded:?}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn manifest_certificate_rejects_path_substitution_around_publication() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = TestDirectory::new("manifest-certificate-substitution");
+        let canonical = directory.path.join("manifest");
+        let canonical_bytes = b"custom.property=kept\nstore.version=1\n";
+        std::fs::write(&canonical, canonical_bytes).expect("write canonical manifest");
+
+        let staged = directory.path.join("manifest.cleaning.000");
+        let expected = b"custom.property=kept\nstore.version=2\n";
+        std::fs::write(&staged, expected).expect("write staged manifest");
+        let staged_metadata = std::fs::symlink_metadata(&staged).expect("staged metadata");
+        let certificate = certify_manifest_file(
+            &staged,
+            &staged_metadata,
+            expected,
+            ManifestFileAccess::ReadWrite,
+            "staged manifest replacement",
+        )
+        .expect("certify staged manifest");
+
+        let retained_inode = directory.path.join("retained-manifest-inode");
+        std::fs::rename(&staged, &retained_inode).expect("move certified inode aside");
+        std::fs::write(&staged, expected).expect("substitute same-byte staged manifest");
+        let substituted_metadata =
+            std::fs::symlink_metadata(&staged).expect("substituted staged metadata");
+        assert_ne!(
+            (substituted_metadata.dev(), substituted_metadata.ino()),
+            (staged_metadata.dev(), staged_metadata.ino()),
+            "the fixture must isolate identity checking from byte checking"
+        );
+        certificate
+            .recertify(
+                &staged,
+                expected,
+                ManifestFileAccess::ReadWrite,
+                "staged manifest replacement",
+            )
+            .expect_err("same bytes on a different inode must not be publishable");
+        assert_eq!(
+            std::fs::read(&canonical).expect("read canonical manifest"),
+            canonical_bytes,
+            "a rejected staging substitution must leave the source canonical"
+        );
+
+        std::fs::remove_file(&staged).expect("remove substituted staging file");
+        std::fs::rename(&retained_inode, &staged).expect("restore certified inode");
+        certificate
+            .recertify(
+                &staged,
+                expected,
+                ManifestFileAccess::ReadWrite,
+                "staged manifest replacement",
+            )
+            .expect("restored certified inode");
+
+        let installed = directory.path.join("installed-manifest");
+        std::fs::rename(&staged, &installed).expect("publish certified inode");
+        certificate
+            .recertify(
+                &installed,
+                expected,
+                ManifestFileAccess::ReadWrite,
+                "installed manifest replacement",
+            )
+            .expect("certificate follows the inode through rename");
+
+        let displaced = directory.path.join("displaced-installed-manifest");
+        std::fs::rename(&installed, &displaced).expect("displace installed inode");
+        std::fs::write(&installed, expected).expect("substitute installed manifest");
+        let installed_substitute =
+            std::fs::symlink_metadata(&installed).expect("installed substitute metadata");
+        assert_ne!(
+            (installed_substitute.dev(), installed_substitute.ino()),
+            (staged_metadata.dev(), staged_metadata.ino()),
+            "the post-publication fixture must install a different inode"
+        );
+        certificate
+            .recertify(
+                &installed,
+                expected,
+                ManifestFileAccess::ReadWrite,
+                "installed manifest replacement",
+            )
+            .expect_err("post-rename same-byte inode substitution must be detected");
+    }
+    #[test]
+    fn manifest_staging_requires_exact_canonical_or_upgrade_bytes() {
+        let directory = TestDirectory::repository("manifest-staging-proof");
+        let canonical = b"custom.property=kept\nstore.version=1\n";
+        std::fs::write(directory.path.join("manifest"), canonical)
+            .expect("write version-one manifest");
+        let identical = directory.path.join("manifest.cleaning.000");
+        std::fs::write(&identical, canonical).expect("write identical staging manifest");
+        let exact_upgrade = directory.path.join("manifest.cleaning.001");
+        std::fs::write(&exact_upgrade, manifest_upgrade_bytes(canonical))
+            .expect("write exact upgrade staging manifest");
+        let divergent = directory.path.join("manifest.cleaning.002");
+        std::fs::write(&divergent, b"store.version=2\noperator.data=lost\n")
+            .expect("write divergent staging manifest");
+        let options = CompactionOptions::default().with_tasks([MaintenanceTask::StaleTemporaries]);
+
+        let plan = plan_compaction(&directory.path, &options).expect("plan stale manifests");
+        let planned_names: Vec<_> = plan
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                CompactionAction::RemoveTemporary { file_name, .. } => Some(file_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            planned_names,
+            ["manifest.cleaning.000", "manifest.cleaning.001"]
+        );
+        assert!(plan.warnings().iter().any(|warning| {
+            warning.contains("manifest.cleaning.002") && warning.contains("not provably redundant")
+        }));
+
+        compact(&directory.path, options).expect("remove proven manifest staging files");
+        assert!(!identical.exists());
+        assert!(!exact_upgrade.exists());
+        assert!(divergent.exists());
+        assert_eq!(
+            std::fs::read(directory.path.join("manifest")).expect("read canonical manifest"),
+            canonical
+        );
+        Repository::open(&directory.path).expect("healthy repository");
+    }
+}

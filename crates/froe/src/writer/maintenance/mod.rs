@@ -8,6 +8,8 @@
 //! until application and fresh post-operation verification complete.
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
 mod apply;
