@@ -6,7 +6,6 @@ use super::cleanup_apply::*;
 use super::providers::*;
 use super::reclaim::*;
 use super::repository::*;
-#[cfg(unix)]
 use crate::content::provider::SegmentProvider;
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::{RecordIdentifier, RecordType};

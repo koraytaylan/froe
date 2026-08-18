@@ -2,9 +2,11 @@
 //! and the fingerprint of every entry the prepared session later
 //! rechecks.
 
+#[cfg(unix)]
+use super::MetadataExt;
 use super::{
-    ArchiveFileName, CompactionOptions, Error, MaintenanceTask, Metadata, MetadataExt, OsStr,
-    OsString, Path, PathBuf, Result, SystemTime, recovery_backup_target, temporary_kind,
+    ArchiveFileName, CompactionOptions, Error, MaintenanceTask, Metadata, OsStr, OsString, Path,
+    PathBuf, Result, SystemTime, recovery_backup_target, temporary_kind,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,6 +220,7 @@ pub(in crate::writer::maintenance) fn file_fingerprint(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
     use crate::store::Repository;
     use crate::writer::maintenance::options::*;

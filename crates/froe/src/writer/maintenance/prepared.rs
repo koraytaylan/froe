@@ -2,8 +2,11 @@
 //! the four entry points callers reach maintenance through.
 
 use super::apply::apply_prepared;
+#[cfg(unix)]
 use super::apply_identity::{
     current_apply_credentials, metadata_source_apply_identity_issue, possible_created_group_ids,
+};
+use super::apply_identity::{
     validate_apply_environment, validate_apply_identity, validate_plan_apply_identity,
 };
 use super::options::{CompactionOptions, MaintenanceTask};
@@ -12,7 +15,9 @@ use super::planning::{
     ManifestUpgradeOnFirstInstall, attach_completed_repairs, build_plan,
     canonical_repository_directory, validate_options, validate_repository_shape,
 };
-use crate::error::{Error, Result};
+#[cfg(unix)]
+use crate::error::Error;
+use crate::error::Result;
 use crate::progress::{DiscardedProgress, ProgressObserver};
 use crate::writer::repository_lock::RepositoryLock;
 use std::path::{Path, PathBuf};

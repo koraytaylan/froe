@@ -208,7 +208,6 @@ pub(in crate::writer::maintenance) fn classify_line(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::{RawJournalLineClassification, RawJournalTimestamp, scan_raw_journal};
     use crate::writer::maintenance::journal::test_support::{FIRST, SECOND, TestDirectory};
 

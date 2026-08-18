@@ -12,11 +12,18 @@
 
 use std::ffi::OsStr;
 
+// Every probe forks a child and ends it with a signal, so the whole
+// harness is Unix-only. The `*_if_armed` helpers below stay available on
+// every target, because production code calls them under `cfg(test)`.
+#[cfg(unix)]
 mod journal;
+#[cfg(unix)]
 mod manifest;
+#[cfg(unix)]
 mod session;
+#[cfg(unix)]
 mod sweep;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod test_support;
 
 pub(crate) const CHILD_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_CHILD";

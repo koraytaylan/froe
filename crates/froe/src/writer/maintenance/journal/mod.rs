@@ -356,7 +356,6 @@ pub(in crate::writer::maintenance) fn assemble_replacement(
 #[cfg(test)]
 mod tests {
     use super::rewrite_journal_atomically;
-    #[cfg(unix)]
     use crate::writer::maintenance::journal::scan::scan_raw_journal;
     use crate::writer::maintenance::journal::test_support::{FIRST, SECOND, TestDirectory};
 

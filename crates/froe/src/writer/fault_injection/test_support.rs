@@ -3,9 +3,11 @@
 //! against afterwards.
 
 use super::{
-    ABSENCE_MODE, CHILD_ENVIRONMENT, CRASH_EXIT_CODE, CRASH_MODE, CUTPOINT_ENVIRONMENT, ERROR_MODE,
-    MODE_ENVIRONMENT, SUBSTITUTE_MODE, VERIFIED_EXIT_CODE,
+    ABSENCE_MODE, CHILD_ENVIRONMENT, CUTPOINT_ENVIRONMENT, ERROR_MODE, MODE_ENVIRONMENT,
+    SUBSTITUTE_MODE,
 };
+#[cfg(unix)]
+use super::{CRASH_EXIT_CODE, CRASH_MODE, VERIFIED_EXIT_CODE};
 use crate::segment::record::RecordIdentifier;
 use crate::store::Repository;
 use crate::tar_archive::file_name::ArchiveFileName;

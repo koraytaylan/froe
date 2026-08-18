@@ -6,14 +6,16 @@
 // `libc::S_ISGID`) is `u16` on Apple targets.
 pub(super) const SETGID_MODE: u32 = 0o2000;
 
+#[cfg(unix)]
 use super::options::MaintenanceTask;
 use super::plan::CompactionPlan;
 use crate::error::{Error, Result};
+#[cfg(unix)]
 use crate::writer::store_writer::{
     PlannedArchiveSweep, StandaloneSegmentCompactionPlan, sync_directory_strict,
 };
-use std::collections::{BTreeSet, HashMap};
 #[cfg(unix)]
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub(super) fn validate_apply_environment(directory: &Path) -> Result<()> {
@@ -361,7 +363,7 @@ pub(super) fn append_apply_identity_preview_warning_for_credentials(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::store::Repository;

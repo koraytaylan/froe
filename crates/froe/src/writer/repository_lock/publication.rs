@@ -2,8 +2,10 @@
 //! directory holds either no lock or one fully hardened, reopenable inode
 //! that exactly one writer holds.
 
+use super::File;
+#[cfg(unix)]
 use super::{
-    AtomicU64, Error, File, HashSet, LockIdentity, Ordering, Path, PathBuf, Result,
+    AtomicU64, Error, HashSet, LockIdentity, Ordering, Path, PathBuf, Result,
     invalid_lock_file_type, lock_identity, open_existing_lock_file,
 };
 
@@ -318,7 +320,7 @@ pub(crate) fn make_new_lock_reopenable(file: &File) -> std::io::Result<()> {
     file.sync_all()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use crate::writer::repository_lock::RepositoryLock;
     use crate::writer::repository_lock::test_support::TestDirectory;

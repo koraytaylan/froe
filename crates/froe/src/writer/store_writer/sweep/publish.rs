@@ -294,7 +294,7 @@ pub(crate) fn retire_swept_source(retired: RetiredSource<'_>) -> Result<ArchiveS
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use crate::segment::identifier::SegmentIdentifier;
     use crate::segment::parsed_segment::ParsedSegment;

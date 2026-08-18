@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -372,6 +373,10 @@ fn assert_windows_readonly_is_observed(
             entry(&before_readonly_change, file_name).metadata.readonly
         );
         assert_ne!(after_readonly_change, before_readonly_change);
+        // The read-only attribute moves without the bytes moving, so the
+        // fixture content is not read here. The parameter stays for symmetry
+        // with the Unix assertion beside it.
+        let _ = content;
     }
     #[cfg(not(windows))]
     {

@@ -32,6 +32,7 @@ mod stale_archives;
 mod temporaries;
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) use self::options::MaintenanceTask;
 pub use self::options::{CompactionOptions, RecoveryBackupPolicy};
 pub use self::plan::{

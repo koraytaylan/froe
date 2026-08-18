@@ -1,7 +1,9 @@
 //! Which inode a lock is held on, so a directory renamed under a live
 //! session cannot buy a second writer the same repository.
 
-use super::{Error, File, HashSet, Mutex, OnceLock, Path};
+#[cfg(unix)]
+use super::{Error, File, Path};
+use super::{HashSet, Mutex, OnceLock};
 
 /// How a locked repository is identified in the process-local registry.
 /// On Unix the lock *file's* `(device, inode)` identity, so directory
@@ -67,7 +69,7 @@ pub(crate) fn open_existing_lock_file(lock_path: &Path) -> std::io::Result<File>
     Ok(file)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use crate::writer::repository_lock::RepositoryLock;
     use crate::writer::repository_lock::test_support::TestDirectory;

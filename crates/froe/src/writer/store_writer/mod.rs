@@ -52,9 +52,11 @@ pub(crate) use self::file_identity::{
 };
 pub use self::reclaim::ArchiveRewritePolicy;
 pub(crate) use self::reclaim::{ReclaimRule, predict_post_compaction_reclamation};
+#[cfg(unix)]
+pub(crate) use self::repair::repair_target_names;
 pub(crate) use self::repair::{
-    AuthorizeVersionTwoWrite, repair_indexless_archive_numbers, repair_target_names,
-    survey_indexless_archive_numbers, unrepairable_archives_refusal,
+    AuthorizeVersionTwoWrite, repair_indexless_archive_numbers, survey_indexless_archive_numbers,
+    unrepairable_archives_refusal,
 };
 pub use self::repository::{StoreSink, WritableRepository};
 pub(crate) use self::startup::{RepairedArchive, reject_duplicate_archive_generations};

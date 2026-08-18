@@ -261,7 +261,7 @@ pub(crate) fn preserve_file_metadata(target: &File, source: &std::fs::Metadata) 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use crate::store::Repository;
     use crate::tar_archive::archive::TarArchiveReader;
