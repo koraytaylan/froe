@@ -322,7 +322,7 @@ mod long_lived_state_tests {
         let sources = [
             (
                 "WritableRepository",
-                include_str!("writer/store_writer.rs"),
+                include_str!("writer/store_writer/repository.rs"),
                 "pub struct WritableRepository {",
             ),
             (
