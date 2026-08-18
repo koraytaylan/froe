@@ -68,7 +68,7 @@ struct CommandLine {
     progress: ProgressWhen,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Show a repository overview: archives, segments, journal, and head.
     Summary {
@@ -399,7 +399,7 @@ enum ExportFormat {
     Sqlite,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum CheckpointAction {
     /// List the checkpoints.
     List {
@@ -519,11 +519,8 @@ fn open_repository(directory: &Path, reporter: &Reporter) -> froe::Result<Reposi
     Repository::open_with_progress(directory, &mut reporter.clone())
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one match arm per command reads best as a single dispatch"
-)]
-fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
+/// The read-only commands that print what the store already holds.
+fn run_inspection_command(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
     match command {
         Command::Summary { repository } => {
             inspection::print_summary(&open_repository(&repository, reporter)?)?;
@@ -579,6 +576,14 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
         Command::Checkpoints { repository } => {
             inspection::print_checkpoints(&open_repository(&repository, reporter)?)?;
         }
+        other => return run_export_command(other, reporter),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `froe export`, which dispatches on the output format it was given.
+fn run_export_command(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
+    match command {
         Command::Export {
             repository: repository_path,
             path,
@@ -653,6 +658,14 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                 }
             }
         }
+        other => return run_diagnostic_command(other, reporter),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The read-only commands that verify, digest, or compare revisions.
+fn run_diagnostic_command(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
+    match command {
         Command::Check {
             repository,
             paths,
@@ -723,6 +736,14 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                 reporter,
             )?;
         }
+        other => return run_compaction_command(other, reporter),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `froe compact`, the one maintenance command.
+fn run_compaction_command(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
+    match command {
         Command::Compact {
             repository,
             tail,
@@ -782,6 +803,14 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        other => return run_mutating_command(other, reporter),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The remaining commands that take the lock and change the store.
+fn run_mutating_command(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
+    match command {
         Command::Backup {
             source,
             target,
@@ -824,8 +853,15 @@ fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        // Unreachable: every dispatcher above delegates here only after
+        // excluding the commands it handles itself.
+        other => unreachable!("{other:?} is not a mutating command"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn run(command: Command, reporter: &Reporter) -> froe::Result<ExitCode> {
+    run_inspection_command(command, reporter)
 }
 
 /// Begins a reported step and ends it when dropped, so a step closes on
