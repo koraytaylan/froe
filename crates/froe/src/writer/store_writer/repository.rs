@@ -1720,3 +1720,209 @@ impl SegmentSink for StoreSink<'_> {
         self.store.persist_segment(segment)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::provider::SegmentProvider;
+    use crate::store::Repository;
+    use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::store_writer::test_support::*;
+
+    #[test]
+    fn flush_without_head_movement_syncs_segments_but_appends_no_journal_line() {
+        let directory = TestDirectory::new("flush-pending");
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        // Write a segment without moving the head, then flush: the
+        // archive fsync must run (flush succeeds with a pending writer)
+        // while the journal stays untouched.
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        writer
+            .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+            .expect("node");
+        writer.finish().expect("finish");
+        store.flush().expect("flush with pending segments");
+        let journal = std::fs::read_to_string(directory.path.join("journal.log")).expect("journal");
+        assert_eq!(
+            journal.lines().count(),
+            1,
+            "only the bootstrap line: an unchanged head appends nothing"
+        );
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn flushing_without_head_movement_writes_no_journal_line() {
+        let directory = TestDirectory::new("no-movement");
+        let store = WritableRepository::open(&directory.path).expect("bootstrap");
+        store.flush().expect("first flush");
+        store.flush().expect("second flush");
+        store.close().expect("close");
+        let journal = std::fs::read_to_string(directory.path.join("journal.log")).expect("journal");
+        assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn head_moving_flush_separates_an_unterminated_malformed_journal_tail() {
+        let directory = TestDirectory::new("torn-journal-tail");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let journal_path = directory.path.join("journal.log");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .expect("open journal for simulated torn append")
+            .write_all(b"malformed-unterminated-tail")
+            .expect("append torn tail");
+
+        let committed_head = {
+            let store = WritableRepository::open(&directory.path).expect("bind before torn tail");
+            crate::writer::commit::create_checkpoint(&store, 10_000_000, &[])
+                .expect("head-moving checkpoint");
+            let head = store.head();
+            store.close().expect("close after checkpoint");
+            head
+        };
+
+        let journal = std::fs::read(&journal_path).expect("read journal");
+        assert!(
+            journal
+                .windows(b"malformed-unterminated-tail\n".len())
+                .any(|window| window == b"malformed-unterminated-tail\n"),
+            "the new durable revision must not be concatenated to a malformed tail"
+        );
+        let committed_prefix = format!(
+            "{}:{} root ",
+            committed_head.segment, committed_head.record_number
+        );
+        assert!(
+            journal
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(committed_prefix.as_bytes())),
+            "the exact committed head must occupy its own journal line"
+        );
+
+        let repository = Repository::open(&directory.path).expect("reopen healthy repository");
+        assert_eq!(repository.head_record_identifier(), committed_head);
+        repository
+            .content_root()
+            .expect("content root remains readable");
+        assert_eq!(repository.checkpoints().expect("checkpoints").len(), 1);
+    }
+
+    #[test]
+    fn writes_survive_reopening_through_both_stores() {
+        let directory = TestDirectory::new("reopen");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        {
+            let store = WritableRepository::open(&directory.path).expect("reopen for write");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            let child = writer
+                .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+                .expect("child");
+            let root = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "content".to_owned(),
+                        node: child,
+                    },
+                    &[],
+                )
+                .expect("root");
+            let head = writer
+                .write_node(
+                    None,
+                    &[],
+                    &ChildNodesToWrite::One {
+                        name: "root".to_owned(),
+                        node: root,
+                    },
+                    &[],
+                )
+                .expect("super root");
+            writer.finish().expect("finish");
+            let previous = store.head();
+            assert!(
+                store.compare_and_set_head(previous, head),
+                "compare and set succeeds"
+            );
+            store.close().expect("close");
+        }
+        let repository = Repository::open(&directory.path).expect("reader opens");
+        let content = repository
+            .node_at_path("/content")
+            .expect("resolve")
+            .expect("present");
+        let template = content.template().expect("template");
+        assert_eq!(template.primary_type.as_deref(), Some("nt:unstructured"));
+        assert_eq!(
+            repository.journal_entries().len(),
+            2,
+            "bootstrap plus one commit"
+        );
+    }
+
+    #[test]
+    fn every_written_segment_starts_with_a_segment_info_record() {
+        let directory = TestDirectory::new("segment-info");
+        let store = WritableRepository::open(&directory.path).expect("open fresh store");
+        store.close().expect("close");
+
+        let repository = Repository::open(&directory.path).expect("reader opens");
+        let mut data_segments_seen = 0usize;
+        for segment_identifier in repository.segment_identifiers() {
+            if segment_identifier.is_bulk_segment() {
+                continue;
+            }
+            data_segments_seen += 1;
+            let view = repository.segment(segment_identifier).expect("segment");
+            let first_record = view
+                .structure
+                .record_table()
+                .first()
+                .expect("a data segment has records")
+                .record_number;
+            let info = crate::content::value::read_string(
+                &repository,
+                crate::segment::record::RecordIdentifier::new(segment_identifier, first_record),
+            )
+            .expect("record 0 is a readable string");
+            // The exact shape backup timestamp parsing and Java-side
+            // diagnostics rely on: {"wid":"...","sno":N,"t":T}.
+            assert!(
+                info.starts_with("{\"wid\":\""),
+                "unexpected info record {info:?}"
+            );
+            assert!(
+                info.contains("\",\"sno\":"),
+                "unexpected info record {info:?}"
+            );
+            assert!(info.contains(",\"t\":"), "unexpected info record {info:?}");
+            assert!(info.ends_with('}'), "unexpected info record {info:?}");
+        }
+        assert!(
+            data_segments_seen > 0,
+            "a bootstrapped store must hold at least one data segment"
+        );
+    }
+
+    #[test]
+    fn the_lock_excludes_concurrent_writers() {
+        let directory = TestDirectory::new("exclusion");
+        let store = WritableRepository::open(&directory.path).expect("first open");
+        assert!(
+            WritableRepository::open(&directory.path).is_err(),
+            "a second writable session must be refused"
+        );
+        store.close().expect("close");
+    }
+}

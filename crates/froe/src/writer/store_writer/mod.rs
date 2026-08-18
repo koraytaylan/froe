@@ -20,11 +20,13 @@
 //! Segments written during the session are kept in memory (shared
 //! buffers) so reads resolve them immediately; on disk they live in the
 //! archives this writer produces.
+//!
+//! Every test lives with the stage it exercises, including the ones that
+//! drive a whole session: a claim about what a sweep publishes belongs
+//! beside the sweep even when it is made through `WritableRepository`.
 
 #[cfg(test)]
 mod test_support;
-#[cfg(test)]
-mod tests;
 
 mod archive_certificate;
 mod archive_numbering;

@@ -1032,10 +1032,23 @@ pub(crate) fn is_reclaimable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::identifier::SegmentIdentifier;
+    use crate::segment::parsed_segment::ParsedSegment;
+    use crate::segment::record::RecordType;
+    use crate::store::Repository;
+    use crate::tar_archive::archive::TarArchiveReader;
+    use crate::tar_archive::file_name::ArchiveFileName;
+    use crate::writer::compaction::CompactionKind;
+    use crate::writer::segment_builder::GarbageCollectionGeneration;
+    use crate::writer::store_writer::archive_certificate::*;
+    use crate::writer::store_writer::reclaim::*;
+    use crate::writer::store_writer::repository::*;
+    use crate::writer::store_writer::sweep_plan::*;
+    use crate::writer::tar_writer::TarArchiveWriter;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
 
     use crate::writer::store_writer::test_support::*;
-    use std::collections::HashMap;
-    use std::collections::HashSet;
 
     #[test]
     fn full_reclaimer_retained_two_honors_exact_and_wrapping_boundaries() {
@@ -1306,6 +1319,613 @@ mod tests {
             missing_graph,
             &source_path,
             &source_before,
+        );
+    }
+
+    /// The boundary the retention value actually moves, and the store shape
+    /// that sits on it: a head Oak tail-compacted to `(1,0,compacted)` over
+    /// generation-zero data segments it still reaches. At two retained
+    /// generations those segments are spared by arithmetic; at one they are
+    /// reclaimable, and only `validate_reclaim_reference_invariant` stands
+    /// between the head and its own data.
+    #[test]
+    fn one_retained_generation_reclaims_what_two_spared() {
+        let tail_compacted_head = generation(1, 0, true);
+        let untouched_tail = generation(0, 0, false);
+        assert!(is_reclaimable(
+            tail_compacted_head,
+            untouched_tail,
+            CompactionKind::Full,
+            1
+        ));
+        assert!(!is_reclaimable(
+            tail_compacted_head,
+            untouched_tail,
+            CompactionKind::Full,
+            2
+        ));
+        assert_eq!(
+            crate::writer::store_writer::RETAINED_GENERATIONS,
+            1,
+            "the run's own retention value is the one this boundary describes"
+        );
+    }
+
+    #[test]
+    fn occupied_next_generation_is_never_truncated_or_rewritten() {
+        let directory = TestDirectory::new("occupied-next-generation");
+        let root = data_identifier(10);
+        let old_one = data_identifier(11);
+        let old_two = data_identifier(12);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(root, 1, generation(4, 4, false)),
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+            ],
+        );
+        let occupied = b"interrupted-cleanup-evidence-must-survive";
+        std::fs::write(directory.path.join("data00000b.tar"), occupied)
+            .expect("write occupied target");
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open source");
+        let cleaned = HashSet::from([old_one, old_two]);
+
+        let planned = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &cleaned,
+            ArchiveRewritePolicy::default(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan")
+        .expect("archive has reclaimable entries");
+        assert!(matches!(
+            planned,
+            PlannedArchiveSweep::BlockedByOccupiedGeneration {
+                ref occupied_name,
+                ..
+            } if occupied_name == "data00000b.tar"
+        ));
+        let mut fallback = None;
+        sweep_one_archive(
+            &directory.path,
+            &reader,
+            &cleaned,
+            &cleaned,
+            &[&reader],
+            &mut fallback,
+            None,
+            ArchiveRewritePolicy::default(),
+        )
+        .expect("blocked sweep is a safe no-op");
+        assert_eq!(
+            std::fs::read(directory.path.join("data00000b.tar")).expect("read occupied target"),
+            occupied
+        );
+        assert!(directory.path.join("data00000a.tar").exists());
+    }
+
+    #[test]
+    fn occupied_higher_generation_blocks_whole_archive_removal() {
+        let directory = TestDirectory::new("occupied-blocks-whole-removal");
+        let obsolete = data_identifier(13);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(obsolete, 1, generation(0, 0, false))],
+        );
+        let occupied = b"damaged-higher-generation-must-not-become-active";
+        std::fs::write(directory.path.join("data00000c.tar"), occupied)
+            .expect("write recovered residue");
+        let source_path = directory.path.join("data00000a.tar");
+        let source_before = std::fs::read(&source_path).expect("read source");
+        let reader = TarArchiveReader::open(&source_path).expect("open source");
+        let cleaned = HashSet::from([obsolete]);
+
+        assert!(matches!(
+            plan_archive_sweep(
+                &directory.path,
+                &reader,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+                .expect("plan")
+                .expect("eligible archive"),
+            PlannedArchiveSweep::BlockedByOccupiedGeneration {
+                occupied_name,
+                segment_count: 1,
+                ..
+            } if occupied_name == "data00000c.tar"
+        ));
+        let mut fallback = None;
+        sweep_one_archive(
+            &directory.path,
+            &reader,
+            &cleaned,
+            &cleaned,
+            &[&reader],
+            &mut fallback,
+            None,
+            ArchiveRewritePolicy::default(),
+        )
+        .expect("blocked removal is a no-op");
+        assert_eq!(
+            std::fs::read(source_path).expect("source remains"),
+            source_before
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("data00000c.tar")).expect("residue remains"),
+            occupied
+        );
+    }
+
+    #[test]
+    fn lower_stale_generation_blocks_whole_active_archive_removal() {
+        let directory = TestDirectory::new("lower-letter-blocks-whole-removal");
+        let stale = data_identifier(14);
+        let obsolete = data_identifier(15);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(stale, 1, generation(0, 0, false))],
+        );
+        write_test_archive(
+            &directory,
+            "data00000b.tar",
+            &[TestArchiveEntry::new(obsolete, 1, generation(0, 0, false))],
+        );
+        let stale_path = directory.path.join("data00000a.tar");
+        let active_path = directory.path.join("data00000b.tar");
+        let stale_before = std::fs::read(&stale_path).expect("read stale generation");
+        let active_before = std::fs::read(&active_path).expect("read active generation");
+        let active = TarArchiveReader::open(&active_path).expect("open active generation");
+        let cleaned = HashSet::from([obsolete]);
+
+        assert!(matches!(
+            plan_archive_sweep(
+                &directory.path,
+                &active,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+                .expect("plan")
+                .expect("eligible archive"),
+            PlannedArchiveSweep::BlockedByOccupiedGeneration {
+                occupied_name,
+                segment_count: 1,
+                ..
+            } if occupied_name == "data00000a.tar"
+        ));
+        let mut fallback = None;
+        sweep_one_archive(
+            &directory.path,
+            &active,
+            &cleaned,
+            &cleaned,
+            &[&active],
+            &mut fallback,
+            None,
+            ArchiveRewritePolicy::default(),
+        )
+        .expect("blocked removal is a no-op");
+        assert_eq!(
+            std::fs::read(active_path).expect("active remains"),
+            active_before
+        );
+        assert_eq!(
+            std::fs::read(stale_path).expect("stale remains"),
+            stale_before
+        );
+    }
+
+    #[test]
+    fn last_generation_z_is_deferred_without_creating_an_invalid_successor() {
+        let directory = TestDirectory::new("generation-z");
+        let root = data_identifier(20);
+        let old_one = data_identifier(21);
+        let old_two = data_identifier(22);
+        write_test_archive(
+            &directory,
+            "data00000z.tar",
+            &[
+                TestArchiveEntry::new(root, 1, generation(4, 4, false)),
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+            ],
+        );
+        let path = directory.path.join("data00000z.tar");
+        let before = std::fs::read(&path).expect("read source");
+        let reader = TarArchiveReader::open(&path).expect("open source");
+        let cleaned = HashSet::from([old_one, old_two]);
+        assert!(matches!(
+            plan_archive_sweep(
+                &directory.path,
+                &reader,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("plan")
+            .expect("has eligible entries"),
+            PlannedArchiveSweep::DeferredAtLastGeneration { .. }
+        ));
+        let mut fallback = None;
+        sweep_one_archive(
+            &directory.path,
+            &reader,
+            &cleaned,
+            &cleaned,
+            &[&reader],
+            &mut fallback,
+            None,
+            ArchiveRewritePolicy::default(),
+        )
+        .expect("z sweep is a no-op");
+        assert_eq!(std::fs::read(path).expect("read after"), before);
+        assert_eq!(
+            std::fs::read_dir(&directory.path)
+                .expect("list")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tar"))
+                .count(),
+            1
+        );
+    }
+
+    /// Rebuilds `source` under `swap_name` as a byte-valid archive with the
+    /// same UUIDs, index layout, generations, graph, and stale binary-reference
+    /// catalog. Only the inline blob identifier changes, at equal length, so the
+    /// sweep plan remains unchanged while the segment-entry CRC is recomputed by
+    /// the writer. Returns the bytes of the archive it wrote.
+    #[cfg(unix)]
+    fn rebuild_source_with_swapped_blob(
+        directory: &Path,
+        source: &TarArchiveReader,
+        swap_name: &str,
+        source_name: &str,
+        blob_segment: SegmentIdentifier,
+        original_blob: &[u8],
+        swapped_blob: &[u8],
+    ) -> Vec<u8> {
+        let mut swapped_writer =
+            TarArchiveWriter::new_exclusive_staged(directory, swap_name, source_name);
+        copy_binary_reference_catalog(&mut swapped_writer, source);
+        let mut entries = source.index().expect("source index").entries().to_vec();
+        entries.sort_by_key(|entry| entry.position);
+        let mut changed_blob = false;
+        for entry in &entries {
+            let identifier = entry.segment_identifier;
+            let mut bytes = source
+                .segment_data(identifier)
+                .expect("indexed source payload")
+                .to_vec();
+            let structure = ParsedSegment::parse(identifier, &bytes).expect("source segment");
+            if identifier == blob_segment {
+                swap_inline_blob_identifier(&mut bytes, &structure, original_blob, swapped_blob);
+                changed_blob = true;
+            }
+            let changed_structure =
+                ParsedSegment::parse(identifier, &bytes).expect("same-layout changed segment");
+            swapped_writer
+                .write_segment(
+                    identifier,
+                    &bytes,
+                    GarbageCollectionGeneration {
+                        generation: entry.generation,
+                        full_generation: entry.full_generation,
+                        is_compacted: entry.is_compacted,
+                    },
+                    &changed_structure.referenced_segments,
+                    &[],
+                )
+                .expect("write changed source entry");
+        }
+        assert!(changed_blob, "the fixture must change one blob identifier");
+        swapped_writer.close().expect("close changed source");
+        std::fs::read(directory.join(swap_name)).expect("read changed source")
+    }
+
+    /// Reproduces `source`'s binary-reference catalog in `writer` verbatim, so
+    /// the rebuilt archive carries the same stale entries the original did.
+    #[cfg(unix)]
+    fn copy_binary_reference_catalog(writer: &mut TarArchiveWriter, source: &TarArchiveReader) {
+        for catalog_generation in source
+            .binary_references()
+            .expect("source binary-reference catalog")
+            .generations
+        {
+            let catalog_gc_generation = GarbageCollectionGeneration {
+                generation: catalog_generation.generation,
+                full_generation: catalog_generation.full_generation,
+                is_compacted: catalog_generation.is_compacted,
+            };
+            for (identifier, references) in catalog_generation.segments {
+                writer.add_binary_references(catalog_gc_generation, identifier, references);
+            }
+        }
+    }
+
+    /// Overwrites the one inline (`0xE0`-class) external-blob identifier in
+    /// `bytes` with `swapped_blob`, asserting the record is the shape the
+    /// fixture depends on and that the replacement is the same length.
+    #[cfg(unix)]
+    fn swap_inline_blob_identifier(
+        bytes: &mut [u8],
+        structure: &ParsedSegment,
+        original_blob: &[u8],
+        swapped_blob: &[u8],
+    ) {
+        let external = structure
+            .record_table()
+            .iter()
+            .find(|record| record.record_type() == Some(RecordType::ExternalBlobIdentifier))
+            .expect("inline external-blob record");
+        let position = structure
+            .buffer_position(external.offset)
+            .expect("external-blob record position");
+        let encoded_length = u16::from_be_bytes([bytes[position], bytes[position + 1]]);
+        assert_eq!(encoded_length & 0xF000, 0xE000);
+        assert_eq!(usize::from(encoded_length & 0x0FFF), original_blob.len());
+        assert_eq!(
+            &bytes[position + 2..position + 2 + original_blob.len()],
+            original_blob
+        );
+        bytes[position + 2..position + 2 + swapped_blob.len()].copy_from_slice(swapped_blob);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immediate_source_certificate_uses_the_reopened_blob_payload() {
+        const ORIGINAL_BLOB: &[u8] = b"live-external-blob";
+        const SWAPPED_BLOB: &[u8] = b"evil-external-blob";
+        assert_eq!(ORIGINAL_BLOB.len(), SWAPPED_BLOB.len());
+
+        let directory = TestDirectory::new("reopened-source-provider");
+        let blob_segment = {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap writer");
+            let previous = store.head();
+            let write_generation = store.writing_generation().expect("write generation");
+            let (head, child) = write_session_semantic_fixture(&store, write_generation);
+            assert!(store.compare_and_set_head(previous, head));
+            store.close().expect("close blob-bearing source");
+            child.segment
+        };
+
+        // Keep this repository open across the path replacement. It models the
+        // complete provider captured before an actionable source is reopened.
+        let stale_repository = Repository::open(&directory.path).expect("open original mapping");
+        let source = stale_repository
+            .archives()
+            .iter()
+            .find(|archive| archive.contains_segment(blob_segment))
+            .expect("archive containing blob segment");
+        certify_active_archive(&stale_repository, source).expect("original source is certified");
+        let source_name = source.file_name().to_owned();
+        let source_path = directory.path.join(&source_name);
+        let swap_name = format!("{source_name}.swapped");
+        let swap_path = directory.path.join(&swap_name);
+
+        let swapped_bytes = rebuild_source_with_swapped_blob(
+            &directory.path,
+            source,
+            &swap_name,
+            &source_name,
+            blob_segment,
+            ORIGINAL_BLOB,
+            SWAPPED_BLOB,
+        );
+        std::fs::rename(&swap_path, &source_path).expect("replace source pathname");
+
+        let reopened = TarArchiveReader::open(&source_path).expect("reopen changed source");
+        // The certificate reconstructs from the payload bytes of the archive
+        // it was handed, so an inline (`0xE0`-class) identifier is caught
+        // whatever provider is passed — a stale one no longer masks it. The
+        // provider still resolves every UUID the segment *references*, which
+        // is what the reopened-source shadowing below remains needed for.
+        let stale_provider_error = certify_active_archive(&stale_repository, &reopened)
+            .expect_err("the reopened payload is certified against itself, not the stale mapping");
+        assert!(
+            stale_provider_error.to_string().contains("catalog differs"),
+            "{stale_provider_error}"
+        );
+
+        let cleaned: HashSet<_> = source
+            .segment_identifiers()
+            .filter(|identifier| *identifier != blob_segment)
+            .collect();
+        assert!(
+            !cleaned.is_empty(),
+            "the fixture must request a partial rewrite"
+        );
+        assert!(matches!(
+            plan_archive_sweep(
+                &directory.path,
+                source,
+                &cleaned,
+                ArchiveRewritePolicy::default(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("source sweep plan"),
+            Some(PlannedArchiveSweep::Rewrite { .. })
+        ));
+        let mut fallback_provider = None;
+        let error = sweep_one_archive(
+            &directory.path,
+            source,
+            &cleaned,
+            &cleaned,
+            &[source],
+            &mut fallback_provider,
+            Some(&stale_repository),
+            ArchiveRewritePolicy::default(),
+        )
+        .expect_err("fresh source payload must invalidate its stale BRF before publication");
+
+        assert!(error.to_string().contains("catalog differs"), "{error}");
+        assert_eq!(
+            std::fs::read(&source_path).expect("changed source remains"),
+            swapped_bytes
+        );
+        let parsed_name = ArchiveFileName::parse(&source_name).expect("source archive name");
+        let next_generation = char::from(parsed_name.file_generation as u8 + 1);
+        assert!(
+            !directory
+                .path
+                .join(format!(
+                    "data{:05}{next_generation}.tar",
+                    parsed_name.archive_number
+                ))
+                .exists(),
+            "no replacement may be published after the fresh certificate fails"
+        );
+    }
+
+    /// The two-archive store the rewrite-replan cases sweep. Each source holds
+    /// segments the sweep may reclaim, and the second holds a root whose graph
+    /// edge points at the first archive's reclaimable target — the edge whose
+    /// survival distinguishes a blocked replan from a published one.
+    struct ReplanFixture {
+        target: SegmentIdentifier,
+        old_one: SegmentIdentifier,
+        old_two: SegmentIdentifier,
+        root: SegmentIdentifier,
+    }
+
+    fn build_replan_fixture(directory: &TestDirectory) -> ReplanFixture {
+        let target = data_identifier(83);
+        let retained = data_identifier(84);
+        let old_one = data_identifier(85);
+        let old_two = data_identifier(86);
+        let root = data_identifier(87);
+        let reference = generation(5, 5, false);
+        write_test_archive(
+            directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(target, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(retained, 1, reference),
+            ],
+        );
+        write_test_archive(
+            directory,
+            "data00001a.tar",
+            &[
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(root, 1, reference).referencing(&[target]),
+            ],
+        );
+        ReplanFixture {
+            target,
+            old_one,
+            old_two,
+            root,
+        }
+    }
+
+    /// Every source must be an actionable rewrite before the sweeps run, or the
+    /// outcomes they report would prove nothing about the replan.
+    fn assert_both_sources_plan_rewrites(
+        directory: &Path,
+        sources: [&TarArchiveReader; 2],
+        reclaimable: &HashSet<SegmentIdentifier>,
+    ) {
+        for source in sources {
+            assert!(matches!(
+                plan_archive_sweep(
+                    directory,
+                    source,
+                    reclaimable,
+                    ArchiveRewritePolicy::default(),
+                    &HashSet::new(),
+                )
+                .expect("initial plan")
+                .expect("archive is initially actionable"),
+                PlannedArchiveSweep::Rewrite { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn rewrite_replan_noop_reports_no_unavailable_graph_targets() {
+        let directory = TestDirectory::new("rewrite-replan-noop-graph-target");
+        let ReplanFixture {
+            target,
+            old_one,
+            old_two,
+            root,
+        } = build_replan_fixture(&directory);
+
+        let first = TarArchiveReader::open(&directory.path.join("data00000a.tar"))
+            .expect("open first rewrite source");
+        let second = TarArchiveReader::open(&directory.path.join("data00001a.tar"))
+            .expect("open second rewrite source");
+        let reclaimable = HashSet::from([target, old_one, old_two]);
+        assert_both_sources_plan_rewrites(&directory.path, [&first, &second], &reclaimable);
+
+        // Model a pathname appearing after the outer plan but before the
+        // immediate per-archive replan. The first sweep must return a proven
+        // no-publication outcome, not inherit the stale Rewrite disposition.
+        let occupied = b"occupied after outer planning";
+        std::fs::write(directory.path.join("data00000b.tar"), occupied)
+            .expect("occupy first replacement");
+        let provider_order = [&first, &second];
+        let mut fallback = None;
+        let mut actually_unavailable = HashSet::new();
+        let first_outcome = sweep_one_archive(
+            &directory.path,
+            &first,
+            &reclaimable,
+            &actually_unavailable,
+            &provider_order,
+            &mut fallback,
+            None,
+            ArchiveRewritePolicy::default(),
+        )
+        .expect("blocked immediate replan is a no-op");
+        assert!(first_outcome.deletion_failures.is_empty());
+        assert!(
+            first_outcome.newly_unavailable.is_empty(),
+            "a planned rewrite that never published cannot justify graph filtering"
+        );
+        assert!(
+            directory.path.join("data00000a.tar").exists(),
+            "the blocked immediate replan must leave its source available"
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("data00000b.tar")).expect("read occupied target"),
+            occupied,
+            "the blocked immediate replan must not replace the new pathname"
+        );
+        actually_unavailable.extend(first_outcome.newly_unavailable);
+
+        let second_outcome = sweep_one_archive(
+            &directory.path,
+            &second,
+            &reclaimable,
+            &actually_unavailable,
+            &provider_order,
+            &mut fallback,
+            None,
+            ArchiveRewritePolicy::default(),
+        )
+        .expect("second rewrite publishes");
+        assert_eq!(
+            second_outcome.newly_unavailable,
+            HashSet::from([old_one, old_two])
+        );
+
+        let rewritten = TarArchiveReader::open(&directory.path.join("data00001b.tar"))
+            .expect("open second replacement");
+        assert_eq!(
+            rewritten.segment_graph().expect("valid graph").as_map()[&root],
+            [target],
+            "the later rewrite must retain an edge to the still-available first target"
         );
     }
 }

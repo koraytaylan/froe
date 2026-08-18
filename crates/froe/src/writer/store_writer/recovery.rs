@@ -436,7 +436,7 @@ pub(super) fn backup_path(directory: &Path, file_name: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::content::provider::SegmentProvider;
     use crate::store::Repository;
 
     use crate::writer::store_writer::repository::*;
@@ -499,5 +499,49 @@ mod tests {
             "the refusal must not surface a bare errno: {message}"
         );
         assert!(junk.exists(), "the refusal leaves the file in place");
+    }
+
+    #[test]
+    fn archives_without_an_index_are_recovered_with_backups() {
+        let directory = TestDirectory::new("write-recovery");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // Truncate the archive's trailers, leaving only entry data.
+        let path = directory.path.join("data00000a.tar");
+        let full = std::fs::read(&path).expect("read");
+        // Find the first trailer: the '.brf' entry header.
+        let trailer_start = full
+            .windows(4)
+            .position(|window| window == b".brf")
+            .map(|position| (position / 512) * 512)
+            .expect("brf trailer present");
+        let mut truncated = full[..trailer_start].to_vec();
+        truncated.extend_from_slice(&[0u8; 1024]);
+        std::fs::write(&path, &truncated).expect("truncate");
+
+        {
+            let store = WritableRepository::open(&directory.path).expect("recovering open");
+            let head = store.head();
+            assert!(
+                store.segment(head.segment).is_ok(),
+                "head segment recovered"
+            );
+            store.close().expect("close");
+        }
+        assert!(
+            directory.path.join("data00000a.tar.bak").exists(),
+            "the damaged archive is backed up"
+        );
+        let repository = Repository::open(&directory.path).expect("reader opens");
+        assert!(
+            !repository
+                .archives()
+                .iter()
+                .any(crate::tar_archive::archive::TarArchiveReader::is_recovered),
+            "the regenerated archive has a valid index"
+        );
+        repository.content_root().expect("content root resolves");
     }
 }

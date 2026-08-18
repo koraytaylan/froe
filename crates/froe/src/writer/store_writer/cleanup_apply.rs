@@ -318,3 +318,348 @@ pub(super) fn apply_standalone_segment_cleanup_from_archives(
     outcome.deletion_failures.dedup();
     Ok((plan, outcome))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tar_archive::archive::TarArchiveReader;
+    use crate::writer::store_writer::reclaim::*;
+    use crate::writer::store_writer::sweep_plan::*;
+    use crate::writer::store_writer::test_support::*;
+    use crate::writer::tar_writer::TarArchiveWriter;
+    use std::collections::HashSet;
+
+    #[test]
+    fn store_wide_reclaim_set_filters_cross_archive_graph_targets() {
+        let directory = TestDirectory::new("global-graph-filter");
+        let target = data_identifier(70);
+        let old_one = data_identifier(71);
+        let old_two = data_identifier(72);
+        let root = data_identifier(73);
+        let reference = generation(5, 5, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(target, 1, generation(0, 0, false))],
+        );
+        write_test_archive(
+            &directory,
+            "data00001a.tar",
+            &[
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(root, 1, reference).referencing(&[target]),
+            ],
+        );
+        write_manifest(&directory);
+
+        let expected =
+            plan_cleanup_from_directory(&directory.path, reference, root, &HashSet::new())
+                .expect("plan");
+        assert_eq!(
+            expected.reclaimable_segments(),
+            &HashSet::from([target, old_one, old_two])
+        );
+        assert!(expected.archives.iter().any(|archive| matches!(
+            archive,
+            PlannedArchiveSweep::Remove { file_name, .. }
+                if file_name == "data00000a.tar"
+        )));
+        assert!(expected.archives.iter().any(|archive| matches!(
+            archive,
+            PlannedArchiveSweep::Rewrite {
+                file_name,
+                replacement_name,
+                ..
+            } if file_name == "data00001a.tar" && replacement_name == "data00001b.tar"
+        )));
+
+        let (_, outcome) = apply_cleanup_from_directory(
+            &directory.path,
+            reference,
+            root,
+            &HashSet::new(),
+            Some(&expected),
+        )
+        .expect("apply");
+        assert_eq!(outcome.removed_archives, 1);
+        assert_eq!(outcome.rewritten_archives, 1);
+        assert_eq!(outcome.removed_segments, 3);
+        assert!(!directory.path.join("data00000a.tar").exists());
+        assert!(!directory.path.join("data00001a.tar").exists());
+
+        let swept = TarArchiveReader::open(&directory.path.join("data00001b.tar"))
+            .expect("open swept archive");
+        assert_eq!(swept.segment_count(), 1);
+        assert!(swept.contains_segment(root));
+        let graph = swept.segment_graph().expect("graph remains valid");
+        assert!(
+            graph
+                .adjacency
+                .iter()
+                .flat_map(|(_, targets)| targets)
+                .all(|identifier| *identifier != target),
+            "the target reclaimed from another tar must be filtered globally"
+        );
+    }
+
+    #[test]
+    fn deferred_cross_archive_target_remains_in_rewritten_graph() {
+        let directory = TestDirectory::new("deferred-global-graph-target");
+        let target = data_identifier(74);
+        let retained_one = data_identifier(75);
+        let retained_two = data_identifier(76);
+        let retained_three = data_identifier(77);
+        let old_one = data_identifier(78);
+        let old_two = data_identifier(79);
+        let root = data_identifier(80);
+        let reference = generation(5, 5, false);
+        // Generation `z` is the deferral the default policy still produces:
+        // the `a`–`z` namespace is a format limit, not an economic choice, so
+        // this archive keeps its reclaimable target on disk however little
+        // rewriting it would free.
+        write_test_archive(
+            &directory,
+            "data00000z.tar",
+            &[
+                TestArchiveEntry::new(target, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(retained_one, 1, reference),
+                TestArchiveEntry::new(retained_two, 1, reference),
+                TestArchiveEntry::new(retained_three, 1, reference),
+            ],
+        );
+        write_test_archive(
+            &directory,
+            "data00001a.tar",
+            &[
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(root, 1, reference).referencing(&[target]),
+            ],
+        );
+        write_manifest(&directory);
+
+        let expected =
+            plan_cleanup_from_directory(&directory.path, reference, root, &HashSet::new())
+                .expect("plan");
+        assert!(expected.archives.iter().any(|archive| matches!(
+            archive,
+            PlannedArchiveSweep::DeferredAtLastGeneration { file_name, .. }
+                if file_name == "data00000z.tar"
+        )));
+        assert!(expected.archives.iter().any(|archive| matches!(
+            archive,
+            PlannedArchiveSweep::Rewrite { file_name, .. }
+                if file_name == "data00001a.tar"
+        )));
+
+        apply_cleanup_from_directory(
+            &directory.path,
+            reference,
+            root,
+            &HashSet::new(),
+            Some(&expected),
+        )
+        .expect("apply");
+
+        assert!(
+            directory.path.join("data00000z.tar").exists(),
+            "the deferred target remains physically available"
+        );
+        let swept = TarArchiveReader::open(&directory.path.join("data00001b.tar"))
+            .expect("open rewritten source");
+        let graph = swept.segment_graph().expect("graph remains valid");
+        assert_eq!(
+            graph.as_map()[&root],
+            [target],
+            "a deferred target must not be filtered by a wider global reclaim set"
+        );
+    }
+
+    #[test]
+    fn immediate_replan_noop_is_not_reported_as_a_completed_rewrite() {
+        let directory = TestDirectory::new("rewrite-replan-noop-outcome");
+        let old_one = data_identifier(81);
+        let old_two = data_identifier(82);
+        let root = data_identifier(83);
+        let reference = generation(5, 5, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(root, 1, reference),
+            ],
+        );
+        write_manifest(&directory);
+
+        let archives = crate::store::open_all_archives(&directory.path).expect("open archives");
+        let occupied = b"occupied after authoritative planning";
+        let after_plan = |plan: &StandaloneSegmentCompactionPlan| {
+            let replacement = plan
+                .archives
+                .iter()
+                .find_map(|archive| match archive {
+                    PlannedArchiveSweep::Rewrite {
+                        file_name,
+                        replacement_name,
+                        ..
+                    } if file_name == "data00000a.tar" => Some(replacement_name),
+                    _ => None,
+                })
+                .expect("the authoritative outer plan must request a rewrite");
+            std::fs::write(directory.path.join(replacement), occupied)?;
+            Ok(())
+        };
+        let (plan, outcome) = apply_standalone_segment_cleanup_from_archives(
+            &directory.path,
+            &archives,
+            None,
+            standalone_rule(reference),
+            root,
+            &HashSet::new(),
+            ArchiveRewritePolicy::default(),
+            None,
+            &mut crate::progress::DiscardedProgress,
+            Some(&after_plan),
+        )
+        .expect("an occupied immediate replan is a safe no-op");
+
+        assert!(matches!(
+            plan.archives.as_slice(),
+            [PlannedArchiveSweep::Rewrite { .. }]
+        ));
+        assert_eq!(outcome.rewritten_archives, 0);
+        assert_eq!(outcome.removed_archives, 0);
+        assert_eq!(outcome.removed_segments, 0);
+        assert!(outcome.deletion_failures.is_empty());
+        assert!(directory.path.join("data00000a.tar").exists());
+        assert_eq!(
+            std::fs::read(directory.path.join("data00000b.tar"))
+                .expect("read occupied replacement"),
+            occupied,
+            "an unrelated occupied generation must not be credited as cleanup output"
+        );
+    }
+
+    #[test]
+    fn sweep_preserves_survivor_brf_generation_triples_and_omits_removed_sources() {
+        let directory = TestDirectory::new("brf-filter-and-triples");
+        let root = data_identifier(80);
+        let removed_one = data_identifier(81);
+        let removed_two = data_identifier(82);
+        let reference = generation(6, 6, false);
+        let survivor_catalog_generation = generation(17, 11, true);
+        let removed_catalog_generation = generation(18, 12, false);
+
+        let mut writer = TarArchiveWriter::new(&directory.path, "data00000a.tar");
+        writer.add_binary_references(survivor_catalog_generation, root, ["live-blob".to_owned()]);
+        writer.add_binary_references(
+            removed_catalog_generation,
+            removed_one,
+            ["dead-blob-one".to_owned()],
+        );
+        writer.add_binary_references(
+            removed_catalog_generation,
+            removed_two,
+            ["dead-blob-two".to_owned()],
+        );
+        for entry in [
+            TestArchiveEntry::new(root, 1, reference),
+            TestArchiveEntry::new(removed_one, 1, generation(0, 0, false)),
+            TestArchiveEntry::new(removed_two, 1, generation(0, 0, false)),
+        ] {
+            writer
+                .write_segment(entry.identifier, &entry.content, entry.generation, &[], &[])
+                .expect("write segment");
+        }
+        writer.close().expect("close archive");
+        write_manifest(&directory);
+
+        let plan = plan_cleanup_from_directory(&directory.path, reference, root, &HashSet::new())
+            .expect("plan");
+        apply_cleanup_from_directory(
+            &directory.path,
+            reference,
+            root,
+            &HashSet::new(),
+            Some(&plan),
+        )
+        .expect("apply");
+
+        let swept = TarArchiveReader::open(&directory.path.join("data00000b.tar"))
+            .expect("open swept archive");
+        let catalog = swept.binary_references().expect("catalog survives");
+        assert_eq!(catalog.generations.len(), 1);
+        let generation = &catalog.generations[0];
+        assert_eq!(
+            generation.generation,
+            survivor_catalog_generation.generation
+        );
+        assert_eq!(
+            generation.full_generation,
+            survivor_catalog_generation.full_generation
+        );
+        assert_eq!(
+            generation.is_compacted,
+            survivor_catalog_generation.is_compacted
+        );
+        assert_eq!(
+            generation.segments,
+            vec![(root, vec!["live-blob".to_owned()])]
+        );
+        assert!(catalog.generations.iter().all(|generation| {
+            generation
+                .segments
+                .iter()
+                .all(|(source, _)| *source != removed_one && *source != removed_two)
+        }));
+    }
+
+    #[test]
+    fn missing_brf_reconstruction_failure_leaves_original_and_no_replacement() {
+        let directory = TestDirectory::new("missing-brf-fail-closed");
+        let root = data_identifier(120);
+        let removed_one = data_identifier(121);
+        let removed_two = data_identifier(122);
+        let reference = generation(5, 5, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(root, 64, reference),
+                TestArchiveEntry::new(removed_one, 64, generation(0, 0, false)),
+                TestArchiveEntry::new(removed_two, 64, generation(0, 0, false)),
+            ],
+        );
+        let source_path = directory.path.join("data00000a.tar");
+        let mut bytes = std::fs::read(&source_path).expect("read archive");
+        let brf_magic = bytes
+            .windows(4)
+            .position(|window| window == [0x0A, 0x31, 0x42, 0x0A])
+            .expect("brf magic");
+        bytes[brf_magic] ^= 0x01;
+        std::fs::write(&source_path, &bytes).expect("corrupt only brf footer");
+        write_manifest(&directory);
+        let reader = TarArchiveReader::open(&source_path).expect("index remains valid");
+        assert!(reader.index().is_some());
+        assert!(reader.segment_graph().is_some());
+        assert!(reader.binary_references().is_none());
+        drop(reader);
+
+        let plan = plan_cleanup_from_directory(&directory.path, reference, root, &HashSet::new())
+            .expect("mark does not need brf");
+        let error = apply_cleanup_from_directory(
+            &directory.path,
+            reference,
+            root,
+            &HashSet::new(),
+            Some(&plan),
+        )
+        .expect_err("catalog reconstruction must fail closed on malformed data");
+        assert!(error.to_string().contains("magic bytes"));
+        assert_eq!(std::fs::read(&source_path).expect("source remains"), bytes);
+        assert!(!directory.path.join("data00000b.tar").exists());
+    }
+}

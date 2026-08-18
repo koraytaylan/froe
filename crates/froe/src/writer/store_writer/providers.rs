@@ -345,10 +345,18 @@ impl SegmentProvider for ArchiveSegmentsProvider<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::provider::SegmentProvider;
+    use crate::store::Repository;
+    use crate::tar_archive::archive::TarArchiveReader;
+    use crate::writer::compaction::CompactionKind;
+    use crate::writer::segment_builder::GarbageCollectionGeneration;
+    use crate::writer::store_writer::reclaim::*;
+    use crate::writer::store_writer::repository::*;
+    use crate::writer::store_writer::sweep_plan::*;
+    use std::collections::HashSet;
 
     use crate::writer::store_writer::test_support::*;
     use crate::writer::tar_writer::TarArchiveWriter;
-    use std::collections::HashSet;
 
     #[test]
     fn mark_and_session_seed_follow_every_non_data_identifier() {
@@ -449,5 +457,115 @@ mod tests {
                 "a proof of {proved:?} must not cover {current:?}"
             );
         }
+    }
+
+    #[test]
+    fn post_compaction_reclaim_certifies_base_payload_before_mutation() {
+        let directory = TestDirectory::new("postcomp-base-source-certificate");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let base_path = directory.path.join("data00000a.tar");
+        let repository = Repository::open(&directory.path).expect("open healthy base");
+        let head = repository.head_record_identifier();
+        let entry = *repository
+            .archives()
+            .iter()
+            .find_map(|archive| archive.index_entry(head.segment))
+            .expect("head index entry");
+        drop(repository);
+        let mut corrupt_base = std::fs::read(&base_path).expect("read base");
+        corrupt_base[entry.position as usize + entry.size as usize - 1] ^= 0x01;
+        std::fs::write(&base_path, &corrupt_base).expect("corrupt base payload CRC");
+        let journal_before =
+            std::fs::read(directory.path.join("journal.log")).expect("journal before");
+
+        let mut store =
+            WritableRepository::open(&directory.path).expect("open corrupt-indexed base");
+        let error = store
+            .reclaim_old_generations(generation(2, 2, true), CompactionKind::Full)
+            .expect_err("base source certificate must precede post-compaction sweeping");
+
+        assert!(error.to_string().contains("payload CRC"), "{error}");
+        assert_eq!(
+            std::fs::read(&base_path).expect("base after refusal"),
+            corrupt_base,
+            "post-compaction certification must not rewrite its corrupt source"
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("journal.log")).expect("journal after refusal"),
+            journal_before,
+            "post-compaction certification must not change the journal"
+        );
+        assert!(!directory.path.join("data00000b.tar").exists());
+    }
+
+    /// A caller's proof excuses re-deriving the bulk certificate, never the
+    /// certificate that guards a mutation. This is the same corrupt source as
+    /// the test above, reclaimed with a proof naming exactly these archives —
+    /// the strongest thing a caller can present, and what compaction presents
+    /// after certifying them before its deep copy. The corruption must still
+    /// be refused, by the per-archive certificate `sweep_one_archive` derives
+    /// through a fresh descriptor, and nothing may be mutated on the way.
+    #[test]
+    fn a_reclaim_proof_never_lets_a_corrupt_source_reach_a_mutation() {
+        let directory = TestDirectory::new("postcomp-proven-source-still-certified");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let base_path = directory.path.join("data00000a.tar");
+        let repository = Repository::open(&directory.path).expect("open healthy base");
+        let head = repository.head_record_identifier();
+        let entry = *repository
+            .archives()
+            .iter()
+            .find_map(|archive| archive.index_entry(head.segment))
+            .expect("head index entry");
+        drop(repository);
+        let mut corrupt_base = std::fs::read(&base_path).expect("read base");
+        corrupt_base[entry.position as usize + entry.size as usize - 1] ^= 0x01;
+        std::fs::write(&base_path, &corrupt_base).expect("corrupt base payload CRC");
+        let journal_before =
+            std::fs::read(directory.path.join("journal.log")).expect("journal before");
+
+        let mut store =
+            WritableRepository::open(&directory.path).expect("open corrupt-indexed base");
+        // The proof a successful preflight would have returned, presented
+        // after the bytes it covered were changed underneath it.
+        let proof = CertifiedReclaimSources {
+            base_names: store.base_archive_names(),
+        };
+        assert!(
+            proof.certifies_exactly(&store.base_archive_names()),
+            "the fixture must present a proof the skip actually accepts"
+        );
+
+        let error = store
+            .reclaim_old_generations_with(GenerationReclaimRequest {
+                rule: ReclaimRule {
+                    reference: generation(2, 2, true),
+                    kind: CompactionKind::Full,
+                    retained_generations: RETAINED_GENERATIONS,
+                },
+                rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
+                certified_sources: Some(&proof),
+                expected: None,
+            })
+            .expect_err("a proven source is still certified at its mutation boundary");
+
+        assert!(error.to_string().contains("payload CRC"), "{error}");
+        assert_eq!(
+            std::fs::read(&base_path).expect("base after refusal"),
+            corrupt_base,
+            "a skipped bulk pass must not let the sweep rewrite its corrupt source"
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("journal.log")).expect("journal after refusal"),
+            journal_before,
+            "a skipped bulk pass must not let the sweep change the journal"
+        );
+        assert!(!directory.path.join("data00000b.tar").exists());
     }
 }

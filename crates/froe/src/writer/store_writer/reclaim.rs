@@ -521,10 +521,18 @@ pub(super) fn mark_one_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::record::{RecordIdentifier, RecordType};
+    use crate::store::Repository;
+    use crate::tar_archive::archive::TarArchiveReader;
+    use crate::writer::compaction::CompactionKind;
+    use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::segment_builder::SegmentBufferBuilder;
+    use crate::writer::store_writer::repository::*;
+    use crate::writer::tar_writer::TarArchiveWriter;
+    use std::collections::HashSet;
 
     use crate::writer::store_writer::sweep_plan::*;
     use crate::writer::store_writer::test_support::*;
-    use std::collections::HashSet;
 
     #[test]
     fn the_oak_savings_gate_defers_at_exactly_twenty_five_percent() {
@@ -877,5 +885,286 @@ mod tests {
         .expect_err("missing root must refuse cleanup");
         assert!(error.to_string().contains("was not encountered"));
         assert!(directory.path.join("data00000a.tar").exists());
+    }
+
+    #[test]
+    fn kept_data_in_a_newer_tar_protects_bulk_in_an_older_tar() {
+        let directory = TestDirectory::new("cross-tar-bulk-reference");
+        let bulk = bulk_identifier(60);
+        let root = data_identifier(61);
+        let current = generation(6, 6, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(bulk, 128, generation(0, 0, false))],
+        );
+        write_test_archive(
+            &directory,
+            "data00001a.tar",
+            &[TestArchiveEntry::new(root, 128, current).referencing(&[bulk])],
+        );
+        write_manifest(&directory);
+
+        let plan = plan_cleanup_from_directory(&directory.path, current, root, &HashSet::new())
+            .expect("plan");
+        assert!(!plan.reclaimable_segments().contains(&bulk));
+        assert_eq!(plan.marked_segments, 0);
+        assert!(plan.archives.is_empty());
+    }
+
+    #[test]
+    fn duplicate_segment_identifiers_across_active_archives_refuse_cleanup() {
+        let directory = TestDirectory::new("duplicate-active-segments");
+        let duplicate = data_identifier(90);
+        let reference = generation(3, 3, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(duplicate, 1, reference)],
+        );
+        write_test_archive(
+            &directory,
+            "data00001a.tar",
+            &[TestArchiveEntry::new(duplicate, 1, reference)],
+        );
+        write_manifest(&directory);
+
+        let error =
+            plan_cleanup_from_directory(&directory.path, reference, duplicate, &HashSet::new())
+                .expect_err("duplicates make a global decision ambiguous");
+        let message = error.to_string();
+        assert!(message.contains("both active archives"));
+        assert!(message.contains("data00000a.tar"));
+        assert!(message.contains("data00001a.tar"));
+    }
+
+    #[test]
+    fn recovered_newer_archive_is_not_swept_and_still_protects_older_bulk() {
+        let directory = TestDirectory::new("recovered-protects-bulk");
+        let bulk = bulk_identifier(100);
+        let root = data_identifier(101);
+        let reference = generation(4, 4, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(bulk, 64, generation(0, 0, false))],
+        );
+
+        let mut builder = SegmentBufferBuilder::new(root, reference);
+        let record = builder
+            .allocate(RecordType::Value, 6, &[bulk])
+            .expect("allocate referencing record");
+        let reference_number = builder.reference_for(bulk);
+        let mut record_bytes = [0u8; 6];
+        SegmentBufferBuilder::write_record_identifier_bytes(reference_number, 0, &mut record_bytes);
+        builder
+            .record_bytes_mut(record)
+            .copy_from_slice(&record_bytes);
+        let built = builder.finish();
+        let mut writer = TarArchiveWriter::new(&directory.path, "data00001a.tar");
+        writer
+            .write_segment(root, &built.bytes, reference, &[bulk], &[])
+            .expect("write root");
+        writer.close().expect("close root archive");
+        truncate_archive_before_trailers(&directory, "data00001a.tar");
+        write_manifest(&directory);
+        assert!(
+            TarArchiveReader::open(&directory.path.join("data00001a.tar"))
+                .expect("open recovered archive")
+                .is_recovered()
+        );
+
+        let plan = plan_cleanup_from_directory(&directory.path, reference, root, &HashSet::new())
+            .expect("recovered archive participates conservatively");
+        assert!(!plan.reclaimable_segments().contains(&root));
+        assert!(!plan.reclaimable_segments().contains(&bulk));
+        assert!(plan.archives.is_empty());
+    }
+
+    #[test]
+    fn malformed_recovered_root_fails_closed_without_mutating_the_archive() {
+        let directory = TestDirectory::new("malformed-recovered-root");
+        let root = data_identifier(110);
+        let reference = generation(4, 4, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(root, 64, reference)],
+        );
+        truncate_archive_before_trailers(&directory, "data00000a.tar");
+        write_manifest(&directory);
+        let path = directory.path.join("data00000a.tar");
+        let before = std::fs::read(&path).expect("read recovered archive");
+
+        let error = plan_cleanup_from_directory(&directory.path, reference, root, &HashSet::new())
+            .expect_err("malformed kept data cannot safely propagate references");
+        assert!(error.to_string().contains("magic bytes"));
+        assert_eq!(std::fs::read(path).expect("read after refusal"), before);
+    }
+
+    #[test]
+    fn post_compaction_reclaim_refuses_duplicate_base_uuids_before_mutation() {
+        let directory = TestDirectory::new("post-compaction-duplicate-base");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let original_path = directory.path.join("data00000a.tar");
+        let duplicate_path = directory.path.join("data00001a.tar");
+        std::fs::copy(&original_path, &duplicate_path).expect("copy duplicate archive");
+
+        let original_before = std::fs::read(&original_path).expect("read original");
+        let duplicate_before = std::fs::read(&duplicate_path).expect("read duplicate");
+        let mut store = WritableRepository::open(&directory.path).expect("open duplicate store");
+        assert_eq!(store.base_archives.len(), 2);
+        let reference = store.writing_generation().expect("head generation");
+        let error = store
+            .reclaim_old_generations(reference, CompactionKind::Full)
+            .expect_err("ambiguous global UUID marking must fail closed");
+        assert!(error.to_string().contains("both active archives"));
+        assert_eq!(
+            store.base_archives.len(),
+            2,
+            "preflight must run before taking the active reader set"
+        );
+        assert_eq!(
+            std::fs::read(&original_path).expect("original remains"),
+            original_before
+        );
+        assert_eq!(
+            std::fs::read(&duplicate_path).expect("duplicate remains"),
+            duplicate_before
+        );
+        store.close().expect("close after refusal");
+
+        let repository = Repository::open(&directory.path).expect("repository remains readable");
+        repository.content_root().expect("content remains healthy");
+    }
+
+    #[test]
+    fn post_compaction_certification_does_not_fill_the_writable_base_cache() {
+        const ORPHAN_SEGMENTS: usize = 128;
+
+        let directory = TestDirectory::new("post-compaction-bounded-certificate-cache");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap writer");
+            let write_generation = store.writing_generation().expect("write generation");
+            for _ in 0..ORPHAN_SEGMENTS {
+                let mut writer = store.record_writer(write_generation);
+                writer
+                    .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                    .expect("write orphan node");
+                writer.finish().expect("persist orphan segment");
+            }
+            store.close().expect("close many-segment base archive");
+        }
+
+        let mut store = WritableRepository::open(&directory.path).expect("open base store");
+        let base_segment_count: usize = store
+            .base_archives
+            .iter()
+            .map(TarArchiveReader::segment_count)
+            .sum();
+        assert!(
+            base_segment_count >= ORPHAN_SEGMENTS,
+            "fixture must exercise certification over many base segments"
+        );
+        assert!(
+            store
+                .parsed_segment_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "write-open must begin with an empty parsed base cache"
+        );
+
+        store
+            .reclaim_old_generations(generation(0, 0, false), CompactionKind::Tail)
+            .expect("certify and retain the generation-zero base");
+
+        assert!(
+            store
+                .parsed_segment_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "post-compaction certification must use the bounded fresh provider"
+        );
+        store.close().expect("close after cache regression");
+        Repository::open(&directory.path)
+            .expect("reopen after cache regression")
+            .content_root()
+            .expect("content remains healthy");
+    }
+
+    #[test]
+    fn reclaim_ignores_unrelated_tar_files() {
+        let directory = TestDirectory::new("unrelated-tar");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // A zero-byte file that matches the `.tar` suffix but not the Oak
+        // archive name pattern must not break reclamation.
+        std::fs::write(directory.path.join("notes.tar"), b"").expect("write unrelated file");
+        let mut store = WritableRepository::open(&directory.path).expect("open");
+        let generation = store.writing_generation().expect("generation");
+        store
+            .reclaim_old_generations(generation, CompactionKind::Tail)
+            .expect("reclaim ignores the unrelated file");
+        store.close().expect("close");
+        assert!(
+            directory.path.join("notes.tar").exists(),
+            "the unrelated file is left untouched"
+        );
+    }
+
+    #[test]
+    fn post_compaction_reclaim_validates_finalized_session_head_before_base_mutation() {
+        let directory = TestDirectory::new("postcomp-finalized-head-ordering");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let base_path = directory.path.join("data00000a.tar");
+        let base_before = std::fs::read(&base_path).expect("base before");
+
+        let mut store = WritableRepository::open(&directory.path).expect("open for compaction");
+        let reference = generation(2, 2, true);
+        let mut writer = store.record_writer(reference);
+        let valid_node = writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("compacted node");
+        writer.finish().expect("persist compacted node");
+        let invalid_head = RecordIdentifier::new(valid_node.segment, u32::MAX);
+        assert!(store.compare_and_set_head(store.head(), invalid_head));
+        store
+            .flush()
+            .expect("normal commit exposes the deliberately invalid test head");
+
+        let error = store
+            .reclaim_old_generations(reference, CompactionKind::Full)
+            .expect_err("finalized head validation must precede base sweep");
+        assert!(error.to_string().contains("not a finalized node record"));
+        assert_eq!(
+            std::fs::read(&base_path).expect("base after refusal"),
+            base_before,
+            "no base archive may be deleted or rewritten before exact-head validation"
+        );
+        assert!(!directory.path.join("data00000b.tar").exists());
+    }
+
+    #[test]
+    fn reclaim_marks_session_archives_so_referenced_base_bulk_survives() {
+        assert_session_reference_keeps_base_bulk_alive("session-mark", 2);
+    }
+
+    #[test]
+    fn old_generation_session_segments_also_seed_bulk_reachability() {
+        // Session archives are never swept, so even a session data
+        // segment *below* the reference generation stays on disk — its
+        // bulk references must be seeded too, or the retained segment
+        // would dangle.
+        assert_session_reference_keeps_base_bulk_alive("session-mark-old-gen", 0);
     }
 }

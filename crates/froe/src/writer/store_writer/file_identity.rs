@@ -260,3 +260,139 @@ pub(crate) fn preserve_file_metadata(target: &File, source: &std::fs::Metadata) 
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Repository;
+    use crate::tar_archive::archive::TarArchiveReader;
+    use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::repository_lock::RepositoryLock;
+    use crate::writer::store_writer::repository::*;
+    use crate::writer::store_writer::sweep_plan::*;
+    use crate::writer::store_writer::test_support::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    fn swept_archive_preserves_source_owner_group_and_mode_before_publication() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = TestDirectory::new("sweep-file-metadata");
+        let root = data_identifier(85);
+        let old_one = data_identifier(86);
+        let old_two = data_identifier(87);
+        let reference = generation(4, 4, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(root, 64, reference),
+                TestArchiveEntry::new(old_one, 64, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 64, generation(0, 0, false)),
+            ],
+        );
+        let source_path = directory.path.join("data00000a.tar");
+        std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o640))
+            .expect("set distinctive source mode");
+        let source_metadata = std::fs::metadata(&source_path).expect("source metadata");
+        write_manifest(&directory);
+
+        let plan = plan_cleanup_from_directory(&directory.path, reference, root, &HashSet::new())
+            .expect("plan rewrite");
+        assert!(matches!(
+            plan.archives.as_slice(),
+            [PlannedArchiveSweep::Rewrite { .. }]
+        ));
+        apply_cleanup_from_directory(
+            &directory.path,
+            reference,
+            root,
+            &HashSet::new(),
+            Some(&plan),
+        )
+        .expect("publish metadata-preserving rewrite");
+
+        let replacement_path = directory.path.join("data00000b.tar");
+        let replacement_metadata =
+            std::fs::metadata(&replacement_path).expect("replacement metadata");
+        assert_eq!(replacement_metadata.uid(), source_metadata.uid());
+        assert_eq!(replacement_metadata.gid(), source_metadata.gid());
+        assert_eq!(
+            replacement_metadata.mode() & 0o7777,
+            source_metadata.mode() & 0o7777
+        );
+        assert_eq!(replacement_metadata.mode() & 0o7777, 0o640);
+        assert!(
+            std::fs::read_dir(&directory.path)
+                .expect("list repository")
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".cleaning.")),
+            "successful publication removes its non-active staging link"
+        );
+        let replacement = TarArchiveReader::open(&replacement_path).expect("open replacement");
+        assert!(!replacement.is_recovered());
+        assert!(replacement.contains_segment(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_rotated_archives_inherit_active_archive_metadata_before_commit() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = TestDirectory::new("prepared-archive-metadata");
+        let previous_head = {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            let head = store.head();
+            store.close().expect("close bootstrap");
+            head
+        };
+        let source_path = directory.path.join("data00000a.tar");
+        std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o640))
+            .expect("set source mode");
+        let source_metadata = std::fs::metadata(&source_path).expect("source metadata");
+
+        let repository_lock =
+            Arc::new(RepositoryLock::acquire(&directory.path).expect("maintenance lock"));
+        let mut store = open_prepared_store(&directory.path, Arc::clone(&repository_lock));
+        store.maximum_archive_size = 1;
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        let content_root = writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("content root");
+        let new_head = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: content_root,
+                },
+                &[],
+            )
+            .expect("super root");
+        writer.finish().expect("rotation finalizes archive");
+        assert!(
+            store.lock_write_state().tar_writer.is_none(),
+            "the tiny threshold exercises the rotation close path"
+        );
+        assert!(store.compare_and_set_head(previous_head, new_head));
+        store.flush().expect("validate then commit prepared head");
+
+        let created_metadata =
+            std::fs::metadata(directory.path.join("data00001a.tar")).expect("created archive");
+        assert_eq!(created_metadata.uid(), source_metadata.uid());
+        assert_eq!(created_metadata.gid(), source_metadata.gid());
+        assert_eq!(
+            created_metadata.mode() & 0o7777,
+            source_metadata.mode() & 0o7777
+        );
+        store.close().expect("close prepared writer");
+        drop(repository_lock);
+
+        let repository = Repository::open(&directory.path).expect("reopen committed store");
+        assert_eq!(repository.head_record_identifier(), new_head);
+        repository.content_root().expect("new root is traversable");
+    }
+}

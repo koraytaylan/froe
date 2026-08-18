@@ -154,3 +154,142 @@ pub(crate) fn reject_duplicate_archive_generations(directory: &Path) -> Result<(
     select_newest_file_generations(&names)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Repository;
+    use crate::writer::store_writer::repository::*;
+    use crate::writer::store_writer::test_support::*;
+
+    #[test]
+    fn bootstraps_a_fresh_store_that_the_reader_opens() {
+        let directory = TestDirectory::new("bootstrap");
+        let store = WritableRepository::open(&directory.path).expect("open fresh store");
+        store.close().expect("close");
+
+        let manifest =
+            std::fs::read_to_string(directory.path.join("manifest")).expect("manifest exists");
+        assert!(manifest.contains("store.version=2"));
+        assert!(directory.path.join("repo.lock").exists());
+
+        let journal = std::fs::read_to_string(directory.path.join("journal.log")).expect("journal");
+        assert_eq!(journal.lines().count(), 1, "exactly one bootstrap revision");
+        assert!(journal.contains(" root "));
+
+        let repository = Repository::open(&directory.path).expect("reader opens");
+        assert!(
+            !repository.archives()[0].is_recovered(),
+            "the archive has a valid index"
+        );
+        let content_root = repository.content_root().expect("content root exists");
+        assert_eq!(content_root.child_node_count().expect("count"), 0);
+        assert!(content_root.properties().expect("properties").is_empty());
+    }
+
+    #[test]
+    fn refuses_to_bootstrap_over_a_populated_store_with_no_resolvable_journal() {
+        let directory = TestDirectory::new("refuse-bootstrap");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            crate::writer::commit::create_checkpoint(&store, 10_000_000, &[]).expect("checkpoint");
+            store.close().expect("close");
+        }
+        std::fs::write(directory.path.join("journal.log"), b"").expect("truncate journal");
+
+        assert!(
+            WritableRepository::open(&directory.path).is_err(),
+            "a populated store with no resolvable journal must not bootstrap an empty head"
+        );
+
+        // The refusal leaves the store intact; journal recovery restores
+        // it and the write open then succeeds.
+        crate::writer::backup::recover_journal(&directory.path).expect("recover");
+        let store = WritableRepository::open(&directory.path).expect("open after recovery");
+        store.close().expect("close");
+    }
+
+    #[test]
+    fn stale_generation_letters_are_deleted_at_write_open() {
+        let directory = TestDirectory::new("stale-letters");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // Fabricate a stale lower letter alongside the valid archive by
+        // copying it: the write open must keep the higher letter and
+        // delete the lower one.
+        let valid = std::fs::read(directory.path.join("data00000a.tar")).expect("read");
+        std::fs::write(directory.path.join("data00000b.tar"), &valid).expect("write copy");
+        {
+            let store = WritableRepository::open(&directory.path).expect("reopen");
+            assert!(store.head().record_number > 0 || store.head().record_number == 0);
+            store.close().expect("close");
+        }
+        assert!(
+            !directory.path.join("data00000a.tar").exists(),
+            "the lower letter is deleted"
+        );
+        assert!(directory.path.join("data00000b.tar").exists());
+    }
+
+    /// The empty number contributes no archive, so nothing is deleted as a
+    /// side effect of opening. Reuse is the only other outcome, and it can
+    /// only ever overwrite zero bytes.
+    #[test]
+    fn an_empty_archive_file_is_never_deleted_by_opening_for_writing() {
+        let directory = TestDirectory::new("empty-archive-retained");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // A number above the next one froe would allocate, so the open
+        // cannot reach it by filling it.
+        let empty = directory.path.join("data00500a.tar");
+        std::fs::write(&empty, b"").expect("create the empty archive");
+
+        let store = WritableRepository::open(&directory.path).expect("write open");
+        store.close().expect("close");
+
+        assert!(
+            empty.exists(),
+            "opening for writing must not delete the empty archive; cleanup removes it \
+             under its own plan-and-confirm contract"
+        );
+    }
+
+    /// Skipping an all-empty archive number must not free it for reuse: the
+    /// letterless spelling of a number collides with the lettered one, and
+    /// `group_file_generations_newest_first` refuses that pair outright, so
+    /// a store that allocated into it could never be opened again by
+    /// anything. Allocation therefore reads the physical namespace.
+    #[test]
+    fn an_empty_archive_number_is_never_reallocated_over_its_own_residue() {
+        let directory = TestDirectory::new("empty-archive-namespace");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // Letterless: `ArchiveFileName::parse` reads this as number 1,
+        // generation 'a' — the same pair a written `data00001a.tar` claims.
+        std::fs::write(directory.path.join("data00001.tar"), b"").expect("empty residue");
+
+        {
+            let store = WritableRepository::open(&directory.path).expect("write open");
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            writer.write_string("forces a new archive").expect("string");
+            writer.finish().expect("finish");
+            store.close().expect("close");
+        }
+
+        assert!(
+            !directory.path.join("data00001a.tar").exists(),
+            "allocation must skip the number the letterless residue claims"
+        );
+        Repository::open(&directory.path).expect("the store is still openable");
+        WritableRepository::open(&directory.path)
+            .expect("and still writable")
+            .close()
+            .expect("close");
+    }
+}

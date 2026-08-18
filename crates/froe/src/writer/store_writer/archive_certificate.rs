@@ -378,7 +378,11 @@ pub(super) fn certify_archives_in_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::provider::SegmentProvider;
     use crate::store::Repository;
+    use crate::tar_archive::archive::TarArchiveReader;
+    use crate::writer::store_writer::providers::*;
+    use std::collections::HashMap;
 
     use crate::writer::store_writer::test_support::*;
 
@@ -417,5 +421,59 @@ mod tests {
             );
             std::fs::write(path_of(corrupt), &pristine).expect("restore the copy");
         }
+    }
+
+    /// Which failure an operator is shown must not depend on how the workers
+    /// interleaved: the lowest-positioned one is what a single-threaded pass
+    /// over this order would have reported.
+    ///
+    /// Exercised through `record_failure` rather than through a corrupt
+    /// multi-archive fixture, because that fixture cannot make the claim.
+    /// Positions are handed out in ascending order, so the earlier archive
+    /// also starts earlier and, on equal-sized archives, reliably fails
+    /// first — a run reports the right archive whether or not any comparison
+    /// happens. Arrival order is inverted here instead, which is the only
+    /// case the comparison exists for.
+    #[test]
+    fn a_certification_pass_reports_its_lowest_positioned_failure() {
+        static NO_SEGMENTS: std::sync::LazyLock<ArchiveSegmentsProvider<'static>> =
+            std::sync::LazyLock::new(|| ArchiveSegmentsProvider {
+                segments: HashMap::new(),
+            });
+        let failure_at = |position: usize| crate::Error::InvalidFormat {
+            details: format!("archive at position {position}"),
+        };
+        let empty: [&TarArchiveReader; 0] = [];
+        let new_pass = |provider: &'static (dyn SegmentProvider + Sync)| ArchiveCertificationPass {
+            provider,
+            archives: &empty,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            certified: std::sync::atomic::AtomicUsize::new(0),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
+        };
+
+        // Later position recorded first: the comparison must displace it.
+        let pass = new_pass(&*NO_SEGMENTS);
+        pass.record_failure(9, failure_at(9));
+        pass.record_failure(3, failure_at(3));
+        assert!(
+            pass.reported_failure()
+                .expect("a failure was recorded")
+                .to_string()
+                .contains("position 3")
+        );
+
+        // Ascending arrival: the first recorded is already the lowest, and
+        // must not be displaced by anything later.
+        let pass = new_pass(&*NO_SEGMENTS);
+        pass.record_failure(3, failure_at(3));
+        pass.record_failure(9, failure_at(9));
+        assert!(
+            pass.reported_failure()
+                .expect("a failure was recorded")
+                .to_string()
+                .contains("position 3")
+        );
     }
 }
