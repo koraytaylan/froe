@@ -354,183 +354,152 @@ fn cleanup_partial_summary_counts(retained: usize, already_absent: usize) -> Str
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the complete deterministic confirmation listing is clearest as one display pass"
-)]
-fn print_cleanup_plan(plan: &CompactionPlan) {
-    println!(
-        "compaction plan for {} (verified head {}):",
-        crate::output::sanitize_terminal_path(plan.directory()),
-        plan.current_head()
-    );
-    if plan.actions().is_empty() {
-        println!("  no mutations");
-    }
-    for action in plan.actions() {
-        match action {
-            CompactionAction::RepairArchiveIndex {
-                file_name,
-                retired_file_names,
-                reason,
-                bytes,
-            } => {
-                println!(
-                    "  repair the index of {} ({}; original retained as {}.bak)",
-                    crate::output::sanitize_terminal_text(file_name),
-                    crate::output::sanitize_terminal_text(reason),
-                    crate::output::sanitize_terminal_text(file_name),
-                );
-                if !retired_file_names.is_empty() {
-                    // These leave the archive namespace, so they are named
-                    // rather than counted: the confirmation covers the files
-                    // the plan printed.
-                    let names: Vec<_> = retired_file_names
-                        .iter()
-                        .map(|name| crate::output::sanitize_terminal_text(name))
-                        .collect();
-                    println!(
-                        "    merging and retiring {} to .bak names",
-                        names.join(", ")
-                    );
-                }
-                println!(
-                    "    {} retained across the retired originals",
-                    froe::format_byte_size(*bytes)
-                );
-            }
-            CompactionAction::PruneJournal {
-                lines,
-                parser_ignored,
-                missing_segments,
-                unreadable_revisions,
-                beyond_retention,
-            } => println!(
-                "  prune {lines} journal lines ({parser_ignored} parser-ignored, {missing_segments} missing-segment, {unreadable_revisions} unreadable historical, {beyond_retention} beyond retention)"
-            ),
-            CompactionAction::UpgradeManifest => {
-                println!("  atomically upgrade manifest to store.version=2");
-            }
-            CompactionAction::RemoveCheckpoints {
-                names,
-                expired,
-                unreferenced,
-            } => {
-                println!(
-                    "  omit {} checkpoints from the copy ({expired} expired, {unreferenced} unreferenced):",
-                    names.len()
-                );
-                for name in names {
-                    println!(
-                        "    checkpoint {}",
-                        crate::output::quote_terminal_text(name)
-                    );
-                }
-            }
-            CompactionAction::RemoveReclaimableArchive {
-                file_name,
-                segments,
-                bytes,
-            } => println!(
-                "  remove {file_name}: {segments} orphan segments, {}",
-                froe::format_byte_size(*bytes)
-            ),
-            CompactionAction::RewriteArchive {
-                file_name,
-                replacement_name,
-                segments,
-                eligible_bytes,
-            } => println!(
-                "  rewrite {file_name} as {replacement_name}: omit {segments} orphan segments ({} of entries)",
-                froe::format_byte_size(*eligible_bytes)
-            ),
-            CompactionAction::RemoveStaleArchive {
-                file_name,
-                reason,
-                bytes,
-            } => println!(
-                "  remove stale archive {file_name} ({reason}; {})",
-                froe::format_byte_size(*bytes)
-            ),
-            CompactionAction::RemoveTemporary { file_name, bytes } => {
-                println!(
-                    "  remove redundant temporary {file_name} ({})",
-                    froe::format_byte_size(*bytes)
-                );
-            }
-            CompactionAction::RetireJournalHistory { revisions } => {
-                println!(
-                    "  retire all {} journal lines, keeping only the compacted head",
-                    crate::progress::format_count(*revisions as u64)
-                );
-                println!("    journal.log is copied to a numbered .bak first");
-                println!("    the removed history is not recoverable from the store afterwards");
-            }
-            CompactionAction::RetireInterruptedCompactionResidue { segments } => {
-                println!(
-                    "  retire {} segments of interrupted-compaction residue",
-                    crate::progress::format_count(*segments as u64)
-                );
-            }
-            CompactionAction::CopyHeadIntoFreshGeneration {
-                head_nodes,
-                target_generation,
-                kind,
-            } => {
-                println!(
-                    "  {} compaction: copy the head into generation ({},{},compacted)",
-                    match kind {
-                        froe::CompactionKind::Full => "full",
-                        froe::CompactionKind::Tail => "tail",
-                    },
-                    target_generation.generation,
-                    target_generation.full_generation
-                );
-                println!(
-                    "    the head reaches {} nodes; the copy rewrites those it still retains",
-                    crate::progress::format_count(*head_nodes)
-                );
-            }
-            CompactionAction::RemoveRecoveryBackup { file_name, bytes } => {
-                println!(
-                    "  remove old recovery backup {file_name} ({})",
-                    froe::format_byte_size(*bytes)
-                );
-            }
-            _ => println!("  apply an action added by this froe version"),
-        }
-    }
-    for removal in plan.journal_line_removals() {
-        let preview = crate::output::escape_terminal_bytes(removal.preview_bytes());
-        let truncated = if removal.preview_truncated() {
-            "…"
-        } else {
-            ""
-        };
-        if let Some(identifier) = removal.record_identifier() {
+/// One line per planned action, in the order the plan lists them.
+fn print_planned_action(action: &CompactionAction) {
+    match action {
+        CompactionAction::RepairArchiveIndex {
+            file_name,
+            retired_file_names,
+            reason,
+            bytes,
+        } => {
             println!(
-                "    journal line {}: {} ({identifier}); b\"{preview}\"{truncated}",
-                removal.line_number(),
-                removal.reason(),
+                "  repair the index of {} ({}; original retained as {}.bak)",
+                crate::output::sanitize_terminal_text(file_name),
+                crate::output::sanitize_terminal_text(reason),
+                crate::output::sanitize_terminal_text(file_name),
             );
-        } else {
+            if !retired_file_names.is_empty() {
+                // These leave the archive namespace, so they are named
+                // rather than counted: the confirmation covers the files
+                // the plan printed.
+                let names: Vec<_> = retired_file_names
+                    .iter()
+                    .map(|name| crate::output::sanitize_terminal_text(name))
+                    .collect();
+                println!(
+                    "    merging and retiring {} to .bak names",
+                    names.join(", ")
+                );
+            }
             println!(
-                "    journal line {}: {}; b\"{preview}\"{truncated}",
-                removal.line_number(),
-                removal.reason(),
+                "    {} retained across the retired originals",
+                froe::format_byte_size(*bytes)
             );
         }
+        CompactionAction::RemoveReclaimableArchive {
+            file_name,
+            segments,
+            bytes,
+        } => println!(
+            "  remove {file_name}: {segments} orphan segments, {}",
+            froe::format_byte_size(*bytes)
+        ),
+        CompactionAction::RewriteArchive {
+            file_name,
+            replacement_name,
+            segments,
+            eligible_bytes,
+        } => println!(
+            "  rewrite {file_name} as {replacement_name}: omit {segments} orphan segments ({} of entries)",
+            froe::format_byte_size(*eligible_bytes)
+        ),
+        CompactionAction::RemoveStaleArchive {
+            file_name,
+            reason,
+            bytes,
+        } => println!(
+            "  remove stale archive {file_name} ({reason}; {})",
+            froe::format_byte_size(*bytes)
+        ),
+        CompactionAction::CopyHeadIntoFreshGeneration {
+            head_nodes,
+            target_generation,
+            kind,
+        } => {
+            println!(
+                "  {} compaction: copy the head into generation ({},{},compacted)",
+                match kind {
+                    froe::CompactionKind::Full => "full",
+                    froe::CompactionKind::Tail => "tail",
+                },
+                target_generation.generation,
+                target_generation.full_generation
+            );
+            println!(
+                "    the head reaches {} nodes; the copy rewrites those it still retains",
+                crate::progress::format_count(*head_nodes)
+            );
+        }
+        other => print_store_action(other),
     }
-    for warning in plan.warnings() {
-        eprintln!(
-            "froe: warning: {}",
-            crate::output::sanitize_terminal_text(warning)
-        );
+}
+
+/// Actions on the journal, checkpoints, manifest, and the files an
+/// interrupted run left behind.
+fn print_store_action(action: &CompactionAction) {
+    match action {
+        CompactionAction::PruneJournal {
+            lines,
+            parser_ignored,
+            missing_segments,
+            unreadable_revisions,
+            beyond_retention,
+        } => println!(
+            "  prune {lines} journal lines ({parser_ignored} parser-ignored, {missing_segments} missing-segment, {unreadable_revisions} unreadable historical, {beyond_retention} beyond retention)"
+        ),
+        CompactionAction::UpgradeManifest => {
+            println!("  atomically upgrade manifest to store.version=2");
+        }
+        CompactionAction::RemoveCheckpoints {
+            names,
+            expired,
+            unreferenced,
+        } => {
+            println!(
+                "  omit {} checkpoints from the copy ({expired} expired, {unreferenced} unreferenced):",
+                names.len()
+            );
+            for name in names {
+                println!(
+                    "    checkpoint {}",
+                    crate::output::quote_terminal_text(name)
+                );
+            }
+        }
+        CompactionAction::RemoveTemporary { file_name, bytes } => {
+            println!(
+                "  remove redundant temporary {file_name} ({})",
+                froe::format_byte_size(*bytes)
+            );
+        }
+        CompactionAction::RetireJournalHistory { revisions } => {
+            println!(
+                "  retire all {} journal lines, keeping only the compacted head",
+                crate::progress::format_count(*revisions as u64)
+            );
+            println!("    journal.log is copied to a numbered .bak first");
+            println!("    the removed history is not recoverable from the store afterwards");
+        }
+        CompactionAction::RetireInterruptedCompactionResidue { segments } => {
+            println!(
+                "  retire {} segments of interrupted-compaction residue",
+                crate::progress::format_count(*segments as u64)
+            );
+        }
+        CompactionAction::RemoveRecoveryBackup { file_name, bytes } => {
+            println!(
+                "  remove old recovery backup {file_name} ({})",
+                froe::format_byte_size(*bytes)
+            );
+        }
+        _ => println!("  apply an action added by this froe version"),
     }
-    // Every other estimate here describes space the run gives back. Repair is
-    // the one action that takes space and keeps it, so it is stated
-    // separately rather than netted against a reclaim figure it would
-    // silently contradict.
+}
+
+/// The plan's totals: what it would reclaim, what it deliberately keeps,
+/// and what the rewrites cost while they run.
+fn print_plan_totals(plan: &CompactionPlan) {
     let repair_bytes: u64 = plan
         .actions()
         .iter()
@@ -580,6 +549,52 @@ fn print_cleanup_plan(plan: &CompactionPlan) {
             froe::format_byte_size(plan.estimated_archive_rewrite_source_bytes())
         );
     }
+}
+
+fn print_cleanup_plan(plan: &CompactionPlan) {
+    println!(
+        "compaction plan for {} (verified head {}):",
+        crate::output::sanitize_terminal_path(plan.directory()),
+        plan.current_head()
+    );
+    if plan.actions().is_empty() {
+        println!("  no mutations");
+    }
+    for action in plan.actions() {
+        print_planned_action(action);
+    }
+    for removal in plan.journal_line_removals() {
+        let preview = crate::output::escape_terminal_bytes(removal.preview_bytes());
+        let truncated = if removal.preview_truncated() {
+            "…"
+        } else {
+            ""
+        };
+        if let Some(identifier) = removal.record_identifier() {
+            println!(
+                "    journal line {}: {} ({identifier}); b\"{preview}\"{truncated}",
+                removal.line_number(),
+                removal.reason(),
+            );
+        } else {
+            println!(
+                "    journal line {}: {}; b\"{preview}\"{truncated}",
+                removal.line_number(),
+                removal.reason(),
+            );
+        }
+    }
+    for warning in plan.warnings() {
+        eprintln!(
+            "froe: warning: {}",
+            crate::output::sanitize_terminal_text(warning)
+        );
+    }
+    // Every other estimate here describes space the run gives back. Repair is
+    // the one action that takes space and keeps it, so it is stated
+    // separately rather than netted against a reclaim figure it would
+    // silently contradict.
+    print_plan_totals(plan);
 }
 
 /// `froe backup`: copy the source repository's head into a target.
