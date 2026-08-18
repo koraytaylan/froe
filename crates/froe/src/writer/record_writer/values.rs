@@ -64,19 +64,6 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     }
 
     /// Copies an inline binary value from `source` into a fresh value
-    /// record, sharing bulk-segment blocks the way compaction does.
-    ///
-    /// Only correct when `source` and this writer's target are the **same
-    /// store**; see [`Self::copy_binary_value_with_sharing`].
-    pub fn copy_binary_value(
-        &mut self,
-        source: &dyn crate::content::provider::SegmentProvider,
-        source_value: RecordIdentifier,
-    ) -> Result<RecordIdentifier> {
-        self.copy_binary_value_with_sharing(source, source_value, BulkBlockSharing::WithinOneStore)
-    }
-
-    /// Copies an inline binary value from `source` into a fresh value
     /// record without holding the whole binary in memory: short and medium
     /// binaries are materialized (they are small by definition), while a
     /// long binary is streamed 4 KiB block at a time into new block
@@ -86,8 +73,9 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     /// `sharing` decides what happens to a block that already lives in a
     /// bulk segment, and getting it wrong is silent: the copy succeeds, the
     /// store opens, the content tree serves, and only reading the binary
-    /// back reveals that its blocks are not there.
-    pub fn copy_binary_value_with_sharing(
+    /// back reveals that its blocks are not there. It has no default for
+    /// that reason — every caller states which store its target is.
+    pub fn copy_binary_value(
         &mut self,
         source: &dyn crate::content::provider::SegmentProvider,
         source_value: RecordIdentifier,

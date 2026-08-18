@@ -256,7 +256,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
                     // Copy the binary streaming, block by block, so a
                     // multi-gigabyte inline binary never has to fit in
                     // memory at once.
-                    self.writer.copy_binary_value_with_sharing(
+                    self.writer.copy_binary_value(
                         self.source,
                         *record_identifier,
                         self.bulk_sharing,
