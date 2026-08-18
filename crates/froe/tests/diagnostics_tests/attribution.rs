@@ -71,6 +71,11 @@ pub(crate) fn assert_bulk_and_block_attribution(
     );
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "31 assertions and no branches; the lint counts each \
+              `assert!` expansion as a decision point"
+)]
 #[test]
 pub(crate) fn segment_dump_and_archive_attribution_are_read_only_end_to_end() {
     let fixture = write_diagnostic_fixture("segment-and-archive-debug", GraphFixture::ValidEmpty);

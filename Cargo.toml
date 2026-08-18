@@ -21,6 +21,9 @@ unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# Nursery, but the one lint that bounds branching rather than length. Its
+# threshold and the reason for it are in `clippy.toml`.
+cognitive_complexity = "warn"
 # Casting between integer widths is inherent to binary format parsing; every cast
 # in this workspace is bounds-checked or provably lossless at its use site.
 cast_possible_truncation = "allow"

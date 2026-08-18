@@ -501,6 +501,11 @@ mod tests {
         assert_eq!(field(&rows[2], "depth"), &Field::Int(2));
     }
 
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "30 assertions and no branches; the lint counts each \
+                  `assert!` expansion as a decision point"
+    )]
     #[test]
     fn exports_the_properties_table() {
         let directory = TestDirectory::new("properties-table");

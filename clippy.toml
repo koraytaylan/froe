@@ -1,0 +1,19 @@
+# Two bounds on a function's shape, measured because neither is obvious.
+#
+# `cognitive_complexity` counts decision points — an `if`, a `match` arm, a
+# loop condition — and does *not* weight them by nesting: twenty-five flat
+# `if`s score 26, while five levels of nested loops and matches score under
+# 20. So it bounds how *many* branches a function has, not how tangled they
+# are. Production sits at 16, so 20 is a ceiling with headroom.
+#
+# It also counts each `assert!` expansion as a decision point, which makes an
+# assertion-dense test score above any branchy function in the tree. The three
+# tests that trip it carry an `#[expect]` saying so.
+cognitive-complexity-threshold = 20
+
+# `excessive_nesting` is what actually bounds depth, and it is disabled by
+# default (its own default threshold is 0). The deepest block in the
+# workspace is 7 — one closure inside a filter inside a match arm in the
+# compaction walk, with a comment explaining why it is shaped that way — so
+# this permits what exists and refuses anything deeper.
+excessive-nesting-threshold = 7

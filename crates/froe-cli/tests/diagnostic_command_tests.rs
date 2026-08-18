@@ -534,6 +534,11 @@ fn debug_cli_escapes_hostile_paths_names_and_non_string_values_end_to_end() {
     assert!(!store_path.join("repo.lock").exists());
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "25 assertions and one branch; the lint counts each \
+              `assert!` expansion as a decision point"
+)]
 #[test]
 fn debug_command_reaches_read_only_production_path() {
     let directory = TestDirectory::new("production-wiring");

@@ -141,6 +141,12 @@ format win.
   between a function's braces, ignoring blank and comment-only lines, so
   the budget is real code. A function that needs more than that is
   telling you it holds more than one idea.
+* **Twenty decision points, and seven levels of nesting.**
+  `cognitive_complexity` and `excessive_nesting` in `clippy.toml` hold the
+  two, and the comments there say what each one does and does not measure —
+  the first counts branches without weighting them by depth, which is why
+  the second exists. Production sits at 16 and 7 today, so both are
+  ceilings rather than a cleanup project.
 * **Split at the seams the function already has.** A long body almost
   always has phases separated by blank lines and a comment introducing
   each; those comments are the names of the functions hiding inside it.
