@@ -59,89 +59,17 @@ enum GraphFixture {
     Missing,
 }
 
-/// Builds this super-root and deliberately stores the binary blocks in a
-/// different archive from every node, template, and property record:
+/// The 256-element block list of the fixture's long binary value.
 ///
-/// ```text
-/// /root/content  data = BINARY(1 MiB), count = -42, title = STRING
-/// ```
-#[allow(
-    clippy::too_many_lines,
-    reason = "one linear independent byte fixture keeps every record relationship auditable"
-)]
-fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> DiagnosticFixture {
-    let directory = TestDirectory::new(test_name);
-    let data_uuid = data_segment_uuid(0x101);
-    let bulk_uuids = [
-        (0x202, 0xB000_0000_0000_0202),
-        (0x203, 0xB000_0000_0000_0203),
-        (0x204, 0xB000_0000_0000_0204),
-        // Oak's getBulkSegmentIds does not filter by segment kind. This
-        // data-kind segment deliberately stores records used as BLOCKs.
-        (0x205, 0xA000_0000_0000_0205),
-    ];
-    let mut data = SegmentBuilder::new(data_uuid);
-    let bulk_references: Vec<u16> = bulk_uuids
-        .iter()
-        .map(|uuid| data.add_referenced_segment(*uuid))
-        .collect();
-
-    // Record zero is the segment-info convention used by SegmentDump.
-    data.add_record(
-        0,
-        TYPE_VALUE,
-        string_record("{\"wid\":\"independent\",\"sno\":1,\"t\":1}"),
-    );
-    data.add_record(
-        1,
-        TYPE_VALUE,
-        if matches!(graph_fixture, GraphFixture::HostileChildName) {
-            0xbfffu16.to_be_bytes().to_vec()
-        } else {
-            string_record("root")
-        },
-    );
-    data.add_record(2, TYPE_VALUE, string_record("content"));
-    data.add_record(
-        3,
-        TYPE_VALUE,
-        if matches!(graph_fixture, GraphFixture::HostileTemplateName) {
-            0xbfffu16.to_be_bytes().to_vec()
-        } else {
-            string_record("data")
-        },
-    );
-    data.add_record(12, TYPE_VALUE, string_record("count"));
-    data.add_record(13, TYPE_VALUE, string_record("title"));
-    data.add_record(14, TYPE_VALUE, string_record("-42"));
-    data.add_record(15, TYPE_VALUE, string_record("Hello \"Oak\"\n"));
-
-    // Single-child templates for the super-root and content root.
-    let mut super_root_template = 0u32.to_be_bytes().to_vec();
-    super_root_template.extend(record_identifier_bytes(0, 1));
-    data.add_record(4, TYPE_TEMPLATE, super_root_template);
-    let mut root_template = 0u32.to_be_bytes().to_vec();
-    root_template.extend(record_identifier_bytes(0, 2));
-    data.add_record(5, TYPE_TEMPLATE, root_template);
-
-    // /content has zero children and three properties. Names follow Oak's
-    // signed-hash order: data, count, title. `data` is a one-value BINARY
-    // array so attribution exercises the counted-list production path.
-    let mut property_names = Vec::new();
-    for record_number in [3, 12, 13] {
-        property_names.extend(record_identifier_bytes(0, record_number));
-    }
-    data.add_record(16, TYPE_LIST_BUCKET, property_names);
-    let mut content_template = ((1u32 << 29) | 3).to_be_bytes().to_vec();
-    content_template.extend(record_identifier_bytes(0, 16));
-    content_template.extend([(-2i8) as u8, 3, 1]); // BINARIES, LONG, STRING
-    data.add_record(6, TYPE_TEMPLATE, content_template);
-
-    // A 256-element list crosses the 255-way list-bucket boundary: record
-    // 20 holds the first 255 block identifiers, while top bucket 7 points
-    // to record 20 and directly to the final element. Four full bulk
-    // segments each hold 64 blocks, so their virtual record numbers are
-    // ordinary byte offsets.
+/// 256 crosses the 255-way list-bucket boundary: record 20 holds the
+/// first 255 block identifiers, while top bucket 7 points to record 20
+/// and directly to the final element. Four full bulk segments each hold
+/// 64 blocks, so their virtual record numbers are ordinary byte offsets.
+fn build_long_binary_list(
+    graph_fixture: GraphFixture,
+    data: &mut SegmentBuilder,
+    bulk_references: &[u16],
+) {
     let block_identifier = |block_index: u32| {
         if matches!(
             graph_fixture,
@@ -174,29 +102,51 @@ fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> Dia
     let mut binary_value = stored_length.to_be_bytes().to_vec();
     binary_value.extend(record_identifier_bytes(0, 7));
     data.add_record(8, TYPE_VALUE, binary_value);
+}
 
-    let mut binary_values = 1u32.to_be_bytes().to_vec();
-    binary_values.extend(record_identifier_bytes(0, 8));
-    data.add_record(18, TYPE_LIST, binary_values);
+/// The three templates the fixture's nodes point at.
+///
+/// /content has zero children and three properties, named in Oak's
+/// signed-hash order — data, count, title — with `data` a one-value
+/// BINARY array so attribution exercises the counted-list path.
+fn add_fixture_templates(data: &mut SegmentBuilder) {
+    // Single-child templates for the super-root and content root.
+    let mut super_root_template = 0u32.to_be_bytes().to_vec();
+    super_root_template.extend(record_identifier_bytes(0, 1));
+    data.add_record(4, TYPE_TEMPLATE, super_root_template);
+    let mut root_template = 0u32.to_be_bytes().to_vec();
+    root_template.extend(record_identifier_bytes(0, 2));
+    data.add_record(5, TYPE_TEMPLATE, root_template);
 
-    let mut property_values = Vec::new();
-    for record_number in [18, 14, 15] {
-        property_values.extend(record_identifier_bytes(0, record_number));
+    let mut property_names = Vec::new();
+    for record_number in [3, 12, 13] {
+        property_names.extend(record_identifier_bytes(0, record_number));
     }
-    data.add_record(17, TYPE_LIST_BUCKET, property_values);
+    data.add_record(16, TYPE_LIST_BUCKET, property_names);
+    let mut content_template = ((1u32 << 29) | 3).to_be_bytes().to_vec();
+    content_template.extend(record_identifier_bytes(0, 16));
+    content_template.extend([(-2i8) as u8, 3, 1]); // BINARIES, LONG, STRING
+    data.add_record(6, TYPE_TEMPLATE, content_template);
+}
 
-    let node_record = |record_number: u32, template: u32, extra: Option<u32>| {
-        let mut bytes = record_identifier_bytes(0, record_number);
-        bytes.extend(record_identifier_bytes(0, template));
-        if let Some(extra) = extra {
-            bytes.extend(record_identifier_bytes(0, extra));
-        }
-        bytes
-    };
-    data.add_record(9, TYPE_NODE, node_record(9, 6, Some(17)));
-    data.add_record(10, TYPE_NODE, node_record(10, 5, Some(9)));
-    data.add_record(11, TYPE_NODE, node_record(11, 4, Some(10)));
+/// The fixture's three archives, plus the identifiers of the segments whose
+/// graph trailers the damaged cases target.
+struct FixtureArchives {
+    bulk: Vec<u8>,
+    data_blocks: Vec<u8>,
+    data: Vec<u8>,
+    graph_empty_identifier: Option<SegmentIdentifier>,
+    invalid_graph_identifier: Option<SegmentIdentifier>,
+}
 
+/// Packs the fixture's segments into their archives, applying whichever
+/// graph-trailer damage the case under test asks for.
+fn build_fixture_archives(
+    graph_fixture: GraphFixture,
+    bulk_uuids: &[support::SegmentUuid],
+    data_uuid: support::SegmentUuid,
+    data: &SegmentBuilder,
+) -> FixtureArchives {
     let mut bulk_archive = ArchiveBuilder::new();
     for bulk_uuid in &bulk_uuids[..3] {
         bulk_archive.add_segment(*bulk_uuid, vec![0x5a; 262_144]);
@@ -261,15 +211,99 @@ fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> Dia
         data_archive_bytes[magic_position - 12] ^= 0x01;
     }
 
+    FixtureArchives {
+        bulk: bulk_archive.build(BULK_ARCHIVE),
+        data_blocks: data_block_archive.build(DATA_BLOCK_ARCHIVE),
+        data: data_archive_bytes,
+        graph_empty_identifier,
+        invalid_graph_identifier,
+    }
+}
+
+/// Builds this super-root and deliberately stores the binary blocks in a
+/// different archive from every node, template, and property record:
+///
+/// ```text
+/// /root/content  data = BINARY(1 MiB), count = -42, title = STRING
+/// ```
+fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> DiagnosticFixture {
+    let directory = TestDirectory::new(test_name);
+    let data_uuid = data_segment_uuid(0x101);
+    let bulk_uuids = [
+        (0x202, 0xB000_0000_0000_0202),
+        (0x203, 0xB000_0000_0000_0203),
+        (0x204, 0xB000_0000_0000_0204),
+        // Oak's getBulkSegmentIds does not filter by segment kind. This
+        // data-kind segment deliberately stores records used as BLOCKs.
+        (0x205, 0xA000_0000_0000_0205),
+    ];
+    let mut data = SegmentBuilder::new(data_uuid);
+    let bulk_references: Vec<u16> = bulk_uuids
+        .iter()
+        .map(|uuid| data.add_referenced_segment(*uuid))
+        .collect();
+
+    // Record zero is the segment-info convention used by SegmentDump.
+    data.add_record(
+        0,
+        TYPE_VALUE,
+        string_record("{\"wid\":\"independent\",\"sno\":1,\"t\":1}"),
+    );
+    data.add_record(
+        1,
+        TYPE_VALUE,
+        if matches!(graph_fixture, GraphFixture::HostileChildName) {
+            0xbfffu16.to_be_bytes().to_vec()
+        } else {
+            string_record("root")
+        },
+    );
+    data.add_record(2, TYPE_VALUE, string_record("content"));
+    data.add_record(
+        3,
+        TYPE_VALUE,
+        if matches!(graph_fixture, GraphFixture::HostileTemplateName) {
+            0xbfffu16.to_be_bytes().to_vec()
+        } else {
+            string_record("data")
+        },
+    );
+    data.add_record(12, TYPE_VALUE, string_record("count"));
+    data.add_record(13, TYPE_VALUE, string_record("title"));
+    data.add_record(14, TYPE_VALUE, string_record("-42"));
+    data.add_record(15, TYPE_VALUE, string_record("Hello \"Oak\"\n"));
+
+    add_fixture_templates(&mut data);
+    build_long_binary_list(graph_fixture, &mut data, &bulk_references);
+    let mut binary_values = 1u32.to_be_bytes().to_vec();
+    binary_values.extend(record_identifier_bytes(0, 8));
+    data.add_record(18, TYPE_LIST, binary_values);
+
+    let mut property_values = Vec::new();
+    for record_number in [18, 14, 15] {
+        property_values.extend(record_identifier_bytes(0, record_number));
+    }
+    data.add_record(17, TYPE_LIST_BUCKET, property_values);
+
+    let node_record = |record_number: u32, template: u32, extra: Option<u32>| {
+        let mut bytes = record_identifier_bytes(0, record_number);
+        bytes.extend(record_identifier_bytes(0, template));
+        if let Some(extra) = extra {
+            bytes.extend(record_identifier_bytes(0, extra));
+        }
+        bytes
+    };
+    data.add_record(9, TYPE_NODE, node_record(9, 6, Some(17)));
+    data.add_record(10, TYPE_NODE, node_record(10, 5, Some(9)));
+    data.add_record(11, TYPE_NODE, node_record(11, 4, Some(10)));
+
+    let archives = build_fixture_archives(graph_fixture, &bulk_uuids, data_uuid, &data);
     write_repository(
         &directory.path,
         &[
-            (BULK_ARCHIVE.to_owned(), bulk_archive.build(BULK_ARCHIVE)),
-            (DATA_ARCHIVE.to_owned(), data_archive_bytes),
-            (
-                DATA_BLOCK_ARCHIVE.to_owned(),
-                data_block_archive.build(DATA_BLOCK_ARCHIVE),
-            ),
+            (BULK_ARCHIVE.to_owned(), archives.bulk),
+            (DATA_ARCHIVE.to_owned(), archives.data),
+            (DATA_BLOCK_ARCHIVE.to_owned(), archives.data_blocks),
         ],
         &[format!("{}:11 root 1", format_uuid(data_uuid))],
     );
@@ -277,8 +311,8 @@ fn write_diagnostic_fixture(test_name: &str, graph_fixture: GraphFixture) -> Dia
         directory,
         data_identifier: SegmentIdentifier::new(data_uuid.0, data_uuid.1),
         bulk_identifiers: bulk_uuids.map(|uuid| SegmentIdentifier::new(uuid.0, uuid.1)),
-        graph_empty_identifier,
-        invalid_graph_identifier,
+        graph_empty_identifier: archives.graph_empty_identifier,
+        invalid_graph_identifier: archives.invalid_graph_identifier,
     }
 }
 
