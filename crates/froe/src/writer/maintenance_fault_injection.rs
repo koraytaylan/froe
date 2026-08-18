@@ -318,10 +318,6 @@ mod tests {
 
     /// Child entrypoint. A normal `cargo test` invocation leaves the marker
     /// unset, so this registered test is a no-op outside its parent harness.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "all isolated fault modes share one exact libtest child entrypoint"
-    )]
     #[test]
     fn cleanup_fault_child() {
         if std::env::var_os(CHILD_ENVIRONMENT).as_deref() != Some(OsStr::new("1")) {
@@ -337,111 +333,132 @@ mod tests {
             std::env::var(CUTPOINT_ENVIRONMENT).expect("fault child cutpoint must be supplied");
         let mode = std::env::var(MODE_ENVIRONMENT).expect("fault child mode must be supplied");
         if scenario == POSTCOMPACTION_SWEEP_SCENARIO {
-            let mut store = WritableRepository::open(&directory)
-                .expect("open post-compaction boundary fixture");
-            let reference = store
-                .writing_generation()
-                .expect("read post-compaction reference generation");
-            let outcome = store.reclaim_old_generations(reference, CompactionKind::Full);
-            match mode.as_str() {
-                ERROR_MODE => {
-                    let error = outcome
-                        .expect_err("post-compaction reclaim completed without injected error");
-                    assert!(
-                        error.to_string().contains(&cutpoint),
-                        "post-compaction reclaim failed before {cutpoint}: {error}"
-                    );
-                }
-                CRASH_MODE => match outcome {
-                    Ok(()) => {
-                        panic!("post-compaction reclaim completed without reaching {cutpoint}")
-                    }
-                    Err(error) => {
-                        panic!("post-compaction reclaim failed before {cutpoint}: {error}")
-                    }
-                },
-                other => panic!("unsupported post-compaction fault mode {other}"),
-            }
-            // SAFETY: `_exit` has no memory-safety preconditions and this is
-            // an isolated child whose error path was checked above.
-            unsafe { libc::_exit(VERIFIED_EXIT_CODE) }
+            run_postcompaction_sweep_child(&directory, &cutpoint, &mode);
+            return;
         }
-        let outcome = compact(&directory, scenario_options(&scenario));
-        match mode.as_str() {
+        run_compaction_child(&directory, &scenario, &cutpoint, &mode);
+    }
+
+    /// The post-compaction sweep scenario: compact first, then arm the
+    /// cutpoint and reclaim, so the fault lands in the sweep rather than in
+    /// the copy that precedes it.
+    fn run_postcompaction_sweep_child(directory: &Path, cutpoint: &str, mode: &str) {
+        let mut store =
+            WritableRepository::open(directory).expect("open post-compaction boundary fixture");
+        let reference = store
+            .writing_generation()
+            .expect("read post-compaction reference generation");
+        let outcome = store.reclaim_old_generations(reference, CompactionKind::Full);
+        match mode {
+            ERROR_MODE => {
+                let error =
+                    outcome.expect_err("post-compaction reclaim completed without injected error");
+                assert!(
+                    error.to_string().contains(cutpoint),
+                    "post-compaction reclaim failed before {cutpoint}: {error}"
+                );
+            }
+            CRASH_MODE => match outcome {
+                Ok(()) => {
+                    panic!("post-compaction reclaim completed without reaching {cutpoint}")
+                }
+                Err(error) => {
+                    panic!("post-compaction reclaim failed before {cutpoint}: {error}")
+                }
+            },
+            other => panic!("unsupported post-compaction fault mode {other}"),
+        }
+        // SAFETY: `_exit` has no memory-safety preconditions and this is
+        // an isolated child whose error path was checked above.
+        unsafe { libc::_exit(VERIFIED_EXIT_CODE) }
+    }
+
+    /// What a path substituted at `cutpoint` must have left behind: either a
+    /// refusal, or a partial outcome naming the file it declined to touch.
+    fn assert_substitution_outcome(
+        scenario: &str,
+        cutpoint: &str,
+        outcome: crate::error::Result<crate::writer::maintenance::CompactionOutcome>,
+    ) {
+        if cutpoint == "remove-planned-file.before-final-identity" && scenario == REMOVAL_SCENARIO {
+            let outcome =
+                outcome.expect("a late planned-file identity refusal is a partial outcome");
+            assert!(!outcome.is_complete());
+            assert!(outcome.deletion_failures().iter().any(|failure| {
+                failure.file_name() == "journal.log.cleaning.000"
+                    && failure.error().contains("changed after")
+            }));
+        } else {
+            let error = outcome.expect_err("cleanup accepted injected post-mutation inconsistency");
+            if cutpoint == "checkpoint.tar-durable-before-journal" {
+                assert!(
+                    error.to_string().contains("finalized session archive"),
+                    "unexpected checkpoint TAR identity refusal: {error}"
+                );
+            }
+            if cutpoint == "sweep.staging-validated-before-publish" {
+                assert!(
+                    error.to_string().contains("validated archive staging file"),
+                    "unexpected staging identity refusal: {error}"
+                );
+            }
+            if cutpoint == "sweep.remove-before-source-identity" {
+                assert!(
+                    error.to_string().contains("certified removal source"),
+                    "unexpected archive-source identity refusal: {error}"
+                );
+            }
+            if cutpoint == "cleanup.before-final-retained-root-verification" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("previously readable journal root"),
+                    "unexpected retained-root refusal: {error}"
+                );
+            }
+            if cutpoint == "cleanup.before-prospective-retained-root-verification" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("segment cleanup would make retained journal root"),
+                    "unexpected prospective retained-root refusal: {error}"
+                );
+            }
+            if cutpoint == "cleanup.before-final-retained-line-verification" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("previously readable physical journal line byte-for-byte"),
+                    "unexpected retained-line refusal: {error}"
+                );
+            }
+            if cutpoint == "remove-planned-file.before-final-identity"
+                && scenario == STALE_ARCHIVE_SCENARIO
+            {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("planned cleanup deletion of data00000a.tar failed"),
+                    "unexpected strict stale-archive refusal: {error}"
+                );
+            }
+        }
+    }
+
+    /// Every other scenario: arm the cutpoint, run the maintenance, and hold
+    /// the store to what the mode says a fault there must leave behind.
+    fn run_compaction_child(directory: &Path, scenario: &str, cutpoint: &str, mode: &str) {
+        let outcome = compact(directory, scenario_options(scenario));
+        match mode {
             ERROR_MODE => {
                 let error = outcome.expect_err("cleanup completed without the injected error");
                 assert!(
-                    error.to_string().contains(&cutpoint),
+                    error.to_string().contains(cutpoint),
                     "cleanup failed at an unexpected seam before {cutpoint}: {error}"
                 );
             }
             SUBSTITUTE_MODE => {
-                if cutpoint == "remove-planned-file.before-final-identity"
-                    && scenario == REMOVAL_SCENARIO
-                {
-                    let outcome =
-                        outcome.expect("a late planned-file identity refusal is a partial outcome");
-                    assert!(!outcome.is_complete());
-                    assert!(outcome.deletion_failures().iter().any(|failure| {
-                        failure.file_name() == "journal.log.cleaning.000"
-                            && failure.error().contains("changed after")
-                    }));
-                } else {
-                    let error =
-                        outcome.expect_err("cleanup accepted injected post-mutation inconsistency");
-                    if cutpoint == "checkpoint.tar-durable-before-journal" {
-                        assert!(
-                            error.to_string().contains("finalized session archive"),
-                            "unexpected checkpoint TAR identity refusal: {error}"
-                        );
-                    }
-                    if cutpoint == "sweep.staging-validated-before-publish" {
-                        assert!(
-                            error.to_string().contains("validated archive staging file"),
-                            "unexpected staging identity refusal: {error}"
-                        );
-                    }
-                    if cutpoint == "sweep.remove-before-source-identity" {
-                        assert!(
-                            error.to_string().contains("certified removal source"),
-                            "unexpected archive-source identity refusal: {error}"
-                        );
-                    }
-                    if cutpoint == "cleanup.before-final-retained-root-verification" {
-                        assert!(
-                            error
-                                .to_string()
-                                .contains("previously readable journal root"),
-                            "unexpected retained-root refusal: {error}"
-                        );
-                    }
-                    if cutpoint == "cleanup.before-prospective-retained-root-verification" {
-                        assert!(
-                            error
-                                .to_string()
-                                .contains("segment cleanup would make retained journal root"),
-                            "unexpected prospective retained-root refusal: {error}"
-                        );
-                    }
-                    if cutpoint == "cleanup.before-final-retained-line-verification" {
-                        assert!(
-                            error.to_string().contains(
-                                "previously readable physical journal line byte-for-byte"
-                            ),
-                            "unexpected retained-line refusal: {error}"
-                        );
-                    }
-                    if cutpoint == "remove-planned-file.before-final-identity"
-                        && scenario == STALE_ARCHIVE_SCENARIO
-                    {
-                        assert!(
-                            error
-                                .to_string()
-                                .contains("planned cleanup deletion of data00000a.tar failed"),
-                            "unexpected strict stale-archive refusal: {error}"
-                        );
-                    }
-                }
+                assert_substitution_outcome(scenario, cutpoint, outcome);
             }
             ABSENCE_MODE => {
                 let outcome = outcome.expect("cleanup lost the already-absent segment outcome");
