@@ -433,3 +433,71 @@ pub(super) fn backup_path(directory: &Path, file_name: &str) -> PathBuf {
         counter += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Repository;
+
+    use crate::writer::store_writer::repository::*;
+
+    use crate::writer::store_writer::test_support::*;
+
+    /// An empty archive file is what a writer killed inside its own lazy
+    /// next-archive creation leaves behind — the read path has always
+    /// skipped it. Before this was mirrored here, the number fell to
+    /// `recover_archive_number`, which rebuilt it as an archive with no
+    /// entries; `TarArchiveWriter` never creates a file for that, so the
+    /// re-open failed on a missing path and every froe write command
+    /// reported a bare `No such file or directory`.
+    #[test]
+    fn an_empty_archive_file_does_not_break_opening_for_writing() {
+        let directory = TestDirectory::new("empty-archive-open");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        let empty = directory.path.join("data00009a.tar");
+        std::fs::write(&empty, b"").expect("create the empty archive");
+
+        let store = WritableRepository::open(&directory.path).expect("write open must succeed");
+        let head = store.head();
+        assert!(store.segment(head.segment).is_ok(), "head still resolves");
+        store.close().expect("close");
+
+        Repository::open(&directory.path).expect("the reader still opens");
+    }
+    /// A non-empty letter that yields no recoverable segment is residue
+    /// `recover_archive_number` cannot act on. It must say so, not surface
+    /// the `ENOENT` of the replacement it declined to write.
+    #[test]
+    fn an_unrecoverable_archive_is_refused_with_its_file_name() {
+        let directory = TestDirectory::new("unrecoverable-archive");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close");
+        }
+        // 512-byte blocks that are neither a valid index nor a parseable
+        // tar entry: the scan recovers nothing from them.
+        let junk = directory.path.join("data00009a.tar");
+        std::fs::write(&junk, vec![0x5au8; 4096]).expect("write junk archive");
+
+        let message = match WritableRepository::open(&directory.path) {
+            Ok(_) => panic!("opening for writing must refuse an unrecoverable archive"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("data00009a.tar"),
+            "the refusal names the unusable file: {message}"
+        );
+        assert!(
+            message.contains("no recoverable segment"),
+            "the refusal states why: {message}"
+        );
+        assert!(
+            !message.contains("No such file or directory"),
+            "the refusal must not surface a bare errno: {message}"
+        );
+        assert!(junk.exists(), "the refusal leaves the file in place");
+    }
+}

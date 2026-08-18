@@ -517,3 +517,365 @@ pub(super) fn mark_one_archive(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::writer::store_writer::sweep_plan::*;
+    use crate::writer::store_writer::test_support::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn the_oak_savings_gate_defers_at_exactly_twenty_five_percent() {
+        let directory = TestDirectory::new("savings-gate");
+        let entries: Vec<_> = (1..=4)
+            .map(|seed| TestArchiveEntry::new(data_identifier(seed), 1, generation(0, 0, false)))
+            .collect();
+        write_test_archive(&directory, "data00000a.tar", &entries);
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
+
+        let exactly_one_quarter = HashSet::from([entries[0].identifier]);
+        let exact = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &exactly_one_quarter,
+            ArchiveRewritePolicy::OakSavingsGate,
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan exact threshold")
+        .expect("one segment is eligible");
+        assert!(matches!(
+            exact,
+            PlannedArchiveSweep::DeferredBySavings {
+                segment_count: 1,
+                eligible_entry_bytes: 1024,
+                ..
+            }
+        ));
+
+        let more_than_one_quarter = HashSet::from([entries[0].identifier, entries[1].identifier]);
+        let rewrite = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &more_than_one_quarter,
+            ArchiveRewritePolicy::OakSavingsGate,
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan above threshold")
+        .expect("two segments are eligible");
+        assert!(matches!(
+            rewrite,
+            PlannedArchiveSweep::Rewrite {
+                segment_count: 2,
+                eligible_entry_bytes: 2048,
+                ref replacement_name,
+                ..
+            } if replacement_name == "data00000b.tar"
+        ));
+    }
+    #[test]
+    fn the_default_policy_rewrites_what_the_oak_savings_gate_defers() {
+        let directory = TestDirectory::new("savings-gate-default");
+        let entries: Vec<_> = (1..=4)
+            .map(|seed| TestArchiveEntry::new(data_identifier(seed), 1, generation(0, 0, false)))
+            .collect();
+        write_test_archive(&directory, "data00000a.tar", &entries);
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
+
+        // The same one-in-four reclaimable set the gate defers above.
+        let exactly_one_quarter = HashSet::from([entries[0].identifier]);
+        let planned = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &exactly_one_quarter,
+            ArchiveRewritePolicy::EveryReclaimableArchive,
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan exact threshold")
+        .expect("one segment is eligible");
+        assert!(
+            matches!(
+                planned,
+                PlannedArchiveSweep::Rewrite {
+                    segment_count: 1,
+                    eligible_entry_bytes: 1024,
+                    ref replacement_name,
+                    ..
+                } if replacement_name == "data00000b.tar"
+            ),
+            "the default policy rewrites regardless of how little it frees, got {planned:?}"
+        );
+    }
+    #[test]
+    fn sweep_gate_reproduces_java_signed_i32_wrap_and_rejects_larger_domains() {
+        assert_eq!(oak_sweep_threshold(4), 3);
+        assert!(oak_sweep_defers(4, 3, "boundary").expect("equality defers"));
+        assert!(!oak_sweep_defers(4, 2, "boundary").expect("more savings rewrites"));
+
+        let largest_unwrapped = i32::MAX / 3;
+        assert_eq!(
+            oak_sweep_threshold(largest_unwrapped),
+            largest_unwrapped * 3 / 4
+        );
+        assert_eq!(
+            oak_sweep_threshold(largest_unwrapped + 1),
+            i32::MIN.saturating_add(1) / 4,
+            "the multiplication wraps before Java's truncating division"
+        );
+        assert!(
+            oak_sweep_defers((largest_unwrapped + 1) as u64, 0, "wrapped")
+                .expect("wrapped Java arithmetic"),
+            "a negative wrapped threshold makes every nonnegative survivor size defer"
+        );
+
+        assert!(oak_sweep_defers(i32::MAX as u64 + 1, 0, "oversize").is_err());
+        assert!(oak_sweep_defers(1, i32::MAX as u64 + 1, "oversize").is_err());
+    }
+    #[test]
+    fn post_compaction_mark_does_not_arm_dangling_future_cleanup() {
+        let directory = TestDirectory::new("post-compaction-no-dangling-root");
+        let compacted = data_identifier(5);
+        let reference = generation(5, 5, true);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(compacted, 1, reference)],
+        );
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
+        let protected = HashSet::new();
+        let policy = ReclaimPolicy {
+            rule: ReclaimRule {
+                reference,
+                kind: CompactionKind::Full,
+                retained_generations: 1,
+            },
+            protected_data_segments: &protected,
+        };
+        let mut references = HashSet::new();
+        let mut reclaimable = HashSet::new();
+        let mut disabled = None;
+        mark_one_archive(
+            &reader,
+            policy,
+            &mut references,
+            &mut reclaimable,
+            &mut disabled,
+        )
+        .expect("mark");
+        assert!(reclaimable.is_empty());
+        assert_eq!(disabled, None);
+    }
+    /// A stale archive letter this same run has already committed to unlink
+    /// must not block the sweep of the archive it shadows. Planning before the
+    /// removals and replanning after them would otherwise disagree about an
+    /// archive the run never named — which is a plan authorizing one mutation
+    /// and an apply performing another.
+    #[test]
+    fn a_sweep_plan_treats_a_pending_stale_removal_as_already_absent() {
+        let directory = TestDirectory::new("pending-stale-removal");
+        let old_one = data_identifier(210);
+        let old_two = data_identifier(211);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+            ],
+        );
+        // The superseded-letter condition a stale-archive removal retires.
+        std::fs::write(
+            directory.path.join("data00000b.tar"),
+            b"stale letter this run removes first",
+        )
+        .expect("write the stale letter");
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open source");
+        let cleaned = HashSet::from([old_one, old_two]);
+
+        let blocked = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &cleaned,
+            ArchiveRewritePolicy::default(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("plan against the live namespace")
+        .expect("every entry is reclaimable");
+        assert!(
+            matches!(
+                blocked,
+                PlannedArchiveSweep::BlockedByOccupiedGeneration {
+                    ref occupied_name,
+                    ..
+                } if occupied_name == "data00000b.tar"
+            ),
+            "the live namespace still holds the stale letter, so the removal is blocked: {blocked:?}"
+        );
+
+        let absent = HashSet::from(["data00000b.tar".to_owned()]);
+        let unblocked = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &cleaned,
+            ArchiveRewritePolicy::default(),
+            &absent,
+        )
+        .expect("plan against the namespace this run will leave behind")
+        .expect("every entry is reclaimable");
+        assert!(
+            matches!(
+                unblocked,
+                PlannedArchiveSweep::Remove {
+                    segment_count: 2,
+                    ..
+                }
+            ),
+            "a letter this run removes first cannot block the whole-file removal: {unblocked:?}"
+        );
+    }
+    #[test]
+    fn staging_namespace_exhaustion_fails_during_plan_without_mutation() {
+        let directory = TestDirectory::new("staging-namespace-exhausted");
+        let root = data_identifier(1010);
+        let old_one = data_identifier(1011);
+        let old_two = data_identifier(1012);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(root, 1, generation(4, 4, false)),
+                TestArchiveEntry::new(old_one, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(old_two, 1, generation(0, 0, false)),
+            ],
+        );
+        let source_path = directory.path.join("data00000a.tar");
+        let source_before = std::fs::read(&source_path).expect("source before");
+        for counter in 0..=999u16 {
+            std::fs::write(
+                directory
+                    .path
+                    .join(format!("data00000b.tar.cleaning.{counter:03}")),
+                counter.to_be_bytes(),
+            )
+            .expect("occupy staging name");
+        }
+        let reader = TarArchiveReader::open(&source_path).expect("open source");
+        let error = plan_archive_sweep(
+            &directory.path,
+            &reader,
+            &HashSet::from([old_one, old_two]),
+            ArchiveRewritePolicy::default(),
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("planning must detect that no exclusive staging name exists");
+        assert!(
+            error
+                .to_string()
+                .contains("all 1000 exclusive staging names")
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source after refusal"),
+            source_before
+        );
+        assert!(!directory.path.join("data00000b.tar").exists());
+        assert_eq!(
+            std::fs::read(directory.path.join("data00000b.tar.cleaning.000"))
+                .expect("first residue"),
+            0u16.to_be_bytes()
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("data00000b.tar.cleaning.999"))
+                .expect("last residue"),
+            999u16.to_be_bytes()
+        );
+    }
+    #[test]
+    fn dangling_future_state_is_global_ordered_and_history_vetoed() {
+        let directory = TestDirectory::new("dangling-future-order");
+        let older_compacted = data_identifier(30);
+        let root = data_identifier(31);
+        let protected_future = data_identifier(32);
+        let future = data_identifier(33);
+        let referenced_future_bulk = bulk_identifier(34);
+        let protected_bulk = bulk_identifier(35);
+        let current = generation(7, 7, true);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(older_compacted, 1, current),
+                TestArchiveEntry::new(root, 1, current),
+                TestArchiveEntry::new(protected_bulk, 1, generation(0, 0, false)),
+                TestArchiveEntry::new(protected_future, 1, current).referencing(&[protected_bulk]),
+                TestArchiveEntry::new(future, 1, current),
+                TestArchiveEntry::new(referenced_future_bulk, 1, current),
+            ],
+        );
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
+        let protected = HashSet::from([protected_future]);
+        let policy = ReclaimPolicy {
+            rule: ReclaimRule {
+                reference: current,
+                kind: CompactionKind::Full,
+                retained_generations: 2,
+            },
+            protected_data_segments: &protected,
+        };
+        let mut references = HashSet::from([referenced_future_bulk]);
+        let mut reclaimable = HashSet::new();
+        let mut ahead_of_root = Some(root);
+        mark_one_archive(
+            &reader,
+            policy,
+            &mut references,
+            &mut reclaimable,
+            &mut ahead_of_root,
+        )
+        .expect("mark");
+
+        assert!(reclaimable.contains(&future));
+        assert!(
+            reclaimable.contains(&referenced_future_bulk),
+            "dangling-future precedes bulk reachability"
+        );
+        assert!(!reclaimable.contains(&protected_future));
+        assert!(
+            !reclaimable.contains(&protected_bulk),
+            "a history-vetoed data segment must still protect its bulk closure"
+        );
+        assert!(!reclaimable.contains(&root));
+        assert!(!reclaimable.contains(&older_compacted));
+        assert_eq!(ahead_of_root, None, "the root disarms the rule forever");
+    }
+    #[test]
+    fn standalone_mark_fails_closed_when_the_exact_head_segment_is_absent() {
+        let directory = TestDirectory::new("dangling-root-absent");
+        let present = data_identifier(40);
+        let missing_root = data_identifier(41);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(present, 1, generation(4, 4, true))],
+        );
+        let reader =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open archive");
+        let error = analyze_standalone_segment_cleanup(
+            &directory.path,
+            &[reader],
+            standalone_rule(generation(4, 4, true)),
+            missing_root,
+            &HashSet::new(),
+            ArchiveRewritePolicy::default(),
+            &mut crate::progress::DiscardedProgress,
+        )
+        .expect_err("missing root must refuse cleanup");
+        assert!(error.to_string().contains("was not encountered"));
+        assert!(directory.path.join("data00000a.tar").exists());
+    }
+}

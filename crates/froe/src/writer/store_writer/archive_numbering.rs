@@ -120,3 +120,142 @@ pub(super) fn validate_cleanup_archive_number(directory: &Path, certified: u32) 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::record_writer::ChildNodesToWrite;
+    use crate::writer::repository_lock::RepositoryLock;
+
+    use crate::writer::store_writer::repository::*;
+
+    use crate::writer::store_writer::test_support::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn archive_number_exhaustion_never_wraps_or_truncates_archive_zero() {
+        let directory = TestDirectory::new("archive-number-exhaustion");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let archive_zero = directory.path.join("data00000a.tar");
+        let archive_max = directory.path.join("data4294967295a.tar");
+        std::fs::copy(&archive_zero, &archive_max).expect("install maximum-number fixture");
+        let zero_before = std::fs::read(&archive_zero).expect("archive zero before");
+        let max_before = std::fs::read(&archive_max).expect("archive max before");
+        let journal_before =
+            std::fs::read(directory.path.join("journal.log")).expect("journal before");
+
+        {
+            let store = WritableRepository::open(&directory.path).expect("normal open at max");
+            assert_eq!(store.lock_write_state().next_archive_number, None);
+            let generation = store.writing_generation().expect("generation");
+            let mut writer = store.record_writer(generation);
+            writer
+                .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                .expect("buffer node");
+            let Err(error) = writer.finish() else {
+                panic!("normal writer must refuse namespace wrap");
+            };
+            assert!(error.to_string().contains("namespace is exhausted"));
+            store.close().expect("unchanged normal store closes");
+        }
+
+        let error = next_cleanup_archive_number(&directory.path)
+            .expect_err("prepared cleanup planning must refuse namespace wrap");
+        assert!(error.to_string().contains("namespace is exhausted"));
+
+        assert_eq!(
+            std::fs::read(&archive_zero).expect("archive zero after"),
+            zero_before
+        );
+        assert_eq!(
+            std::fs::read(&archive_max).expect("archive max after"),
+            max_before
+        );
+        assert_eq!(
+            std::fs::read(directory.path.join("journal.log")).expect("journal after"),
+            journal_before
+        );
+        assert!(!directory.path.join("data00001a.tar").exists());
+    }
+    #[test]
+    fn prepared_writer_never_truncates_a_next_archive_occupied_after_open() {
+        let directory = TestDirectory::new("prepared-next-archive-race");
+        {
+            let store = WritableRepository::open(&directory.path).expect("bootstrap");
+            store.close().expect("close bootstrap");
+        }
+        let repository_lock =
+            Arc::new(RepositoryLock::acquire(&directory.path).expect("maintenance lock"));
+        let store = open_prepared_store(&directory.path, Arc::clone(&repository_lock));
+        assert_eq!(store.lock_write_state().next_archive_number, Some(1));
+
+        let occupied_path = directory.path.join("data00001a.tar");
+        let residue = b"interrupted writer recovery evidence";
+        std::fs::write(&occupied_path, residue).expect("occupy planned next archive after open");
+        let generation = store.writing_generation().expect("generation");
+        let mut writer = store.record_writer(generation);
+        writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+            .expect("buffer node");
+        let Err(error) = writer.finish() else {
+            panic!("exclusive prepared writer must reject the occupied path");
+        };
+        assert!(error.to_string().contains("exists"));
+        assert_eq!(
+            std::fs::read(&occupied_path).expect("read occupied path"),
+            residue,
+            "neither the failed write nor later close may truncate or rewrite residue"
+        );
+        store.close().expect("unchanged prepared store closes");
+        drop(repository_lock);
+        assert_eq!(
+            std::fs::read(occupied_path).expect("read residue after close"),
+            residue
+        );
+    }
+    #[test]
+    fn prepared_open_rechecks_certified_archive_aliases_and_higher_numbers() {
+        for (case, occupied_name, expected_error) in [
+            (
+                "prepared-certified-lettered-alias",
+                "data00001a.tar",
+                "output alias",
+            ),
+            (
+                "prepared-certified-letterless-alias",
+                "data00001.tar",
+                "output alias",
+            ),
+            (
+                "prepared-certified-higher-number",
+                "data00002b.tar",
+                "at or above",
+            ),
+        ] {
+            let directory = TestDirectory::new(case);
+            {
+                let store = WritableRepository::open(&directory.path).expect("bootstrap");
+                store.close().expect("close bootstrap");
+            }
+            let certified =
+                next_cleanup_archive_number(&directory.path).expect("initial certificate");
+            assert_eq!(certified, 1);
+            let repository_lock =
+                Arc::new(RepositoryLock::acquire(&directory.path).expect("maintenance lock"));
+            std::fs::write(directory.path.join(occupied_name), b"")
+                .expect("occupy namespace after certification");
+
+            let Err(error) = WritableRepository::open_prepared(
+                &directory.path,
+                Arc::clone(&repository_lock),
+                certified,
+            ) else {
+                panic!("strict prepared open must reject {occupied_name}");
+            };
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
+    }
+}

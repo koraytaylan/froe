@@ -341,3 +341,113 @@ impl SegmentProvider for ArchiveSegmentsProvider<'_> {
         read_template(self, record_identifier).map(Arc::new)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::writer::store_writer::test_support::*;
+    use crate::writer::tar_writer::TarArchiveWriter;
+    use std::collections::HashSet;
+
+    #[test]
+    fn mark_and_session_seed_follow_every_non_data_identifier() {
+        let directory = TestDirectory::new("cross-tar-non-data-reference");
+        let non_data = non_data_identifier(65);
+        let root = data_identifier(66);
+        let current = generation(6, 6, false);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[TestArchiveEntry::new(
+                non_data,
+                128,
+                generation(0, 0, false),
+            )],
+        );
+        write_test_archive(
+            &directory,
+            "data00001a.tar",
+            &[TestArchiveEntry::new(root, 128, current).referencing(&[non_data])],
+        );
+        write_manifest(&directory);
+
+        let plan = plan_cleanup_from_directory(&directory.path, current, root, &HashSet::new())
+            .expect("plan");
+        assert!(
+            !plan.reclaimable_segments().contains(&non_data),
+            "Oak follows every non-data identifier, not only the canonical 0xB kind"
+        );
+
+        let session = TarArchiveReader::open(&directory.path.join("data00001a.tar"))
+            .expect("open session-style archive");
+        let mut references = HashSet::new();
+        seed_references_from_archive(&session, &mut references).expect("seed session references");
+        assert_eq!(references, HashSet::from([non_data]));
+    }
+    #[test]
+    fn catalog_provider_resolves_duplicate_segments_to_the_newest_archive() {
+        let directory = TestDirectory::new("provider-newest-wins");
+        std::fs::create_dir_all(&directory.path).expect("create directory");
+        let bulk = crate::writer::identifier_generator::new_bulk_segment_identifier();
+        let generation = GarbageCollectionGeneration {
+            generation: 0,
+            full_generation: 0,
+            is_compacted: false,
+        };
+        let write_archive = |name: &str, content: &[u8]| {
+            let mut writer = TarArchiveWriter::new(&directory.path, name);
+            writer
+                .write_segment(bulk, content, generation, &[], &[])
+                .expect("write segment");
+            writer.close().expect("close archive");
+        };
+        write_archive("data00000a.tar", b"old-archive-copy");
+        write_archive("data00001a.tar", b"new-archive-copy");
+
+        // Newest archive first, the order `base_archives` maintains.
+        let newest =
+            TarArchiveReader::open(&directory.path.join("data00001a.tar")).expect("open newest");
+        let oldest =
+            TarArchiveReader::open(&directory.path.join("data00000a.tar")).expect("open oldest");
+        let provider = archive_segments_provider(&[&newest, &oldest]).expect("provider");
+        let view = provider.segment(bulk).expect("duplicate resolves");
+        assert_eq!(
+            &view.bytes[..],
+            b"new-archive-copy",
+            "a duplicated segment resolves to the newest archive's copy"
+        );
+    }
+    /// The proof names what it covers, so it cannot excuse work it did not
+    /// do. A base archive set that has gained, lost, or exchanged a name
+    /// since the certificate was taken is not the set it proved.
+    #[test]
+    fn a_reclaim_proof_covers_only_the_sources_it_named() {
+        let proved: std::collections::HashSet<String> =
+            ["data00000a.tar".to_owned(), "data00001a.tar".to_owned()]
+                .into_iter()
+                .collect();
+        let proof = CertifiedReclaimSources {
+            base_names: proved.clone(),
+        };
+        assert!(proof.certifies_exactly(&proved));
+
+        for divergent in [
+            // One retired since.
+            vec!["data00000a.tar"],
+            // One added since.
+            vec!["data00000a.tar", "data00001a.tar", "data00002a.tar"],
+            // One rewritten to the next generation letter since.
+            vec!["data00000a.tar", "data00001b.tar"],
+            // Nothing left.
+            vec![],
+        ] {
+            let current: std::collections::HashSet<String> =
+                divergent.iter().map(|name| (*name).to_owned()).collect();
+            assert!(
+                !proof.certifies_exactly(&current),
+                "a proof of {proved:?} must not cover {current:?}"
+            );
+        }
+    }
+}

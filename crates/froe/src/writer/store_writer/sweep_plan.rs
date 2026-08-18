@@ -317,3 +317,147 @@ pub(crate) fn planned_unavailable_segments(
     }
     Ok(unavailable)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::compaction::CompactionKind;
+
+    use crate::writer::store_writer::reclaim::*;
+
+    use crate::writer::store_writer::repository::*;
+
+    use crate::writer::store_writer::test_support::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn dangling_future_boundary_is_shared_across_archive_files() {
+        let directory = TestDirectory::new("dangling-future-cross-archive");
+        let older = data_identifier(50);
+        let root = data_identifier(51);
+        let future = data_identifier(52);
+        let current = generation(9, 9, true);
+        write_test_archive(
+            &directory,
+            "data00000a.tar",
+            &[
+                TestArchiveEntry::new(older, 1, current),
+                TestArchiveEntry::new(root, 1, current),
+            ],
+        );
+        write_test_archive(
+            &directory,
+            "data00001a.tar",
+            &[TestArchiveEntry::new(future, 1, current)],
+        );
+        write_manifest(&directory);
+
+        let plan = plan_cleanup_from_directory(&directory.path, current, root, &HashSet::new())
+            .expect("plan across archives");
+        assert_eq!(plan.marked_segments, 1);
+        assert_eq!(plan.reclaimable_segments(), &HashSet::from([future]));
+        assert!(matches!(
+            plan.archives.as_slice(),
+            [PlannedArchiveSweep::Remove {
+                file_name,
+                segment_count: 1,
+                ..
+            }] if file_name == "data00001a.tar"
+        ));
+        assert!(!plan.reclaimable_segments().contains(&root));
+        assert!(!plan.reclaimable_segments().contains(&older));
+    }
+    /// The authorization the post-compaction sweep never had: a confirmed plan
+    /// it must match before it unlinks anything. A disagreement is answered by
+    /// refusing, not by explaining afterwards.
+    #[test]
+    fn a_post_compaction_sweep_refuses_an_unconfirmed_disposition_before_it_unlinks() {
+        let (directory, live) = reclaimable_base_fixture("sweep-authorization");
+        let before: Vec<String> = crate::store::list_archive_file_names(&directory.path)
+            .expect("list the archives before");
+        assert!(!before.is_empty());
+
+        // A plan naming a disposition this store cannot produce.
+        let impossible = StandaloneSegmentCompactionPlan {
+            archives: vec![PlannedArchiveSweep::Remove {
+                file_name: "data09999a.tar".to_owned(),
+                segment_count: 1,
+                file_bytes: 1,
+            }],
+            marked_segments: 1,
+            reclaimable: std::collections::HashSet::new(),
+        };
+
+        let mut store = WritableRepository::open(&directory.path).expect("open for the sweep");
+        let error = store
+            .reclaim_old_generations_with(GenerationReclaimRequest {
+                rule: ReclaimRule {
+                    reference: live,
+                    kind: CompactionKind::Full,
+                    retained_generations: RETAINED_GENERATIONS,
+                },
+                rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
+                certified_sources: None,
+                expected: Some(&impossible),
+            })
+            .expect_err("an unconfirmed disposition must be refused");
+        store.close().expect("close after the refusal");
+
+        assert!(
+            error.to_string().contains("changed after confirmation"),
+            "the refusal names its reason: {error}"
+        );
+        assert_eq!(
+            crate::store::list_archive_file_names(&directory.path)
+                .expect("list the archives after"),
+            before,
+            "a refused sweep unlinks nothing"
+        );
+    }
+    /// The rewrite policy now reaches the code that acts on it. Before this,
+    /// a run under Oak's savings heuristic predicted a deferral and then
+    /// rewrote the archive anyway.
+    #[test]
+    fn the_savings_gate_reaches_the_post_compaction_sweep() {
+        for (policy, expect_unchanged) in [
+            (ArchiveRewritePolicy::OakSavingsGate, true),
+            (ArchiveRewritePolicy::EveryReclaimableArchive, false),
+        ] {
+            let (directory, live) = reclaimable_base_fixture(&format!("sweep-policy-{policy:?}"));
+            let before = crate::store::list_archive_file_names(&directory.path).expect("list");
+
+            let mut store = WritableRepository::open(&directory.path).expect("open for the sweep");
+            let outcome = store
+                .reclaim_old_generations_with(GenerationReclaimRequest {
+                    rule: ReclaimRule {
+                        reference: live,
+                        kind: CompactionKind::Full,
+                        retained_generations: RETAINED_GENERATIONS,
+                    },
+                    rewrite_policy: policy,
+                    certified_sources: None,
+                    expected: None,
+                })
+                .expect("the sweep runs");
+            store.close().expect("close after the sweep");
+
+            let after = crate::store::list_archive_file_names(&directory.path).expect("list");
+            if expect_unchanged {
+                assert_eq!(
+                    after, before,
+                    "Oak's heuristic leaves an archive it will not repay: {outcome:?}"
+                );
+                assert_eq!(outcome, SegmentSweepOutcome::default());
+            } else {
+                assert_ne!(
+                    after, before,
+                    "the default policy reclaims what the heuristic declined"
+                );
+                assert!(
+                    outcome.removed_archives + outcome.rewritten_archives > 0,
+                    "and reports what it did: {outcome:?}"
+                );
+            }
+        }
+    }
+}

@@ -374,3 +374,48 @@ pub(super) fn certify_archives_in_parallel(
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Repository;
+
+    use crate::writer::store_writer::test_support::*;
+
+    /// Certification hands archives out to workers, so no position may be
+    /// left unclaimed. Proven by breaking one archive at a time and
+    /// requiring the pass to find it: a worker loop that skipped a position
+    /// would still pass the all-healthy case, and fail here.
+    #[test]
+    fn parallel_certification_proves_every_archive() {
+        const ARCHIVES: usize = 12;
+        let (source, copies, last_payload_byte) =
+            build_identical_certifiable_archives("parallel-certify-all", ARCHIVES);
+        let provider = Repository::open(&source.path).expect("open provider");
+        let path_of = |number: usize| copies.path.join(format!("data{number:05}a.tar"));
+        let pristine = std::fs::read(path_of(0)).expect("read pristine copy");
+        let open_all = || -> Vec<TarArchiveReader> {
+            (0..ARCHIVES)
+                .map(|number| TarArchiveReader::open(&path_of(number)).expect("open archive copy"))
+                .collect()
+        };
+
+        certify_active_archives(&provider, &open_all())
+            .expect("every healthy archive is certified");
+
+        for corrupt in 0..ARCHIVES {
+            let mut bytes = pristine.clone();
+            bytes[last_payload_byte] ^= 0x01;
+            std::fs::write(path_of(corrupt), &bytes).expect("corrupt one copy");
+            let error = certify_active_archives(&provider, &open_all())
+                .expect_err("the one corrupt archive must be found");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("data{corrupt:05}a.tar")),
+                "position {corrupt} went unclaimed: {error}"
+            );
+            std::fs::write(path_of(corrupt), &pristine).expect("restore the copy");
+        }
+    }
+}

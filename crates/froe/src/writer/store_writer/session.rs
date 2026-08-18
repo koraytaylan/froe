@@ -186,3 +186,113 @@ impl FinalizedSessionCertificate {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::BoundedCache;
+    use crate::writer::record_writer::ChildNodesToWrite;
+
+    use crate::writer::store_writer::repository::*;
+
+    use crate::writer::store_writer::test_support::*;
+    use std::sync::RwLock;
+
+    /// The regression guard for the defect that made `compact` unusable: a
+    /// session that keeps what it writes.
+    ///
+    /// This asserts the property directly rather than a consequence of it.
+    /// Writing more segments must not make the session hold more payload —
+    /// if it does, this fails no matter which structure grew or why. A test
+    /// that only checked "the store is still correct" would have passed
+    /// throughout the entire period the bug existed.
+    #[test]
+    fn writing_more_segments_does_not_make_a_session_hold_more_bytes() {
+        /// A ceiling far below what this many segments occupy, so eviction
+        /// is doing the bounding rather than the fixture simply being
+        /// smaller than the default budget.
+        const TEST_BUDGET_BYTES: usize = 4096;
+
+        fn payload_bytes_held_after(directory: &TestDirectory, segments: usize) -> usize {
+            let mut store = WritableRepository::open(&directory.path).expect("open");
+            store.session_segment_cache = RwLock::new(BoundedCache::new(TEST_BUDGET_BYTES));
+            let generation = store.writing_generation().expect("generation");
+            for _ in 0..segments {
+                let mut writer = store.record_writer(generation);
+                writer
+                    .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+                    .expect("node");
+                writer.finish().expect("finish");
+            }
+            let held = store
+                .session_segment_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .used_bytes();
+            let locators = store
+                .session_segments
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            assert_eq!(locators, segments, "every write must be locatable");
+            store.close().expect("close");
+            held
+        }
+
+        // A budget small enough that even this fixture's tiny segments
+        // overflow it, so the ceiling is what limits residency rather than
+        // the fixture being smaller than the default budget.
+        let few = TestDirectory::new("session-growth-few");
+        WritableRepository::open(&few.path)
+            .expect("bootstrap")
+            .close()
+            .expect("close bootstrap");
+        let many = TestDirectory::new("session-growth-many");
+        WritableRepository::open(&many.path)
+            .expect("bootstrap")
+            .close()
+            .expect("close bootstrap");
+
+        let after_few = payload_bytes_held_after(&few, 8);
+        let after_many = payload_bytes_held_after(&many, 64);
+
+        // Eight times the writes, and the payload held must not grow with
+        // them. The locator count does grow — that is metadata, and the
+        // assertion above pins it — but bytes must not.
+        assert!(
+            after_many <= TEST_BUDGET_BYTES,
+            "payload residency exceeded the ceiling: {after_many} bytes held \
+             against a {TEST_BUDGET_BYTES}-byte budget"
+        );
+        assert!(
+            after_few <= TEST_BUDGET_BYTES,
+            "payload residency exceeded the ceiling: {after_few} bytes"
+        );
+        // And the production budget is a constant of the archive size, not
+        // of the store: nothing here may make it a function of content.
+        assert_eq!(
+            session_cache_budget_bytes(DEFAULT_MAXIMUM_ARCHIVE_SIZE),
+            (DEFAULT_MAXIMUM_ARCHIVE_SIZE as usize) * 2
+        );
+    }
+    /// Guards the locator against regrowing into what it replaced.
+    ///
+    /// `session_segments` holds one entry per segment for the life of the
+    /// session, so anything heap-owning added to its value type is once
+    /// again a per-segment allocation across the whole store. Keeping the
+    /// type `Copy` and small is what makes that map metadata rather than a
+    /// second copy of the repository.
+    #[test]
+    fn a_session_locator_owns_no_heap_and_stays_small() {
+        // `Copy` cannot be derived for a type owning heap, so binding this
+        // is a compile-time proof that no String, Vec, or Arc crept in.
+        fn assert_copy<Type: Copy>() {}
+        assert_copy::<SessionSegment>();
+        assert!(
+            std::mem::size_of::<SessionSegment>() <= 24,
+            "SessionSegment grew to {} bytes; a field that scales per segment \
+             belongs on disk or in a bounded cache, not here",
+            std::mem::size_of::<SessionSegment>()
+        );
+    }
+}

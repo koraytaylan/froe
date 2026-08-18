@@ -651,3 +651,239 @@ pub(crate) fn is_reclaimable(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::writer::store_writer::test_support::*;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    #[test]
+    fn full_reclaimer_retained_two_honors_exact_and_wrapping_boundaries() {
+        let reference = generation(10, 8, true);
+
+        // Full-generation age is decisive for compacted and non-compacted
+        // segments, with equality at the retained count included.
+        assert!(is_reclaimable(
+            reference,
+            generation(10, 6, true),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(10, 7, true),
+            CompactionKind::Full,
+            2
+        ));
+        // Generation age is an alternate path only for non-compacted data.
+        assert!(is_reclaimable(
+            reference,
+            generation(8, 7, false),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(8, 7, true),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(9, 7, false),
+            CompactionKind::Full,
+            2
+        ));
+
+        // Java subtraction wraps in signed i32 arithmetic. These pairs
+        // straddle the boundary and distinguish a wrapped delta of 1 from 2.
+        let wrapping_reference = generation(i32::MIN, i32::MIN, false);
+        assert!(!is_reclaimable(
+            wrapping_reference,
+            generation(i32::MAX, i32::MAX, false),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(is_reclaimable(
+            wrapping_reference,
+            generation(i32::MAX - 1, i32::MAX - 1, false),
+            CompactionKind::Full,
+            2
+        ));
+        assert!(!is_reclaimable(
+            generation(i32::MAX, i32::MAX, false),
+            generation(i32::MIN, i32::MIN, false),
+            CompactionKind::Full,
+            2
+        ));
+    }
+    #[test]
+    fn post_compaction_reclaimer_still_retains_exactly_one_generation() {
+        let reference = generation(5, 5, true);
+        assert!(is_reclaimable(
+            reference,
+            generation(4, 4, true),
+            CompactionKind::Full,
+            1
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(5, 5, true),
+            CompactionKind::Full,
+            1
+        ));
+        assert!(is_reclaimable(
+            reference,
+            generation(4, 5, false),
+            CompactionKind::Tail,
+            1
+        ));
+        assert!(!is_reclaimable(
+            reference,
+            generation(4, 5, true),
+            CompactionKind::Tail,
+            1
+        ));
+    }
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture exercises graph, BRF, ordering, logical-name, and non-active-residue validation together"
+    )]
+    #[test]
+    fn staged_rewrite_validation_requires_exact_trailers_and_physical_order() {
+        let directory = TestDirectory::new("staged-semantic-validation");
+        let first = data_identifier(83);
+        let second = data_identifier(84);
+        let generation = generation(7, 6, true);
+        let first_bytes = vec![0x83; 64];
+        let second_bytes = vec![0x84; 64];
+        let live_blob = "live-blob".to_owned();
+
+        let mut source_writer = TarArchiveWriter::new(&directory.path, "data00000a.tar");
+        source_writer
+            .write_segment(
+                first,
+                &first_bytes,
+                generation,
+                &[second],
+                std::slice::from_ref(&live_blob),
+            )
+            .expect("write source first");
+        source_writer
+            .write_segment(second, &second_bytes, generation, &[], &[])
+            .expect("write source second");
+        source_writer.close().expect("close source");
+        let source_path = directory.path.join("data00000a.tar");
+        let source_before = std::fs::read(&source_path).expect("read source");
+        let source = TarArchiveReader::open(&source_path).expect("open source");
+        let mut survivors = source.index().expect("source index").entries().to_vec();
+        survivors.sort_by_key(|entry| entry.position);
+
+        let expected_graph = HashMap::from([(first, HashSet::from([second]))]);
+        let expected_binary_references = HashMap::from([(
+            (
+                generation.generation,
+                generation.full_generation,
+                generation.is_compacted,
+            ),
+            HashMap::from([(first, HashSet::from([live_blob.clone()]))]),
+        )]);
+
+        let write_staged =
+            |physical_name: &str, order: &[SegmentIdentifier], graph: bool, catalog: bool| {
+                let mut writer = TarArchiveWriter::new_exclusive_staged(
+                    &directory.path,
+                    physical_name,
+                    "data00000b.tar",
+                );
+                for identifier in order {
+                    let bytes = if *identifier == first {
+                        &first_bytes
+                    } else {
+                        &second_bytes
+                    };
+                    let references = if *identifier == first && graph {
+                        vec![second]
+                    } else {
+                        Vec::new()
+                    };
+                    let binary_references = if *identifier == first && catalog {
+                        vec![live_blob.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    writer
+                        .write_segment(
+                            *identifier,
+                            bytes,
+                            generation,
+                            &references,
+                            &binary_references,
+                        )
+                        .expect("write staged survivor");
+                }
+                writer.close().expect("close staged archive");
+            };
+
+        let missing_graph = "data00000b.tar.cleaning.000";
+        write_staged(missing_graph, &[first, second], false, true);
+        let graph_error = validate_swept_archive(
+            &source,
+            &directory.path.join(missing_graph),
+            &survivors,
+            &expected_graph,
+            &expected_binary_references,
+        )
+        .expect_err("a valid-checksum rewrite may not omit a live graph edge");
+        assert!(graph_error.to_string().contains("graph differs"));
+
+        let missing_catalog = "data00000b.tar.cleaning.001";
+        write_staged(missing_catalog, &[first, second], true, false);
+        let catalog_error = validate_swept_archive(
+            &source,
+            &directory.path.join(missing_catalog),
+            &survivors,
+            &expected_graph,
+            &expected_binary_references,
+        )
+        .expect_err("a valid-checksum rewrite may not omit a live BRF entry");
+        assert!(catalog_error.to_string().contains("catalog differs"));
+
+        let reordered = "data00000b.tar.cleaning.002";
+        write_staged(reordered, &[second, first], true, true);
+        let order_error = validate_swept_archive(
+            &source,
+            &directory.path.join(reordered),
+            &survivors,
+            &expected_graph,
+            &expected_binary_references,
+        )
+        .expect_err("a semantically equal rewrite may not reorder physical segments");
+        assert!(order_error.to_string().contains("physical order"));
+
+        let staged_bytes = std::fs::read(directory.path.join(missing_graph)).expect("read stage");
+        for suffix in ["brf", "gph", "idx"] {
+            let logical = format!("data00000b.tar.{suffix}");
+            assert!(
+                staged_bytes
+                    .windows(logical.len())
+                    .any(|window| window == logical.as_bytes()),
+                "staged trailers must carry the final logical basename"
+            );
+        }
+
+        write_manifest(&directory);
+        let selected = crate::store::open_all_archives(&directory.path)
+            .expect("non-active staging residue is ignored");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name(), "data00000a.tar");
+        assert_eq!(
+            std::fs::read(source_path).expect("healthy source remains"),
+            source_before
+        );
+        assert!(!directory.path.join("data00000b.tar").exists());
+    }
+}

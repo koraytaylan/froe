@@ -22,6 +22,8 @@
 //! archives this writer produces.
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
 mod archive_certificate;
