@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 mod head;
 mod reclaim_session;
-mod session;
+mod writes;
 
 pub(in crate::writer::store_writer) use head::*;
 pub(crate) use reclaim_session::*;

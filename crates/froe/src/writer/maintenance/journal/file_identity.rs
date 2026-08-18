@@ -3,7 +3,9 @@
 
 use super::{Error, File, Metadata, OpenOptions, Path, PathBuf, Read, Result};
 
-pub(crate) fn open_regular_journal(path: &Path) -> Result<(File, Metadata)> {
+pub(in crate::writer::maintenance) fn open_regular_journal(
+    path: &Path,
+) -> Result<(File, Metadata)> {
     let link_metadata = std::fs::symlink_metadata(path).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             Error::InvalidFormat {
@@ -46,17 +48,17 @@ pub(crate) fn open_regular_journal(path: &Path) -> Result<(File, Metadata)> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum StagingAccess {
+pub(in crate::writer::maintenance) enum StagingAccess {
     Read,
     ReadAppend,
 }
 
-pub(crate) struct JournalFileCertificate {
-    pub(crate) held: File,
+pub(in crate::writer::maintenance) struct JournalFileCertificate {
+    pub(in crate::writer::maintenance) held: File,
     #[cfg(unix)]
-    pub(crate) device: u64,
+    pub(in crate::writer::maintenance) device: u64,
     #[cfg(unix)]
-    pub(crate) inode: u64,
+    pub(in crate::writer::maintenance) inode: u64,
 }
 
 impl JournalFileCertificate {
@@ -92,7 +94,7 @@ impl JournalFileCertificate {
 /// Reopens a prepared journal file through its pathname and proves that the
 /// service identity can use it after publication. Matching uid/gid/mode is not
 /// sufficient when the source relies on ACLs that are not copied.
-pub(crate) fn certify_journal_file(
+pub(in crate::writer::maintenance) fn certify_journal_file(
     path: &Path,
     expected_identity: &Metadata,
     expected_bytes: &[u8],
@@ -115,7 +117,7 @@ pub(crate) fn certify_journal_file(
     })
 }
 
-pub(crate) fn open_verified_journal_file(
+pub(in crate::writer::maintenance) fn open_verified_journal_file(
     path: &Path,
     expected_identity: &Metadata,
     expected_bytes: &[u8],
@@ -177,7 +179,7 @@ pub(crate) fn open_verified_journal_file(
     Ok(reopened)
 }
 
-pub(crate) fn create_numbered_file(
+pub(in crate::writer::maintenance) fn create_numbered_file(
     directory: &Path,
     stem: &str,
 ) -> Result<(PathBuf, File, UncommittedFile)> {
@@ -197,14 +199,9 @@ pub(crate) fn create_numbered_file(
     })
 }
 
-pub(crate) fn sync_directory_strict(directory: &Path) -> Result<()> {
-    File::open(directory)?.sync_all()?;
-    Ok(())
-}
-
-pub(crate) struct UncommittedFile {
-    pub(crate) path: PathBuf,
-    pub(crate) committed: bool,
+pub(in crate::writer::maintenance) struct UncommittedFile {
+    pub(in crate::writer::maintenance) path: PathBuf,
+    pub(in crate::writer::maintenance) committed: bool,
 }
 
 impl UncommittedFile {

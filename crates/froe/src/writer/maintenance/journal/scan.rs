@@ -9,31 +9,31 @@ use super::{
 
 /// A byte-exact snapshot of an existing `journal.log`.
 #[derive(Debug)]
-pub(crate) struct RawJournal {
-    pub(crate) path: PathBuf,
-    pub(crate) source_bytes: Vec<u8>,
-    pub(crate) metadata: Metadata,
-    pub(crate) lines: Vec<RawJournalLine>,
+pub(in crate::writer::maintenance) struct RawJournal {
+    pub(in crate::writer::maintenance) path: PathBuf,
+    pub(in crate::writer::maintenance) source_bytes: Vec<u8>,
+    pub(in crate::writer::maintenance) metadata: Metadata,
+    pub(in crate::writer::maintenance) lines: Vec<RawJournalLine>,
 }
 
 impl RawJournal {
     /// Returns the physical lines in their original, oldest-first order.
-    pub(crate) fn lines(&self) -> &[RawJournalLine] {
+    pub(in crate::writer::maintenance) fn lines(&self) -> &[RawJournalLine] {
         &self.lines
     }
 
     /// Returns every source byte exactly as it appeared on disk.
-    pub(crate) fn source_bytes(&self) -> &[u8] {
+    pub(in crate::writer::maintenance) fn source_bytes(&self) -> &[u8] {
         &self.source_bytes
     }
 }
 
 /// One physical journal line, including its original line terminator.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct RawJournalLine {
-    pub(crate) raw_bytes: Vec<u8>,
-    pub(crate) content_length: usize,
-    pub(crate) classification: RawJournalLineClassification,
+pub(in crate::writer::maintenance) struct RawJournalLine {
+    pub(in crate::writer::maintenance) raw_bytes: Vec<u8>,
+    pub(in crate::writer::maintenance) content_length: usize,
+    pub(in crate::writer::maintenance) classification: RawJournalLineClassification,
 }
 
 impl RawJournalLine {
@@ -42,7 +42,7 @@ impl RawJournalLine {
         dead_code,
         reason = "the byte-exact line accessor is part of the cleanup scanner's internal contract"
     )]
-    pub(crate) fn raw_bytes(&self) -> &[u8] {
+    pub(in crate::writer::maintenance) fn raw_bytes(&self) -> &[u8] {
         &self.raw_bytes
     }
 
@@ -51,19 +51,19 @@ impl RawJournalLine {
         dead_code,
         reason = "callers inspecting unusual journal syntax need the un-terminated bytes"
     )]
-    pub(crate) fn content_bytes(&self) -> &[u8] {
+    pub(in crate::writer::maintenance) fn content_bytes(&self) -> &[u8] {
         &self.raw_bytes[..self.content_length]
     }
 
     /// Returns the reader-compatible classification of this line.
-    pub(crate) fn classification(&self) -> &RawJournalLineClassification {
+    pub(in crate::writer::maintenance) fn classification(&self) -> &RawJournalLineClassification {
         &self.classification
     }
 }
 
 /// Why the ordinary journal reader would retain or ignore a physical line.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum RawJournalLineClassification {
+pub(in crate::writer::maintenance) enum RawJournalLineClassification {
     /// The line contains no ASCII space and is skipped before field parsing.
     ParserSkippedNoSpace,
     /// The line has fields, but its first field is not a record identifier.
@@ -77,20 +77,20 @@ pub(crate) enum RawJournalLineClassification {
 
 /// Parsed fields needed by cleanup while the enclosing line retains the bytes.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct RawJournalRecord {
+pub(in crate::writer::maintenance) struct RawJournalRecord {
     /// The validated record identifier from the first field.
-    pub(crate) record_identifier: RecordIdentifier,
+    pub(in crate::writer::maintenance) record_identifier: RecordIdentifier,
     /// The exact bytes of the first field.
-    pub(crate) revision_text: Vec<u8>,
+    pub(in crate::writer::maintenance) revision_text: Vec<u8>,
     /// The exact bytes of the second (historical tag) field.
-    pub(crate) tag: Vec<u8>,
+    pub(in crate::writer::maintenance) tag: Vec<u8>,
     /// The third-field timestamp classification.
-    pub(crate) timestamp: RawJournalTimestamp,
+    pub(in crate::writer::maintenance) timestamp: RawJournalTimestamp,
 }
 
 /// Timestamp parsing that preserves the distinction between absent and bad.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum RawJournalTimestamp {
+pub(in crate::writer::maintenance) enum RawJournalTimestamp {
     /// The line has no third space-separated field.
     Missing,
     /// A third field exists but is not an `i64` timestamp.
@@ -111,14 +111,14 @@ pub(crate) enum RawJournalTimestamp {
 ///
 /// The returned line indexes are stable for the lifetime of the snapshot and
 /// are the indexes accepted by [`rewrite_journal_atomically`].
-pub(crate) fn scan_raw_journal(directory: &Path) -> Result<RawJournal> {
+pub(in crate::writer::maintenance) fn scan_raw_journal(directory: &Path) -> Result<RawJournal> {
     scan_raw_journal_file(&directory.join("journal.log"))
 }
 
 /// Scans an explicitly named journal-shaped staging file without following
 /// links. Cleanup uses this to prove that every physical staging line is
 /// already represented by the canonical journal before deleting it.
-pub(crate) fn scan_raw_journal_file(path: &Path) -> Result<RawJournal> {
+pub(in crate::writer::maintenance) fn scan_raw_journal_file(path: &Path) -> Result<RawJournal> {
     let path = path.to_owned();
     let (mut file, metadata) = open_regular_journal(&path)?;
     let mut source_bytes = Vec::new();
@@ -132,7 +132,9 @@ pub(crate) fn scan_raw_journal_file(path: &Path) -> Result<RawJournal> {
     })
 }
 
-pub(crate) fn split_and_classify_lines(source: &[u8]) -> Vec<RawJournalLine> {
+pub(in crate::writer::maintenance) fn split_and_classify_lines(
+    source: &[u8],
+) -> Vec<RawJournalLine> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut cursor = 0;
@@ -156,7 +158,10 @@ pub(crate) fn split_and_classify_lines(source: &[u8]) -> Vec<RawJournalLine> {
     lines
 }
 
-pub(crate) fn make_line(raw: &[u8], content_length: usize) -> RawJournalLine {
+pub(in crate::writer::maintenance) fn make_line(
+    raw: &[u8],
+    content_length: usize,
+) -> RawJournalLine {
     let content = &raw[..content_length];
     RawJournalLine {
         raw_bytes: raw.to_vec(),
@@ -165,7 +170,9 @@ pub(crate) fn make_line(raw: &[u8], content_length: usize) -> RawJournalLine {
     }
 }
 
-pub(crate) fn classify_line(content: &[u8]) -> RawJournalLineClassification {
+pub(in crate::writer::maintenance) fn classify_line(
+    content: &[u8],
+) -> RawJournalLineClassification {
     if !content.contains(&b' ') {
         return RawJournalLineClassification::ParserSkippedNoSpace;
     }

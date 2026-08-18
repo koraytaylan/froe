@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::journal::parse_record_identifier_text;
 use crate::segment::record::RecordIdentifier;
-use crate::writer::store_writer::preserve_file_metadata;
+use crate::writer::store_writer::{preserve_file_metadata, sync_directory_strict};
 
 mod analysis;
 mod file_identity;
@@ -27,22 +27,22 @@ mod scan;
 mod test_support;
 
 pub(in crate::writer::maintenance) use analysis::*;
-pub(crate) use file_identity::*;
-pub(crate) use scan::*;
+pub(in crate::writer::maintenance) use file_identity::*;
+pub(in crate::writer::maintenance) use scan::*;
 
 /// The durable result of replacing a journal.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct JournalRewriteOutcome {
+pub(in crate::writer::maintenance) struct JournalRewriteOutcome {
     /// Whether the installed journal bytes changed.
-    pub(crate) changed: bool,
+    pub(in crate::writer::maintenance) changed: bool,
     /// The recovery backup created for a changed journal.
-    pub(crate) backup_path: Option<PathBuf>,
+    pub(in crate::writer::maintenance) backup_path: Option<PathBuf>,
     /// Number of syntactic record lines retained.
-    pub(crate) retained_record_count: usize,
+    pub(in crate::writer::maintenance) retained_record_count: usize,
     /// Number of physical input lines not retained.
-    pub(crate) removed_line_count: usize,
+    pub(in crate::writer::maintenance) removed_line_count: usize,
     /// Number of bytes in the installed journal.
-    pub(crate) bytes_written: usize,
+    pub(in crate::writer::maintenance) bytes_written: usize,
 }
 
 /// Atomically installs only the selected syntactic record lines.
@@ -53,7 +53,7 @@ pub(crate) struct JournalRewriteOutcome {
 /// record receives one `LF`; existing `LF`, `CRLF`, and bare-`CR` terminators
 /// remain byte-exact. Before replacement, the original bytes are copied to the
 /// first unused numbered backup, and both files are durably synced.
-pub(crate) fn rewrite_journal_atomically(
+pub(in crate::writer::maintenance) fn rewrite_journal_atomically(
     snapshot: &RawJournal,
     retained_record_line_indexes: &[usize],
 ) -> Result<JournalRewriteOutcome> {
@@ -98,26 +98,26 @@ pub(crate) fn rewrite_journal_atomically(
 /// What the caller already counted, carried through publication into the
 /// outcome it reports.
 #[derive(Clone, Copy)]
-pub(crate) struct JournalRewriteCounts {
-    pub(crate) retained_record_count: usize,
-    pub(crate) removed_line_count: usize,
+pub(in crate::writer::maintenance) struct JournalRewriteCounts {
+    pub(in crate::writer::maintenance) retained_record_count: usize,
+    pub(in crate::writer::maintenance) removed_line_count: usize,
 }
 
 /// The replacement and the recovery backup, written and certified but not
 /// yet published.
-pub(crate) struct StagedJournal {
-    pub(crate) directory: PathBuf,
-    pub(crate) temporary_path: PathBuf,
-    pub(crate) temporary_certificate: JournalFileCertificate,
-    pub(crate) temporary_guard: UncommittedFile,
-    pub(crate) backup_path: PathBuf,
-    pub(crate) backup_certificate: JournalFileCertificate,
-    pub(crate) backup_guard: UncommittedFile,
+pub(in crate::writer::maintenance) struct StagedJournal {
+    pub(in crate::writer::maintenance) directory: PathBuf,
+    pub(in crate::writer::maintenance) temporary_path: PathBuf,
+    pub(in crate::writer::maintenance) temporary_certificate: JournalFileCertificate,
+    pub(in crate::writer::maintenance) temporary_guard: UncommittedFile,
+    pub(in crate::writer::maintenance) backup_path: PathBuf,
+    pub(in crate::writer::maintenance) backup_certificate: JournalFileCertificate,
+    pub(in crate::writer::maintenance) backup_guard: UncommittedFile,
 }
 
 /// Writes the replacement and the recovery backup beside the journal,
 /// certifying each, without touching the journal itself.
-pub(crate) fn stage_journal_replacement(
+pub(in crate::writer::maintenance) fn stage_journal_replacement(
     snapshot: &RawJournal,
     output: &[u8],
 ) -> Result<StagedJournal> {
@@ -178,13 +178,13 @@ pub(crate) fn stage_journal_replacement(
 /// Named as a pair because the proof must not drift: the pre-rename path is
 /// the temporary and the post-rename path is the journal itself, and the
 /// recovery backup is checked alongside both.
-pub(crate) struct PublicationProofs<'proof> {
-    pub(crate) snapshot: &'proof RawJournal,
-    pub(crate) output: &'proof [u8],
-    pub(crate) temporary_path: &'proof Path,
-    pub(crate) temporary_certificate: &'proof JournalFileCertificate,
-    pub(crate) backup_path: &'proof Path,
-    pub(crate) backup_certificate: &'proof JournalFileCertificate,
+pub(in crate::writer::maintenance) struct PublicationProofs<'proof> {
+    pub(in crate::writer::maintenance) snapshot: &'proof RawJournal,
+    pub(in crate::writer::maintenance) output: &'proof [u8],
+    pub(in crate::writer::maintenance) temporary_path: &'proof Path,
+    pub(in crate::writer::maintenance) temporary_certificate: &'proof JournalFileCertificate,
+    pub(in crate::writer::maintenance) backup_path: &'proof Path,
+    pub(in crate::writer::maintenance) backup_certificate: &'proof JournalFileCertificate,
 }
 
 impl PublicationProofs<'_> {
@@ -220,7 +220,7 @@ impl PublicationProofs<'_> {
     }
 }
 
-pub(crate) fn publish_journal_replacement(
+pub(in crate::writer::maintenance) fn publish_journal_replacement(
     snapshot: &RawJournal,
     output: &[u8],
     source_certificate: JournalFileCertificate,
@@ -300,7 +300,7 @@ pub(crate) fn publish_journal_replacement(
     })
 }
 
-pub(crate) fn validate_retained_indexes(
+pub(in crate::writer::maintenance) fn validate_retained_indexes(
     snapshot: &RawJournal,
     indexes: &[usize],
 ) -> Result<BTreeSet<usize>> {
@@ -330,7 +330,10 @@ pub(crate) fn validate_retained_indexes(
     Ok(retained)
 }
 
-pub(crate) fn assemble_replacement(snapshot: &RawJournal, retained: &BTreeSet<usize>) -> Vec<u8> {
+pub(in crate::writer::maintenance) fn assemble_replacement(
+    snapshot: &RawJournal,
+    retained: &BTreeSet<usize>,
+) -> Vec<u8> {
     let retained_bytes = snapshot
         .lines
         .iter()

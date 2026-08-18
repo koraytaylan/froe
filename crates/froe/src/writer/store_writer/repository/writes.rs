@@ -1,6 +1,9 @@
-//! The segments this session has written: recording them, rereading one
-//! from disk, and the certificates proving its finalized archive holds
-//! exactly what the writer produced.
+//! Writing through the repository: persisting a segment, rereading one
+//! from disk, and the flush that makes a head move visible.
+//!
+//! The session state these operate on lives in
+//! [`crate::writer::store_writer::session`]; this is the repository's side
+//! of it.
 
 use super::*;
 
