@@ -39,6 +39,8 @@
 //! structurally invalid data segment encountered during graph reconstruction
 //! gets an explicit unavailable row so other archive rows remain useful.
 
+use crate::content::template::Template;
+use crate::segment::view::SegmentView;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
@@ -643,6 +645,60 @@ pub fn debug_archive(
     )
 }
 
+/// Restates a traversal refusal in the vocabulary of `froe debug`.
+///
+/// A per-node bound the caller set is reported as that bound; anything else
+/// the traversal refused was charged against the shared work budget, so it
+/// is reported as work.
+fn translate_scheduling_error(
+    error: Error,
+    options: ArchiveDebugOptions,
+    work_budget: &WorkBudget,
+) -> ArchiveDebugError {
+    match error {
+        Error::TraversalSchedulingBudgetExceeded {
+            attempted_scheduled_children,
+            ..
+        } if attempted_scheduled_children > options.maximum_scheduled_children_per_node => {
+            ArchiveDebugError::NodeChildBudgetExceeded {
+                maximum_scheduled_children_per_node: options.maximum_scheduled_children_per_node,
+                attempted_scheduled_children,
+            }
+        }
+        Error::TraversalSchedulingBudgetExceeded {
+            attempted_scheduled_children,
+            ..
+        } => work_budget.exceeded_by(attempted_scheduled_children),
+        Error::TraversalChildNameBudgetExceeded {
+            attempted_stored_child_name_bytes,
+            ..
+        } if attempted_stored_child_name_bytes > options.maximum_name_bytes_per_node => {
+            ArchiveDebugError::NodeNameBudgetExceeded {
+                maximum_name_bytes_per_node: options.maximum_name_bytes_per_node,
+                attempted_name_bytes: attempted_stored_child_name_bytes,
+            }
+        }
+        Error::TraversalChildNameBudgetExceeded {
+            attempted_stored_child_name_bytes,
+            scheduled_children,
+            ..
+        } => work_budget
+            .exceeded_by(scheduled_children.saturating_add(attempted_stored_child_name_bytes)),
+        Error::TraversalSchedulingWorkBudgetExceeded {
+            attempted_scheduling_work,
+            ..
+        } => work_budget.exceeded_by(attempted_scheduling_work),
+        Error::TraversalPendingBudgetExceeded {
+            attempted_pending_nodes,
+            ..
+        } => ArchiveDebugError::PendingNodeBudgetExceeded {
+            maximum_pending_nodes: options.maximum_pending_nodes,
+            attempted_pending_nodes,
+        },
+        other => ArchiveDebugError::Repository(other),
+    }
+}
+
 /// Attributes current-head content paths with explicit work, traversal,
 /// graph, and result-retention limits.
 ///
@@ -650,10 +706,6 @@ pub fn debug_archive(
 /// property slot, and long-binary block must be inspected to decide whether
 /// it belongs to the requested archive. Both that logical work and retained
 /// result memory are bounded by `options`.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the linear scan keeps budget reservation, traversal, graph work, and final counters in one transaction"
-)]
 pub fn debug_archive_with_options(
     repository: &Repository,
     archive_file_name: &str,
@@ -708,50 +760,7 @@ pub fn debug_archive_with_options(
                 remaining_work,
                 options.maximum_pending_nodes,
             )
-            .map_err(|error| match error {
-                Error::TraversalSchedulingBudgetExceeded {
-                    attempted_scheduled_children,
-                    ..
-                } if attempted_scheduled_children > options.maximum_scheduled_children_per_node => {
-                    ArchiveDebugError::NodeChildBudgetExceeded {
-                        maximum_scheduled_children_per_node: options
-                            .maximum_scheduled_children_per_node,
-                        attempted_scheduled_children,
-                    }
-                }
-                Error::TraversalSchedulingBudgetExceeded {
-                    attempted_scheduled_children,
-                    ..
-                } => work_budget.exceeded_by(attempted_scheduled_children),
-                Error::TraversalChildNameBudgetExceeded {
-                    attempted_stored_child_name_bytes,
-                    ..
-                } if attempted_stored_child_name_bytes > options.maximum_name_bytes_per_node => {
-                    ArchiveDebugError::NodeNameBudgetExceeded {
-                        maximum_name_bytes_per_node: options.maximum_name_bytes_per_node,
-                        attempted_name_bytes: attempted_stored_child_name_bytes,
-                    }
-                }
-                Error::TraversalChildNameBudgetExceeded {
-                    attempted_stored_child_name_bytes,
-                    scheduled_children,
-                    ..
-                } => work_budget.exceeded_by(
-                    scheduled_children.saturating_add(attempted_stored_child_name_bytes),
-                ),
-                Error::TraversalSchedulingWorkBudgetExceeded {
-                    attempted_scheduling_work,
-                    ..
-                } => work_budget.exceeded_by(attempted_scheduling_work),
-                Error::TraversalPendingBudgetExceeded {
-                    attempted_pending_nodes,
-                    ..
-                } => ArchiveDebugError::PendingNodeBudgetExceeded {
-                    maximum_pending_nodes: options.maximum_pending_nodes,
-                    attempted_pending_nodes,
-                },
-                other => ArchiveDebugError::Repository(other),
-            })?;
+            .map_err(|error| translate_scheduling_error(error, options, &work_budget))?;
         let Some(visited) = traversal_step else {
             break;
         };
@@ -1131,9 +1140,107 @@ fn oak_node_path(path: &str) -> String {
     }
 }
 
+/// Where a node's property-value list sits depends on its child arity: a
+/// childless node has no child-map slot, so the list moves up one.
+fn read_property_list_identifier(
+    node_view: &SegmentView<'_>,
+    node_identifier: RecordIdentifier,
+    template: &Template,
+    work_budget: &mut WorkBudget,
+) -> ArchiveDebugResult<RecordIdentifier> {
+    let property_list_slot = if template.child_arity == ChildNodeArity::Zero {
+        2
+    } else {
+        3
+    };
+    work_budget.charge_one()?;
+    Ok(node_view.read_record_identifier(node_identifier.record_number, 0, property_list_slot)?)
+}
+
+/// The two records a node always has: the node itself and its template.
+#[derive(Clone, Copy)]
+struct OwnRecords<'records> {
+    path: &'records str,
+    node_identifier: RecordIdentifier,
+    template_identifier: RecordIdentifier,
+}
+
+/// Records whichever of the node's own two records live in this archive.
+fn collect_own_records(
+    references: &mut BTreeMap<Vec<u16>, ArchivePathReference>,
+    records: OwnRecords<'_>,
+    archive: &crate::tar_archive::TarArchiveReader,
+    work_budget: &mut WorkBudget,
+    result_budget: &mut ResultBudget,
+) -> ArchiveDebugResult<()> {
+    let OwnRecords {
+        path,
+        node_identifier,
+        template_identifier,
+    } = records;
+    if archive.contains_segment(node_identifier.segment) {
+        collect_reference(
+            references,
+            ArchivePathReference::Node {
+                path: path.to_owned(),
+                record_identifier: node_identifier,
+            },
+            work_budget,
+            result_budget,
+        )?;
+    }
+    if archive.contains_segment(template_identifier.segment) {
+        collect_reference(
+            references,
+            ArchivePathReference::Template {
+                path: path.to_owned(),
+                record_identifier: template_identifier,
+            },
+            work_budget,
+            result_budget,
+        )?;
+    }
+    Ok(())
+}
+
+/// Restates a template-read refusal in the vocabulary of `froe debug`.
+///
+/// A node's own name budget is reported against that budget, counting the
+/// child names already scheduled for it; everything else was charged
+/// against the shared work budget.
+fn translate_template_error(
+    error: Error,
+    maximum_name_bytes_per_node: u64,
+    scheduled_child_name_bytes: u64,
+    work_budget: &WorkBudget,
+) -> ArchiveDebugError {
+    match error {
+        Error::StringMaterializationBudgetExceeded {
+            attempted_stored_bytes,
+            ..
+        } if scheduled_child_name_bytes.saturating_add(attempted_stored_bytes)
+            > maximum_name_bytes_per_node =>
+        {
+            ArchiveDebugError::NodeNameBudgetExceeded {
+                maximum_name_bytes_per_node,
+                attempted_name_bytes: scheduled_child_name_bytes
+                    .saturating_add(attempted_stored_bytes),
+            }
+        }
+        Error::StringMaterializationBudgetExceeded {
+            attempted_stored_bytes,
+            ..
+        } => work_budget.exceeded_by(attempted_stored_bytes),
+        Error::TemplatePropertyBudgetExceeded {
+            attempted_properties,
+            ..
+        } => work_budget.exceeded_by(attempted_properties),
+        other => ArchiveDebugError::Repository(other),
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "the per-node attribution transaction explicitly carries both resource ledgers and archive membership"
 )]
 fn references_for_node(
@@ -1169,28 +1276,13 @@ fn references_for_node(
         work_budget.remaining(),
         maximum_template_name_bytes,
     )
-    .map_err(|error| match error {
-        Error::StringMaterializationBudgetExceeded {
-            attempted_stored_bytes,
-            ..
-        } if scheduled_child_name_bytes.saturating_add(attempted_stored_bytes)
-            > maximum_name_bytes_per_node =>
-        {
-            ArchiveDebugError::NodeNameBudgetExceeded {
-                maximum_name_bytes_per_node,
-                attempted_name_bytes: scheduled_child_name_bytes
-                    .saturating_add(attempted_stored_bytes),
-            }
-        }
-        Error::StringMaterializationBudgetExceeded {
-            attempted_stored_bytes,
-            ..
-        } => work_budget.exceeded_by(attempted_stored_bytes),
-        Error::TemplatePropertyBudgetExceeded {
-            attempted_properties,
-            ..
-        } => work_budget.exceeded_by(attempted_properties),
-        other => ArchiveDebugError::Repository(other),
+    .map_err(|error| {
+        translate_template_error(
+            error,
+            maximum_name_bytes_per_node,
+            scheduled_child_name_bytes,
+            work_budget,
+        )
     })?;
     work_budget.charge_amount(template_name_bytes)?;
     // Oak uses a TreeSet of complete rendered lines per visited node. Using a
@@ -1199,40 +1291,23 @@ fn references_for_node(
     // entries reserve the aggregate result budget before insertion.
     let mut references = BTreeMap::new();
 
-    if archive.contains_segment(node_identifier.segment) {
-        collect_reference(
-            &mut references,
-            ArchivePathReference::Node {
-                path: path.to_owned(),
-                record_identifier: node_identifier,
-            },
-            work_budget,
-            result_budget,
-        )?;
-    }
-    if archive.contains_segment(template_identifier.segment) {
-        collect_reference(
-            &mut references,
-            ArchivePathReference::Template {
-                path: path.to_owned(),
-                record_identifier: template_identifier,
-            },
-            work_budget,
-            result_budget,
-        )?;
-    }
+    collect_own_records(
+        &mut references,
+        OwnRecords {
+            path,
+            node_identifier,
+            template_identifier,
+        },
+        archive,
+        work_budget,
+        result_budget,
+    )?;
 
     if template.properties.is_empty() {
         return Ok(references.into_values().collect());
     }
-    let property_list_slot = if template.child_arity == ChildNodeArity::Zero {
-        2
-    } else {
-        3
-    };
-    work_budget.charge_one()?;
     let property_list_identifier =
-        node_view.read_record_identifier(node_identifier.record_number, 0, property_list_slot)?;
+        read_property_list_identifier(&node_view, node_identifier, &template, work_budget)?;
 
     let property_count = template.properties.len() as u64;
     for (property_index, property) in template.properties.iter().enumerate() {
