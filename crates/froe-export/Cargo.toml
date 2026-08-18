@@ -12,7 +12,7 @@ keywords.workspace = true
 categories = ["filesystem", "encoding"]
 
 [dependencies]
-froe = { version = "0.9.0", path = "../froe" }
+froe = { version = "0.10.0", path = "../froe" }
 parquet = { version = "59.2.0", default-features = false, features = ["zstd"], optional = true }
 # Bundled SQLite: a reproducible, system-independent build; the artifact's
 # file format is version-stable regardless.
