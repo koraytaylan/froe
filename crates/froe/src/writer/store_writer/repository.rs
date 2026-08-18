@@ -96,6 +96,186 @@ pub struct WritableRepository {
     pub(super) finalized_session_semantic_validations: std::sync::atomic::AtomicUsize,
 }
 
+/// Proves every segment in one finalized session archive against what the
+/// session recorded for it, and rebuilds the graph and binary-reference
+/// trailers those segments imply.
+///
+/// The payload is checked against the CRC in the segment's own tar entry
+/// name and then against what the session actually wrote. Together those
+/// two establish what comparing against a retained copy of every byte used
+/// to, without the session holding its whole output to say it.
+fn certify_archive_segments(
+    provider: &crate::store::Repository,
+    archive: &TarArchiveReader,
+    expected_segments: &HashMap<SegmentIdentifier, SessionSegment>,
+    seen: &mut std::collections::HashSet<SegmentIdentifier>,
+) -> Result<(ExpectedGraph, ExpectedBinaryReferences)> {
+    let mut expected_graph = ExpectedGraph::new();
+    let mut expected_binary_references = ExpectedBinaryReferences::new();
+    for identifier in archive.segment_identifiers() {
+        let Some(expected_session) = expected_segments.get(&identifier) else {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "finalized session archive {} contains non-session segment {identifier}",
+                    archive.file_name()
+                ),
+            });
+        };
+        if !seen.insert(identifier) {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "session segment {identifier} occurs more than once in finalized session archives"
+                ),
+            });
+        }
+        // Proves the archive's payload against the CRC in its own
+        // tar entry name.
+        archive.validate_indexed_segment_entry(identifier)?;
+        // And this closes the loop to what the session actually
+        // wrote. Together the two are what comparing against a
+        // retained copy of every byte used to establish, without the
+        // session holding its whole output to say it.
+        let actual_crc =
+            archive
+                .segment_entry_checksum(identifier)
+                .ok_or(Error::SegmentNotFound {
+                    segment_identifier: identifier,
+                })?;
+        if actual_crc != expected_session.payload_crc {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "finalized session archive {} changed the payload of segment {identifier}",
+                    archive.file_name()
+                ),
+            });
+        }
+        let disk_segment = provider.segment(identifier)?;
+        let actual = archive
+            .index_entry(identifier)
+            .ok_or(Error::SegmentNotFound {
+                segment_identifier: identifier,
+            })?;
+        let expected_generation = stored_segment_generation(identifier, &disk_segment.structure);
+        let actual_generation = GarbageCollectionGeneration {
+            generation: actual.generation,
+            full_generation: actual.full_generation,
+            is_compacted: actual.is_compacted,
+        };
+        if actual_generation != expected_generation {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "finalized session archive {} indexes segment {identifier} as {actual_generation:?}, but its header/session generation is {expected_generation:?}",
+                    archive.file_name()
+                ),
+            });
+        }
+        if !disk_segment.structure.referenced_segments.is_empty() {
+            expected_graph
+                .entry(identifier)
+                .or_default()
+                .extend(disk_segment.structure.referenced_segments.iter().copied());
+        }
+        let binary_references =
+            read_blob_identifiers(provider, &disk_segment).map_err(|error| {
+                Error::InvalidFormat {
+                    details: format!(
+                        "cannot reconstruct binary references for finalized session segment {identifier}: {error}"
+                    ),
+                }
+            })?;
+        if !binary_references.is_empty() {
+            expected_binary_references
+                .entry((
+                    expected_generation.generation,
+                    expected_generation.full_generation,
+                    expected_generation.is_compacted,
+                ))
+                .or_default()
+                .entry(identifier)
+                .or_default()
+                .extend(binary_references);
+        }
+    }
+    Ok((expected_graph, expected_binary_references))
+}
+
+/// Walks every archive this session wrote and proves each of its segments
+/// is exactly what the session recorded: right archive, right position,
+/// right payload, right generation, and trailers that agree.
+///
+/// Returns the segments and archives actually seen, so the caller can name
+/// anything the session expected but the disk does not hold.
+fn certify_session_archives<'archives>(
+    provider: &crate::store::Repository,
+    archives: &'archives [TarArchiveReader],
+    base_names: &std::collections::HashSet<&str>,
+    expected_segments: &HashMap<SegmentIdentifier, SessionSegment>,
+    expected_archive_order: &HashMap<String, Vec<SegmentIdentifier>>,
+) -> Result<(
+    std::collections::HashSet<SegmentIdentifier>,
+    std::collections::HashSet<&'archives str>,
+)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut seen_archives = std::collections::HashSet::new();
+    for archive in archives
+        .iter()
+        .filter(|archive| !base_names.contains(archive.file_name()))
+    {
+        if archive.is_recovered() {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "finalized session archive {} has no valid index",
+                    archive.file_name()
+                ),
+            });
+        }
+        if archive.segment_count() == 0 {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "finalized session archive {} contains no session segments",
+                    archive.file_name()
+                ),
+            });
+        }
+        let expected_order = expected_archive_order
+            .get(archive.file_name())
+            .ok_or_else(|| Error::InvalidFormat {
+                details: format!(
+                    "finalized archive {} was not created by the current write session",
+                    archive.file_name()
+                ),
+            })?;
+        let mut actual_in_file_order = archive
+            .index()
+            .expect("a non-recovered session archive has an index")
+            .entries()
+            .to_vec();
+        actual_in_file_order.sort_by_key(|entry| entry.position);
+        let actual_order: Vec<_> = actual_in_file_order
+            .iter()
+            .map(|entry| entry.segment_identifier)
+            .collect();
+        if actual_order.as_slice() != expected_order.as_slice() {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "finalized session archive {} changed the physical write order or archive boundary of its session segments",
+                    archive.file_name()
+                ),
+            });
+        }
+        seen_archives.insert(archive.file_name());
+        let (expected_graph, expected_binary_references) =
+            certify_archive_segments(provider, archive, expected_segments, &mut seen)?;
+        validate_exact_archive_trailers(
+            archive,
+            archive.file_name(),
+            &expected_graph,
+            &expected_binary_references,
+        )?;
+    }
+    Ok((seen, seen_archives))
+}
+
 impl WritableRepository {
     /// Opens (or bootstraps) a segment store for writing.
     pub fn open(directory: &Path) -> Result<Self> {
@@ -1118,22 +1298,12 @@ impl WritableRepository {
         Ok(certificate)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "session membership, payload, generation, trailer, and optional head checks form one fail-closed pre-mutation certificate"
-    )]
-    pub(super) fn validate_finalized_session_semantics(
+    /// The order this session recorded writing its segments, per archive,
+    /// after proving the write-order ledger and the segment set agree.
+    fn expected_session_archive_order(
         &self,
-        head: Option<RecordIdentifier>,
-    ) -> Result<()> {
-        #[cfg(test)]
-        self.finalized_session_semantic_validations
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let expected_segments: HashMap<SegmentIdentifier, SessionSegment> = self
-            .session_segments
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        expected_segments: &HashMap<SegmentIdentifier, SessionSegment>,
+    ) -> Result<HashMap<String, Vec<SegmentIdentifier>>> {
         let expected_writes = self
             .session_segment_writes
             .read()
@@ -1166,6 +1336,23 @@ impl WritableRepository {
                 .or_default()
                 .push(write.identifier);
         }
+        Ok(expected_archive_order)
+    }
+
+    pub(super) fn validate_finalized_session_semantics(
+        &self,
+        head: Option<RecordIdentifier>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        self.finalized_session_semantic_validations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let expected_segments: HashMap<SegmentIdentifier, SessionSegment> = self
+            .session_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let expected_archive_order = self.expected_session_archive_order(&expected_segments)?;
+
         if let Some(head) = head
             && !expected_segments.contains_key(&head.segment)
         {
@@ -1192,150 +1379,13 @@ impl WritableRepository {
             .iter()
             .map(TarArchiveReader::file_name)
             .collect();
-        let mut seen = std::collections::HashSet::new();
-        let mut seen_archives = std::collections::HashSet::new();
-        for archive in archives
-            .iter()
-            .filter(|archive| !base_names.contains(archive.file_name()))
-        {
-            if archive.is_recovered() {
-                return Err(Error::InvalidFormat {
-                    details: format!(
-                        "finalized session archive {} has no valid index",
-                        archive.file_name()
-                    ),
-                });
-            }
-            if archive.segment_count() == 0 {
-                return Err(Error::InvalidFormat {
-                    details: format!(
-                        "finalized session archive {} contains no session segments",
-                        archive.file_name()
-                    ),
-                });
-            }
-            let expected_order =
-                expected_archive_order
-                    .get(archive.file_name())
-                    .ok_or_else(|| Error::InvalidFormat {
-                        details: format!(
-                            "finalized archive {} was not created by the current write session",
-                            archive.file_name()
-                        ),
-                    })?;
-            let mut actual_in_file_order = archive
-                .index()
-                .expect("a non-recovered session archive has an index")
-                .entries()
-                .to_vec();
-            actual_in_file_order.sort_by_key(|entry| entry.position);
-            let actual_order: Vec<_> = actual_in_file_order
-                .iter()
-                .map(|entry| entry.segment_identifier)
-                .collect();
-            if actual_order.as_slice() != expected_order.as_slice() {
-                return Err(Error::InvalidFormat {
-                    details: format!(
-                        "finalized session archive {} changed the physical write order or archive boundary of its session segments",
-                        archive.file_name()
-                    ),
-                });
-            }
-            seen_archives.insert(archive.file_name());
-            let mut expected_graph = ExpectedGraph::new();
-            let mut expected_binary_references = ExpectedBinaryReferences::new();
-            for identifier in archive.segment_identifiers() {
-                let Some(expected_session) = expected_segments.get(&identifier) else {
-                    return Err(Error::InvalidFormat {
-                        details: format!(
-                            "finalized session archive {} contains non-session segment {identifier}",
-                            archive.file_name()
-                        ),
-                    });
-                };
-                if !seen.insert(identifier) {
-                    return Err(Error::InvalidFormat {
-                        details: format!(
-                            "session segment {identifier} occurs more than once in finalized session archives"
-                        ),
-                    });
-                }
-                // Proves the archive's payload against the CRC in its own
-                // tar entry name.
-                archive.validate_indexed_segment_entry(identifier)?;
-                // And this closes the loop to what the session actually
-                // wrote. Together the two are what comparing against a
-                // retained copy of every byte used to establish, without the
-                // session holding its whole output to say it.
-                let actual_crc =
-                    archive
-                        .segment_entry_checksum(identifier)
-                        .ok_or(Error::SegmentNotFound {
-                            segment_identifier: identifier,
-                        })?;
-                if actual_crc != expected_session.payload_crc {
-                    return Err(Error::InvalidFormat {
-                        details: format!(
-                            "finalized session archive {} changed the payload of segment {identifier}",
-                            archive.file_name()
-                        ),
-                    });
-                }
-                let disk_segment = provider.segment(identifier)?;
-                let actual = archive
-                    .index_entry(identifier)
-                    .ok_or(Error::SegmentNotFound {
-                        segment_identifier: identifier,
-                    })?;
-                let expected_generation =
-                    stored_segment_generation(identifier, &disk_segment.structure);
-                let actual_generation = GarbageCollectionGeneration {
-                    generation: actual.generation,
-                    full_generation: actual.full_generation,
-                    is_compacted: actual.is_compacted,
-                };
-                if actual_generation != expected_generation {
-                    return Err(Error::InvalidFormat {
-                        details: format!(
-                            "finalized session archive {} indexes segment {identifier} as {actual_generation:?}, but its header/session generation is {expected_generation:?}",
-                            archive.file_name()
-                        ),
-                    });
-                }
-                if !disk_segment.structure.referenced_segments.is_empty() {
-                    expected_graph
-                        .entry(identifier)
-                        .or_default()
-                        .extend(disk_segment.structure.referenced_segments.iter().copied());
-                }
-                let binary_references =
-                    read_blob_identifiers(&provider, &disk_segment).map_err(|error| {
-                        Error::InvalidFormat {
-                            details: format!(
-                                "cannot reconstruct binary references for finalized session segment {identifier}: {error}"
-                            ),
-                        }
-                    })?;
-                if !binary_references.is_empty() {
-                    expected_binary_references
-                        .entry((
-                            expected_generation.generation,
-                            expected_generation.full_generation,
-                            expected_generation.is_compacted,
-                        ))
-                        .or_default()
-                        .entry(identifier)
-                        .or_default()
-                        .extend(binary_references);
-                }
-            }
-            validate_exact_archive_trailers(
-                archive,
-                archive.file_name(),
-                &expected_graph,
-                &expected_binary_references,
-            )?;
-        }
+        let (seen, seen_archives) = certify_session_archives(
+            &provider,
+            archives,
+            &base_names,
+            &expected_segments,
+            &expected_archive_order,
+        )?;
         if seen_archives.len() != expected_archive_order.len() {
             let mut missing_archives: Vec<_> = expected_archive_order
                 .keys()

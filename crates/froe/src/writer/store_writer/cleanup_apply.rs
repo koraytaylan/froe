@@ -64,62 +64,26 @@ pub(crate) fn apply_standalone_segment_cleanup(
     )
 }
 
-#[cfg(test)]
-pub(super) type StandaloneAfterPlanHook<'hook> =
-    dyn Fn(&StandaloneSegmentCompactionPlan) -> Result<()> + 'hook;
+/// What one sweep pass observed, per archive it actually changed.
+struct SweepPass {
+    observed_sweeps: HashMap<String, (ArchiveSweepDisposition, usize)>,
+    deletion_failures: Vec<DeferredFileDeletion>,
+}
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the test-only uncertified path and production certified path share one ordered mutation engine"
-)]
-pub(super) fn apply_standalone_segment_cleanup_from_archives(
+/// Sweeps every archive the plan names, whole removals before rewrites.
+///
+/// The two phases are ordered deliberately: a graph edge is filtered only
+/// once its target has really become unavailable, or when the same rewrite
+/// is about to make it so. That retains conservative extra edges to
+/// deferred, blocked, later, or failed sweep targets.
+fn sweep_planned_archives(
     directory: &Path,
     archives: &[TarArchiveReader],
+    plan: &StandaloneSegmentCompactionPlan,
     source_certificate_provider: Option<&dyn SegmentProvider>,
-    rule: ReclaimRule,
-    current_head_segment: SegmentIdentifier,
-    protected: &std::collections::HashSet<SegmentIdentifier>,
     rewrite_policy: ArchiveRewritePolicy,
-    expected: Option<&StandaloneSegmentCompactionPlan>,
     observer: &mut dyn crate::progress::ProgressObserver,
-    #[cfg(test)] after_plan: Option<&StandaloneAfterPlanHook<'_>>,
-) -> Result<(
-    StandaloneSegmentCompactionPlan,
-    StandaloneSegmentCompactionOutcome,
-)> {
-    let plan = crate::progress::observe(
-        observer,
-        &crate::progress::Step::new(
-            "replanning segment reclamation",
-            crate::progress::WorkUnit::Archives,
-        )
-        .with_total(crate::progress::count(archives.len())),
-        |observer| {
-            analyze_standalone_segment_cleanup(
-                directory,
-                archives,
-                rule,
-                current_head_segment,
-                protected,
-                rewrite_policy,
-                observer,
-            )
-        },
-    )?;
-    if expected.is_some_and(|expected| expected != &plan) {
-        return Err(Error::InvalidFormat {
-            details: "the standalone segment-cleanup plan changed after confirmation; refusing \
-                      to apply an unconfirmed archive mutation"
-                .to_owned(),
-        });
-    }
-
-    let archive_bytes_before = archive_file_bytes(directory)?;
-    #[cfg(test)]
-    if let Some(after_plan) = after_plan {
-        after_plan(&plan)?;
-    }
+) -> Result<SweepPass> {
     let provider_order: Vec<&TarArchiveReader> = archives.iter().collect();
     let mut fallback_provider = None;
     let mut deletion_failures = Vec::new();
@@ -130,10 +94,6 @@ pub(super) fn apply_standalone_segment_cleanup_from_archives(
         .iter()
         .map(|planned| (planned.file_name(), planned))
         .collect();
-    // Apply whole removals first, then rewrites. A graph edge is filtered
-    // only after its target has really become unavailable (or when the same
-    // rewrite is about to make it unavailable). This retains conservative
-    // extra edges to deferred, blocked, later, or failed sweep targets.
     crate::progress::observe(
         observer,
         &crate::progress::Step::new("sweeping archives", crate::progress::WorkUnit::Archives)
@@ -187,14 +147,20 @@ pub(super) fn apply_standalone_segment_cleanup_from_archives(
     )?;
     drop(fallback_provider);
     drop(provider_order);
-    sync_directory_strict(directory)?;
-
-    let mut outcome = StandaloneSegmentCompactionOutcome {
-        archive_bytes_before,
-        archive_bytes_after: archive_file_bytes(directory)?,
+    Ok(SweepPass {
+        observed_sweeps,
         deletion_failures,
-        ..StandaloneSegmentCompactionOutcome::default()
-    };
+    })
+}
+
+/// Turns what the sweep observed into the run's counted outcome, refusing
+/// any disposition the authoritative plan does not account for.
+fn account_for_swept_archives(
+    directory: &Path,
+    plan: &StandaloneSegmentCompactionPlan,
+    observed_sweeps: &HashMap<String, (ArchiveSweepDisposition, usize)>,
+    outcome: &mut StandaloneSegmentCompactionOutcome,
+) -> Result<()> {
     for archive in &plan.archives {
         match archive {
             PlannedArchiveSweep::Remove { file_name, .. }
@@ -269,6 +235,81 @@ pub(super) fn apply_standalone_segment_cleanup_from_archives(
             | PlannedArchiveSweep::BlockedByOccupiedGeneration { .. } => {}
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) type StandaloneAfterPlanHook<'hook> =
+    dyn Fn(&StandaloneSegmentCompactionPlan) -> Result<()> + 'hook;
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test-only uncertified path and production certified path share one ordered mutation engine"
+)]
+pub(super) fn apply_standalone_segment_cleanup_from_archives(
+    directory: &Path,
+    archives: &[TarArchiveReader],
+    source_certificate_provider: Option<&dyn SegmentProvider>,
+    rule: ReclaimRule,
+    current_head_segment: SegmentIdentifier,
+    protected: &std::collections::HashSet<SegmentIdentifier>,
+    rewrite_policy: ArchiveRewritePolicy,
+    expected: Option<&StandaloneSegmentCompactionPlan>,
+    observer: &mut dyn crate::progress::ProgressObserver,
+    #[cfg(test)] after_plan: Option<&StandaloneAfterPlanHook<'_>>,
+) -> Result<(
+    StandaloneSegmentCompactionPlan,
+    StandaloneSegmentCompactionOutcome,
+)> {
+    let plan = crate::progress::observe(
+        observer,
+        &crate::progress::Step::new(
+            "replanning segment reclamation",
+            crate::progress::WorkUnit::Archives,
+        )
+        .with_total(crate::progress::count(archives.len())),
+        |observer| {
+            analyze_standalone_segment_cleanup(
+                directory,
+                archives,
+                rule,
+                current_head_segment,
+                protected,
+                rewrite_policy,
+                observer,
+            )
+        },
+    )?;
+    if expected.is_some_and(|expected| expected != &plan) {
+        return Err(Error::InvalidFormat {
+            details: "the standalone segment-cleanup plan changed after confirmation; refusing \
+                      to apply an unconfirmed archive mutation"
+                .to_owned(),
+        });
+    }
+
+    let archive_bytes_before = archive_file_bytes(directory)?;
+    #[cfg(test)]
+    if let Some(after_plan) = after_plan {
+        after_plan(&plan)?;
+    }
+    let pass = sweep_planned_archives(
+        directory,
+        archives,
+        &plan,
+        source_certificate_provider,
+        rewrite_policy,
+        observer,
+    )?;
+    sync_directory_strict(directory)?;
+
+    let mut outcome = StandaloneSegmentCompactionOutcome {
+        archive_bytes_before,
+        archive_bytes_after: archive_file_bytes(directory)?,
+        deletion_failures: pass.deletion_failures,
+        ..StandaloneSegmentCompactionOutcome::default()
+    };
+    account_for_swept_archives(directory, &plan, &pass.observed_sweeps, &mut outcome)?;
     outcome.deletion_failures.sort_by(|left, right| {
         left.file_name
             .cmp(&right.file_name)
