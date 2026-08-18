@@ -80,6 +80,103 @@ pub struct RepositoryLock {
     registered_identity: LockIdentity,
 }
 
+/// Opens `repo.lock`, or publishes it when absent, returning the descriptor
+/// with the identity it was proved to have.
+///
+/// Retries because both halves race an outside actor: an existing inode can
+/// be replaced between the stat and the open, and an absent-only
+/// publication can be lost to a competing creator.
+#[cfg(unix)]
+fn open_or_publish_lock_file(
+    repository_directory: &Path,
+    lock_path: &Path,
+    registry: &HashSet<LockIdentity>,
+) -> Result<(std::fs::File, LockIdentity, Option<LockCreationStage>)> {
+    let in_use = |detail: &str| Error::InvalidFormat {
+        details: format!(
+            "the repository at {} is locked by {detail} — \
+             is an AEM or Oak instance still running?",
+            repository_directory.display()
+        ),
+    };
+    // Stat *before* open: on classic process-associated POSIX
+    // locks, merely opening and closing a descriptor of a lock
+    // file another guard in this process holds would release
+    // that guard's locks — so the existing file is opened only
+    // once the registry proves no in-process guard holds this
+    // identity. An absent file is never created at `repo.lock`
+    // directly; competing creators race at an absent-only link.
+    let mut attempts = 0u16;
+    loop {
+        attempts += 1;
+        if attempts > 1000 {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "{} changed repeatedly while the repository lock was being opened",
+                    lock_path.display()
+                ),
+            });
+        }
+        match std::fs::symlink_metadata(lock_path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(invalid_lock_file_type(lock_path));
+                }
+                let observed_identity = lock_identity(&metadata);
+                if registry.contains(&observed_identity) {
+                    return Err(in_use("this process"));
+                }
+                let file = match open_existing_lock_file(lock_path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let identity = lock_identity(&file.metadata()?);
+                if registry.contains(&identity) {
+                    // The lock file changed identity between the stat
+                    // and open and this process already holds the new
+                    // inode. Closing our descriptor would release that
+                    // guard's classic record locks, so leak this one
+                    // descriptor in the pathological race.
+                    std::mem::forget(file);
+                    return Err(in_use("this process"));
+                }
+                match std::fs::symlink_metadata(lock_path) {
+                    Ok(current)
+                        if current.file_type().is_file() && lock_identity(&current) == identity =>
+                    {
+                        break Ok((file, identity, None));
+                    }
+                    Ok(current) if !current.file_type().is_file() => {
+                        drop(file);
+                        return Err(invalid_lock_file_type(lock_path));
+                    }
+                    Ok(_) => {
+                        // The path was replaced after open. This inode
+                        // is not registered in-process, so closing it
+                        // is safe; retry against the current name.
+                        drop(file);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        drop(file);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some((file, stage)) = publish_new_lock(repository_directory, lock_path)? {
+                    let identity = lock_identity(&file.metadata()?);
+                    break Ok((file, identity, Some(stage)));
+                }
+                // Another creator won the absent-only publication.
+                // Its distinct stage was not opened or replaced; retry
+                // through the ordinary existing-inode path.
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 impl RepositoryLock {
     /// Acquires the exclusive repository lock, creating `repo.lock` when
     /// absent. Fails immediately — with a message pointing at a possibly
@@ -90,10 +187,6 @@ impl RepositoryLock {
     /// A newly created lock is hardened to retain owner read/write access
     /// even under a restrictive umask; an existing inode's mode is never
     /// changed.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "existing-inode safety, absent-only publication, registration, and classic record locking form one indivisible acquisition protocol"
-    )]
     pub fn acquire(repository_directory: &Path) -> Result<Self> {
         let in_use = |detail: &str| Error::InvalidFormat {
             details: format!(
@@ -110,87 +203,8 @@ impl RepositoryLock {
         let mut registry = locked_identities();
 
         #[cfg(unix)]
-        let (lock_file, identity, creation_stage) = {
-            // Stat *before* open: on classic process-associated POSIX
-            // locks, merely opening and closing a descriptor of a lock
-            // file another guard in this process holds would release
-            // that guard's locks — so the existing file is opened only
-            // once the registry proves no in-process guard holds this
-            // identity. An absent file is never created at `repo.lock`
-            // directly; competing creators race at an absent-only link.
-            let mut attempts = 0u16;
-            loop {
-                attempts += 1;
-                if attempts > 1000 {
-                    return Err(Error::InvalidFormat {
-                        details: format!(
-                            "{} changed repeatedly while the repository lock was being opened",
-                            lock_path.display()
-                        ),
-                    });
-                }
-                match std::fs::symlink_metadata(&lock_path) {
-                    Ok(metadata) => {
-                        if !metadata.file_type().is_file() {
-                            return Err(invalid_lock_file_type(&lock_path));
-                        }
-                        let observed_identity = lock_identity(&metadata);
-                        if registry.contains(&observed_identity) {
-                            return Err(in_use("this process"));
-                        }
-                        let file = match open_existing_lock_file(&lock_path) {
-                            Ok(file) => file,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(error) => return Err(error.into()),
-                        };
-                        let identity = lock_identity(&file.metadata()?);
-                        if registry.contains(&identity) {
-                            // The lock file changed identity between the stat
-                            // and open and this process already holds the new
-                            // inode. Closing our descriptor would release that
-                            // guard's classic record locks, so leak this one
-                            // descriptor in the pathological race.
-                            std::mem::forget(file);
-                            return Err(in_use("this process"));
-                        }
-                        match std::fs::symlink_metadata(&lock_path) {
-                            Ok(current)
-                                if current.file_type().is_file()
-                                    && lock_identity(&current) == identity =>
-                            {
-                                break (file, identity, None);
-                            }
-                            Ok(current) if !current.file_type().is_file() => {
-                                drop(file);
-                                return Err(invalid_lock_file_type(&lock_path));
-                            }
-                            Ok(_) => {
-                                // The path was replaced after open. This inode
-                                // is not registered in-process, so closing it
-                                // is safe; retry against the current name.
-                                drop(file);
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                drop(file);
-                            }
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        if let Some((file, stage)) =
-                            publish_new_lock(repository_directory, &lock_path)?
-                        {
-                            let identity = lock_identity(&file.metadata()?);
-                            break (file, identity, Some(stage));
-                        }
-                        // Another creator won the absent-only publication.
-                        // Its distinct stage was not opened or replaced; retry
-                        // through the ordinary existing-inode path.
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        };
+        let (lock_file, identity, creation_stage) =
+            open_or_publish_lock_file(repository_directory, &lock_path, &registry)?;
         #[cfg(not(unix))]
         let (lock_file, identity, created) = {
             let (file, created) = open_lock_file(&lock_path)?;

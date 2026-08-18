@@ -101,13 +101,25 @@ fn signed_order_key(identifier: SegmentIdentifier) -> (i64, i64) {
 /// the version 1 entry size even for version 2 indexes, and entry ordering
 /// is checked with signed comparison. Any failure means the archive has no
 /// usable index and the caller must fall back to the recovery scan.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the validation sequence mirrors the Java loader step for step and reads best linearly"
-)]
 pub fn parse_segment_index(archive_bytes: &[u8]) -> Result<SegmentIndex> {
-    let invalid = |details: String| Error::InvalidFormat { details };
-    let length = archive_bytes.len();
+    validate_archive_shape(archive_bytes.len())?;
+    let anchor = archive_bytes.len() - TERMINATING_ZERO_BLOCKS;
+    let footer = read_index_footer(archive_bytes, anchor)?;
+    let entries_bytes = locate_index_entries(archive_bytes, anchor, &footer)?;
+    let entries = parse_index_entries(entries_bytes, &footer)?;
+    Ok(SegmentIndex {
+        version: footer.version,
+        entries,
+    })
+}
+
+fn invalid(details: String) -> Error {
+    Error::InvalidFormat { details }
+}
+
+/// Rejects an archive that cannot hold an index at all, before any offset
+/// is derived from its length.
+fn validate_archive_shape(length: usize) -> Result<()> {
     if !length.is_multiple_of(512) {
         return Err(invalid(format!(
             "archive length {length} is not a multiple of 512"
@@ -123,8 +135,20 @@ pub fn parse_segment_index(archive_bytes: &[u8]) -> Result<SegmentIndex> {
             "archive of {length} bytes exceeds the 2 GiB addressing limit"
         )));
     }
+    Ok(())
+}
 
-    let anchor = length - TERMINATING_ZERO_BLOCKS;
+/// The index trailer: what the entry table is and how to check it.
+struct IndexFooter {
+    version: u8,
+    entry_size: usize,
+    entry_count: usize,
+    stored_checksum: u32,
+}
+
+/// Decodes and validates the fixed-size trailer that sits before the
+/// terminating zero blocks.
+fn read_index_footer(archive_bytes: &[u8], anchor: usize) -> Result<IndexFooter> {
     let footer = &archive_bytes[anchor - FOOTER_SIZE..anchor];
     let stored_checksum = read_u32(footer, 0);
     let entry_count = read_u32(footer, 4) as i32;
@@ -157,64 +181,72 @@ pub fn parse_segment_index(archive_bytes: &[u8]) -> Result<SegmentIndex> {
             "index size {declared_size} is not aligned to 512 bytes"
         )));
     }
+    Ok(IndexFooter {
+        version,
+        entry_size,
+        entry_count,
+        stored_checksum,
+    })
+}
 
+/// Locates the entry table the footer describes and proves its checksum
+/// before a single entry is decoded.
+fn locate_index_entries<'bytes>(
+    archive_bytes: &'bytes [u8],
+    anchor: usize,
+    footer: &IndexFooter,
+) -> Result<&'bytes [u8]> {
     // Checked: on 32-bit targets a huge entry count could otherwise wrap
     // past the bounds check below.
-    let entries_size = entry_count.checked_mul(entry_size).ok_or_else(|| {
-        invalid(format!(
-            "index with {entry_count} entries does not fit the archive"
-        ))
-    })?;
+    let entries_size = footer
+        .entry_count
+        .checked_mul(footer.entry_size)
+        .ok_or_else(|| {
+            invalid(format!(
+                "index with {} entries does not fit the archive",
+                footer.entry_count
+            ))
+        })?;
     let entries_end = anchor - FOOTER_SIZE;
     let entries_start = entries_end.checked_sub(entries_size).ok_or_else(|| {
         invalid(format!(
-            "index with {entry_count} entries does not fit the archive"
+            "index with {} entries does not fit the archive",
+            footer.entry_count
         ))
     })?;
     let entries_bytes = &archive_bytes[entries_start..entries_end];
-    if crc32(entries_bytes) != stored_checksum {
+    if crc32(entries_bytes) != footer.stored_checksum {
         return Err(invalid("index checksum mismatch".to_owned()));
     }
+    Ok(entries_bytes)
+}
 
-    let mut entries = Vec::with_capacity(entry_count);
+/// Decodes every entry, holding each to the ordering and bounds rules the
+/// Java loader applies as it reads.
+fn parse_index_entries(
+    entries_bytes: &[u8],
+    footer: &IndexFooter,
+) -> Result<Vec<SegmentIndexEntry>> {
+    let mut entries = Vec::with_capacity(footer.entry_count);
     let mut previous_key: Option<(i64, i64)> = None;
-    for entry_index in 0..entry_count {
-        let entry_bytes = &entries_bytes[entry_index * entry_size..(entry_index + 1) * entry_size];
+    for entry_index in 0..footer.entry_count {
+        let entry_bytes =
+            &entries_bytes[entry_index * footer.entry_size..(entry_index + 1) * footer.entry_size];
         let most_significant_bits = read_u64(entry_bytes, 0);
         let least_significant_bits = read_u64(entry_bytes, 8);
         let position = read_u32(entry_bytes, 16) as i32;
         let size = read_u32(entry_bytes, 20) as i32;
         let generation = read_u32(entry_bytes, 24) as i32;
-        let (full_generation, is_compacted) = if version == 2 {
+        let (full_generation, is_compacted) = if footer.version == 2 {
             (read_u32(entry_bytes, 28) as i32, entry_bytes[32] != 0)
         } else {
             (generation, true)
         };
 
         let key = (most_significant_bits as i64, least_significant_bits as i64);
-        if let Some(previous) = previous_key {
-            if previous > key {
-                return Err(invalid(
-                    "index entries are not sorted by segment identifier".to_owned(),
-                ));
-            }
-            if previous == key {
-                return Err(invalid("duplicate segment identifier in index".to_owned()));
-            }
-        }
+        reject_out_of_order_key(previous_key, key)?;
         previous_key = Some(key);
-
-        if position < 0 {
-            return Err(invalid(format!("negative index entry position {position}")));
-        }
-        if position % 512 != 0 {
-            return Err(invalid(format!(
-                "index entry position {position} is not aligned to 512 bytes"
-            )));
-        }
-        if size < 1 {
-            return Err(invalid(format!("invalid index entry size {size}")));
-        }
+        validate_entry_extent(position, size)?;
 
         entries.push(SegmentIndexEntry {
             segment_identifier: SegmentIdentifier::new(
@@ -228,8 +260,40 @@ pub fn parse_segment_index(archive_bytes: &[u8]) -> Result<SegmentIndex> {
             is_compacted,
         });
     }
+    Ok(entries)
+}
 
-    Ok(SegmentIndex { version, entries })
+/// Entries are sorted by *signed* identifier comparison, matching Java's
+/// `Long` ordering, and no identifier may repeat.
+fn reject_out_of_order_key(previous_key: Option<(i64, i64)>, key: (i64, i64)) -> Result<()> {
+    let Some(previous) = previous_key else {
+        return Ok(());
+    };
+    if previous > key {
+        return Err(invalid(
+            "index entries are not sorted by segment identifier".to_owned(),
+        ));
+    }
+    if previous == key {
+        return Err(invalid("duplicate segment identifier in index".to_owned()));
+    }
+    Ok(())
+}
+
+/// An entry must name a block-aligned, non-empty region of the archive.
+fn validate_entry_extent(position: i32, size: i32) -> Result<()> {
+    if position < 0 {
+        return Err(invalid(format!("negative index entry position {position}")));
+    }
+    if position % 512 != 0 {
+        return Err(invalid(format!(
+            "index entry position {position} is not aligned to 512 bytes"
+        )));
+    }
+    if size < 1 {
+        return Err(invalid(format!("invalid index entry size {size}")));
+    }
+    Ok(())
 }
 
 /// The bytes the index occupies on disk as a complete tar entry: header

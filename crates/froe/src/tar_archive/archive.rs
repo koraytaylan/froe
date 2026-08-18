@@ -69,6 +69,12 @@ pub struct TarArchiveReader {
     content: ArchiveContent,
 }
 
+/// A malformation of an archive, named so every check reports it the same
+/// way.
+fn malformed(details: String) -> crate::error::Error {
+    crate::error::Error::InvalidFormat { details }
+}
+
 impl TarArchiveReader {
     /// Opens an archive file, trying the index first and falling back to
     /// the recovery scan.
@@ -253,120 +259,140 @@ impl TarArchiveReader {
     /// certificate: a valid trailer index must not authorize deletion of an
     /// alternate archive when its referenced payload entry is stale or
     /// corrupt.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the index/header/name/size/payload certificate is safest as one linear validation sequence"
-    )]
     pub(crate) fn validate_indexed_segment_entry(
         &self,
         segment_identifier: SegmentIdentifier,
     ) -> crate::error::Result<()> {
         let entry = self.index_entry(segment_identifier).ok_or_else(|| {
-            crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} has no index entry for segment {segment_identifier}",
-                    self.file_name
-                ),
-            }
+            malformed(format!(
+                "archive {} has no index entry for segment {segment_identifier}",
+                self.file_name
+            ))
         })?;
+        let (header_block, header) = self.indexed_entry_header(entry, segment_identifier)?;
+        let expected_checksum = self.certified_entry_name(&header, segment_identifier)?;
+        self.reject_header_disagreement(entry, &header, header_block, segment_identifier)?;
+        self.verify_payload_checksum(entry, expected_checksum, segment_identifier)
+    }
+
+    /// The 512-byte tar header block sitting immediately before the payload
+    /// the index points at, and its parse.
+    fn indexed_entry_header(
+        &self,
+        entry: &crate::tar_archive::index::SegmentIndexEntry,
+        segment_identifier: SegmentIdentifier,
+    ) -> crate::error::Result<(&[u8], TarEntryHeader)> {
         let payload_start = entry.position as usize;
         let header_start = payload_start.checked_sub(512).ok_or_else(|| {
-            crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} indexes segment {segment_identifier} before a complete tar header",
-                    self.file_name
-                ),
-            }
+            malformed(format!(
+                "archive {} indexes segment {segment_identifier} before a complete tar header",
+                self.file_name
+            ))
         })?;
         let header_end = header_start.checked_add(512).ok_or_else(|| {
-            crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} overflows the tar-header range for segment {segment_identifier}",
-                    self.file_name
-                ),
-            }
+            malformed(format!(
+                "archive {} overflows the tar-header range for segment {segment_identifier}",
+                self.file_name
+            ))
         })?;
         let header_block = self.bytes.get(header_start..header_end).ok_or_else(|| {
-            crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} truncates the tar header for segment {segment_identifier}",
-                    self.file_name
-                ),
-            }
+            malformed(format!(
+                "archive {} truncates the tar header for segment {segment_identifier}",
+                self.file_name
+            ))
         })?;
         let header = TarEntryHeader::parse(header_block).ok_or_else(|| {
-            crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} has no tar entry header for indexed segment {segment_identifier}",
-                    self.file_name
-                ),
-            }
+            malformed(format!(
+                "archive {} has no tar entry header for indexed segment {segment_identifier}",
+                self.file_name
+            ))
         })?;
-        let (header_identifier, expected_crc) = parse_segment_entry_name(&header.name)
+        Ok((header_block, header))
+    }
+
+    /// The payload checksum encoded in the entry name, once that name is
+    /// proved to be the canonical one for the segment the index claims.
+    fn certified_entry_name(
+        &self,
+        header: &TarEntryHeader,
+        segment_identifier: SegmentIdentifier,
+    ) -> crate::error::Result<u32> {
+        let (header_identifier, expected_checksum) = parse_segment_entry_name(&header.name)
             .and_then(|(identifier, checksum)| checksum.map(|checksum| (identifier, checksum)))
-            .ok_or_else(|| crate::error::Error::InvalidFormat {
-                details: format!(
+            .ok_or_else(|| {
+                malformed(format!(
                     "archive {} has malformed or checksum-free tar entry name {:?} for indexed segment {segment_identifier}",
                     self.file_name, header.name
-                ),
+                ))
             })?;
         if header_identifier != segment_identifier {
-            return Err(crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} index names segment {segment_identifier}, but its tar entry names {header_identifier}",
-                    self.file_name
-                ),
-            });
+            return Err(malformed(format!(
+                "archive {} index names segment {segment_identifier}, but its tar entry names {header_identifier}",
+                self.file_name
+            )));
         }
-        let canonical_name = format!("{segment_identifier}.{expected_crc:08x}");
+        let canonical_name = format!("{segment_identifier}.{expected_checksum:08x}");
         if header.name != canonical_name {
-            return Err(crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} tar entry name {:?} is not the canonical indexed-segment name {canonical_name:?}",
-                    self.file_name, header.name
-                ),
-            });
+            return Err(malformed(format!(
+                "archive {} tar entry name {:?} is not the canonical indexed-segment name {canonical_name:?}",
+                self.file_name, header.name
+            )));
         }
+        Ok(expected_checksum)
+    }
+
+    /// The index row and the tar header must agree on the entry's size, and
+    /// the header must carry its own valid checksum.
+    fn reject_header_disagreement(
+        &self,
+        entry: &crate::tar_archive::index::SegmentIndexEntry,
+        header: &TarEntryHeader,
+        header_block: &[u8],
+        segment_identifier: SegmentIdentifier,
+    ) -> crate::error::Result<()> {
         if header.size != i64::from(entry.size) {
-            return Err(crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} index size {} disagrees with tar entry size {} for segment {segment_identifier}",
-                    self.file_name, entry.size, header.size
-                ),
-            });
+            return Err(malformed(format!(
+                "archive {} index size {} disagrees with tar entry size {} for segment {segment_identifier}",
+                self.file_name, entry.size, header.size
+            )));
         }
         if !tar_header_checksum_is_valid(header_block) {
-            return Err(crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} has an invalid tar-header checksum for segment {segment_identifier}",
-                    self.file_name
-                ),
-            });
+            return Err(malformed(format!(
+                "archive {} has an invalid tar-header checksum for segment {segment_identifier}",
+                self.file_name
+            )));
         }
+        Ok(())
+    }
+
+    /// The payload must hash to the checksum its own entry name records.
+    fn verify_payload_checksum(
+        &self,
+        entry: &crate::tar_archive::index::SegmentIndexEntry,
+        expected_checksum: u32,
+        segment_identifier: SegmentIdentifier,
+    ) -> crate::error::Result<()> {
+        let payload_start = entry.position as usize;
         let payload_end = payload_start
             .checked_add(entry.size as usize)
-            .ok_or_else(|| crate::error::Error::InvalidFormat {
-                details: format!(
+            .ok_or_else(|| {
+                malformed(format!(
                     "archive {} overflows the payload range for segment {segment_identifier}",
                     self.file_name
-                ),
+                ))
             })?;
         let payload = self.bytes.get(payload_start..payload_end).ok_or_else(|| {
-            crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} truncates the payload for segment {segment_identifier}",
-                    self.file_name
-                ),
-            }
+            malformed(format!(
+                "archive {} truncates the payload for segment {segment_identifier}",
+                self.file_name
+            ))
         })?;
-        let actual_crc = crc32(payload);
-        if actual_crc != expected_crc {
-            return Err(crate::error::Error::InvalidFormat {
-                details: format!(
-                    "archive {} payload CRC {actual_crc:08x} disagrees with tar entry CRC {expected_crc:08x} for segment {segment_identifier}",
-                    self.file_name
-                ),
-            });
+        let actual_checksum = crc32(payload);
+        if actual_checksum != expected_checksum {
+            return Err(malformed(format!(
+                "archive {} payload CRC {actual_checksum:08x} disagrees with tar entry CRC {expected_checksum:08x} for segment {segment_identifier}",
+                self.file_name
+            )));
         }
         Ok(())
     }

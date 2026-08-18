@@ -9,24 +9,46 @@ use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "source/staging certification and every durability cutpoint form one atomic publication protocol"
-)]
+/// A staged upgrade: the certified source, the bytes that will replace it,
+/// and the temporary holding them until the rename publishes it.
+struct StagedManifestUpgrade {
+    source: Vec<u8>,
+    source_certificate: ManifestFileCertificate,
+    output: Vec<u8>,
+    temporary_path: PathBuf,
+    temporary_certificate: ManifestFileCertificate,
+    guard: UncommittedFile,
+}
+
 pub(super) fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
     let manifest_path = directory.join("manifest");
-    let metadata = std::fs::symlink_metadata(&manifest_path)?;
+    let Some(staged) = stage_manifest_upgrade(directory, &manifest_path)? else {
+        return Ok(());
+    };
+    publish_manifest_upgrade(directory, &manifest_path, staged)
+}
+
+/// Certifies the current manifest and writes its replacement to a
+/// temporary, without touching the manifest itself.
+///
+/// Returns `None` when the store is already at version 2, which is the
+/// only case in which no file is created at all.
+fn stage_manifest_upgrade(
+    directory: &Path,
+    manifest_path: &Path,
+) -> Result<Option<StagedManifestUpgrade>> {
+    let metadata = std::fs::symlink_metadata(manifest_path)?;
     if !metadata.file_type().is_file() {
         return Err(Error::InvalidFormat {
             details: format!("{} is not a regular file", manifest_path.display()),
         });
     }
-    if crate::store::read_manifest_store_version(&manifest_path)? >= 2 {
-        return Ok(());
+    if crate::store::read_manifest_store_version(manifest_path)? >= 2 {
+        return Ok(None);
     }
-    let source = std::fs::read(&manifest_path)?;
+    let source = std::fs::read(manifest_path)?;
     let source_certificate = certify_manifest_file(
-        &manifest_path,
+        manifest_path,
         &metadata,
         &source,
         ManifestFileAccess::Read,
@@ -36,7 +58,7 @@ pub(super) fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
 
     let (temporary_path, mut temporary) =
         create_exclusive_numbered_file(directory, "manifest.cleaning")?;
-    let mut guard = UncommittedFile::new(temporary_path.clone());
+    let guard = UncommittedFile::new(temporary_path.clone());
     temporary.write_all(&output)?;
     preserve_file_metadata(&temporary, &metadata)?;
     let temporary_identity = temporary.metadata()?;
@@ -48,6 +70,47 @@ pub(super) fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
         ManifestFileAccess::ReadWrite,
         "staged manifest replacement",
     )?;
+    Ok(Some(StagedManifestUpgrade {
+        source,
+        source_certificate,
+        output,
+        temporary_path,
+        temporary_certificate,
+        guard,
+    }))
+}
+
+/// Renames the staged replacement over the manifest and makes that
+/// durable.
+///
+/// The order here is the safety argument and is meant to be read straight
+/// down: every fault boundary is bracketed by a proof that both files are
+/// still exactly what staging certified, so a crash at any cutpoint leaves
+/// either the old manifest or the new one, never a blend.
+fn publish_manifest_upgrade(
+    directory: &Path,
+    manifest_path: &Path,
+    staged: StagedManifestUpgrade,
+) -> Result<()> {
+    let StagedManifestUpgrade {
+        source,
+        source_certificate,
+        output,
+        temporary_path,
+        temporary_certificate,
+        mut guard,
+    } = staged;
+    // Re-proven at every boundary below; naming it keeps six occurrences
+    // from drifting apart in path or access mode.
+    let recertify_installed = || -> Result<()> {
+        temporary_certificate.recertify(
+            manifest_path,
+            &output,
+            ManifestFileAccess::ReadWrite,
+            "installed manifest replacement",
+        )
+    };
+
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed("manifest.temporary-durable")?;
     #[cfg(test)]
@@ -57,7 +120,7 @@ pub(super) fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::crash_if_armed("manifest.before-rename");
     source_certificate.recertify(
-        &manifest_path,
+        manifest_path,
         &source,
         ManifestFileAccess::Read,
         "source manifest",
@@ -68,13 +131,8 @@ pub(super) fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
         ManifestFileAccess::ReadWrite,
         "staged manifest replacement",
     )?;
-    std::fs::rename(&temporary_path, &manifest_path)?;
-    temporary_certificate.recertify(
-        &manifest_path,
-        &output,
-        ManifestFileAccess::ReadWrite,
-        "installed manifest replacement",
-    )?;
+    std::fs::rename(&temporary_path, manifest_path)?;
+    recertify_installed()?;
     drop(source_certificate);
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed(
@@ -93,41 +151,20 @@ pub(super) fn upgrade_manifest_atomically(directory: &Path) -> Result<()> {
     crate::writer::maintenance_fault_injection::crash_if_armed(
         "manifest.before-post-rename-directory-sync",
     );
-    temporary_certificate.recertify(
-        &manifest_path,
-        &output,
-        ManifestFileAccess::ReadWrite,
-        "installed manifest replacement",
-    )?;
+    recertify_installed()?;
     sync_directory_strict(directory)?;
-    temporary_certificate.recertify(
-        &manifest_path,
-        &output,
-        ManifestFileAccess::ReadWrite,
-        "installed manifest replacement",
-    )?;
+    recertify_installed()?;
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::fail_if_armed("manifest.rename-durable")?;
     #[cfg(test)]
     crate::writer::maintenance_fault_injection::crash_if_armed("manifest.rename-durable");
-    temporary_certificate.recertify(
-        &manifest_path,
-        &output,
-        ManifestFileAccess::ReadWrite,
-        "installed manifest replacement",
-    )?;
-    if crate::store::read_manifest_store_version(&manifest_path)? != 2 {
+    recertify_installed()?;
+    if crate::store::read_manifest_store_version(manifest_path)? != 2 {
         return Err(Error::InvalidFormat {
             details: "atomic manifest upgrade did not install store.version=2".to_owned(),
         });
     }
-    temporary_certificate.recertify(
-        &manifest_path,
-        &output,
-        ManifestFileAccess::ReadWrite,
-        "installed manifest replacement",
-    )?;
-    Ok(())
+    recertify_installed()
 }
 
 pub(super) fn manifest_upgrade_bytes(source: &[u8]) -> Vec<u8> {

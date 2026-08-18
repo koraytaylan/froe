@@ -134,13 +134,23 @@ format win.
   reader to hold two altitudes at once. Split at that seam. The
   reliable smells are a comment introducing a block, a block whose
   locals are used nowhere else, and a name containing "and".
-* **Length is a symptom, not the disease.** There is no line limit. A
-  long function whose body is one flat sequence at one altitude — a
-  serializer emitting fields in format order, a match over every record
-  type — is clearer whole than shattered into single-use helpers that
-  scatter the format across a file. Over-decomposition has its own
-  cost, paid at every read. Split for altitude and reuse, not to hit a
-  number.
+* **A hundred lines is the limit, and there is no escape hatch.**
+  clippy's `too_many_lines` is the enforcement, and
+  `#[allow(clippy::too_many_lines)]` is forbidden anywhere in the tree —
+  production, fixtures, and tests alike. The lint counts physical lines
+  between a function's braces, ignoring blank and comment-only lines, so
+  the budget is real code. A function that needs more than that is
+  telling you it holds more than one idea.
+* **Split at the seams the function already has.** A long body almost
+  always has phases separated by blank lines and a comment introducing
+  each; those comments are the names of the functions hiding inside it.
+  Extract them so the caller reads as the sequence it always was, with
+  each step's *what* in its name and its *why* in its own doc comment.
+  Where a linear order is load-bearing — a crash-safe mutation
+  sequence, a durability protocol — the extracted steps stay in the same
+  order in the same caller, so the ordering is still read top to bottom
+  in one place. What must not survive is one screen's worth of code that
+  a reader has to re-derive that structure from every time.
 * **Few parameters, and none of them bare `bool`.** Past roughly three,
   group them into a struct — a caller passing five positional arguments
   cannot be reviewed for argument order. A boolean at a call site is
