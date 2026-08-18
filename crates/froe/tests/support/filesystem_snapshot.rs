@@ -158,15 +158,13 @@ fn set_modified(path: &Path, timestamp: SystemTime) {
 }
 
 /// Verifies that every metadata component relied on by read-only tests is
-/// independently capable of changing snapshot equality.
+/// independently capable of changing snapshot equality: change one field and
+/// the snapshot must differ, so none is silently ignored.
 #[allow(
     dead_code,
     reason = "called only by the package's dedicated snapshot integration target"
 )]
 #[cfg(unix)]
-#[cfg(unix)]
-/// Every field the snapshot records must move on its own: change one
-/// and the snapshot must differ, so no field is silently ignored.
 fn assert_every_metadata_field_is_observed(
     directory: &SnapshotTestDirectory,
     file_path: &Path,
