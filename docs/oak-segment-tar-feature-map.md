@@ -156,7 +156,6 @@ safely; archive rewrites have the additional hard-link requirement noted below:
 
 | Command | Purpose |
 | --- | --- |
-| `froe compact REPOSITORY [--dry-run] [--task TASK]…` | Strictly read-only plan with `--dry-run`; otherwise safely reclaim orphaned storage and stale metadata; see [`compact.md`](compact.md). |
 | `froe compact REPOSITORY [--tail] [--dry-run]` | The one maintenance command: offline full or tail compaction, the reclamation it makes possible, and the journal retirement, in one run. `--dry-run` previews it read-only. Archive rewrites require same-directory hard-link support. |
 | `froe backup SOURCE TARGET` | Copy a repository's head into a target store. |
 | `froe restore BACKUP TARGET` | Copy a backup's head into an existing store. |

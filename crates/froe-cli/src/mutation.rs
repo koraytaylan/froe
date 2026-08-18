@@ -206,21 +206,13 @@ pub(crate) fn run_compact(
 struct RetentionSummary {
     segments: usize,
     bytes: u64,
-    history_segments: usize,
-    history_reclaimable_segments: usize,
-    history_reclaimable_bytes: u64,
 }
 
 impl RetentionSummary {
     fn of(plan: &froe::CompactionPlan) -> Self {
-        let (history_reclaimable_segments, history_reclaimable_bytes) =
-            plan.history_protected_reclaimable();
         Self {
             segments: plan.retained_reclaimable_segments(),
             bytes: plan.retained_reclaimable_bytes(),
-            history_segments: plan.history_protected_segments(),
-            history_reclaimable_segments,
-            history_reclaimable_bytes,
         }
     }
 }
@@ -254,17 +246,9 @@ fn print_cleanup_summary(outcome: &froe::CompactionOutcome, retention: Retention
             froe::format_byte_size(retention.bytes),
         );
     }
-    if retention.history_segments != 0 {
-        println!(
-            "journal history still protects {} data segments the head does not reach; retiring it would let this sweep free a further {} segments ({})",
-            crate::progress::format_count(retention.history_segments as u64),
-            crate::progress::format_count(retention.history_reclaimable_segments as u64),
-            froe::format_byte_size(retention.history_reclaimable_bytes),
-        );
-    }
     if outcome.repaired_archives != 0 {
         println!(
-            "archive indexes rebuilt: {} (originals retained under .bak names; a later run with --task recovery-backups can retire them once the store is verified)",
+            "archive indexes rebuilt: {} (originals retained under .bak names; a later run with --backup-minimum-age-days and --backup-keep-latest can retire them once the store is verified)",
             outcome.repaired_archives
         );
     }
@@ -527,21 +511,6 @@ fn print_plan_totals(plan: &CompactionPlan) {
             crate::progress::format_count(plan.retained_reclaimable_segments() as u64),
             froe::format_byte_size(plan.retained_reclaimable_bytes()),
         );
-    }
-    let (history_reclaimable_segments, history_reclaimable_bytes) =
-        plan.history_protected_reclaimable();
-    if plan.history_protected_segments() != 0 {
-        println!(
-            "journal history protects {} data segments the current head does not reach; retiring that history would let this same sweep free {} segments ({}), binary content included",
-            crate::progress::format_count(plan.history_protected_segments() as u64),
-            crate::progress::format_count(history_reclaimable_segments as u64),
-            froe::format_byte_size(history_reclaimable_bytes),
-        );
-        if history_reclaimable_segments != 0 {
-            println!(
-                "  to retire it: run `froe compact` on a stopped repository, or bound the journal with --retain-journal-revisions"
-            );
-        }
     }
     if plan.estimated_archive_rewrite_source_bytes() != 0 {
         println!(

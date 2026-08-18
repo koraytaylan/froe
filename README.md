@@ -187,7 +187,6 @@ $ target/release/froe debug /path/to/segmentstore data00000a.tar
 # Maintenance — stopped repository only (mutating forms ask for confirmation):
 $ target/release/froe compact /path/to/segmentstore --dry-run
 $ target/release/froe compact /path/to/segmentstore
-$ target/release/froe compact /path/to/segmentstore
 $ target/release/froe backup /path/to/segmentstore /path/to/backup
 $ target/release/froe recover-journal /path/to/segmentstore
 ```

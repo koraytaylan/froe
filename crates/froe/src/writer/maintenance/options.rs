@@ -14,7 +14,7 @@ pub(crate) enum MaintenanceTask {
     /// Remove parser-ignored, missing-segment, and unreadable historical
     /// journal lines while retaining every readable revision byte-for-byte.
     Journal,
-    /// Run Oak's standalone FULL/two-retained-generation segment sweep.
+    /// Run Oak's standalone FULL segment sweep, retaining one generation.
     Segments,
     /// Remove superseded archive letters and empty incomplete archives.
     StaleArchives,

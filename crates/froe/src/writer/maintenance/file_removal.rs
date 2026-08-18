@@ -271,7 +271,7 @@ pub(super) fn remove_planned_files_core(
 ///
 /// Counted with the same predicate that decides what the backup retention
 /// policy may retire, so the reported figure is exactly the material a later
-/// `--task recovery-backups` run can reclaim — and, before that run, exactly
+/// run under a recovery-backup policy can reclaim — and, before that run, exactly
 /// the growth the archive byte line does not show.
 pub(super) fn recovery_backup_file_bytes(directory: &Path) -> Result<u64> {
     let mut bytes = 0u64;

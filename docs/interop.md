@@ -349,18 +349,20 @@ Depends on `compact` (to build the gen 0→1→2 fixture).
 
 ### journal_retention
 
-`--retain-journal-revisions` is the only froe operation that makes repository
-bytes unreachable *by policy* rather than by Oak's generation predicate. It
-removes journal lines whose revisions still resolve, and the segments behind
-them are swept in the same run.
+Journal retirement is the only thing froe does that makes repository bytes
+unreachable *by policy* rather than by Oak's generation predicate: it removes
+journal lines whose revisions still resolve, and the segments behind them are
+swept in the same run. It is not opt-in — every `froe compact` does it — which
+is exactly why it needs Oak evidence rather than froe's own agreement with
+itself.
 
 That is precisely the case a froe-to-froe round trip cannot answer: froe
 agreeing with its own reachability rules says nothing about whether Oak can
-open what is left. So this phase bounds the journal to one revision on a copy
-of the Oak fixture, asserts the plan names the revisions it retires and that
-exactly one line survives on disk beside a numbered backup, and then boots
-Sling against the result — which must serve the exact baseline tree from the
-single revision froe kept.
+open what is left. So this phase runs a plain `froe compact` on a copy of the
+Oak fixture, asserts the plan names the revisions it retires and that exactly
+one line survives on disk beside a numbered backup, and then boots Sling
+against the result — which must serve the exact baseline tree from the single
+revision froe kept.
 
 Depends on `generate` only; it uses the Oak-written journal directly, because
 Oak's own history is the thing being retired.
