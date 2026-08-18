@@ -291,6 +291,7 @@ pub(crate) struct ValidatedBase {
 mod tests {
     use crate::refresh::ParquetRefresh;
     use crate::refresh::test_support::*;
+    #[cfg(unix)]
     use froe::store::Repository;
 
     #[test]

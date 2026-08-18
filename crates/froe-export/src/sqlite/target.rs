@@ -61,10 +61,13 @@ pub(crate) fn path_still_names(path: &Path, file: &std::fs::File) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use crate::export::export_subtree;
     use crate::sqlite::test_support::{TestDirectory, populate};
     use crate::sqlite::{SqliteExportOptions, SqliteSink};
+    #[cfg(unix)]
     use froe::store::Repository;
+    #[cfg(unix)]
     use rusqlite::Connection;
 
     #[test]
