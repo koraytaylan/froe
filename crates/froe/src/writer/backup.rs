@@ -21,6 +21,8 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cache::BoundedCache;
 use crate::content::node::NodeState;
@@ -29,7 +31,7 @@ use crate::error::{Error, Result};
 use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::RecordIdentifier;
-use crate::store::Repository;
+use crate::store::{ArchiveSet, Repository};
 use crate::writer::compaction::deep_copy_tree_across_stores_with_progress;
 use crate::writer::repository_lock::RepositoryLock;
 use crate::writer::segment_builder::GarbageCollectionGeneration;
@@ -163,6 +165,108 @@ struct Candidate {
     timestamp_milliseconds: i64,
 }
 
+fn parallel_worker_count(work_items: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(work_items.max(1))
+}
+
+/// Distinct data segments, not every archive occurrence. A segment's record
+/// table is strictly ascending by record number, so one segment cannot yield
+/// a duplicate record; only a segment served by two archives could, and the
+/// location map settles that for free.
+fn collect_super_root_candidates(
+    provider: &ArchiveSet,
+    observer: &mut dyn ProgressObserver,
+) -> Vec<Candidate> {
+    let identifiers: Vec<SegmentIdentifier> = provider.distinct_segment_identifiers().collect();
+    observer.step_began(
+        &Step::new("scanning segments for super-roots", WorkUnit::Segments)
+            .with_total(crate::progress::count(identifiers.len())),
+    );
+    let workers = parallel_worker_count(identifiers.len());
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Vec<Candidate>>> =
+        identifiers.iter().map(|_| Mutex::new(Vec::new())).collect();
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            scope.spawn(|| scan_super_root_worker(provider, &identifiers, &next, &slots));
+        }
+        while scan_next_super_root_segment(provider, &identifiers, &next, &slots) {
+            let completed = next.load(Ordering::Relaxed).min(identifiers.len());
+            observer.step_advanced(crate::progress::count(completed));
+        }
+    });
+    observer.step_advanced(crate::progress::count(identifiers.len()));
+    observer.step_ended();
+    slots
+        .into_iter()
+        .flat_map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .collect()
+}
+
+fn scan_super_root_worker(
+    provider: &ArchiveSet,
+    identifiers: &[SegmentIdentifier],
+    next: &AtomicUsize,
+    slots: &[Mutex<Vec<Candidate>>],
+) {
+    while scan_next_super_root_segment(provider, identifiers, next, slots) {}
+}
+
+fn scan_next_super_root_segment(
+    provider: &ArchiveSet,
+    identifiers: &[SegmentIdentifier],
+    next: &AtomicUsize,
+    slots: &[Mutex<Vec<Candidate>>],
+) -> bool {
+    let position = next.fetch_add(1, Ordering::Relaxed);
+    let Some(identifier) = identifiers.get(position) else {
+        return false;
+    };
+    let found = super_roots_in_segment(provider, *identifier);
+    *slots[position]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = found;
+    true
+}
+
+fn super_roots_in_segment(
+    provider: &ArchiveSet,
+    segment_identifier: SegmentIdentifier,
+) -> Vec<Candidate> {
+    if segment_identifier.is_bulk_segment() {
+        return Vec::new();
+    }
+    let Ok(view) = provider.segment(segment_identifier) else {
+        return Vec::new();
+    };
+    // A segment without a parseable info timestamp is skipped whole,
+    // as in Java ("No timestamp found in segment ..."); Java aborts
+    // the entire run on malformed info JSON, which is folded into the
+    // same skip here — strictly safer, recovery proceeds on the rest.
+    let Some(timestamp) = read_segment_info_timestamp(provider, segment_identifier) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in view.structure.record_table() {
+        if entry.record_type() != Some(crate::segment::record::RecordType::Node) {
+            continue;
+        }
+        let record = RecordIdentifier::new(segment_identifier, entry.record_number);
+        if is_super_root(provider, record) {
+            candidates.push(Candidate {
+                record,
+                timestamp_milliseconds: timestamp,
+            });
+        }
+    }
+    candidates
+}
+
 /// Rebuilds `journal.log` from the segments on disk. Scans every data
 /// segment for super-root candidates, verifies the newest one is fully
 /// traversable, and rewrites the journal with the surviving candidates
@@ -195,61 +299,8 @@ pub fn recover_journal_with_progress(
     // A read-only view of every archive, opened without needing a
     // resolvable journal.
     let archives = crate::store::open_all_archives_with_progress(directory, observer)?;
-
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let provider = crate::store::ArchiveSet::new(archives);
-
-    // Every statement in this loop is infallible — an unreadable segment
-    // is skipped, not raised — so the step is closed by the single
-    // `step_ended` after it.
-    observer.step_began(
-        &Step::new("scanning segments for super-roots", WorkUnit::Segments)
-            .with_total(crate::progress::count(provider.segment_identifier_count())),
-    );
-    let mut scanned_segments = 0usize;
-    // Distinct segments, not every archive occurrence. This scan used to
-    // dedupe with a `HashSet<RecordIdentifier>` over every node record in
-    // every data segment — live and garbage alike, the largest set in the
-    // codebase. It was never needed at that grain: a segment's record table
-    // is rejected unless it is strictly ascending by record number, so one
-    // segment cannot yield a duplicate record. Only a segment served by two
-    // archives could, and that is settled here for free.
-    for (scanned, segment_identifier) in provider.distinct_segment_identifiers().enumerate() {
-        observer.step_advanced(crate::progress::count(scanned));
-        scanned_segments = scanned + 1;
-        if segment_identifier.is_bulk_segment() {
-            continue;
-        }
-        let Ok(view) = provider.segment(segment_identifier) else {
-            continue;
-        };
-        // A segment without a parseable info timestamp is skipped whole,
-        // as in Java ("No timestamp found in segment ..."); Java aborts
-        // the entire run on malformed info JSON, which is folded into the
-        // same skip here — strictly safer, recovery proceeds on the rest.
-        let Some(timestamp) = read_segment_info_timestamp(&provider, segment_identifier) else {
-            continue;
-        };
-        // Every NODE record of the segment is a potential super-root.
-        let node_records: Vec<u32> = view
-            .structure
-            .record_table()
-            .iter()
-            .filter(|entry| entry.record_type() == Some(crate::segment::record::RecordType::Node))
-            .map(|entry| entry.record_number)
-            .collect();
-        for record_number in node_records {
-            let record = RecordIdentifier::new(segment_identifier, record_number);
-            if is_super_root(&provider, record) {
-                candidates.push(Candidate {
-                    record,
-                    timestamp_milliseconds: timestamp,
-                });
-            }
-        }
-    }
-    observer.step_advanced(crate::progress::count(scanned_segments));
-    observer.step_ended();
+    let provider = ArchiveSet::new(archives);
+    let mut candidates = collect_super_root_candidates(&provider, observer);
     let candidates_examined = candidates.len();
 
     // Order candidates newest first — the exact reverse of Oak's

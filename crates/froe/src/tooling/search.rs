@@ -4,13 +4,20 @@
 //! `search_nodes` scans every node record in the store — not only those
 //! reachable from the current head, so it finds nodes in old revisions
 //! and orphaned by garbage — and reports those matching all of the
-//! query's predicates.
+//! query's predicates. The scan fans out across host cores over windows
+//! of segments, visiting matches in archive probe order so a limit still
+//! stops after a bounded prefix. Worker threads share the provider's
+//! existing byte-budgeted caches; they do not clone them.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::content::node::{NodeState, PropertyValues};
 use crate::content::property::PropertyValue;
 use crate::content::provider::SegmentProvider;
 use crate::error::Result;
 use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
+use crate::segment::identifier::SegmentIdentifier;
 use crate::segment::record::{RecordIdentifier, RecordType};
 use crate::store::{ArchiveSet, open_all_archives_with_progress};
 
@@ -100,6 +107,11 @@ pub fn search_nodes_with_progress(
 /// a large repository buffers far more than the caller ever needed at once.
 /// Returning [`std::ops::ControlFlow::Break`] stops the scan.
 ///
+/// Segments are searched in windows no wider than the host's parallelism so
+/// a `--limit` still stops after a bounded prefix; matches are visited in
+/// archive probe order. Worker caches are the provider's existing byte
+/// budgets, shared, not copied per thread.
+///
 /// Returns the number of node records that could not be read, the same count
 /// [`SearchOutcome::unreadable_nodes`] carries.
 pub fn search_nodes_visiting(
@@ -110,58 +122,139 @@ pub fn search_nodes_visiting(
 ) -> Result<u64> {
     let archives = open_all_archives_with_progress(directory, observer)?;
     let provider = ArchiveSet::new(archives);
-
+    let identifiers: Vec<SegmentIdentifier> = provider.distinct_segment_identifiers().collect();
     let mut unreadable_nodes = 0u64;
     observer.step_began(
         &Step::new("searching segments", WorkUnit::Segments)
-            .with_total(crate::progress::count(provider.segment_identifier_count())),
+            .with_total(crate::progress::count(identifiers.len())),
     );
+    let window_size = parallel_worker_count(identifiers.len());
     let mut searched_segments = 0usize;
-    for (searched, segment_identifier) in provider.distinct_segment_identifiers().enumerate() {
-        observer.step_advanced(crate::progress::count(searched));
-        searched_segments = searched + 1;
-        if segment_identifier.is_bulk_segment() {
-            continue;
-        }
-        let Ok(view) = provider.segment(segment_identifier) else {
-            continue;
-        };
-        // An unknown type byte means the record table itself is suspect;
-        // Java's search dies on it, froe keeps scanning but the skipped
-        // entries must be visible in the outcome.
-        let mut node_records: Vec<u32> = Vec::new();
-        for entry in view.structure.record_table() {
-            match entry.record_type() {
-                Some(RecordType::Node) => node_records.push(entry.record_number),
-                Some(_) => {}
-                None => unreadable_nodes += 1,
-            }
-        }
-        for record_number in node_records {
-            let record = RecordIdentifier::new(segment_identifier, record_number);
-            match node_matches(&provider, record, query) {
-                Ok(false) => {}
-                Ok(true) => {
-                    let stable_identifier = NodeState::new(&provider, record)
-                        .stable_identifier()
-                        .unwrap_or_else(|_| record.to_string());
-                    let found = NodeMatch {
-                        record,
-                        stable_identifier,
-                    };
-                    if visit(found).is_break() {
-                        observer.step_advanced(crate::progress::count(searched_segments));
-                        observer.step_ended();
-                        return Ok(unreadable_nodes);
-                    }
+    for window in identifiers.chunks(window_size.max(1)) {
+        observer.step_advanced(crate::progress::count(searched_segments));
+        let window_hits = search_segment_window(&provider, window, query);
+        searched_segments += window.len();
+        for hits in window_hits {
+            unreadable_nodes += hits.unreadable_nodes;
+            for found in hits.matches {
+                if visit(found).is_break() {
+                    observer.step_advanced(crate::progress::count(searched_segments));
+                    observer.step_ended();
+                    return Ok(unreadable_nodes);
                 }
-                Err(_) => unreadable_nodes += 1,
             }
         }
     }
     observer.step_advanced(crate::progress::count(searched_segments));
     observer.step_ended();
     Ok(unreadable_nodes)
+}
+
+fn parallel_worker_count(work_items: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(work_items.max(1))
+}
+
+struct SegmentSearchHits {
+    matches: Vec<NodeMatch>,
+    unreadable_nodes: u64,
+}
+
+fn search_segment_window(
+    provider: &ArchiveSet,
+    identifiers: &[SegmentIdentifier],
+    query: &SearchQuery,
+) -> Vec<SegmentSearchHits> {
+    let workers = parallel_worker_count(identifiers.len());
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<SegmentSearchHits>>> =
+        identifiers.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            scope.spawn(|| search_window_worker(provider, identifiers, query, &next, &slots));
+        }
+        search_window_worker(provider, identifiers, query, &next, &slots);
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("every window slot is filled")
+        })
+        .collect()
+}
+
+fn search_window_worker(
+    provider: &ArchiveSet,
+    identifiers: &[SegmentIdentifier],
+    query: &SearchQuery,
+    next: &AtomicUsize,
+    slots: &[Mutex<Option<SegmentSearchHits>>],
+) {
+    loop {
+        let position = next.fetch_add(1, Ordering::Relaxed);
+        let Some(identifier) = identifiers.get(position) else {
+            return;
+        };
+        let hits = search_one_segment(provider, *identifier, query);
+        *slots[position]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hits);
+    }
+}
+
+fn search_one_segment(
+    provider: &ArchiveSet,
+    segment_identifier: SegmentIdentifier,
+    query: &SearchQuery,
+) -> SegmentSearchHits {
+    if segment_identifier.is_bulk_segment() {
+        return SegmentSearchHits {
+            matches: Vec::new(),
+            unreadable_nodes: 0,
+        };
+    }
+    let Ok(view) = provider.segment(segment_identifier) else {
+        return SegmentSearchHits {
+            matches: Vec::new(),
+            unreadable_nodes: 0,
+        };
+    };
+    let mut unreadable_nodes = 0u64;
+    let mut node_records = Vec::new();
+    // An unknown type byte means the record table itself is suspect;
+    // Java's search dies on it, froe keeps scanning but the skipped
+    // entries must be visible in the outcome.
+    for entry in view.structure.record_table() {
+        match entry.record_type() {
+            Some(RecordType::Node) => node_records.push(entry.record_number),
+            Some(_) => {}
+            None => unreadable_nodes += 1,
+        }
+    }
+    let mut matches = Vec::new();
+    for record_number in node_records {
+        let record = RecordIdentifier::new(segment_identifier, record_number);
+        match node_matches(provider, record, query) {
+            Ok(false) => {}
+            Ok(true) => {
+                let stable_identifier = NodeState::new(provider, record)
+                    .stable_identifier()
+                    .unwrap_or_else(|_| record.to_string());
+                matches.push(NodeMatch {
+                    record,
+                    stable_identifier,
+                });
+            }
+            Err(_) => unreadable_nodes += 1,
+        }
+    }
+    SegmentSearchHits {
+        matches,
+        unreadable_nodes,
+    }
 }
 
 /// Whether one node satisfies every predicate of the query.
@@ -367,5 +460,22 @@ mod tests {
         };
         let limited = search_nodes(&directory.path, &query, 2).expect("search");
         assert_eq!(limited.matches.len(), 2, "the limit caps the results");
+    }
+
+    #[test]
+    fn matches_are_emitted_in_the_same_order_on_every_run() {
+        let directory = TestDirectory::new("stable-order");
+        populate(&directory.path);
+        let query = SearchQuery {
+            has_properties: vec!["jcr:primaryType".to_owned()],
+            ..SearchQuery::default()
+        };
+        let first = search_nodes(&directory.path, &query, 0).expect("first");
+        let second = search_nodes(&directory.path, &query, 0).expect("second");
+        assert_eq!(
+            first.matches, second.matches,
+            "windowed parallel search must visit in archive probe order"
+        );
+        assert!(!first.matches.is_empty());
     }
 }

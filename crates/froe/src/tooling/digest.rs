@@ -49,6 +49,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
+use crate::cache::{BoundedCache, CacheWeight};
 use crate::checksum::Crc32;
 use crate::content::node::{NodeState, PropertyValues};
 use crate::content::property::PropertyValue;
@@ -61,6 +62,13 @@ use crate::store::Repository;
 /// blocks, so a multiple of that reads whole blocks and keeps the checksum
 /// on its striding path.
 const BINARY_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Byte ceiling for checksums of inline binaries already folded on this
+/// walk. A miss re-reads that one binary through `BINARY_BUFFER_BYTES`;
+/// it never re-walks a subtree, so eviction is time rather than a different
+/// digest. Insertion-order eviction matches a forward traversal: repeats
+/// inside the current working set hit, a checkpoint after the head may not.
+const BINARY_CHECKSUM_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many lookup disagreements are retained before the digest stops
 /// recording individuals. The count keeps rising; only the detail is
@@ -142,6 +150,7 @@ pub fn digest_repository<Output: Write + ?Sized>(
     let mut renderer = Renderer {
         repository,
         buffer: vec![0u8; BINARY_BUFFER_BYTES],
+        binary_checksums: BoundedCache::new(BINARY_CHECKSUM_CACHE_BUDGET_BYTES),
     };
 
     // The content tree first, so the commonest diff — a content change —
@@ -174,6 +183,21 @@ pub fn digest_repository<Output: Write + ?Sized>(
 struct Renderer<'repository> {
     repository: &'repository Repository,
     buffer: Vec<u8>,
+    binary_checksums: BoundedCache<RecordIdentifier, CachedBinaryChecksum>,
+}
+
+/// What folding one inline binary produced, so a later property that names
+/// the same record does not stream it again.
+#[derive(Clone, Copy)]
+struct CachedBinaryChecksum {
+    read_bytes: u64,
+    checksum: u32,
+}
+
+impl CacheWeight for CachedBinaryChecksum {
+    fn cache_weight(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
 }
 
 /// One step of the explicit walk. `Leave` restores the ancestor set, which
@@ -329,30 +353,49 @@ impl Renderer<'_> {
                 length,
                 record_identifier,
             }) => {
-                let mut stream = read_binary_stream(self.repository, *record_identifier)?;
-                let mut running = Crc32::new();
-                let mut read_bytes: u64 = 0;
-                loop {
-                    let count = stream.read(&mut self.buffer).map_err(Error::InputOutput)?;
-                    if count == 0 {
-                        break;
-                    }
-                    running.update(&self.buffer[..count]);
-                    read_bytes += count as u64;
-                }
+                let folded = self.fold_inline_binary(*record_identifier)?;
                 summary.binaries += 1;
-                summary.binary_bytes += read_bytes;
+                summary.binary_bytes += folded.read_bytes;
                 // The declared length is rendered beside the content
                 // checksum rather than trusted: a length that disagrees
                 // with what the blocks actually yield is itself damage,
                 // and it shows up here as a changed line.
-                Ok(format!("{length}/{read_bytes}@{:08x}", running.finish()))
+                Ok(format!(
+                    "{length}/{}@{:08x}",
+                    folded.read_bytes, folded.checksum
+                ))
             }
             PropertyValue::Binary(BinaryValue::External { blob_identifier }) => {
                 Ok(format!("external:{}", escape(blob_identifier)))
             }
             other => Ok(escape(&other.as_text().unwrap_or_default())),
         }
+    }
+
+    fn fold_inline_binary(
+        &mut self,
+        record_identifier: RecordIdentifier,
+    ) -> Result<CachedBinaryChecksum> {
+        if let Some(cached) = self.binary_checksums.get(&record_identifier) {
+            return Ok(cached);
+        }
+        let mut stream = read_binary_stream(self.repository, record_identifier)?;
+        let mut running = Crc32::new();
+        let mut read_bytes: u64 = 0;
+        loop {
+            let count = stream.read(&mut self.buffer).map_err(Error::InputOutput)?;
+            if count == 0 {
+                break;
+            }
+            running.update(&self.buffer[..count]);
+            read_bytes += count as u64;
+        }
+        let folded = CachedBinaryChecksum {
+            read_bytes,
+            checksum: running.finish(),
+        };
+        self.binary_checksums.insert(record_identifier, folded);
+        Ok(folded)
     }
 }
 

@@ -327,6 +327,19 @@ fn retire_swept_source(retired: RetiredSource<'_>) -> Result<ArchiveSweepOutcome
     })
 }
 
+/// What the published name still has to prove after `hard_link`.
+///
+/// Staging already compared every survivor payload to the source. The
+/// published path is a second name for that same inode once identity holds;
+/// re-reading every byte would only catch an in-place rewrite, which the
+/// segment-store file protocol forbids. A substituted pathname fails the
+/// identity checks instead.
+#[derive(Clone, Copy)]
+enum SurvivorPayloadProof {
+    CompareWithSource,
+    SameInodeAsValidatedStaging,
+}
+
 /// The replacement, once the hard link that published it exists.
 struct PublishedReplacement<'published> {
     directory: &'published Path,
@@ -395,7 +408,7 @@ fn certify_published_replacement(published: &PublishedReplacement<'_>) -> Result
             "published archive replacement",
         )?;
         let replacement_reader = TarArchiveReader::open_file(replacement_path, &replacement_file)?;
-        validate_open_swept_archive(
+        validate_published_swept_archive(
             reader,
             &replacement_reader,
             replacement_path,
@@ -822,10 +835,6 @@ pub(super) fn probe_archive_sweep_phase_boundary(cutpoint: &str) -> Result<()> {
 /// Reopens a swept archive and proves that every survivor's payload and
 /// generation metadata exactly match the immutable source before the source
 /// may be removed.
-#[allow(
-    clippy::too_many_lines,
-    reason = "payload, generation, order, graph, and BRF checks are one fail-closed archive validation certificate"
-)]
 #[cfg(test)]
 pub(super) fn validate_swept_archive(
     source: &TarArchiveReader,
@@ -845,10 +854,8 @@ pub(super) fn validate_swept_archive(
     )
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "payload, generation, order, graph, and BRF checks are one fail-closed archive validation certificate"
-)]
+/// Staging certificate: CRC32 plus a full memcmp of every survivor against
+/// the source, then generation, order, and trailers.
 pub(super) fn validate_open_swept_archive(
     source: &TarArchiveReader,
     swept: &TarArchiveReader,
@@ -856,6 +863,56 @@ pub(super) fn validate_open_swept_archive(
     survivors: &[crate::tar_archive::index::SegmentIndexEntry],
     expected_graph: &ExpectedGraph,
     expected_binary_references: &ExpectedBinaryReferences,
+) -> Result<()> {
+    prove_survivor_count_order_and_entries(
+        source,
+        swept,
+        swept_path,
+        survivors,
+        SurvivorPayloadProof::CompareWithSource,
+    )?;
+    validate_exact_archive_trailers(
+        swept,
+        &swept_path.display().to_string(),
+        expected_graph,
+        expected_binary_references,
+    )
+}
+
+/// Published-path certificate after `hard_link` plus inode identity.
+///
+/// Payload bytes were already compared on the staging inode; this name is
+/// a second directory entry for that inode. Count, order, generation, and
+/// trailers still run against the published mapping.
+pub(super) fn validate_published_swept_archive(
+    source: &TarArchiveReader,
+    swept: &TarArchiveReader,
+    swept_path: &Path,
+    survivors: &[crate::tar_archive::index::SegmentIndexEntry],
+    expected_graph: &ExpectedGraph,
+    expected_binary_references: &ExpectedBinaryReferences,
+) -> Result<()> {
+    prove_survivor_count_order_and_entries(
+        source,
+        swept,
+        swept_path,
+        survivors,
+        SurvivorPayloadProof::SameInodeAsValidatedStaging,
+    )?;
+    validate_exact_archive_trailers(
+        swept,
+        &swept_path.display().to_string(),
+        expected_graph,
+        expected_binary_references,
+    )
+}
+
+fn prove_survivor_count_order_and_entries(
+    source: &TarArchiveReader,
+    swept: &TarArchiveReader,
+    swept_path: &Path,
+    survivors: &[crate::tar_archive::index::SegmentIndexEntry],
+    payload_proof: SurvivorPayloadProof,
 ) -> Result<()> {
     if swept.is_recovered() {
         return Err(Error::InvalidFormat {
@@ -895,7 +952,9 @@ pub(super) fn validate_open_swept_archive(
         });
     }
     for expected in survivors {
-        swept.validate_indexed_segment_entry(expected.segment_identifier)?;
+        if matches!(payload_proof, SurvivorPayloadProof::CompareWithSource) {
+            swept.validate_indexed_segment_entry(expected.segment_identifier)?;
+        }
         let actual = swept
             .index_entry(expected.segment_identifier)
             .ok_or_else(|| Error::InvalidFormat {
@@ -918,35 +977,31 @@ pub(super) fn validate_open_swept_archive(
                 ),
             });
         }
-        let source_bytes =
-            source
-                .segment_data(expected.segment_identifier)
-                .ok_or(Error::SegmentNotFound {
-                    segment_identifier: expected.segment_identifier,
-                })?;
-        let swept_bytes =
-            swept
-                .segment_data(expected.segment_identifier)
-                .ok_or(Error::SegmentNotFound {
-                    segment_identifier: expected.segment_identifier,
-                })?;
-        if source_bytes != swept_bytes {
-            return Err(Error::InvalidFormat {
-                details: format!(
-                    "{} changed the payload of surviving segment {}",
-                    swept_path.display(),
-                    expected.segment_identifier
-                ),
-            });
+        if matches!(payload_proof, SurvivorPayloadProof::CompareWithSource) {
+            let source_bytes =
+                source
+                    .segment_data(expected.segment_identifier)
+                    .ok_or(Error::SegmentNotFound {
+                        segment_identifier: expected.segment_identifier,
+                    })?;
+            let swept_bytes =
+                swept
+                    .segment_data(expected.segment_identifier)
+                    .ok_or(Error::SegmentNotFound {
+                        segment_identifier: expected.segment_identifier,
+                    })?;
+            if source_bytes != swept_bytes {
+                return Err(Error::InvalidFormat {
+                    details: format!(
+                        "{} changed the payload of surviving segment {}",
+                        swept_path.display(),
+                        expected.segment_identifier
+                    ),
+                });
+            }
         }
     }
-
-    validate_exact_archive_trailers(
-        swept,
-        &swept_path.display().to_string(),
-        expected_graph,
-        expected_binary_references,
-    )
+    Ok(())
 }
 
 pub(crate) fn is_reclaimable(

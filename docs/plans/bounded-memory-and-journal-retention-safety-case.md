@@ -99,7 +99,14 @@ certificate set, both proportional to the tree by design, and the walk state
 that replaced the depth caps, now proportional to depth. See "The two store-proportional memos" and "What
 removing the depth caps costs".
 
-* Read caches: 192 MiB parsed segments, 48 MiB strings, 48 MiB templates.
+* Read caches: 192 MiB parsed segments, 48 MiB strings, 48 MiB templates,
+  on both `Repository` and `ArchiveSet` (the journal-less provider used by
+  check, search, diff, history, and recover-journal). A miss re-decodes from
+  the mapping, so they cannot grow with the store. Digest adds a 16 MiB
+  insertion-order cache of inline-binary checksums; a miss re-reads that one
+  binary. Check reuses one `PackedRecordSet` across paths of a single journal
+  revision and drops it before the next, so historical unique nodes cannot
+  accumulate.
 * Writer base-segment cache: 192 MiB. Session read-back cache: twice the
   archive rotation threshold (512 MiB by default), sized so the archive being
   written is always resident.

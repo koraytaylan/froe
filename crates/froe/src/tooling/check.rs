@@ -9,6 +9,11 @@
 //! which the last outstanding path verified; the check as a whole
 //! succeeds when *any* path found a good revision (Java's default,
 //! fail-fast off).
+//!
+//! Paths checked at one revision share one `PackedRecordSet` of completed
+//! subtrees, so a checkpoint that shares the live root is not walked twice.
+//! The set is dropped between journal revisions: keeping it would accumulate
+//! historical nodes toward the size of the store.
 
 use std::collections::HashSet;
 
@@ -190,6 +195,11 @@ pub fn check_consistency_with_progress(
         }
         let super_root = NodeState::new(&provider, head);
         let mut all_pinned = true;
+        // Dropped at the end of this revision so historical unique nodes
+        // cannot accumulate. Peak is the union of paths checked here, which
+        // for `/` plus checkpoints is the super-root — the same ceiling
+        // compact already pays.
+        let mut verified_this_revision = PackedRecordSet::new();
         for path_to_check in &mut paths_to_check {
             if path_to_check.verdict.latest_good_revision.is_some() {
                 continue;
@@ -199,6 +209,7 @@ pub fn check_consistency_with_progress(
                 &super_root,
                 path_to_check,
                 binary_check,
+                &mut verified_this_revision,
                 &mut nodes,
             ) {
                 Ok(()) => {
@@ -357,6 +368,7 @@ fn check_one_path(
     super_root: &NodeState<'_>,
     path_to_check: &mut PathToCheck,
     binary_check: BinaryCheck,
+    verified: &mut PackedRecordSet,
     progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<(), String> {
     let node = match resolve_path(super_root, &path_to_check.root, &path_to_check.path) {
@@ -397,6 +409,7 @@ fn check_one_path(
             binaries: binary_check,
             stable_identifiers: false,
         },
+        verified,
         progress,
     ) {
         Ok(()) => Ok(()),
@@ -650,15 +663,10 @@ fn verify_subtree(
     provider: &dyn SegmentProvider,
     root: RecordIdentifier,
     checks: SubtreeChecks,
+    verified: &mut PackedRecordSet,
     progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<(), CorruptLocation> {
-    verify_subtree_with_cache(
-        provider,
-        root,
-        checks,
-        &mut PackedRecordSet::new(),
-        progress,
-    )
+    verify_subtree_with_cache(provider, root, checks, verified, progress)
 }
 
 /// Counts verified nodes for a [`ProgressObserver`], reporting on a stride

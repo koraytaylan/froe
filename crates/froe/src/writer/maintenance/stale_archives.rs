@@ -46,26 +46,30 @@ pub(super) fn plan_stale_archives(
             if std::fs::symlink_metadata(&path)?.len() == 0 {
                 continue;
             }
-            if let Ok(reader) = TarArchiveReader::open(&path)
-                && !reader.is_recovered()
-            {
-                // This is the exact generation normal repository discovery
-                // will select. Never skip past it to promote an older letter:
-                // doing so could roll the active archive back. Its graph and
-                // BRF are recovery-critical even when content reads happen to
-                // succeed, so alternate letters are removable only when both
-                // trailers validate as well as the index.
-                match certify_active_archive(repository, &reader) {
-                    Ok(()) => winner = Some(candidate.file_name.as_str()),
-                    Err(error) => {
-                        indexed_but_incomplete = Some(format!(
-                            "active archive {} has incomplete recovery metadata ({error})",
-                            candidate.file_name
-                        ));
-                    }
-                }
-                break;
+            let Some(opened) =
+                archive_reader_for_letter(directory, &candidate.file_name, repository)
+            else {
+                continue;
+            };
+            if opened.reader().is_recovered() {
+                continue;
             }
+            // This is the exact generation normal repository discovery
+            // will select. Never skip past it to promote an older letter:
+            // doing so could roll the active archive back. Its graph and
+            // BRF are recovery-critical even when content reads happen to
+            // succeed, so alternate letters are removable only when both
+            // trailers validate as well as the index.
+            match certify_active_archive(repository, opened.reader()) {
+                Ok(()) => winner = Some(candidate.file_name.as_str()),
+                Err(error) => {
+                    indexed_but_incomplete = Some(format!(
+                        "active archive {} has incomplete recovery metadata ({error})",
+                        candidate.file_name
+                    ));
+                }
+            }
+            break;
         }
         if let Some(winner) = winner {
             for candidate in &group {
@@ -125,6 +129,42 @@ pub(super) fn plan_stale_archives(
     observer.step_advanced(crate::progress::count(group_count));
     stale.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     Ok(stale)
+}
+
+/// The already-mapped selected generation when this letter is the live
+/// archive, otherwise a fresh mapping of a non-selected letter.
+///
+/// Planning used to mmap every winner a second time while `repository`
+/// already held it. Alternate letters still need their own mapping.
+enum OpenedArchive<'repository> {
+    Selected(&'repository TarArchiveReader),
+    Other(TarArchiveReader),
+}
+
+impl OpenedArchive<'_> {
+    fn reader(&self) -> &TarArchiveReader {
+        match self {
+            Self::Selected(reader) => reader,
+            Self::Other(reader) => reader,
+        }
+    }
+}
+
+fn archive_reader_for_letter<'repository>(
+    directory: &Path,
+    file_name: &str,
+    repository: &'repository Repository,
+) -> Option<OpenedArchive<'repository>> {
+    if let Some(selected) = repository
+        .archives()
+        .iter()
+        .find(|archive| archive.file_name() == file_name)
+    {
+        return Some(OpenedArchive::Selected(selected));
+    }
+    TarArchiveReader::open(&directory.join(file_name))
+        .ok()
+        .map(OpenedArchive::Other)
 }
 
 pub(super) fn generation_from_header(
