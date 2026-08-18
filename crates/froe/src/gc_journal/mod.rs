@@ -25,184 +25,16 @@ use std::path::Path;
 use crate::journal::parse_record_identifier_text;
 use crate::segment::{GarbageCollectionGeneration, RecordIdentifier};
 
+mod java;
+mod limits;
+#[cfg(test)]
+mod test_support;
+
+pub(crate) use java::*;
+pub use limits::*;
+
 /// Oak's textual representation of its null record identifier.
-const NULL_RECORD_IDENTIFIER_TEXT: &str = "00000000-0000-0000-0000-000000000000:0";
-
-/// Default maximum accepted length of one `gc.log` file.
-///
-/// This limit includes line terminators and also bounds byte-oriented scanning
-/// work. Limit enforcement may read one additional probe byte when metadata
-/// understates the length or the file grows during the scan. Sixty-four MiB
-/// leaves room for a maintenance history far larger than an ordinary Oak
-/// journal without trusting a sparse or hostile file size.
-pub const DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Default maximum UTF-8 bytes in one `gc.log` line.
-///
-/// Line terminators are excluded. Oak-written entries are normally well below
-/// one KiB; the larger default accommodates manually annotated root fields
-/// while bounding the parser's only input-sized scratch allocation.
-pub const DEFAULT_MAXIMUM_GC_JOURNAL_LINE_BYTES: usize = 1024 * 1024;
-
-/// Default maximum number of entries read from one `gc.log` file.
-///
-/// The limit bounds both parsing work and the fixed-size portion of the vector
-/// returned by [`read_all_gc_journal_with_options`].
-pub const DEFAULT_MAXIMUM_GC_JOURNAL_ENTRIES: usize = 250_000;
-
-/// Resource limits for reading a garbage-collection journal.
-///
-/// Together, the file-byte and entry limits bound parsing work by the bytes
-/// scanned plus the lines parsed. The line and file limits bound transient
-/// text, while the entry and file limits bound an all-entry result.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[non_exhaustive]
-pub struct GarbageCollectionJournalReadOptions {
-    /// Maximum accepted file length, including CR and LF line terminators.
-    /// The reader may consume one additional probe byte to detect growth.
-    pub maximum_file_bytes: u64,
-    /// Maximum UTF-8 bytes retained for one line, excluding its terminator.
-    pub maximum_line_bytes: usize,
-    /// Maximum physical lines parsed. This also bounds returned entries for an
-    /// all-entry read.
-    pub maximum_entries: usize,
-}
-
-impl Default for GarbageCollectionJournalReadOptions {
-    fn default() -> Self {
-        Self {
-            maximum_file_bytes: DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES,
-            maximum_line_bytes: DEFAULT_MAXIMUM_GC_JOURNAL_LINE_BYTES,
-            maximum_entries: DEFAULT_MAXIMUM_GC_JOURNAL_ENTRIES,
-        }
-    }
-}
-
-impl GarbageCollectionJournalReadOptions {
-    /// Creates explicit resource limits for a journal read.
-    ///
-    /// Zero is a valid limit for every dimension. [`Default::default`]
-    /// implementation supplies the conservative library defaults, and its
-    /// public fields may also be adjusted after construction.
-    #[must_use]
-    pub const fn new(
-        maximum_file_bytes: u64,
-        maximum_line_bytes: usize,
-        maximum_entries: usize,
-    ) -> Self {
-        Self {
-            maximum_file_bytes,
-            maximum_line_bytes,
-            maximum_entries,
-        }
-    }
-}
-
-/// Failure from a bounded garbage-collection journal read.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum GarbageCollectionJournalReadError {
-    /// Opening, inspecting, or reading the journal failed.
-    InputOutput(std::io::Error),
-    /// The file exceeded the configured byte limit.
-    FileByteLimitExceeded {
-        /// Configured maximum bytes.
-        maximum_file_bytes: u64,
-        /// Size reported by metadata, or the smallest size observed if the
-        /// file grew while it was read.
-        observed_file_bytes: u64,
-    },
-    /// A physical line exceeded the configured byte limit.
-    LineByteLimitExceeded {
-        /// One-based physical line number.
-        line_number: usize,
-        /// Configured maximum line bytes.
-        maximum_line_bytes: usize,
-        /// Length that the rejected byte would have produced.
-        attempted_line_bytes: usize,
-    },
-    /// The file contained more physical lines than configured.
-    EntryLimitExceeded {
-        /// Configured maximum entries.
-        maximum_entries: usize,
-        /// Entry count that the rejected line would have produced.
-        attempted_entries: usize,
-    },
-    /// A physical line was not valid UTF-8.
-    InvalidUtf8 {
-        /// One-based physical line number.
-        line_number: usize,
-        /// Zero-based byte offset of the first invalid sequence in the file.
-        invalid_byte_offset: u64,
-        /// Length of the invalid sequence, or `None` for an incomplete
-        /// sequence at the end of the physical line.
-        error_length: Option<usize>,
-    },
-}
-
-impl fmt::Display for GarbageCollectionJournalReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InputOutput(source) => write!(formatter, "input/output error: {source}"),
-            Self::FileByteLimitExceeded {
-                maximum_file_bytes,
-                observed_file_bytes,
-            } => write!(
-                formatter,
-                "garbage-collection journal contains at least {observed_file_bytes} bytes, \
-                 exceeding the {maximum_file_bytes}-byte limit"
-            ),
-            Self::LineByteLimitExceeded {
-                line_number,
-                maximum_line_bytes,
-                attempted_line_bytes,
-            } => write!(
-                formatter,
-                "garbage-collection journal line {line_number} would contain \
-                 {attempted_line_bytes} bytes, exceeding the {maximum_line_bytes}-byte limit"
-            ),
-            Self::EntryLimitExceeded {
-                maximum_entries,
-                attempted_entries,
-            } => write!(
-                formatter,
-                "garbage-collection journal would contain {attempted_entries} entries, \
-                 exceeding the {maximum_entries}-entry limit"
-            ),
-            Self::InvalidUtf8 {
-                line_number,
-                invalid_byte_offset,
-                ..
-            } => write!(
-                formatter,
-                "garbage-collection journal line {line_number} contains invalid UTF-8 at byte \
-                 offset {invalid_byte_offset}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for GarbageCollectionJournalReadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InputOutput(source) => Some(source),
-            Self::FileByteLimitExceeded { .. }
-            | Self::LineByteLimitExceeded { .. }
-            | Self::EntryLimitExceeded { .. }
-            | Self::InvalidUtf8 { .. } => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for GarbageCollectionJournalReadError {
-    fn from(source: std::io::Error) -> Self {
-        Self::InputOutput(source)
-    }
-}
-
-/// Result type returned by bounded garbage-collection journal reads.
-pub type GarbageCollectionJournalReadResult<Value> =
-    std::result::Result<Value, GarbageCollectionJournalReadError>;
+pub(crate) const NULL_RECORD_IDENTIFIER_TEXT: &str = "00000000-0000-0000-0000-000000000000:0";
 
 /// One parsed line of `gc.log`.
 ///
@@ -378,7 +210,7 @@ pub fn read_all_gc_journal_with_options(
     Ok(entries)
 }
 
-fn oak_optional_read_fallback<Value: Default>(
+pub(crate) fn oak_optional_read_fallback<Value: Default>(
     result: GarbageCollectionJournalReadResult<Value>,
 ) -> GarbageCollectionJournalReadResult<Value> {
     match result {
@@ -391,107 +223,9 @@ fn oak_optional_read_fallback<Value: Default>(
     }
 }
 
-fn parse_i64_field(fields: &JavaSplitFields<'_>, index: usize) -> i64 {
-    fields
-        .get(index)
-        .and_then(|field| parse_java_signed_decimal(field, i64::MIN.into(), i64::MAX.into()))
-        .and_then(|value| i64::try_from(value).ok())
-        .unwrap_or(-1)
-}
+pub(crate) const GC_JOURNAL_READ_BUFFER_BYTES: usize = 8 * 1024;
 
-fn parse_i32_field(fields: &JavaSplitFields<'_>, index: usize) -> i32 {
-    fields
-        .get(index)
-        .and_then(|field| parse_java_signed_decimal(field, i32::MIN.into(), i32::MAX.into()))
-        .and_then(|value| i32::try_from(value).ok())
-        .unwrap_or(-1)
-}
-
-/// Mirrors the decimal subset of Java's `Long.parseLong` and
-/// `Integer.parseInt`. Those methods consume UTF-16 code units through
-/// `Character.digit(char, 10)`, so all BMP decimal-digit blocks are accepted
-/// while supplementary-code-point digits (seen as surrogate pairs) are not.
-fn parse_java_signed_decimal(value: &str, minimum: i128, maximum: i128) -> Option<i128> {
-    let mut units = value.encode_utf16();
-    let first = units.next()?;
-    let negative = first == u16::from(b'-');
-    let has_sign = negative || first == u16::from(b'+');
-    let mut magnitude = 0i128;
-    let mut has_digit = false;
-    if !has_sign {
-        magnitude = i128::from(java_decimal_digit(first)?);
-        has_digit = true;
-    }
-    for unit in units {
-        let digit = i128::from(java_decimal_digit(unit)?);
-        magnitude = magnitude.checked_mul(10)?.checked_add(digit)?;
-        has_digit = true;
-    }
-    if !has_digit {
-        return None;
-    }
-    let parsed = if negative { -magnitude } else { magnitude };
-    (minimum..=maximum).contains(&parsed).then_some(parsed)
-}
-
-/// Zero code units of the BMP `Nd` blocks recognized by
-/// `Character.digit(char, 10)`. Letter digits never have a value below ten at
-/// radix ten and therefore do not apply here.
-const JAVA_BMP_DECIMAL_ZEROES: [u16; 37] = [
-    0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66, 0x0ce6,
-    0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80,
-    0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0,
-    0xff10,
-];
-
-fn java_decimal_digit(unit: u16) -> Option<u16> {
-    JAVA_BMP_DECIMAL_ZEROES.iter().find_map(|&zero| {
-        let digit = unit.wrapping_sub(zero);
-        (digit < 10).then_some(digit)
-    })
-}
-
-struct JavaSplitFields<'line> {
-    first_fields: [Option<&'line str>; 7],
-    length: usize,
-}
-
-impl<'line> JavaSplitFields<'line> {
-    fn get(&self, index: usize) -> Option<&'line str> {
-        if index < self.length {
-            self.first_fields.get(index).copied().flatten()
-        } else {
-            None
-        }
-    }
-}
-
-fn split_like_java(line: &str) -> JavaSplitFields<'_> {
-    let mut first_fields = [None; 7];
-    let mut split_field_count = 0usize;
-    let mut last_nonempty_field_count = 0usize;
-    for field in line.split(',') {
-        if split_field_count < first_fields.len() {
-            first_fields[split_field_count] = Some(field);
-        }
-        split_field_count = split_field_count.saturating_add(1);
-        if !field.is_empty() {
-            last_nonempty_field_count = split_field_count;
-        }
-    }
-    JavaSplitFields {
-        first_fields,
-        length: if line.is_empty() {
-            1
-        } else {
-            last_nonempty_field_count
-        },
-    }
-}
-
-const GC_JOURNAL_READ_BUFFER_BYTES: usize = 8 * 1024;
-
-fn scan_gc_journal_lines(
+pub(crate) fn scan_gc_journal_lines(
     gc_journal_path: &Path,
     options: GarbageCollectionJournalReadOptions,
     mut consume_line: impl FnMut(&str),
@@ -579,7 +313,7 @@ fn scan_gc_journal_lines(
     Ok(())
 }
 
-fn finish_gc_journal_line(
+pub(crate) fn finish_gc_journal_line(
     line_bytes: &[u8],
     line_start_byte_offset: u64,
     entries_read: &mut usize,
@@ -609,44 +343,15 @@ fn finish_gc_journal_line(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::{
-        DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES, GC_JOURNAL_READ_BUFFER_BYTES,
-        GarbageCollectionJournalEntry, GarbageCollectionJournalReadError,
-        GarbageCollectionJournalReadOptions, NULL_RECORD_IDENTIFIER_TEXT, parse_gc_journal_entry,
-        read_all_gc_journal, read_all_gc_journal_with_options, read_gc_journal,
-        read_gc_journal_with_options,
+        GC_JOURNAL_READ_BUFFER_BYTES, GarbageCollectionJournalEntry, NULL_RECORD_IDENTIFIER_TEXT,
+        parse_gc_journal_entry, read_all_gc_journal, read_all_gc_journal_with_options,
+        read_gc_journal, read_gc_journal_with_options,
     };
-
-    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    struct TestDirectory {
-        path: PathBuf,
-    }
-
-    impl TestDirectory {
-        fn new(name: &str) -> Self {
-            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time after Unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "froe-gc-journal-{name}-{}-{timestamp}-{sequence}",
-                std::process::id(),
-            ));
-            std::fs::create_dir(&path).expect("create test directory");
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::gc_journal::limits::{
+        GarbageCollectionJournalReadError, GarbageCollectionJournalReadOptions,
+    };
+    use crate::gc_journal::test_support::TestDirectory;
 
     #[test]
     fn parses_current_seven_field_entries() {
@@ -727,30 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn numeric_fields_match_java_unicode_decimal_and_overflow_rules() {
-        let unicode = parse_gc_journal_entry("١٢,３४,-٥,६,７,+٨,root");
-        assert_eq!(unicode.repository_size, 12);
-        assert_eq!(unicode.reclaimed_size, 34);
-        assert_eq!(unicode.timestamp_milliseconds, -5);
-        assert_eq!(unicode.generation.generation, 6);
-        assert_eq!(unicode.generation.full_generation, 7);
-        assert_eq!(unicode.compacted_nodes, 8);
-
-        let overflow = parse_gc_journal_entry("٩٢٢٣٣٧٢٠٣٦٨٥٤٧٧٥٨٠٨,٠,٠,٢١٤٧٤٨٣٦٤٨,٠,٠,root");
-        assert_eq!(overflow.repository_size, -1, "i64 overflow falls back");
-        assert_eq!(
-            overflow.generation.generation, -1,
-            "i32 overflow falls back"
-        );
-
-        let supplementary_digit = parse_gc_journal_entry("𞥑,0,0,0,0,0,root");
-        assert_eq!(
-            supplementary_digit.repository_size, -1,
-            "Java examines a supplementary digit as two invalid surrogate code units"
-        );
-    }
-
-    #[test]
     fn defaults_absent_fields_without_discarding_the_line() {
         let entry = parse_gc_journal_entry("1,2,3,4");
 
@@ -764,46 +445,6 @@ mod tests {
             entry.root_record_identifier_text,
             NULL_RECORD_IDENTIFIER_TEXT
         );
-    }
-
-    #[test]
-    fn matches_java_trailing_empty_and_surplus_field_layout_selection() {
-        let delimiter_only = parse_gc_journal_entry(",,,,,,");
-        assert_eq!(delimiter_only.repository_size, -1);
-        assert_eq!(delimiter_only.generation.generation, -1);
-        assert_eq!(
-            delimiter_only.root_record_identifier_text,
-            NULL_RECORD_IDENTIFIER_TEXT
-        );
-
-        let leading_empty = parse_gc_journal_entry(",2,3,4,5,6,root");
-        assert_eq!(leading_empty.repository_size, -1);
-        assert_eq!(leading_empty.reclaimed_size, 2);
-        assert_eq!(leading_empty.generation.generation, 4);
-        assert_eq!(leading_empty.generation.full_generation, 5);
-        assert_eq!(leading_empty.compacted_nodes, 6);
-        assert_eq!(leading_empty.root_record_identifier_text, "root");
-
-        let trailing_empty = parse_gc_journal_entry("1,2,3,4,5,6,");
-        assert_eq!(trailing_empty.generation.full_generation, 4);
-        assert_eq!(trailing_empty.compacted_nodes, 5);
-        assert_eq!(trailing_empty.root_record_identifier_text, "6");
-
-        let current_with_trailing_delimiter = parse_gc_journal_entry("1,2,3,4,5,6,root,");
-        assert_eq!(
-            current_with_trailing_delimiter.generation.full_generation,
-            5
-        );
-        assert_eq!(current_with_trailing_delimiter.compacted_nodes, 6);
-        assert_eq!(
-            current_with_trailing_delimiter.root_record_identifier_text,
-            "root"
-        );
-
-        let surplus = parse_gc_journal_entry("1,2,3,4,5,6,root,surplus");
-        assert_eq!(surplus.generation.full_generation, 4);
-        assert_eq!(surplus.compacted_nodes, 5);
-        assert_eq!(surplus.root_record_identifier_text, "6");
     }
 
     #[test]
@@ -948,182 +589,6 @@ mod tests {
                 == u64::try_from(first_line.len() + second_line_prefix.len())
                     .expect("fixture length fits u64")
         ));
-    }
-
-    #[test]
-    fn sparse_oversized_file_fails_from_the_default_metadata_limit() {
-        let directory = TestDirectory::new("sparse-file-limit");
-        let path = directory.path.join("gc.log");
-        let file = std::fs::File::create(&path).expect("create sparse fixture");
-        file.set_len(DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1)
-            .expect("set sparse fixture length");
-        drop(file);
-
-        let error =
-            read_all_gc_journal_with_options(&path, GarbageCollectionJournalReadOptions::default())
-                .expect_err("sparse oversized file must fail before reading");
-        assert!(matches!(
-            error,
-            GarbageCollectionJournalReadError::FileByteLimitExceeded {
-                maximum_file_bytes: DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES,
-                observed_file_bytes,
-            } if observed_file_bytes == DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1
-        ));
-        assert!(matches!(
-            read_gc_journal(&path),
-            Err(GarbageCollectionJournalReadError::FileByteLimitExceeded {
-                maximum_file_bytes: DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES,
-                observed_file_bytes,
-            }) if observed_file_bytes == DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1
-        ));
-        assert!(matches!(
-            read_all_gc_journal(&path),
-            Err(GarbageCollectionJournalReadError::FileByteLimitExceeded {
-                maximum_file_bytes: DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES,
-                observed_file_bytes,
-            }) if observed_file_bytes == DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1
-        ));
-        assert_eq!(
-            std::fs::metadata(&path)
-                .expect("metadata after bounded reads")
-                .len(),
-            DEFAULT_MAXIMUM_GC_JOURNAL_FILE_BYTES + 1
-        );
-    }
-
-    #[test]
-    fn line_limit_rejects_the_next_byte_before_parsing() {
-        let directory = TestDirectory::new("line-limit");
-        let path = directory.path.join("gc.log");
-        std::fs::write(&path, b"1234\n").expect("write overlong line fixture");
-        let options = GarbageCollectionJournalReadOptions {
-            maximum_file_bytes: 5,
-            maximum_line_bytes: 3,
-            maximum_entries: 1,
-        };
-
-        let error = read_all_gc_journal_with_options(&path, options)
-            .expect_err("fourth line byte must exceed configured limit");
-        assert!(matches!(
-            error,
-            GarbageCollectionJournalReadError::LineByteLimitExceeded {
-                line_number: 1,
-                maximum_line_bytes: 3,
-                attempted_line_bytes: 4,
-            }
-        ));
-    }
-
-    #[test]
-    fn custom_limits_accept_exact_boundaries_and_reject_the_next_unit() {
-        let directory = TestDirectory::new("exact-resource-limits");
-        let path = directory.path.join("gc.log");
-        // CRLF consumes two file bytes, but neither byte belongs to a line.
-        // The final U+00E9 consumes two UTF-8 bytes in the second line.
-        let fixture = "x\r\né".as_bytes();
-        std::fs::write(&path, fixture).expect("write exact-limit fixture");
-
-        let exact = GarbageCollectionJournalReadOptions {
-            maximum_file_bytes: u64::try_from(fixture.len()).expect("fixture length fits u64"),
-            maximum_line_bytes: 2,
-            maximum_entries: 2,
-        };
-        let entries = read_all_gc_journal_with_options(&path, exact)
-            .expect("all three resource dimensions accept equality");
-        assert_eq!(entries.len(), 2);
-
-        let file_error = read_all_gc_journal_with_options(
-            &path,
-            GarbageCollectionJournalReadOptions {
-                maximum_file_bytes: u64::try_from(fixture.len() - 1)
-                    .expect("fixture length fits u64"),
-                ..exact
-            },
-        )
-        .expect_err("one byte below the file size must fail");
-        assert!(matches!(
-            file_error,
-            GarbageCollectionJournalReadError::FileByteLimitExceeded {
-                maximum_file_bytes: 4,
-                observed_file_bytes: 5,
-            }
-        ));
-
-        let line_error = read_all_gc_journal_with_options(
-            &path,
-            GarbageCollectionJournalReadOptions {
-                maximum_line_bytes: 1,
-                ..exact
-            },
-        )
-        .expect_err("a two-byte UTF-8 value must not fit a one-byte line limit");
-        assert!(matches!(
-            line_error,
-            GarbageCollectionJournalReadError::LineByteLimitExceeded {
-                line_number: 2,
-                maximum_line_bytes: 1,
-                attempted_line_bytes: 2,
-            }
-        ));
-
-        let entry_error = read_all_gc_journal_with_options(
-            &path,
-            GarbageCollectionJournalReadOptions {
-                maximum_entries: 1,
-                ..exact
-            },
-        )
-        .expect_err("the second physical line must exceed a one-entry limit");
-        assert!(matches!(
-            entry_error,
-            GarbageCollectionJournalReadError::EntryLimitExceeded {
-                maximum_entries: 1,
-                attempted_entries: 2,
-            }
-        ));
-    }
-
-    #[test]
-    fn entry_limit_bounds_newline_heavy_input_work() {
-        let directory = TestDirectory::new("entry-limit");
-        let path = directory.path.join("gc.log");
-        let fixture = vec![b'\n'; 10_000];
-        std::fs::write(&path, fixture).expect("write newline-heavy fixture");
-        let options = GarbageCollectionJournalReadOptions {
-            maximum_file_bytes: 10_000,
-            maximum_line_bytes: 0,
-            maximum_entries: 32,
-        };
-
-        let error = read_all_gc_journal_with_options(&path, options)
-            .expect_err("thirty-third line must exceed configured limit");
-        assert!(matches!(
-            error,
-            GarbageCollectionJournalReadError::EntryLimitExceeded {
-                maximum_entries: 32,
-                attempted_entries: 33,
-            }
-        ));
-    }
-
-    #[test]
-    fn comma_heavy_lines_preserve_java_trailing_field_semantics() {
-        let directory = TestDirectory::new("comma-heavy");
-        let path = directory.path.join("gc.log");
-        let mut current_entry = b"1,2,3,4,5,6,root".to_vec();
-        current_entry.resize(200_000, b',');
-        current_entry.push(b'\n');
-        let mut delimiter_only = vec![b','; 200_000];
-        delimiter_only.push(b'\n');
-        current_entry.extend_from_slice(&delimiter_only);
-        std::fs::write(&path, current_entry).expect("write comma-heavy fixture");
-
-        let entries = read_all_gc_journal(&path).expect("read comma-heavy fixture");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].generation.generation, 4);
-        assert_eq!(entries[0].generation.full_generation, 5);
-        assert_eq!(entries[0].root_record_identifier_text, "root");
-        assert_eq!(entries[1], parse_gc_journal_entry(""));
     }
 
     #[test]
