@@ -203,7 +203,7 @@ pub(crate) fn classify_line(content: &[u8]) -> RawJournalLineClassification {
 mod tests {
     #[cfg(unix)]
     use super::{RawJournalLineClassification, RawJournalTimestamp, scan_raw_journal};
-    use crate::writer::journal_maintenance::test_support::{FIRST, SECOND, TestDirectory};
+    use crate::writer::maintenance::journal::test_support::{FIRST, SECOND, TestDirectory};
 
     #[test]
     fn scanner_preserves_every_raw_byte_and_classifies_ignored_lines() {
@@ -217,7 +217,7 @@ mod tests {
             journal
                 .lines()
                 .iter()
-                .flat_map(crate::writer::journal_maintenance::RawJournalLine::raw_bytes)
+                .flat_map(crate::writer::maintenance::journal::RawJournalLine::raw_bytes)
                 .copied()
                 .collect::<Vec<_>>(),
             bytes.as_bytes()

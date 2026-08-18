@@ -5,7 +5,7 @@ use super::file_removal::{
     PlannedFileRemovalFailureMode, archive_file_bytes, read_optional_regular_file,
     recovery_backup_file_bytes, remove_planned_files,
 };
-use super::journal_analysis::analyze_journal;
+use super::journal::analyze_journal;
 use super::manifest::upgrade_manifest_atomically;
 use super::options::MaintenanceTask;
 use super::plan::{CompactedGeneration, CompactionOutcome, CompactionPlan, FileDeletionFailure};
@@ -19,7 +19,7 @@ use crate::segment::record::RecordIdentifier;
 use crate::store::Repository;
 use crate::writer::commit::remove_checkpoints;
 use crate::writer::compaction::CompactionKind;
-use crate::writer::journal_maintenance::{
+use crate::writer::maintenance::journal::{
     JournalRewriteOutcome, RawJournal, RawJournalLineClassification, rewrite_journal_atomically,
     scan_raw_journal,
 };

@@ -18,7 +18,9 @@ mod apply;
 mod apply_identity;
 mod checkpoints;
 mod file_removal;
-mod journal_analysis;
+/// Everything maintenance does with the journal: classifying its lines,
+/// and rewriting the file that holds them.
+mod journal;
 mod manifest;
 mod options;
 mod plan;

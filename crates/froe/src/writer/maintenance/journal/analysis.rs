@@ -1,28 +1,28 @@
 //! Classifying journal lines: which resolve, which are stale, and where
 //! the retention boundary falls.
 
-use super::plan::{JournalLineRemoval, JournalRemovalReason};
-use super::planning::{JournalPlan, verify_exact_super_root_with_verifier};
+use super::super::plan::{JournalLineRemoval, JournalRemovalReason};
+use super::super::planning::{JournalPlan, verify_exact_super_root_with_verifier};
 use crate::error::{Error, Result};
 use crate::progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 use crate::segment::record::RecordIdentifier;
 use crate::store::Repository;
 use crate::tooling::NodeTreeVerifier;
-use crate::writer::journal_maintenance::{
+use crate::writer::maintenance::journal::{
     RawJournal, RawJournalLine, RawJournalLineClassification,
 };
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
-pub(super) struct JournalAnalysis {
-    pub(super) plan: JournalPlan,
-    pub(super) retained_indexes: Vec<usize>,
-    pub(super) retained_record_ids: Vec<RecordIdentifier>,
+pub(in crate::writer::maintenance) struct JournalAnalysis {
+    pub(in crate::writer::maintenance) plan: JournalPlan,
+    pub(in crate::writer::maintenance) retained_indexes: Vec<usize>,
+    pub(in crate::writer::maintenance) retained_record_ids: Vec<RecordIdentifier>,
 }
 
-pub(super) const JOURNAL_LINE_PREVIEW_LIMIT: usize = 160;
+pub(in crate::writer::maintenance) const JOURNAL_LINE_PREVIEW_LIMIT: usize = 160;
 
-pub(super) fn journal_line_removal(
+pub(in crate::writer::maintenance) fn journal_line_removal(
     index: usize,
     line: &RawJournalLine,
     record_identifier: Option<RecordIdentifier>,
@@ -39,7 +39,7 @@ pub(super) fn journal_line_removal(
     }
 }
 
-pub(super) fn analyze_journal(
+pub(in crate::writer::maintenance) fn analyze_journal(
     repository: &Repository,
     raw: &RawJournal,
     current_head: RecordIdentifier,
@@ -62,7 +62,7 @@ pub(super) fn analyze_journal(
 /// the walk skips the expensive per-revision verification for exactly the
 /// lines being discarded. On a store with tens of thousands of journal lines
 /// that is the difference between minutes and seconds.
-pub(super) fn journal_retention_boundary(
+pub(in crate::writer::maintenance) fn journal_retention_boundary(
     repository: &Repository,
     raw: &RawJournal,
     retention: NonZeroUsize,
@@ -124,7 +124,7 @@ struct JournalTally {
 }
 
 /// The journal pass itself; [`analyze_journal`] owns the step around it.
-pub(super) fn analyze_journal_lines(
+pub(in crate::writer::maintenance) fn analyze_journal_lines(
     repository: &Repository,
     raw: &RawJournal,
     current_head: RecordIdentifier,

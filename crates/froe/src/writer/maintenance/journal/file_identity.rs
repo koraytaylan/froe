@@ -231,10 +231,10 @@ impl Drop for UncommittedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::journal_maintenance::rewrite_journal_atomically;
+    use crate::writer::maintenance::journal::rewrite_journal_atomically;
     #[cfg(unix)]
-    use crate::writer::journal_maintenance::scan::scan_raw_journal;
-    use crate::writer::journal_maintenance::test_support::{FIRST, TestDirectory};
+    use crate::writer::maintenance::journal::scan::scan_raw_journal;
+    use crate::writer::maintenance::journal::test_support::{FIRST, TestDirectory};
 
     #[cfg(unix)]
     #[test]

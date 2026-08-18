@@ -1,4 +1,8 @@
-//! Byte-preserving journal inspection and replacement for offline cleanup.
+//! Everything maintenance does with the journal.
+//!
+//! [`analysis`] decides which of its lines a run removes and where the
+//! retention boundary falls; the rest of this module carries out the
+//! rewrite, byte for byte.
 //!
 //! The ordinary journal reader intentionally presents a tolerant, semantic
 //! view. Cleanup needs a second view: it must be able to identify lines that
@@ -16,11 +20,13 @@ use crate::journal::parse_record_identifier_text;
 use crate::segment::record::RecordIdentifier;
 use crate::writer::store_writer::preserve_file_metadata;
 
+mod analysis;
 mod file_identity;
 mod scan;
 #[cfg(test)]
 mod test_support;
 
+pub(in crate::writer::maintenance) use analysis::*;
 pub(crate) use file_identity::*;
 pub(crate) use scan::*;
 
@@ -348,8 +354,8 @@ pub(crate) fn assemble_replacement(snapshot: &RawJournal, retained: &BTreeSet<us
 mod tests {
     use super::rewrite_journal_atomically;
     #[cfg(unix)]
-    use crate::writer::journal_maintenance::scan::scan_raw_journal;
-    use crate::writer::journal_maintenance::test_support::{FIRST, SECOND, TestDirectory};
+    use crate::writer::maintenance::journal::scan::scan_raw_journal;
+    use crate::writer::maintenance::journal::test_support::{FIRST, SECOND, TestDirectory};
 
     #[test]
     fn crlf_and_duplicate_records_survive_byte_for_byte() {

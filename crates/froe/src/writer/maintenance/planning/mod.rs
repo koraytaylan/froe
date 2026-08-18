@@ -3,8 +3,8 @@
 
 use super::apply_identity::append_apply_identity_preview_warning;
 use super::checkpoints::plan_checkpoints;
-use super::journal_analysis::JournalAnalysis;
-use super::journal_analysis::analyze_journal;
+use super::journal::JournalAnalysis;
+use super::journal::analyze_journal;
 use super::manifest::upgrade_manifest_atomically;
 use super::options::{CompactionOptions, MaintenanceTask};
 use super::plan::{
@@ -33,8 +33,8 @@ use crate::store::Repository;
 use crate::tar_archive::file_name::ArchiveFileName;
 use crate::tooling::NodeTreeVerifier;
 use crate::writer::compaction::CompactionKind;
-use crate::writer::journal_maintenance::RawJournal;
-use crate::writer::journal_maintenance::scan_raw_journal;
+use crate::writer::maintenance::journal::RawJournal;
+use crate::writer::maintenance::journal::scan_raw_journal;
 use crate::writer::segment_builder::GarbageCollectionGeneration;
 use crate::writer::store_writer::StandaloneSegmentCompactionPlan;
 use crate::writer::store_writer::{

@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::progress::ProgressObserver;
 use crate::store::Repository;
 use crate::tar_archive::file_name::ArchiveFileName;
-use crate::writer::journal_maintenance::{
+use crate::writer::maintenance::journal::{
     RawJournal, RawJournalLineClassification, scan_raw_journal_file,
 };
 use std::collections::HashSet;

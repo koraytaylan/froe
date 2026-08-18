@@ -20,7 +20,6 @@ pub mod compaction;
 #[cfg(test)]
 mod fault_injection;
 pub mod identifier_generator;
-pub(crate) mod journal_maintenance;
 /// The one maintenance pipeline: plan, confirm, and apply a compaction and
 /// everything it reclaims. Its surface is re-exported below, so callers name
 /// the operation rather than the module it happens to live in.
