@@ -38,27 +38,20 @@ impl Drop for TestDirectory {
 
 /// Returns the write end of an OS pipe after closing its only read end.
 /// A child receiving this as standard output therefore encounters `SIGPIPE`
-/// deterministically on its first write, rather than racing a parent that
-/// closes a captured `ChildStdout` after spawning it.
+/// on its first write, rather than racing a parent that closes a captured
+/// `ChildStdout` after spawning it.
+///
+/// `std::io::pipe` rather than `libc::pipe`, because the descriptors must be
+/// close-on-exec from the instant they exist. Tests in this file run
+/// concurrently and spawn eight other `froe` processes; a raw `pipe` leaves
+/// both ends inheritable, so a process spawned between the call and the
+/// `drop` below inherits the read end and holds the pipe open for as long as
+/// it lives. The dump then writes successfully and exits zero, and this test
+/// fails claiming froe did not use SIGPIPE. Measured at roughly one run in
+/// fifteen before the change, and never when the file runs single-threaded.
 #[cfg(unix)]
 fn closed_pipe_stdout() -> std::process::Stdio {
-    use std::os::fd::FromRawFd as _;
-
-    let mut descriptors = [-1; 2];
-    // SAFETY: `descriptors` points at storage for exactly the two file
-    // descriptors required by `pipe`.
-    let result = unsafe { libc::pipe(descriptors.as_mut_ptr()) };
-    assert_eq!(
-        result,
-        0,
-        "create closed-stdout test pipe: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: a successful `pipe` call initialized both unique descriptors,
-    // and each is transferred into exactly one owning `File`.
-    let read_end = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
-    // SAFETY: as above, this is the distinct initialized write descriptor.
-    let write_end = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+    let (read_end, write_end) = std::io::pipe().expect("create closed-stdout test pipe");
     drop(read_end);
     std::process::Stdio::from(write_end)
 }
