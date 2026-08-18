@@ -34,10 +34,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the apply path intentionally presents its crash-safe mutation order as one linear transaction"
-)]
 /// What the compaction phase of a merged run did.
 #[derive(Clone, Debug)]
 pub(super) struct CompactionPhaseOutcome {
@@ -187,276 +183,20 @@ pub(super) fn apply_compaction_phase(
     })
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the ordered mutation sequence and the barriers between its phases are one safety argument that reads worse split apart"
-)]
-pub(super) fn apply_prepared(
-    prepared: PreparedCompaction,
-    observer: &mut dyn ProgressObserver,
-) -> Result<CompactionOutcome> {
-    let PreparedCompaction {
-        directory,
-        options,
-        plan,
-        repaired,
-        repository_lock,
-    } = prepared;
-    let current_fingerprint = directory_fingerprint(&directory)?;
-    if current_fingerprint != plan.fingerprint {
-        return Err(Error::InvalidFormat {
-            details: "the repository changed after the authoritative cleanup plan was built; refusing to apply a stale plan"
-                .to_owned(),
-        });
-    }
-
-    repository_lock.validate_path_identity(&directory)?;
-
-    let gc_log_before = read_optional_regular_file(&directory.join("gc.log"))?;
-    let archive_bytes_before = archive_file_bytes(&directory)?;
-    if plan.segment_plan.is_some() && plan.manifest_upgrade {
-        // This is the final all-source gate before even the manifest may be
-        // replaced. Version-two stores do this once inside the segment apply;
-        // only the one-time manifest transition needs an additional pass so a
-        // bad source cannot leave even a compatible metadata upgrade behind.
-        let repository = Repository::open_with_progress(&directory, observer)?;
-        reject_duplicate_active_segments(&repository)?;
-        certify_active_archives_with_progress(&repository, repository.archives(), observer)?;
-    }
-    if plan.manifest_upgrade {
-        repository_lock.validate_path_identity(&directory)?;
-        upgrade_manifest_atomically(&directory)?;
-    }
-
-    let mut segment_outcome = StandaloneSegmentCompactionOutcome::default();
-    if let Some(expected) = &plan.segment_plan {
-        repository_lock.validate_path_identity(&directory)?;
-        let (_, outcome) = apply_standalone_segment_cleanup(
-            &directory,
-            ReclaimRule {
-                reference: plan.reference_generation,
-                kind: CompactionKind::Full,
-                retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
-            },
-            plan.current_head.segment,
-            &plan.protected_history_segments,
-            options.archive_rewrite_policy,
-            Some(expected),
-            observer,
-        )?;
-        segment_outcome = outcome;
-    }
-
-    repository_lock.validate_path_identity(&directory)?;
-    let (removed_stale_archives, mut stale_not_deleted) =
-        if options.contains(MaintenanceTask::StaleArchives) {
-            crate::progress::observe(
-                observer,
-                &Step::new("removing stale archives", WorkUnit::Files)
-                    .with_total(crate::progress::count(plan.stale_archives.len())),
-                |observer| {
-                    remove_planned_files(
-                        &directory,
-                        plan.stale_archives
-                            .iter()
-                            .map(|archive| PlannedFileRemoval {
-                                file_name: archive.file_name.clone(),
-                                bytes: archive.bytes,
-                                fingerprint: archive.fingerprint.clone(),
-                            }),
-                        PlannedFileRemovalFailureMode::RequireCertifiedTarget,
-                        observer,
-                    )
-                },
-            )?
-        } else {
-            (0, Vec::new())
-        };
-
-    // Before the copy, because a killed run's output holds bulk segments alive
-    // through its references, and because retiring it first means a retry
-    // converges instead of accumulating one more orphan generation.
-    if let Some(expected) = &plan.residue_sweep {
-        repository_lock.validate_path_identity(&directory)?;
-        crate::progress::observe(
-            observer,
-            &Step::new(
-                "retiring interrupted-compaction residue",
-                WorkUnit::Archives,
-            ),
-            |observer| -> Result<()> {
-                apply_standalone_segment_cleanup(
-                    &directory,
-                    ReclaimRule {
-                        reference: plan.reference_generation,
-                        kind: CompactionKind::Full,
-                        retained_generations: i32::MAX,
-                    },
-                    plan.current_head.segment,
-                    &HashSet::new(),
-                    options.archive_rewrite_policy,
-                    Some(expected),
-                    observer,
-                )
-                .map(|_| ())
-            },
-        )?;
-    }
-
-    let mut expected_head_after = plan.current_head;
-    let mut compaction_outcome: Option<CompactionPhaseOutcome> = None;
-    let removed_checkpoints = if let Some(kind) = options.compaction_kind {
-        // The head moves exactly once, and the checkpoints this run retires
-        // are simply never carried into the fresh generation. Removing them
-        // from the live head first would move the head twice, append a second
-        // journal line, and strand records at a generation this same run then
-        // reclaims — inside a session archive the reclaim pass never sweeps.
-        let outcome = apply_compaction_phase(
-            &directory,
-            &plan,
-            &repository_lock,
-            kind,
-            options.archive_rewrite_policy,
-            observer,
-        )?;
-        expected_head_after = outcome.head_after;
-        let omitted = plan.checkpoints.names.len() as u64;
-        compaction_outcome = Some(outcome);
-        omitted
-    } else if plan.checkpoints.names.is_empty() {
-        0
-    } else {
-        let (removed, head_after_checkpoints) = crate::progress::observe(
-            observer,
-            // No total: the removal is one indivisible commit, so there
-            // is nothing to count up to and a declared total would stand
-            // at zero for the whole phase.
-            &Step::new("removing checkpoints", WorkUnit::Checkpoints),
-            |_observer| -> Result<(u64, RecordIdentifier)> {
-                repository_lock.validate_path_identity(&directory)?;
-                let checkpoint_archive_number =
-                    plan.checkpoint_archive_number
-                        .ok_or_else(|| Error::InvalidFormat {
-                            details: "checkpoint cleanup has no certified output archive number"
-                                .to_owned(),
-                        })?;
-                let store = WritableRepository::open_prepared(
-                    &directory,
-                    Arc::clone(&repository_lock),
-                    checkpoint_archive_number,
-                )?;
-                if store.head() != plan.current_head {
-                    return Err(Error::InvalidFormat {
-                        details: format!(
-                            "cleanup expected checkpoint base head {}, but strict writable open selected {}",
-                            plan.current_head,
-                            store.head()
-                        ),
-                    });
-                }
-                let removed = remove_checkpoints(&store, &plan.checkpoints.names)?;
-                if removed != plan.checkpoints.names.len() as u64 {
-                    return Err(Error::InvalidFormat {
-                        details: format!(
-                            "cleanup planned to remove {} checkpoints, but the locked head contained {removed}",
-                            plan.checkpoints.names.len()
-                        ),
-                    });
-                }
-                let head_after_checkpoints = store.head();
-                store.close()?;
-                sync_directory_strict(&directory)?;
-                Ok((removed, head_after_checkpoints))
-            },
-        )?;
-        expected_head_after = head_after_checkpoints;
-        removed
-    };
-
-    // No step wraps this phase: the head verification and the journal
-    // analysis inside it report steps of their own, and a step around
-    // them would mix nodes and journal lines into one count.
-    let journal_outcome = if let Some(compaction) = &compaction_outcome {
-        // A compacting run retires history by identity, not by re-analysis.
-        // The plan's retained roots named revisions of a head this run has
-        // since replaced, and the segments behind them are already reclaimed,
-        // so comparing a fresh analysis against them would refuse every run.
-        // What is provable instead is exact: the journal keeps the single
-        // physical line naming the head the copy just published, and nothing
-        // else. That is the same shape Oak's own offline compact tool leaves.
-        repository_lock.validate_path_identity(&directory)?;
-        let repository = Repository::open_with_progress(&directory, observer)?;
-        verify_exact_super_root(&repository, compaction.head_after, observer)?;
-        let raw = scan_raw_journal(&directory)?;
-        let retained = retained_compacted_head_line(&raw, compaction.head_after)?;
-        verify_retained_journal_lines(&raw, &[raw.lines()[retained].content_bytes().to_vec()])?;
-        if raw.lines().len() == 1 {
-            JournalRewriteOutcome {
-                changed: false,
-                backup_path: None,
-                retained_record_count: 1,
-                removed_line_count: 0,
-                bytes_written: raw.source_bytes().len(),
-            }
-        } else {
-            rewrite_journal_atomically(&raw, &[retained])?
-        }
-    } else if options.contains(MaintenanceTask::Journal) {
-        repository_lock.validate_path_identity(&directory)?;
-        let repository = Repository::open_with_progress(&directory, observer)?;
-        let head = repository.head_record_identifier();
-        verify_exact_super_root(&repository, head, observer)?;
-        let raw = scan_raw_journal(&directory)?;
-        // The same bound the plan was built with: a fresh analysis that
-        // retained every readable revision would disagree with the plan's
-        // retained roots and abort the run the bound was set to enable.
-        let analysis = analyze_journal(
-            &repository,
-            &raw,
-            head,
-            options.journal_revision_retention,
-            observer,
-        )?;
-        // Earlier archive/checkpoint work ran after the operator confirmed the
-        // plan. Do not let a fresh analysis turn an unexpected loss into an
-        // unconfirmed journal deletion. The final reopen repeats both proofs,
-        // but that would be too late to protect the canonical journal.
-        verify_retained_journal_roots(
-            &plan.journal.retained_record_ids,
-            &analysis.retained_record_ids,
-        )?;
-        verify_retained_journal_lines(&raw, &plan.journal.retained_raw_lines)?;
-        if analysis.plan.removed_lines == 0 {
-            JournalRewriteOutcome {
-                changed: false,
-                backup_path: None,
-                retained_record_count: analysis.retained_indexes.len(),
-                removed_line_count: 0,
-                bytes_written: raw.source_bytes().len(),
-            }
-        } else {
-            rewrite_journal_atomically(&raw, &analysis.retained_indexes)?
-        }
-    } else {
-        JournalRewriteOutcome {
-            changed: false,
-            backup_path: None,
-            retained_record_count: 0,
-            removed_line_count: 0,
-            bytes_written: 0,
-        }
-    };
-
-    sync_directory_strict(&directory)?;
-
-    // `gc.log` records completed compaction cycles and nothing else. A run
-    // that did not compact must leave it byte-identical; a run that did must
-    // have appended exactly the one line describing the cycle it completed,
-    // and changed nothing already in the file.
+/// `gc.log` records completed compaction cycles and nothing else.
+///
+/// A run that did not compact must leave it byte-identical; a run that did
+/// must have appended exactly the one line describing the cycle it
+/// completed, and changed nothing already in the file.
+fn verify_gc_log_delta(
+    directory: &Path,
+    gc_log_before: Option<&[u8]>,
+    compaction_outcome: Option<&CompactionPhaseOutcome>,
+) -> Result<()> {
     let gc_log_after = read_optional_regular_file(&directory.join("gc.log"))?;
-    match &compaction_outcome {
+    match compaction_outcome {
         None => {
-            if gc_log_before != gc_log_after {
+            if gc_log_before != gc_log_after.as_deref() {
                 return Err(Error::InvalidFormat {
                     details: "a run that did not compact changed gc.log, which is reserved for completed compaction cycles"
                         .to_owned(),
@@ -464,7 +204,7 @@ pub(super) fn apply_prepared(
             }
         }
         Some(compaction) => {
-            let before = gc_log_before.as_deref().unwrap_or_default();
+            let before = gc_log_before.unwrap_or_default();
             let after = gc_log_after.as_deref().unwrap_or_default();
             let expected = compaction.garbage_collection_entry.as_bytes();
             if after.len() != before.len() + expected.len()
@@ -479,12 +219,37 @@ pub(super) fn apply_prepared(
         }
     }
 
-    // All old archive mappings and writable caches are out of scope here.
-    // Reopen from disk and prove the exact newly selected head and every
-    // readable retained journal root through fresh mappings.
-    // As above, the reopen, the head verification, and the journal
-    // analysis each report a step of their own.
-    let final_repository = Repository::open_with_progress(&directory, observer)?;
+    Ok(())
+}
+
+/// What a finished run must be able to prove about the store it leaves.
+struct AppliedState<'state> {
+    directory: &'state Path,
+    expected_head_after: RecordIdentifier,
+    compaction_outcome: Option<&'state CompactionPhaseOutcome>,
+    options: &'state super::options::CompactionOptions,
+    plan: &'state CompactionPlan,
+    observer: &'state mut dyn ProgressObserver,
+}
+
+/// Reopens the store from disk and proves the exact newly selected head
+/// and every readable retained journal root through fresh mappings.
+///
+/// All old archive mappings and writable caches are out of scope here.
+/// The reopen, the head verification, and the journal analysis each
+/// report a step of their own, so no step wraps this phase.
+fn verify_applied_state(state: &mut AppliedState<'_>) -> Result<RecordIdentifier> {
+    let AppliedState {
+        directory,
+        expected_head_after,
+        compaction_outcome,
+        options,
+        observer,
+        plan,
+    } = state;
+    let directory = *directory;
+    let expected_head_after = *expected_head_after;
+    let final_repository = Repository::open_with_progress(directory, observer)?;
     let head_after = final_repository.head_record_identifier();
     if head_after != expected_head_after {
         return Err(Error::InvalidFormat {
@@ -494,10 +259,7 @@ pub(super) fn apply_prepared(
         });
     }
     verify_exact_super_root(&final_repository, head_after, observer)?;
-    let final_raw_journal = scan_raw_journal(&directory)?;
-    // After the rewrite the journal holds at most the bound's worth of
-    // resolvable revisions, so the boundary finds nothing beyond it and the
-    // "no removable lines remain" assertion below stays exact.
+    let final_raw_journal = scan_raw_journal(directory)?;
     let mut final_journal_analysis = analyze_journal(
         &final_repository,
         &final_raw_journal,
@@ -507,10 +269,6 @@ pub(super) fn apply_prepared(
     )?;
     inject_final_retained_root_fault(&mut final_journal_analysis.retained_record_ids);
     if let Some(compaction) = &compaction_outcome {
-        // Exactly one line, naming exactly the head the copy published.
-        // Stronger than the root comparison it replaces: that proved a set of
-        // revisions still resolved, this proves the file holds one line and
-        // which one.
         if final_raw_journal.lines().len() != 1 {
             return Err(Error::InvalidFormat {
                 details: format!(
@@ -540,16 +298,287 @@ pub(super) fn apply_prepared(
         verify_retained_journal_lines(&final_raw_journal, &expected_retained_lines)?;
     }
 
-    // Recovery/staging material is the final, independent mutation. Never
-    // discard it until every repository mutation has passed a fresh exact-head
-    // and retained-history verification. These names are outside active
-    // archive discovery, so their removal cannot invalidate the verified
-    // state.
-    repository_lock.validate_path_identity(&directory)?;
-    // Each step is reported only when its task was selected. An unselected
-    // task has nothing to remove, and announcing the work anyway told the
-    // operator froe had considered backups it was never asked to touch.
-    let (removed_temporaries, mut temporary_not_deleted) =
+    Ok(head_after)
+}
+
+/// Runs the compaction phase when one was selected, returning what it
+/// removed, what it did, and the head the run must end at.
+fn run_compaction_phase(
+    directory: &Path,
+    plan: &CompactionPlan,
+    options: &super::options::CompactionOptions,
+    repository_lock: &Arc<RepositoryLock>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(u64, Option<CompactionPhaseOutcome>, RecordIdentifier)> {
+    let mut expected_head_after = plan.current_head;
+    let mut compaction_outcome: Option<CompactionPhaseOutcome> = None;
+    let removed_checkpoints = if let Some(kind) = options.compaction_kind {
+        // The head moves exactly once, and the checkpoints this run retires
+        // are simply never carried into the fresh generation. Removing them
+        // from the live head first would move the head twice, append a second
+        // journal line, and strand records at a generation this same run then
+        // reclaims — inside a session archive the reclaim pass never sweeps.
+        let outcome = apply_compaction_phase(
+            directory,
+            plan,
+            repository_lock,
+            kind,
+            options.archive_rewrite_policy,
+            observer,
+        )?;
+        expected_head_after = outcome.head_after;
+        let omitted = plan.checkpoints.names.len() as u64;
+        compaction_outcome = Some(outcome);
+        omitted
+    } else if plan.checkpoints.names.is_empty() {
+        0
+    } else {
+        let (removed, head_after_checkpoints) = crate::progress::observe(
+            observer,
+            // No total: the removal is one indivisible commit, so there
+            // is nothing to count up to and a declared total would stand
+            // at zero for the whole phase.
+            &Step::new("removing checkpoints", WorkUnit::Checkpoints),
+            |_observer| -> Result<(u64, RecordIdentifier)> {
+                repository_lock.validate_path_identity(directory)?;
+                let checkpoint_archive_number =
+                    plan.checkpoint_archive_number
+                        .ok_or_else(|| Error::InvalidFormat {
+                            details: "checkpoint cleanup has no certified output archive number"
+                                .to_owned(),
+                        })?;
+                let store = WritableRepository::open_prepared(
+                    directory,
+                    Arc::clone(repository_lock),
+                    checkpoint_archive_number,
+                )?;
+                if store.head() != plan.current_head {
+                    return Err(Error::InvalidFormat {
+                        details: format!(
+                            "cleanup expected checkpoint base head {}, but strict writable open selected {}",
+                            plan.current_head,
+                            store.head()
+                        ),
+                    });
+                }
+                let removed = remove_checkpoints(&store, &plan.checkpoints.names)?;
+                if removed != plan.checkpoints.names.len() as u64 {
+                    return Err(Error::InvalidFormat {
+                        details: format!(
+                            "cleanup planned to remove {} checkpoints, but the locked head contained {removed}",
+                            plan.checkpoints.names.len()
+                        ),
+                    });
+                }
+                let head_after_checkpoints = store.head();
+                store.close()?;
+                sync_directory_strict(directory)?;
+                Ok((removed, head_after_checkpoints))
+            },
+        )?;
+        expected_head_after = head_after_checkpoints;
+        removed
+    };
+
+    Ok((removed_checkpoints, compaction_outcome, expected_head_after))
+}
+
+/// Rewrites the journal for whatever this run changed.
+///
+/// No step wraps this phase: the head verification and the journal
+/// analysis inside it report steps of their own, and a step around them
+/// would mix nodes and journal lines into one count.
+fn rewrite_journal_for_run(
+    directory: &Path,
+    plan: &CompactionPlan,
+    options: &super::options::CompactionOptions,
+    compaction_outcome: Option<&CompactionPhaseOutcome>,
+    repository_lock: &Arc<RepositoryLock>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<JournalRewriteOutcome> {
+    let journal_outcome = if let Some(compaction) = &compaction_outcome {
+        repository_lock.validate_path_identity(directory)?;
+        let repository = Repository::open_with_progress(directory, observer)?;
+        verify_exact_super_root(&repository, compaction.head_after, observer)?;
+        let raw = scan_raw_journal(directory)?;
+        let retained = retained_compacted_head_line(&raw, compaction.head_after)?;
+        verify_retained_journal_lines(&raw, &[raw.lines()[retained].content_bytes().to_vec()])?;
+        if raw.lines().len() == 1 {
+            JournalRewriteOutcome {
+                changed: false,
+                backup_path: None,
+                retained_record_count: 1,
+                removed_line_count: 0,
+                bytes_written: raw.source_bytes().len(),
+            }
+        } else {
+            rewrite_journal_atomically(&raw, &[retained])?
+        }
+    } else if options.contains(MaintenanceTask::Journal) {
+        repository_lock.validate_path_identity(directory)?;
+        let repository = Repository::open_with_progress(directory, observer)?;
+        let head = repository.head_record_identifier();
+        verify_exact_super_root(&repository, head, observer)?;
+        let raw = scan_raw_journal(directory)?;
+        let analysis = analyze_journal(
+            &repository,
+            &raw,
+            head,
+            options.journal_revision_retention,
+            observer,
+        )?;
+        verify_retained_journal_roots(
+            &plan.journal.retained_record_ids,
+            &analysis.retained_record_ids,
+        )?;
+        verify_retained_journal_lines(&raw, &plan.journal.retained_raw_lines)?;
+        if analysis.plan.removed_lines == 0 {
+            JournalRewriteOutcome {
+                changed: false,
+                backup_path: None,
+                retained_record_count: analysis.retained_indexes.len(),
+                removed_line_count: 0,
+                bytes_written: raw.source_bytes().len(),
+            }
+        } else {
+            rewrite_journal_atomically(&raw, &analysis.retained_indexes)?
+        }
+    } else {
+        JournalRewriteOutcome {
+            changed: false,
+            backup_path: None,
+            retained_record_count: 0,
+            removed_line_count: 0,
+            bytes_written: 0,
+        }
+    };
+
+    sync_directory_strict(directory)?;
+    Ok(journal_outcome)
+}
+
+/// What the mutations before the copy removed.
+struct PreMutationOutcome {
+    segment_outcome: StandaloneSegmentCompactionOutcome,
+    removed_stale_archives: usize,
+    stale_not_deleted: Vec<FileDeletionFailure>,
+}
+
+/// Applies the segment plan, the stale archives, and the residue sweep.
+///
+/// The residue sweep runs before the copy because a killed run's output
+/// holds bulk segments alive through its references, and because retiring
+/// it first means a retry converges instead of accumulating one more
+/// orphan generation.
+fn apply_pre_copy_mutations(
+    directory: &Path,
+    plan: &CompactionPlan,
+    options: &super::options::CompactionOptions,
+    repository_lock: &Arc<RepositoryLock>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<PreMutationOutcome> {
+    let mut segment_outcome = StandaloneSegmentCompactionOutcome::default();
+    if let Some(expected) = &plan.segment_plan {
+        repository_lock.validate_path_identity(directory)?;
+        let (_, outcome) = apply_standalone_segment_cleanup(
+            directory,
+            ReclaimRule {
+                reference: plan.reference_generation,
+                kind: CompactionKind::Full,
+                retained_generations: crate::writer::store_writer::RETAINED_GENERATIONS,
+            },
+            plan.current_head.segment,
+            &plan.protected_history_segments,
+            options.archive_rewrite_policy,
+            Some(expected),
+            observer,
+        )?;
+        segment_outcome = outcome;
+    }
+
+    repository_lock.validate_path_identity(directory)?;
+    let (removed_stale_archives, stale_not_deleted) =
+        if options.contains(MaintenanceTask::StaleArchives) {
+            crate::progress::observe(
+                observer,
+                &Step::new("removing stale archives", WorkUnit::Files)
+                    .with_total(crate::progress::count(plan.stale_archives.len())),
+                |observer| {
+                    remove_planned_files(
+                        directory,
+                        plan.stale_archives
+                            .iter()
+                            .map(|archive| PlannedFileRemoval {
+                                file_name: archive.file_name.clone(),
+                                bytes: archive.bytes,
+                                fingerprint: archive.fingerprint.clone(),
+                            }),
+                        PlannedFileRemovalFailureMode::RequireCertifiedTarget,
+                        observer,
+                    )
+                },
+            )?
+        } else {
+            (0, Vec::new())
+        };
+
+    if let Some(expected) = &plan.residue_sweep {
+        repository_lock.validate_path_identity(directory)?;
+        crate::progress::observe(
+            observer,
+            &Step::new(
+                "retiring interrupted-compaction residue",
+                WorkUnit::Archives,
+            ),
+            |observer| -> Result<()> {
+                apply_standalone_segment_cleanup(
+                    directory,
+                    ReclaimRule {
+                        reference: plan.reference_generation,
+                        kind: CompactionKind::Full,
+                        retained_generations: i32::MAX,
+                    },
+                    plan.current_head.segment,
+                    &HashSet::new(),
+                    options.archive_rewrite_policy,
+                    Some(expected),
+                    observer,
+                )
+                .map(|_| ())
+            },
+        )?;
+    }
+
+    Ok(PreMutationOutcome {
+        segment_outcome,
+        removed_stale_archives,
+        stale_not_deleted,
+    })
+}
+
+/// What retiring the run's leftover material removed.
+struct RetiredResidue {
+    removed_temporaries: usize,
+    temporary_not_deleted: Vec<FileDeletionFailure>,
+    removed_recovery_backups: usize,
+    recovery_backup_not_deleted: Vec<FileDeletionFailure>,
+}
+
+/// Removes recovery and staging material, the run's final mutation.
+///
+/// Never discarded until every repository mutation has passed a fresh
+/// exact-head and retained-history verification. These names are outside
+/// active archive discovery, so their removal cannot invalidate the
+/// verified state.
+fn retire_run_residue(
+    directory: &Path,
+    plan: &CompactionPlan,
+    options: &super::options::CompactionOptions,
+    repository_lock: &Arc<RepositoryLock>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<RetiredResidue> {
+    repository_lock.validate_path_identity(directory)?;
+    let (removed_temporaries, temporary_not_deleted) =
         if options.contains(MaintenanceTask::StaleTemporaries) {
             crate::progress::observe(
                 observer,
@@ -557,7 +586,7 @@ pub(super) fn apply_prepared(
                     .with_total(crate::progress::count(plan.temporaries.len())),
                 |observer| {
                     remove_planned_files(
-                        &directory,
+                        directory,
                         plan.temporaries.iter().cloned(),
                         PlannedFileRemovalFailureMode::Partial,
                         observer,
@@ -567,7 +596,7 @@ pub(super) fn apply_prepared(
         } else {
             (0, Vec::new())
         };
-    let (removed_recovery_backups, mut backup_not_deleted) =
+    let (removed_recovery_backups, backup_not_deleted) =
         if options.contains(MaintenanceTask::RecoveryBackups) {
             crate::progress::observe(
                 observer,
@@ -575,7 +604,7 @@ pub(super) fn apply_prepared(
                     .with_total(crate::progress::count(plan.recovery_backups.len())),
                 |observer| {
                     remove_planned_files(
-                        &directory,
+                        directory,
                         plan.recovery_backups.iter().cloned(),
                         PlannedFileRemovalFailureMode::Partial,
                         observer,
@@ -585,9 +614,26 @@ pub(super) fn apply_prepared(
         } else {
             (0, Vec::new())
         };
-    sync_directory_strict(&directory)?;
+    sync_directory_strict(directory)?;
 
-    let archive_bytes_after = archive_file_bytes(&directory)?;
+    Ok(RetiredResidue {
+        removed_temporaries,
+        temporary_not_deleted,
+        removed_recovery_backups,
+        recovery_backup_not_deleted: backup_not_deleted,
+    })
+}
+
+/// Gathers every deletion this run planned but did not achieve, in a
+/// stable order, translating the segment layer's failures into the
+/// caller-facing ones.
+///
+/// Returns the failures themselves and the distinct file names they name,
+/// which the outcome reports separately.
+fn collect_deletion_failures(
+    segment_outcome: StandaloneSegmentCompactionOutcome,
+    remaining: Vec<Vec<FileDeletionFailure>>,
+) -> (Vec<FileDeletionFailure>, Vec<String>) {
     let mut deletion_failures: Vec<_> = segment_outcome
         .deletion_failures
         .into_iter()
@@ -599,9 +645,9 @@ pub(super) fn apply_prepared(
             }
         })
         .collect();
-    deletion_failures.append(&mut stale_not_deleted);
-    deletion_failures.append(&mut temporary_not_deleted);
-    deletion_failures.append(&mut backup_not_deleted);
+    for mut failures in remaining {
+        deletion_failures.append(&mut failures);
+    }
     deletion_failures.sort_by(|left, right| {
         left.file_name
             .cmp(&right.file_name)
@@ -614,25 +660,127 @@ pub(super) fn apply_prepared(
         .collect();
     files_not_deleted.sort();
     files_not_deleted.dedup();
+    (deletion_failures, files_not_deleted)
+}
+
+/// Which pass's archive counts the outcome reports.
+///
+/// A run that compacted reports its sweep's; one that only reclaimed
+/// reports the standalone segment pass's.
+fn archive_counts(
+    compaction_outcome: Option<&CompactionPhaseOutcome>,
+    segment_counts: (usize, usize, usize),
+) -> (usize, usize, usize) {
+    match compaction_outcome {
+        Some(compaction) => (
+            compaction.sweep.rewritten_archives,
+            compaction.sweep.removed_archives,
+            compaction.sweep.removed_segments,
+        ),
+        None => segment_counts,
+    }
+}
+
+/// Refuses to apply a plan the directory no longer matches.
+fn reject_changed_directory(
+    directory: &Path,
+    plan: &CompactionPlan,
+    repository_lock: &Arc<RepositoryLock>,
+) -> Result<()> {
+    let current_fingerprint = directory_fingerprint(directory)?;
+    if current_fingerprint != plan.fingerprint {
+        return Err(Error::InvalidFormat {
+            details: "the repository changed after the authoritative cleanup plan was built; refusing to apply a stale plan"
+                .to_owned(),
+        });
+    }
+
+    repository_lock.validate_path_identity(directory)?;
+
+    Ok(())
+}
+
+pub(super) fn apply_prepared(
+    prepared: PreparedCompaction,
+    observer: &mut dyn ProgressObserver,
+) -> Result<CompactionOutcome> {
+    let PreparedCompaction {
+        directory,
+        options,
+        plan,
+        repaired,
+        repository_lock,
+    } = prepared;
+    reject_changed_directory(&directory, &plan, &repository_lock)?;
+    let gc_log_before = read_optional_regular_file(&directory.join("gc.log"))?;
+    let archive_bytes_before = archive_file_bytes(&directory)?;
+    if plan.segment_plan.is_some() && plan.manifest_upgrade {
+        // This is the final all-source gate before even the manifest may be
+        // replaced. Version-two stores do this once inside the segment apply;
+        // only the one-time manifest transition needs an additional pass so a
+        // bad source cannot leave even a compatible metadata upgrade behind.
+        let repository = Repository::open_with_progress(&directory, observer)?;
+        reject_duplicate_active_segments(&repository)?;
+        certify_active_archives_with_progress(&repository, repository.archives(), observer)?;
+    }
+    if plan.manifest_upgrade {
+        repository_lock.validate_path_identity(&directory)?;
+        upgrade_manifest_atomically(&directory)?;
+    }
+
+    let PreMutationOutcome {
+        segment_outcome,
+        removed_stale_archives,
+        stale_not_deleted,
+    } = apply_pre_copy_mutations(&directory, &plan, &options, &repository_lock, observer)?;
+    let (removed_checkpoints, compaction_outcome, expected_head_after) =
+        run_compaction_phase(&directory, &plan, &options, &repository_lock, observer)?;
+    let journal_outcome = rewrite_journal_for_run(
+        &directory,
+        &plan,
+        &options,
+        compaction_outcome.as_ref(),
+        &repository_lock,
+        observer,
+    )?;
+    verify_gc_log_delta(
+        &directory,
+        gc_log_before.as_deref(),
+        compaction_outcome.as_ref(),
+    )?;
+    let head_after = verify_applied_state(&mut AppliedState {
+        directory: &directory,
+        expected_head_after,
+        compaction_outcome: compaction_outcome.as_ref(),
+        options: &options,
+        observer,
+        plan: &plan,
+    })?;
+    let RetiredResidue {
+        removed_temporaries,
+        temporary_not_deleted,
+        removed_recovery_backups,
+        recovery_backup_not_deleted,
+    } = retire_run_residue(&directory, &plan, &options, &repository_lock, observer)?;
+    let archive_bytes_after = archive_file_bytes(&directory)?;
+    let segment_counts = (
+        segment_outcome.rewritten_archives,
+        segment_outcome.removed_archives,
+        segment_outcome.removed_segments,
+    );
+    let (deletion_failures, files_not_deleted) = collect_deletion_failures(
+        segment_outcome,
+        vec![
+            stale_not_deleted,
+            temporary_not_deleted,
+            recovery_backup_not_deleted,
+        ],
+    );
     let removed_journal_lines = journal_outcome.removed_line_count;
     let journal_backup_path = journal_outcome.backup_path;
 
-    // A run either sweeps through the directory-level engine or through the
-    // compaction phase's own reclaim pass; never both, because a pre-copy plan
-    // describes a store the copy replaces. Whichever ran carries the counts.
     let (rewritten_archives, removed_reclaimable_archives, removed_segments) =
-        match &compaction_outcome {
-            Some(compaction) => (
-                compaction.sweep.rewritten_archives,
-                compaction.sweep.removed_archives,
-                compaction.sweep.removed_segments,
-            ),
-            None => (
-                segment_outcome.rewritten_archives,
-                segment_outcome.removed_archives,
-                segment_outcome.removed_segments,
-            ),
-        };
+        archive_counts(compaction_outcome.as_ref(), segment_counts);
     Ok(CompactionOutcome {
         head_before: plan.current_head,
         head_after,
