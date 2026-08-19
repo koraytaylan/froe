@@ -371,6 +371,8 @@ pub(crate) fn interop_full() {
     checkpoint_removal();
     cleanup();
     journal_retention();
+    compact_convergence();
+    version_history_purge();
     repair();
     backup();
     recover();

@@ -302,13 +302,27 @@ pub(crate) fn make_stale_archive(store: &Path) -> StaleArchive {
 
 /// Truncate the journal to just the head line, exactly as Oak's `compact`
 /// tool does after compaction.
+///
+/// The line kept is the one naming the head froe actually *binds* — the
+/// newest revision whose segment exists — not blindly the last line: a
+/// Sling shutdown outrun by the container's stop grace can append a
+/// revision whose segments never reached disk, and truncating to that line
+/// would discard the tolerant fallback and leave an unopenable store.
 pub(crate) fn truncate_journal_to_head(store: &Path) {
+    let bound_head = froe::Repository::open(store)
+        .expect("open the store to resolve its bound head")
+        .head_record_identifier();
+    let bound_revision = format!("{}:{}", bound_head.segment, bound_head.record_number);
     let journal = store.join("journal.log");
     let content = std::fs::read_to_string(&journal).expect("read journal");
     let head_line = content
         .lines()
-        .rfind(|l| !l.trim().is_empty())
-        .expect("journal has at least one non-empty line");
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find(|line| line.split_whitespace().next() == Some(bound_revision.as_str()))
+        .unwrap_or_else(|| {
+            panic!("no journal line names the bound head {bound_revision}:\n{content}")
+        });
     eprintln!("  truncating journal to head: {head_line}");
     std::fs::write(&journal, format!("{head_line}\n")).expect("write journal");
 }

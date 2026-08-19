@@ -85,8 +85,15 @@ pub(crate) fn assert_check_passes_at_head(store: &Path, phase: &str) {
 // Store manipulation helpers
 // ---------------------------------------------------------------------------
 
-/// Copy a store directory, removing repo.lock.
+/// Copy a store directory, removing repo.lock. The target is cleared
+/// first: a rerun's leftover output would otherwise merge with the fresh
+/// copy, and a stale higher-letter archive from a previous compaction
+/// shadows the fresh archive of the same number — a franken-store whose
+/// head resolves against the wrong bytes.
 pub(crate) fn copy_store(src: &Path, dst: &Path) {
+    if dst.exists() {
+        std::fs::remove_dir_all(dst).expect("clear a leftover store copy");
+    }
     std::fs::create_dir_all(dst).expect("create dst");
     copy_dir_recursive(src, dst);
     let _ = std::fs::remove_file(dst.join("repo.lock"));
@@ -105,8 +112,13 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
-/// Copy a store from a podman volume to a host directory.
+/// Copy a store from a podman volume to a host directory. Cleared first
+/// for the same reason as [`copy_store`]: extraction into a rerun's
+/// leftovers merges two stores into neither.
 pub(crate) fn store_from_volume(volume: &str, dst: &Path) {
+    if dst.exists() {
+        std::fs::remove_dir_all(dst).expect("clear a leftover extraction");
+    }
     std::fs::create_dir_all(dst).expect("create dst");
     let src_mount = "/sling/repository/segmentstore";
     podman(&[

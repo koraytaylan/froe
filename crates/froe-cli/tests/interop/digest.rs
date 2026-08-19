@@ -7,6 +7,18 @@ use super::*;
 // Content digest: the attribution mechanism
 // ---------------------------------------------------------------------------
 
+/// Digests with content subtrees excluded — the comparison a confirmed
+/// purge is held to: before-digest and after-digest carry the same named
+/// exclusions, and everything outside them must match.
+pub(crate) fn digest_store_excluding(store: &Path, excluded: &[&str]) -> String {
+    let mut arguments = vec!["digest", store.to_str().unwrap()];
+    for prefix in excluded {
+        arguments.push("--exclude-subtree");
+        arguments.push(prefix);
+    }
+    froe(&arguments)
+}
+
 /// The canonical content rendering of a store.
 ///
 /// This is what makes damage attributable rather than merely detectable.

@@ -287,10 +287,15 @@ pub(crate) fn cleanup() {
     assert_first_compaction_rewrites_a_partial_archive(&clean_store);
 
     eprintln!("  step 2: froe compact again (gen 1 -> 2)");
+    // `--always-copy`, because after step 1 the store is exactly the state
+    // the convergence gate exists to detect, and this fixture *wants* the
+    // pointless second copy: advancing the head another generation is the
+    // whole point of the step. This is the flag's documented purpose.
     froe(&[
         "compact",
         clean_store.to_str().unwrap(),
         "--keep-expired-checkpoints",
+        "--always-copy",
         "--yes",
     ]);
 
@@ -513,4 +518,228 @@ pub(crate) fn journal_retention() {
 
     drop(sling);
     eprintln!("  journal-retention phase passed");
+}
+
+/// Phase: the convergence gate against a real Oak store. The first run
+/// compacts and says the store is now fully compacted; the second proves
+/// it, mutates nothing, and Oak still boots against the twice-run store.
+#[test]
+#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
+pub(crate) fn compact_convergence() {
+    let store = oak_store();
+    let convergence_store = work_root().join("convergence-store");
+    eprintln!("  copying store to {}", convergence_store.display());
+    copy_store(&store, &convergence_store);
+    truncate_journal_to_head(&convergence_store);
+
+    eprintln!("  first froe compact --yes");
+    let first = froe(&["compact", convergence_store.to_str().unwrap(), "--yes"]);
+    assert!(
+        first.contains("the store is now fully compacted; a repeat run will report nothing to do"),
+        "the first run must state the convergence it produced: {first}"
+    );
+
+    let files_before = store_file_snapshot(&convergence_store);
+    eprintln!("  second froe compact --yes");
+    let second = froe(&["compact", convergence_store.to_str().unwrap(), "--yes"]);
+    assert!(
+        second.contains("the head is already fully compacted"),
+        "the second run must state the gate's verdict: {second}"
+    );
+    assert!(
+        second.contains("the store is already fully compacted; nothing to do"),
+        "the second run must be a stated no-op: {second}"
+    );
+    assert_eq!(
+        store_file_snapshot(&convergence_store),
+        files_before,
+        "a gated run must leave the store byte-identical"
+    );
+
+    eprintln!("  booting Sling against the twice-run store");
+    let volume = PodmanVolume::new("froe-interop-convergence");
+    let bootstrap = PodmanContainer::run_detached("froe-convergence-bootstrap", 8092, &volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(&convergence_store, &volume.name);
+    let sling = PodmanContainer::run_detached("froe-convergence-verify", 8092, &volume.name);
+    wait_for_sling(8092, "froe-convergence-verify");
+    assert_oak_consumed_store_as_written("froe-convergence-verify", "compact_convergence");
+    let snapshot = content_snapshot(8092);
+    assert!(snapshot.contains("Page 1"), "content preserved: {snapshot}");
+    drop(sling);
+    eprintln!("  compact_convergence phase passed");
+}
+
+/// Every file of the store with its bytes, `repo.lock` aside.
+fn store_file_snapshot(store: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+    std::fs::read_dir(store)
+        .expect("read the store directory")
+        .map(|entry| {
+            let entry = entry.expect("directory entry");
+            (
+                entry.file_name(),
+                std::fs::read(entry.path()).expect("read the file"),
+            )
+        })
+        .filter(|(name, _)| name != "repo.lock")
+        .collect()
+}
+
+/// Phase: the orphaned-version-history purge, end to end against Oak.
+///
+/// Oak itself versions two nodes and deletes one, producing a genuinely
+/// Oak-made orphaned history. froe detects it, purges it under the digest
+/// discipline — before and after compared with exactly the purge excluded —
+/// and Oak then boots the purged store, serves the surviving content, and
+/// checks the surviving versionable in again, which proves its history is
+/// still a working history and not a leftover shape.
+#[test]
+#[ignore = "requires podman and the apache/sling:14 image; run `generate` first"]
+pub(crate) fn version_history_purge() {
+    let store = oak_store();
+    let purge_store = work_root().join("purge-store");
+    eprintln!("  copying store to {}", purge_store.display());
+    copy_store(&store, &purge_store);
+
+    eprintln!("  booting Sling to version content");
+    let volume = PodmanVolume::new("froe-interop-purge");
+    let bootstrap = PodmanContainer::run_detached("froe-purge-bootstrap", 8090, &volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(&purge_store, &volume.name);
+    let sling = PodmanContainer::run_detached("froe-purge-author", 8090, &volume.name);
+    wait_for_sling(8090, "froe-purge-author");
+
+    eprintln!("  Oak versions two nodes and deletes one");
+    sling_post_versionable(8090, "/content/interop/versioned-live", "Kept Page");
+    sling_checkin(8090, "/content/interop/versioned-live");
+    let live_identifier = sling_node_identifier(8090, "/content/interop/versioned-live");
+    sling_post_versionable(8090, "/content/interop/versioned-orphan", "Deleted Page");
+    sling_checkin(8090, "/content/interop/versioned-orphan");
+    let orphan_identifier = sling_node_identifier(8090, "/content/interop/versioned-orphan");
+    sling_delete(8090, "/content/interop/versioned-orphan");
+    drop(sling);
+    let versioned_store = work_root().join("purge-versioned-store");
+    let _ = std::fs::remove_dir_all(&versioned_store);
+    store_from_volume(&volume.name, &versioned_store);
+
+    let orphan_history_path = version_history_path(&orphan_identifier);
+    // The digest exclusion covers everything the purge removes: the history
+    // and the hash intermediates it empties. An intermediate is pruned
+    // exactly when no other history shares it, so the exclusion starts at
+    // the first hash level where the orphan diverges from the live history
+    // — the only other history in this store.
+    let purge_exclusion = purge_exclusion_prefix(&orphan_identifier, &live_identifier);
+    eprintln!("  orphan history at {orphan_history_path}");
+    eprintln!("  digest exclusion at {purge_exclusion}");
+
+    eprintln!("  froe compact --dry-run reports the orphan");
+    let detection = froe(&["compact", versioned_store.to_str().unwrap(), "--dry-run"]);
+    assert!(
+        detection.contains("orphaned version histories: 1 (their versionables no longer exist)"),
+        "exactly the Oak-made orphan is reported: {detection}"
+    );
+
+    eprintln!("  content digest before the purge, orphan excluded");
+    let digest_before = digest_store_excluding(&versioned_store, &[&purge_exclusion]);
+
+    eprintln!("  froe compact --yes --purge-orphaned-version-histories");
+    let purge = froe(&[
+        "compact",
+        versioned_store.to_str().unwrap(),
+        "--yes",
+        "--purge-orphaned-version-histories",
+    ]);
+    assert!(
+        purge.contains("purge 1 orphaned version histories"),
+        "the purge is a listed action: {purge}"
+    );
+    assert!(
+        purge.contains("removed 1 orphaned version histories holding"),
+        "the summary states the content delta: {purge}"
+    );
+
+    eprintln!("  content digest after the purge, same exclusion");
+    assert_digest_delta(
+        &digest_before,
+        &digest_store_excluding(&versioned_store, &[&purge_exclusion]),
+        ExpectedDigestDelta::CheckpointsOnly,
+        "version_history_purge",
+    );
+
+    eprintln!("  the orphan's history is gone; the live one survives");
+    let storage_tree = froe(&[
+        "tree",
+        versioned_store.to_str().unwrap(),
+        "/jcr:system/jcr:versionStorage",
+        "--depth",
+        "4",
+    ]);
+    assert!(
+        !storage_tree.contains(&orphan_identifier),
+        "the purged history must not resolve: {storage_tree}"
+    );
+    assert!(
+        storage_tree.contains(&live_identifier),
+        "the live history must survive: {storage_tree}"
+    );
+
+    eprintln!("  booting Sling against the purged store");
+    let verify_volume = PodmanVolume::new("froe-interop-purge-verify");
+    let verify_bootstrap =
+        PodmanContainer::run_detached("froe-purge-verify-bootstrap", 8091, &verify_volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(verify_bootstrap);
+    store_into_volume(&versioned_store, &verify_volume.name);
+    let verify = PodmanContainer::run_detached("froe-purge-verify", 8091, &verify_volume.name);
+    wait_for_sling(8091, "froe-purge-verify");
+    assert_oak_consumed_store_as_written("froe-purge-verify", "version_history_purge");
+    let snapshot = content_snapshot(8091);
+    assert!(
+        snapshot.contains("Page 1"),
+        "baseline content preserved: {snapshot}"
+    );
+    // The strongest proof the surviving history is a *working* history and
+    // not a leftover shape: Oak checks the versionable out and in again,
+    // which appends a version to that very history.
+    eprintln!("  Oak versions the survivor again on the purged store");
+    sling_checkout(8091, "/content/interop/versioned-live");
+    sling_checkin(8091, "/content/interop/versioned-live");
+    let survivor = sling_get_json(8091, "/content/interop/versioned-live");
+    assert!(
+        survivor.contains("mix:versionable"),
+        "the survivor stays versionable: {survivor}"
+    );
+    drop(verify);
+    eprintln!("  version_history_purge phase passed");
+}
+
+/// The digest-exclusion prefix a purge of `orphan` implies: the first hash
+/// level the orphan does not share with `live`, because the purge prunes
+/// every intermediate left without a history — or the history's own path in
+/// the astronomically unlikely case all three levels collide.
+fn purge_exclusion_prefix(orphan: &str, live: &str) -> String {
+    let mut path = String::from("/jcr:system/jcr:versionStorage");
+    for level in [0..2, 2..4, 4..6] {
+        let orphan_level = &orphan[level.clone()];
+        path.push('/');
+        path.push_str(orphan_level);
+        if orphan_level != &live[level] {
+            return path;
+        }
+    }
+    format!("{path}/{orphan}")
+}
+
+/// The version-storage path Oak files a history under: three hash levels
+/// from the versionable identifier's leading hexadecimal pairs, then the
+/// identifier itself.
+fn version_history_path(identifier: &str) -> String {
+    format!(
+        "/jcr:system/jcr:versionStorage/{}/{}/{}/{identifier}",
+        &identifier[0..2],
+        &identifier[2..4],
+        &identifier[4..6],
+    )
 }

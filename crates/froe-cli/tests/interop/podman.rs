@@ -77,7 +77,14 @@ impl PodmanContainer {
     }
 
     pub(crate) fn stop(&self) {
-        let _ = Command::new("podman").args(["stop", &self.name]).output();
+        // A minute of grace, not podman's ten-second default: Oak's
+        // shutdown hook has archives to close and an index to write, and a
+        // host slower than the one this suite was tuned on can otherwise
+        // see the JVM SIGKILLed mid-write — a torn store that then fails a
+        // *later* phase, attributing the fault to the wrong operation.
+        let _ = Command::new("podman")
+            .args(["stop", "-t", "60", &self.name])
+            .output();
         let _ = Command::new("podman").args(["rm", &self.name]).output();
     }
 
