@@ -165,8 +165,14 @@ jobs:
     container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install stable --profile minimal
-      - run: rustup target add ${{ matrix.target }}
+      # Only outside the containers: the rust-musl-cross image ships its
+      # own stable toolchain with the target's std preinstalled, and
+      # asking rustup to reinstall stable there fails removing the
+      # image's preseeded components.
+      - if: ${{ !matrix.container }}
+        run: rustup toolchain install stable --profile minimal
+      - if: ${{ !matrix.container }}
+        run: rustup target add ${{ matrix.target }}
       # Warms same-tag re-runs; first runs per target stay cold builds
       # because nothing on the default branch compiles these targets.
       - uses: Swatinem/rust-cache@v2
