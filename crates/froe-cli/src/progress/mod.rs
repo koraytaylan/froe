@@ -397,6 +397,7 @@ impl ProgressObserver for Reporter {
             started: Instant::now(),
             last_report: None,
             announced: false,
+            conclusion: None,
         });
         self.inner.render(&mut state);
     }
@@ -415,6 +416,23 @@ impl ProgressObserver for Reporter {
             active.completed = active.completed.max(completed);
         }
         self.inner.render(&mut state);
+    }
+
+    fn step_concluded(&mut self, conclusion: &str) {
+        if self.inner.style == Style::Silent {
+            return;
+        }
+        let mut state = self.inner.state.lock().unwrap_or_else(|error| {
+            self.inner.state.clear_poison();
+            error.into_inner()
+        });
+        if let Some(active) = state.active.as_mut() {
+            active.conclusion = Some(sanitize_terminal_text(conclusion));
+            // A concluded step is worth its completion line even when it
+            // finished inside the announcement delay: the conclusion is a
+            // result, not a heartbeat.
+            active.announced = true;
+        }
     }
 
     fn step_total_resolved(&mut self, total: u64) {

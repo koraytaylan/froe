@@ -195,6 +195,17 @@ pub trait ProgressObserver {
         let _ = total;
     }
 
+    /// The current step's result, as one short factual clause a renderer
+    /// may append to the step's completion line — for example
+    /// `"73,967 pre-existing bulk segments (15.0 GiB) will be shared in
+    /// place and retained"`. Reported at most once per step, after the
+    /// step's counting is complete and before [`Self::step_ended`]. The
+    /// default implementation ignores it: a conclusion is a courtesy to
+    /// the reader, never something an operation depends on.
+    fn step_concluded(&mut self, conclusion: &str) {
+        let _ = conclusion;
+    }
+
     /// The current step finished. An operation that fails mid-step still
     /// ends the step before returning its error.
     fn step_ended(&mut self);
@@ -228,6 +239,10 @@ impl<Observer: ProgressObserver + ?Sized> ProgressObserver for &mut Observer {
 
     fn step_total_resolved(&mut self, total: u64) {
         (**self).step_total_resolved(total);
+    }
+
+    fn step_concluded(&mut self, conclusion: &str) {
+        (**self).step_concluded(conclusion);
     }
 
     fn step_ended(&mut self) {

@@ -47,9 +47,25 @@ pub fn format_byte_size(bytes: u64) -> String {
     format!("{bytes} bytes")
 }
 
+/// A count with thousands separators, so an operator can read
+/// `18,796,598` where `18796598` would have to be counted digit by digit:
+/// the same grouping every froe report uses for node and segment counts.
+#[must_use]
+pub fn format_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (position, digit) in digits.chars().enumerate() {
+        if position != 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_byte_size;
+    use super::{format_byte_size, format_count};
 
     /// Expectations computed by hand rather than by running the code under
     /// test, including every figure from the field report that motivated the
@@ -81,6 +97,26 @@ mod tests {
         ];
         for (bytes, expected) in table {
             assert_eq!(format_byte_size(bytes), expected, "for {bytes} bytes");
+        }
+    }
+
+    /// Expectations written out by hand, spanning the group boundaries where
+    /// a separator-placement defect would show.
+    #[test]
+    fn grouped_counts_match_a_hand_computed_table() {
+        let table = [
+            (0u64, "0"),
+            (1, "1"),
+            (999, "999"),
+            (1000, "1,000"),
+            (9999, "9,999"),
+            (999_999, "999,999"),
+            (1_000_000, "1,000,000"),
+            (18_796_598, "18,796,598"),
+            (u64::MAX, "18,446,744,073,709,551,615"),
+        ];
+        for (count, expected) in table {
+            assert_eq!(format_count(count), expected, "for {count}");
         }
     }
 

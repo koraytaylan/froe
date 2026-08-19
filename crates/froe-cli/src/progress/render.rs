@@ -136,16 +136,10 @@ pub(crate) fn format_rate(completed: u64, elapsed: Duration) -> String {
 }
 
 /// A count with thousands separators: `1234567` becomes `1,234,567`.
+/// The one implementation lives in the library, so a conclusion a step
+/// reports and the line the reporter renders can never group differently.
 pub(crate) fn format_count(count: u64) -> String {
-    let digits = count.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (position, digit) in digits.chars().enumerate() {
-        if position != 0 && (digits.len() - position).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
+    froe::format_count(count)
 }
 
 /// A running clock: `0:07`, `4:31`, `1:04:31`.

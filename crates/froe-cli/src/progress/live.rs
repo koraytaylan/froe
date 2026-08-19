@@ -30,6 +30,8 @@ pub(crate) struct ActiveStep {
     /// Whether the step has been mentioned on the stream at all. A step
     /// that was never announced prints no completion line either.
     pub(crate) announced: bool,
+    /// The step's reported conclusion, appended to the completion line.
+    pub(crate) conclusion: Option<String>,
 }
 
 /// The reporter's shared state.
@@ -180,13 +182,19 @@ impl ReporterInner {
         let elapsed = step.started.elapsed();
         // A step that counted nothing is not a step that did nothing: a
         // phase without a counter of its own reports the time it took
-        // rather than an untrue "0 archives".
+        // rather than an untrue "0 archives". Its conclusion still
+        // matters — a prediction that advances no counter concludes all
+        // the same.
         if step.completed == 0 {
-            return format!(
+            let mut line = format!(
                 "froe: {}: done in {}",
                 step.description,
                 format_duration(elapsed)
             );
+            if let Some(conclusion) = &step.conclusion {
+                let _ = write!(line, "; {conclusion}");
+            }
+            return line;
         }
         let rate = rate_per_second(step.completed, elapsed);
         let mut line = format!(
@@ -203,6 +211,9 @@ impl ReporterInner {
                 format_count(rate),
                 step.unit.plural_noun()
             );
+        }
+        if let Some(conclusion) = &step.conclusion {
+            let _ = write!(line, "; {conclusion}");
         }
         line
     }
@@ -335,6 +346,59 @@ mod tests {
         assert!(
             !visible.contains('['),
             "the live line was not erased before the completion line: {printed}"
+        );
+    }
+
+    /// A conclusion is appended to the completion line after a semicolon,
+    /// for a counted and an uncounted step alike — the uncounted case is
+    /// the reclamation prediction, whose completion line is otherwise a
+    /// bare duration.
+    #[test]
+    fn a_concluded_step_appends_its_conclusion_to_the_completion_line() {
+        let captured = SharedBuffer::new();
+        let mut reporter = reporter(Style::Plain, &captured);
+        reporter.step_began(&Step::new("scanning archives", WorkUnit::Archives));
+        reporter.step_advanced(2);
+        reporter.step_concluded("2 archives hold nothing reclaimable");
+        reporter.step_ended();
+        reporter.step_began(&Step::new("predicting the reclamation", WorkUnit::Archives));
+        reporter.step_concluded("the sweep removes 1 archive (1.0 MiB)");
+        reporter.step_ended();
+        let printed = captured.text();
+        assert!(
+            printed.contains("in 0.0s; 2 archives hold nothing reclaimable"),
+            "a counted step's conclusion follows its counts: {printed}"
+        );
+        assert!(
+            printed.contains("done in 0.0s; the sweep removes 1 archive (1.0 MiB)"),
+            "an uncounted step's conclusion follows its duration: {printed}"
+        );
+    }
+
+    /// A conclusion is a result, so it must survive the announcement
+    /// deferral that silences prompt steps: the operator asked what the
+    /// prediction found, not how long it took to find it.
+    #[test]
+    fn a_conclusion_forces_the_completion_line_of_a_prompt_step() {
+        let captured = SharedBuffer::new();
+        let mut reporter = Reporter::with_output(
+            Style::Plain,
+            ANNOUNCE_DELAY,
+            Duration::ZERO,
+            Some(100),
+            Box::new(captured.clone()),
+        );
+        reporter.step_began(&Step::new("predicting the reclamation", WorkUnit::Archives));
+        reporter.step_concluded("the sweep has nothing to reclaim");
+        reporter.step_ended();
+        let printed = captured.text();
+        assert!(
+            printed.contains("froe: predicting the reclamation: done in"),
+            "the concluded step left no completion line: {printed}"
+        );
+        assert!(
+            printed.contains("; the sweep has nothing to reclaim"),
+            "the conclusion was dropped: {printed}"
         );
     }
 

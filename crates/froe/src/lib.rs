@@ -105,7 +105,7 @@ pub use segment::{
     GarbageCollectionGeneration, RecordIdentifier, RecordType, SegmentIdentifier, SegmentKind,
 };
 pub use store::Repository;
-pub use units::format_byte_size;
+pub use units::{format_byte_size, format_count};
 pub use writer::{
     ArchiveRewritePolicy, CompactedGeneration, CompactionAction, CompactionKind, CompactionOptions,
     CompactionOutcome, CompactionPlan, FileDeletionFailure, JournalLineRemoval,
