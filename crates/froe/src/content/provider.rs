@@ -37,7 +37,7 @@ pub trait SegmentProvider {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -92,6 +92,7 @@ pub(crate) mod tests {
         inner: &'provider MemorySegmentProvider,
         string_reads: Cell<usize>,
         template_reads: Cell<usize>,
+        reads_by_segment: RefCell<HashMap<SegmentIdentifier, usize>>,
     }
 
     impl<'provider> CountingSegmentProvider<'provider> {
@@ -100,6 +101,7 @@ pub(crate) mod tests {
                 inner,
                 string_reads: Cell::new(0),
                 template_reads: Cell::new(0),
+                reads_by_segment: RefCell::new(HashMap::new()),
             }
         }
 
@@ -110,10 +112,23 @@ pub(crate) mod tests {
         pub(crate) fn template_reads(&self) -> usize {
             self.template_reads.get()
         }
+
+        pub(crate) fn segment_reads_for(&self, segment_identifier: SegmentIdentifier) -> usize {
+            self.reads_by_segment
+                .borrow()
+                .get(&segment_identifier)
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
     impl SegmentProvider for CountingSegmentProvider<'_> {
         fn segment(&self, segment_identifier: SegmentIdentifier) -> Result<SegmentView<'_>> {
+            *self
+                .reads_by_segment
+                .borrow_mut()
+                .entry(segment_identifier)
+                .or_insert(0) += 1;
             self.inner.segment(segment_identifier)
         }
 

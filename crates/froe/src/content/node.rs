@@ -265,7 +265,8 @@ impl<'provider> NodeState<'provider> {
     /// same view Oak's node state API presents.
     pub fn properties(&self) -> Result<Vec<PropertyState>> {
         let template = self.template()?;
-        let mut properties = Vec::with_capacity(2 + template.properties.len());
+        let stored = self.stored_property_states(&template)?;
+        let mut properties = Vec::with_capacity(2 + stored.len());
         if let Some(primary_type) = &template.primary_type {
             properties.push(PropertyState {
                 name: "jcr:primaryType".to_owned(),
@@ -287,9 +288,7 @@ impl<'provider> NodeState<'provider> {
                 ),
             });
         }
-        for property_index in 0..template.properties.len() {
-            properties.push(self.property_at(&template, property_index)?);
-        }
+        properties.extend(stored);
         Ok(properties)
     }
 
@@ -301,9 +300,29 @@ impl<'provider> NodeState<'provider> {
     /// stored property and would otherwise be lost.
     pub fn stored_properties(&self) -> Result<Vec<PropertyState>> {
         let template = self.template()?;
-        let mut properties = Vec::with_capacity(template.properties.len());
-        for property_index in 0..template.properties.len() {
-            properties.push(self.property_at(&template, property_index)?);
+        self.stored_property_states(&template)
+    }
+
+    /// Walks the property-value list once, then decodes each slot. A
+    /// per-slot descent would re-walk the same bucket records for every
+    /// property of the node.
+    fn stored_property_states(&self, template: &Template) -> Result<Vec<PropertyState>> {
+        if template.properties.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list_identifier = self.property_list_identifier(template)?;
+        let value_identifiers = uncounted_list_entries(
+            self.provider,
+            list_identifier,
+            template.properties.len() as u64,
+        )?;
+        let mut properties = Vec::with_capacity(value_identifiers.len());
+        for (property_index, value_identifier) in value_identifiers.into_iter().enumerate() {
+            properties.push(self.property_from_value(
+                template,
+                property_index,
+                value_identifier,
+            )?);
         }
         Ok(properties)
     }
@@ -349,7 +368,6 @@ impl<'provider> NodeState<'provider> {
     /// Reads the property at `property_index` of the template's property
     /// list.
     fn property_at(&self, template: &Template, property_index: usize) -> Result<PropertyState> {
-        let property_template = &template.properties[property_index];
         let list_identifier = self.property_list_identifier(template)?;
         let value_identifier = uncounted_list_entry(
             self.provider,
@@ -357,6 +375,16 @@ impl<'provider> NodeState<'provider> {
             template.properties.len() as u64,
             property_index as u64,
         )?;
+        self.property_from_value(template, property_index, value_identifier)
+    }
+
+    fn property_from_value(
+        &self,
+        template: &Template,
+        property_index: usize,
+        value_identifier: RecordIdentifier,
+    ) -> Result<PropertyState> {
+        let property_template = &template.properties[property_index];
         let values = if property_template.is_multiple {
             let counted = read_counted_list(self.provider, value_identifier)?;
             let mut values = Vec::with_capacity(counted.size as usize);
@@ -428,9 +456,10 @@ impl std::fmt::Debug for NodeState<'_> {
 mod tests {
     use super::{NodeState, PropertyValues};
     use crate::content::property::{PropertyType, PropertyValue};
-    use crate::content::provider::tests::MemorySegmentProvider;
+    use crate::content::provider::tests::{CountingSegmentProvider, MemorySegmentProvider};
     use crate::content::template::tests::{TemplateArity, template_record};
     use crate::content::value::BinaryValue;
+    use crate::hashing::map_entry_hash;
     use crate::segment::parsed_segment::tests::{data_segment_identifier, synthetic_data_segment};
     use crate::segment::record::RecordIdentifier;
 
@@ -635,6 +664,123 @@ mod tests {
                 length: 3,
                 record_identifier: RecordIdentifier::new(segment, 4),
             }))
+        );
+    }
+
+    fn foreign_identifier_bytes(segment_reference: u16, record_number: u32) -> [u8; 6] {
+        let mut bytes = [0u8; 6];
+        bytes[0..2].copy_from_slice(&segment_reference.to_be_bytes());
+        bytes[2..6].copy_from_slice(&record_number.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_property_value_list_already_walked_while_enumerating_is_not_walked_again() {
+        let node_segment = data_segment_identifier(1);
+        let list_segment = data_segment_identifier(2);
+        let names = ["one", "two", "three", "four"];
+        let mut records: Vec<(u32, u8, Vec<u8>)> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (1 + index as u32, 4, small_string_record(name)))
+            .collect();
+        for (index, name) in names.iter().enumerate() {
+            records.push((10 + index as u32, 4, small_string_record(*name)));
+        }
+        let mut name_bucket = Vec::new();
+        for record_number in 1..=4u32 {
+            name_bucket.extend_from_slice(&identifier_bytes(record_number));
+        }
+        records.push((20, 2, name_bucket));
+        records.push((
+            21,
+            6,
+            template_record(None, &[], &TemplateArity::Zero, Some(20), &[1, 1, 1, 1]),
+        ));
+        let mut node = Vec::new();
+        node.extend_from_slice(&identifier_bytes(30));
+        node.extend_from_slice(&identifier_bytes(21));
+        node.extend_from_slice(&foreign_identifier_bytes(1, 1));
+        records.push((30, 7, node));
+
+        let mut value_bucket = Vec::new();
+        for record_number in 10..=13u32 {
+            value_bucket.extend_from_slice(&foreign_identifier_bytes(1, record_number));
+        }
+
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(
+            node_segment,
+            synthetic_data_segment(&[list_segment], &records),
+        );
+        inner.insert(
+            list_segment,
+            synthetic_data_segment(&[node_segment], &[(1, 2, value_bucket)]),
+        );
+        let provider = CountingSegmentProvider::new(&inner);
+        let node = NodeState::new(&provider, RecordIdentifier::new(node_segment, 30));
+
+        let properties = node.properties().expect("properties");
+        assert_eq!(properties.len(), 4);
+        assert_eq!(
+            provider.segment_reads_for(list_segment),
+            1,
+            "enumerating four stored properties must walk the value-list \
+             bucket once, not once per slot"
+        );
+    }
+
+    #[test]
+    fn a_child_map_record_already_read_to_leave_the_diff_chain_is_not_read_again() {
+        let node_segment = data_segment_identifier(3);
+        let map_segment = data_segment_identifier(4);
+        let mut child_name = vec![5u8];
+        child_name.extend_from_slice(b"child");
+        let mut child = Vec::new();
+        child.extend_from_slice(&identifier_bytes(31));
+        child.extend_from_slice(&identifier_bytes(22));
+        let mut root = Vec::new();
+        root.extend_from_slice(&identifier_bytes(30));
+        root.extend_from_slice(&identifier_bytes(21));
+        root.extend_from_slice(&foreign_identifier_bytes(1, 10));
+
+        let mut leaf = 1u32.to_be_bytes().to_vec();
+        leaf.extend_from_slice(&map_entry_hash("child").to_be_bytes());
+        leaf.extend_from_slice(&foreign_identifier_bytes(1, 1));
+        leaf.extend_from_slice(&foreign_identifier_bytes(1, 31));
+
+        let mut inner = MemorySegmentProvider::default();
+        inner.insert(
+            node_segment,
+            synthetic_data_segment(
+                &[map_segment],
+                &[
+                    (1, 4, child_name),
+                    (21, 6, (1u32 << 28).to_be_bytes().to_vec()),
+                    (
+                        22,
+                        6,
+                        template_record(None, &[], &TemplateArity::Zero, None, &[]),
+                    ),
+                    (30, 7, root),
+                    (31, 7, child),
+                ],
+            ),
+        );
+        inner.insert(
+            map_segment,
+            synthetic_data_segment(&[node_segment], &[(10, 0, leaf)]),
+        );
+        let provider = CountingSegmentProvider::new(&inner);
+        let node = NodeState::new(&provider, RecordIdentifier::new(node_segment, 30));
+
+        let entries = node.child_node_entries().expect("children");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            provider.segment_reads_for(map_segment),
+            1,
+            "enumerating a leaf child map must not re-read the record already \
+             opened to leave the diff chain"
         );
     }
 }

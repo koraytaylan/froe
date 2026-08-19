@@ -176,7 +176,7 @@ pub struct VisitedNode<'traversal, 'provider> {
 /// scheduling-work charge for a successful step is the saturating sum of
 /// `scheduled_children`, `scheduled_child_name_bytes`, and
 /// `scheduled_child_map_records`; the last counter includes records inspected
-/// by both the child-count scan and the subsequent enumeration scan.
+/// by the child-count scan and by the enumeration scan that follows.
 #[non_exhaustive]
 pub struct BoundedVisitedNode<'traversal, 'provider> {
     /// The node, path, and depth returned by an ordinary traversal.
@@ -241,7 +241,7 @@ impl<'provider> DepthFirstTraversal<'provider> {
     ///
     /// One scheduling-work unit is charged for each declared child, each map
     /// record inspected while counting children, each map record inspected
-    /// again while enumerating them, and each stored child-name byte. The
+    /// while enumerating them, and each stored child-name byte. The
     /// pending-node cap is independent and applies to the traversal's total
     /// scheduled-but-not-yet-visited nodes after this expansion.
     pub fn next_node_with_scheduling_limits(
@@ -846,26 +846,26 @@ mod tests {
             traversal.next_node_with_scheduling_limits(1, 5, 6, u64::MAX),
             Err(crate::Error::TraversalSchedulingWorkBudgetExceeded {
                 maximum_scheduling_work: 6,
-                attempted_scheduling_work: 9,
+                attempted_scheduling_work: 8,
             })
         ));
 
         let mut traversal = DepthFirstTraversal::new(root(), "/", None);
         assert!(matches!(
-            traversal.next_node_with_scheduling_limits(1, 5, 8, u64::MAX),
+            traversal.next_node_with_scheduling_limits(1, 5, 7, u64::MAX),
             Err(crate::Error::TraversalSchedulingWorkBudgetExceeded {
-                maximum_scheduling_work: 8,
-                attempted_scheduling_work: 9,
+                maximum_scheduling_work: 7,
+                attempted_scheduling_work: 8,
             })
         ));
 
         let mut traversal = DepthFirstTraversal::new(root(), "/", None);
         let visited = traversal
-            .next_node_with_scheduling_limits(1, 5, 9, 1)
+            .next_node_with_scheduling_limits(1, 5, 8, 1)
             .expect("all count, enumeration, and name work fits exactly")
             .expect("root visit");
         assert_eq!(visited.scheduled_children, 1);
         assert_eq!(visited.scheduled_child_name_bytes, 5);
-        assert_eq!(visited.scheduled_child_map_records, 3);
+        assert_eq!(visited.scheduled_child_map_records, 2);
     }
 }

@@ -254,9 +254,14 @@ fn map_entries_internal(
     let mut overlays: Vec<(RecordIdentifier, RecordIdentifier)> = Vec::new();
     let mut current = map_identifier;
 
-    // Walk down any diff chain, remembering the overlaid entries.
+    // Walk down any diff chain, remembering the overlaid entries. The first
+    // non-diff record is the trie root: expand it from the view already in
+    // hand so the same record is not charged and read again to start collect.
     let mut walk_length = 0u32;
-    let base = loop {
+    let mut entries = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    loop {
         if walk_length >= MAXIMUM_WALK_LENGTH {
             return Err(walk_too_long(map_identifier));
         }
@@ -264,24 +269,32 @@ fn map_entries_internal(
         charge_map_record(&mut budget)?;
         let view = provider.segment(current.segment)?;
         let head = view.read_u32(current.record_number, 0)?;
-        if head != DIFF_HEAD {
-            break current;
+        if head == DIFF_HEAD {
+            let key = view.read_record_identifier(current.record_number, 8, 0)?;
+            let value = view.read_record_identifier(current.record_number, 8, 1)?;
+            // Earlier diffs win over later ones in the chain.
+            if !overlays
+                .iter()
+                .any(|(existing_key, _)| *existing_key == key)
+            {
+                overlays.push((key, value));
+            }
+            current = view.read_record_identifier(current.record_number, 8, 2)?;
+            continue;
         }
-        let key = view.read_record_identifier(current.record_number, 8, 0)?;
-        let value = view.read_record_identifier(current.record_number, 8, 1)?;
-        // Earlier diffs win over later ones in the chain.
-        if !overlays
-            .iter()
-            .any(|(existing_key, _)| *existing_key == key)
-        {
-            overlays.push((key, value));
-        }
-        current = view.read_record_identifier(current.record_number, 8, 2)?;
-    };
-
-    let mut entries = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    collect_map_entries(provider, base, &mut entries, &mut visited, &mut budget)?;
+        visited.insert(current);
+        expand_map_record(
+            provider,
+            current,
+            &view,
+            head,
+            &mut entries,
+            &mut pending,
+            &mut budget,
+        )?;
+        break;
+    }
+    collect_map_entries(provider, pending, &mut entries, &mut visited, &mut budget)?;
     if !overlays.is_empty() {
         for entry in &mut entries {
             if let Some((_, value)) = overlays
@@ -373,7 +386,7 @@ struct CollectedEntry {
 
 fn collect_map_entries(
     provider: &dyn SegmentProvider,
-    map_identifier: RecordIdentifier,
+    mut pending: Vec<RecordIdentifier>,
     entries: &mut Vec<CollectedEntry>,
     visited: &mut std::collections::HashSet<RecordIdentifier>,
     budget: &mut Option<MapEnumerationBudget>,
@@ -385,7 +398,6 @@ fn collect_map_entries(
     // decides corruption exactly, and it is what stops a walk that a depth
     // bound alone could not (Java enumerates a DAG-shaped map forever;
     // returning an error is the documented safer deviation).
-    let mut pending = vec![map_identifier];
     while let Some(map_identifier) = pending.pop() {
         if !visited.insert(map_identifier) {
             return Err(walk_too_long(map_identifier));
@@ -393,64 +405,87 @@ fn collect_map_entries(
         charge_map_record(budget)?;
         let view = provider.segment(map_identifier.segment)?;
         let head = view.read_u32(map_identifier.record_number, 0)?;
-        if head == DIFF_HEAD {
-            // A nested diff below a branch never occurs in well-formed data,
-            // but the Java reader recurses, so we do too.
-            let base = view.read_record_identifier(map_identifier.record_number, 8, 2)?;
-            pending.push(base);
-            continue;
-        }
-        let size = head & SIZE_MASK;
-        let level = head >> LEVEL_SHIFT;
-        if size == 0 {
-            continue;
-        }
-        if size > BUCKETS_PER_LEVEL && level < MAXIMUM_LEVEL {
-            let bitmap = view.read_u32(map_identifier.record_number, 4)?;
-            let bucket_count = bitmap.count_ones() as usize;
-            let mut buckets = Vec::with_capacity(bucket_count);
-            for bucket_position in 0..bucket_count {
-                buckets.push(view.read_record_identifier(
-                    map_identifier.record_number,
-                    8,
-                    bucket_position,
-                )?);
-            }
-            // Reversed so `pop` yields bucket order, keeping enumeration order
-            // identical to the recursive walk's.
-            pending.extend(buckets.into_iter().rev());
-            continue;
-        }
-        let size = size as usize;
-        let identifiers_base = 4 + size * 4;
-        for position in 0..size {
-            if let Some(budget) = budget {
-                let attempted_entries = u64::try_from(entries.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                if attempted_entries > budget.maximum_entries {
-                    return Err(Error::MapEntryBudgetExceeded {
-                        maximum_entries: budget.maximum_entries,
-                        attempted_entries,
-                    });
-                }
-            }
-            let key_identifier = view.read_record_identifier(
+        expand_map_record(
+            provider,
+            map_identifier,
+            &view,
+            head,
+            entries,
+            &mut pending,
+            budget,
+        )?;
+    }
+    Ok(())
+}
+
+/// Expands one already-read map record: schedule its children, or collect
+/// its leaf entries. The caller charged the visit and holds the view.
+fn expand_map_record(
+    provider: &dyn SegmentProvider,
+    map_identifier: RecordIdentifier,
+    view: &crate::segment::view::SegmentView<'_>,
+    head: u32,
+    entries: &mut Vec<CollectedEntry>,
+    pending: &mut Vec<RecordIdentifier>,
+    budget: &mut Option<MapEnumerationBudget>,
+) -> Result<()> {
+    if head == DIFF_HEAD {
+        // A nested diff below a branch never occurs in well-formed data,
+        // but the Java reader recurses, so we do too.
+        let base = view.read_record_identifier(map_identifier.record_number, 8, 2)?;
+        pending.push(base);
+        return Ok(());
+    }
+    let size = head & SIZE_MASK;
+    let level = head >> LEVEL_SHIFT;
+    if size == 0 {
+        return Ok(());
+    }
+    if size > BUCKETS_PER_LEVEL && level < MAXIMUM_LEVEL {
+        let bitmap = view.read_u32(map_identifier.record_number, 4)?;
+        let bucket_count = bitmap.count_ones() as usize;
+        let mut buckets = Vec::with_capacity(bucket_count);
+        for bucket_position in 0..bucket_count {
+            buckets.push(view.read_record_identifier(
                 map_identifier.record_number,
-                identifiers_base,
-                position * 2,
-            )?;
-            let value = view.read_record_identifier(
-                map_identifier.record_number,
-                identifiers_base,
-                position * 2 + 1,
-            )?;
-            entries.push(CollectedEntry {
-                name: read_map_name(provider, key_identifier, budget)?,
-                key_identifier,
-                value,
-            });
+                8,
+                bucket_position,
+            )?);
         }
+        // Reversed so `pop` yields bucket order, keeping enumeration order
+        // identical to the recursive walk's.
+        pending.extend(buckets.into_iter().rev());
+        return Ok(());
+    }
+    let size = size as usize;
+    let identifiers_base = 4 + size * 4;
+    for position in 0..size {
+        if let Some(budget) = budget {
+            let attempted_entries = u64::try_from(entries.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            if attempted_entries > budget.maximum_entries {
+                return Err(Error::MapEntryBudgetExceeded {
+                    maximum_entries: budget.maximum_entries,
+                    attempted_entries,
+                });
+            }
+        }
+        let key_identifier = view.read_record_identifier(
+            map_identifier.record_number,
+            identifiers_base,
+            position * 2,
+        )?;
+        let value = view.read_record_identifier(
+            map_identifier.record_number,
+            identifiers_base,
+            position * 2 + 1,
+        )?;
+        entries.push(CollectedEntry {
+            name: read_map_name(provider, key_identifier, budget)?,
+            key_identifier,
+            value,
+        });
     }
     Ok(())
 }
@@ -661,20 +696,112 @@ mod tests {
             map_entries_with_limits(&provider, map, 1, 5, 1),
             Err(crate::Error::MapTraversalWorkBudgetExceeded {
                 maximum_work_units: 1,
-                attempted_work_units: 2,
+                attempted_work_units: 6,
             })
         ));
         assert!(matches!(
-            map_entries_with_limits(&provider, map, 1, 5, 6),
+            map_entries_with_limits(&provider, map, 1, 5, 5),
             Err(crate::Error::MapTraversalWorkBudgetExceeded {
-                maximum_work_units: 6,
-                attempted_work_units: 7,
+                maximum_work_units: 5,
+                attempted_work_units: 6,
             })
         ));
-        let (entries, name_bytes, map_records) = map_entries_with_limits(&provider, map, 1, 5, 7)
-            .expect("two record visits and five stored name bytes fit exactly");
+        let (entries, name_bytes, map_records) = map_entries_with_limits(&provider, map, 1, 5, 6)
+            .expect("one record visit and five stored name bytes fit exactly");
         assert_eq!(entries.len(), 1);
-        assert_eq!((name_bytes, map_records), (5, 2));
+        assert_eq!((name_bytes, map_records), (5, 1));
+    }
+
+    #[test]
+    fn a_map_record_already_handled_in_the_same_enumeration_is_not_walked_again() {
+        let segment = data_segment_identifier(8);
+        let name = "child";
+        let hash = map_entry_hash(name);
+        let bucket_index = (hash >> 27) & 0x1F;
+        let mut branch = 0x21u32.to_be_bytes().to_vec();
+        branch.extend_from_slice(&(1u32 << bucket_index).to_be_bytes());
+        branch.extend_from_slice(&identifier_bytes(10));
+
+        let mut leaf_provider = MemorySegmentProvider::default();
+        leaf_provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record(name)),
+                    (4, 4, small_string_record("value")),
+                    (10, 0, leaf_record(0, &[(name, 1, 4)])),
+                ],
+            ),
+        );
+        let leaf = RecordIdentifier::new(segment, 10);
+        let (_, _, leaf_visits) =
+            map_entries_with_limits(&leaf_provider, leaf, 1, u64::MAX, u64::MAX)
+                .expect("leaf enumeration");
+        assert_eq!(
+            leaf_visits, 1,
+            "a leaf is one map record; reading it to leave the diff chain \
+             already yields its entries"
+        );
+
+        let mut branch_provider = MemorySegmentProvider::default();
+        branch_provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record(name)),
+                    (4, 4, small_string_record("value")),
+                    (10, 0, leaf_record(1, &[(name, 1, 4)])),
+                    (20, 1, branch),
+                ],
+            ),
+        );
+        let branch_map = RecordIdentifier::new(segment, 20);
+        let (entries, _, branch_visits) =
+            map_entries_with_limits(&branch_provider, branch_map, 1, u64::MAX, u64::MAX)
+                .expect("branch enumeration");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            branch_visits, 2,
+            "a branch and its one leaf are two records; the branch already \
+             read to leave the diff chain must not be walked again"
+        );
+
+        let mut diff = 0xFFFF_FFFFu32.to_be_bytes().to_vec();
+        diff.extend_from_slice(&map_entry_hash("alpha").to_be_bytes());
+        diff.extend_from_slice(&identifier_bytes(1));
+        diff.extend_from_slice(&identifier_bytes(6));
+        diff.extend_from_slice(&identifier_bytes(10));
+        let mut diff_provider = MemorySegmentProvider::default();
+        diff_provider.insert(
+            segment,
+            synthetic_data_segment(
+                &[],
+                &[
+                    (1, 4, small_string_record("alpha")),
+                    (2, 4, small_string_record("beta")),
+                    (4, 4, small_string_record("old")),
+                    (5, 4, small_string_record("kept")),
+                    (6, 4, small_string_record("new")),
+                    (10, 0, leaf_record(0, &[("alpha", 1, 4), ("beta", 2, 5)])),
+                    (20, 1, diff),
+                ],
+            ),
+        );
+        let (_, _, diff_visits) = map_entries_with_limits(
+            &diff_provider,
+            RecordIdentifier::new(segment, 20),
+            2,
+            u64::MAX,
+            u64::MAX,
+        )
+        .expect("diff enumeration");
+        assert_eq!(
+            diff_visits, 2,
+            "a diff and its base leaf are two records; the base already \
+             identified as the trie root must not be walked again"
+        );
     }
 
     #[test]
