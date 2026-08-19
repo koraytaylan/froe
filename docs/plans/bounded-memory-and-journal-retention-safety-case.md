@@ -58,8 +58,10 @@ defect this range removes.
 
 ## Authoritative state
 
-Unchanged by this range. The preview is advisory and discarded; the lock
-boundary, the replan under the lock, and the re-verification of every retained
+Unchanged by this range as written; a successor range then removed the
+advisory preview entirely — apply now acquires the lock first and builds its
+one authoritative plan under it (`--dry-run` runs the same pass read-only,
+lockless). The lock boundary and the re-verification of every retained
 journal root against locked state are as before. Two additions bind to it:
 
 * The retention bound reaches all three `analyze_journal` call sites — plan,
@@ -134,7 +136,19 @@ Planning is *not* bounded by configuration. On the default `--task segments`
 path, under the lock, peak store-scale sets are `head_data_segments`,
 `protected_history_segments`, the plan's `reclaimable`, and the second
 marking pass's own `references` and `reclaimable` — five, where before this
-range there were three. An applied run plans twice (preview and authoritative).
+range there were three. An applied run now plans exactly once, under the
+lock.
+
+The maintenance-remediation range adds three more store-proportional
+structures, stated rather than hidden. The planning census keeps one
+`HistoryFacts` per version history (path, counts, its bulk-segment set, and
+— only when a purge is selected — its internal identifiers), proportional
+to the number of histories, which on the motivating field store was 31,473.
+The plan's purge carries the omitted-record and context-dependent-record
+sets, proportional to the selection. And the compactor splits its sharing
+memo per scope for the context-dependent records — two maps whose combined
+size is what the single memo held before, plus one entry per
+context-dependent record per scope that reaches it.
 
 Temporary disk is bounded by the live set rather than by the store, and the
 two record-reuse changes cut what "live set" means in practice. Measured on

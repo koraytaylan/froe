@@ -67,9 +67,9 @@ process effective gid and the parent-directory gid. A known credential mismatch
 is printed as an apply-preflight warning in the read-only preview, including
 `--dry-run`; dry-run stays read-only.
 
-After taking the lock and rebuilding the authoritative plan, apply repeats
-that check and refuses a known mismatch before the first planned repository-
-content mutation. The metadata sources in scope are the manifest when it will
+Apply builds its one plan under the held lock, repeats that check there,
+and refuses a known mismatch before the first planned repository-content
+mutation. The metadata sources in scope are the manifest when it will
 be upgraded, the journal when it will be rewritten, each source TAR it will
 rewrite, and the TARs that could become the newest metadata template after a
 leading run of planned whole-archive removals during a checkpoint head move. A
@@ -101,32 +101,123 @@ prompt. See [`cli-output.md`](cli-output.md).
 
 Dry-run is a strict read-only operation: it writes no bytes, creates no files,
 and does not create or acquire `repo.lock`. It validates the repository and
-prints the exact actions, warnings, verified head, and conservative byte
-estimate. Journal removals include the one-based physical
+prints the exact actions, warnings, verified head, and the run's byte
+estimates — what the sweep reclaims (conservative) and what the copy writes
+into the fresh generation, so a run that trades a large rewrite for a small
+reclaim says so before it is confirmed. Journal removals include the one-based physical
 line, structured reason, optional record identifier, and an exact bounded
 byte-string prefix; non-ASCII and control bytes are escaped rather than decoded
 or sent to the terminal.
 
+## The convergence gate
+
+A selected copy is dropped from the plan when the planner proves it would
+only replace a generation with an identical one: every data segment the head
+reaches already carries the head's own compacted triple, no checkpoint is
+selected for omission, no orphaned-version-history purge is selected — an
+omission is content work, however compact the store already is — and the
+journal already holds the single line a completed compaction leaves. The plan says so —
+`the head is already fully compacted; the selected copy … was dropped` — and
+the run performs the standalone sweep instead, so garbage never hides behind
+the gate; a run with nothing at all left prints
+`the store is already fully compacted; nothing to do` and mutates nothing. A
+completed full compaction states the consequence in its summary:
+`the store is now fully compacted; a repeat run will report nothing to do`.
+`--always-copy` overrides the gate for the operator who wants a rewrite
+anyway; it is never needed for space.
+
+The verdict is a triple-equality test against the head segment's own
+generation, never an ordering or a store-wide maximum: old Java-written
+archives can carry version-1-index synthesized full generations far ahead of
+the real ones, generation arithmetic wraps, and killed-run residue stamped
+ahead of the head sits outside the head's closure entirely — none of them
+can confuse an equality.
+
+## Orphaned version histories
+
+Every plan reports the store's orphaned version histories: the
+`nt:versionHistory` subtrees under `/jcr:system/jcr:versionStorage` whose
+`jcr:versionableUuid` matches no live `jcr:uuid` outside version storage.
+Structurally they are reachable content, so no generation sweep may touch
+them; semantically they are garbage the moment their versionable is gone,
+and on a long-lived store they pin the version payloads and inline binaries
+of everything ever deleted. The report states what they hold — nodes,
+inline binary bytes, external references, and how many histories carry
+identifiers that do not parse and so were never classified — and what a
+purge releases: the bulk segments only the purged histories reference, and
+their share of the copy's node records (an estimate scaled from the head's
+average; the plan's predicted copy cost is reduced by exactly this figure,
+and the copy realizes it). When a purge is selected, both figures describe
+that selection — a history the run keeps is not a saving the run delivers.
+The bulk figure is an upper bound, printed as `up to`: a record shared
+between a purged history and one the store keeps — Oak's writer dedups
+identical frozen subtrees into shared records — keeps its blocks alive
+without the plan-time walk being able to see it, and a retained
+checkpoint's snapshot can pin blocks until it expires (the line names the
+checkpoint count when that applies). The sweep that follows the copy frees
+exactly what is actually unreferenced.
+
+Removal is `--purge-orphaned-version-histories`: the run's one *content*
+mutation, listed as its own plan action with the same irreversibility
+warning the journal retirement carries, and confirmed with everything else.
+The copy simply declines to enter the confirmed subtrees — the mechanism
+checkpoint retirement already uses — and the reclaim pass that follows
+turns the omission into reclaimed space. Deliberate boundaries:
+
+* **Checkpoint snapshots keep everything they froze.** A purged history
+  still resolves through a retained checkpoint, whose own copy of version
+  storage is left intact; its storage returns when the checkpoint expires,
+  and the plan says so. Internally the copy memoizes the affected ancestor
+  records per scope, so a subtree shared between the head and a checkpoint
+  can never leak one scope's shape into the other, whichever the walk
+  reaches first.
+* **Histories that freeze `nt:configuration` versionables are kept**, with
+  a warning: configuration versioning is not this purge's business.
+* **Advisory reference protection.** REFERENCE- or WEAKREFERENCE-typed
+  values outside version storage naming a record inside a candidate demote
+  it, with a warning — Oak does not enforce referential integrity, so this
+  is best-effort protection for applications that store version references.
+* **An optional age bound** (`--purged-history-minimum-age-days`) keeps
+  histories whose newest version is younger than the bound, or carries no
+  parsable creation date — the guard for content deleted moments ago and
+  about to be restored from a package, whose recreated versionable would
+  otherwise have re-attached the history by identifier.
+* **A full compaction is required**: tail reclamation retains the shared
+  full generation, which could leave every released record on disk after a
+  run that promised to remove them, so the flag refuses `--tail`.
+
+The summary states the content delta —
+`nodes: 18,796,598 -> 18,184,000 (removed 31,473 orphaned version histories …)` —
+and `froe digest --exclude-subtree <path>` renders a digest with named
+exclusions, so a before-digest can be compared against an after-digest with
+the purge and nothing else excused.
+
 ## Applying a plan
 
-Without `--dry-run`, the command uses two planning stages:
+Without `--dry-run`, the command plans exactly once, under the lock:
 
-1. It builds and prints the same lock-free preview shown by dry-run.
-2. After confirmation, it acquires the exclusive Oak-compatible repository
-   lock and rebuilds the plan from disk.
-3. If the authoritative locked plan differs, it prints the changed plan and
-   asks for confirmation again.
-4. It fingerprints the directory before the first mutation, applies the
-   locked plan, forces durable metadata updates to disk, and reopens the
+1. It acquires the exclusive Oak-compatible repository lock, runs any
+   selected index repairs, and builds the one plan from disk while holding
+   it — so the plan the operator confirms is byte-for-byte the plan that
+   applies, and nothing can change the store between the evidence and the
+   decision.
+2. It prints that plan and asks for confirmation while still holding the
+   lock. The store is offline by precondition, so holding the lock through
+   the prompt is a strengthening, not a discourtesy: an accidentally started
+   Oak cannot open the store while the operator is reading.
+3. It re-fingerprints the directory before the first mutation — a
+   non-cooperating change during the prompt is refused, never silently
+   replanned — applies the plan, verifies the fresh copy in full through the
+   open session *before* the head is published or a single archive is
+   unlinked, forces durable metadata updates to disk, and reopens the
    repository through fresh mappings for a final health check.
 
-If the first preview contains no mutations, the CLI reports that result and
-returns without creating or taking `repo.lock`; there is no destructive plan
-to authorize. Use the library's `PreparedCompaction` health-only apply when a
-lock-protected final verification is specifically required.
+A plan with no mutations reports that result and releases the lock without
+applying anything; `--dry-run` remains the way to preview without creating
+or taking `repo.lock` at all.
 
-`--yes` answers both possible confirmation questions automatically; it does
-not bypass the lock, replan, fingerprint, validation, or final verification.
+`--yes` answers the confirmation automatically; it does not bypass the lock,
+fingerprint, validation, copy verification, or final verification.
 Lock acquisition fails immediately if Oak/AEM or another writer is using the
 repository. As with Oak's own repository lock, safety assumes every other
 writer cooperates with the persistent `repo.lock` inode and does not unlink or
@@ -153,7 +244,7 @@ it:
 | journal | Discards parser-ignored lines, lines with invalid record identifiers, revisions whose head segment is absent, and unreadable *non-current* historical revisions — and then retires the readable ones too, leaving `journal.log` holding the single line naming the head the copy just published. |
 | reclaim | Sweeps against the generation the copy created, retaining one, and rewrites or unlinks archives holding segments the new head does not reach. What the format will not let it move is reported rather than dropped. |
 | stale archives | Removes superseded archive letters only after authenticating every active TAR entry and reconstructing its segment graph and binary-reference catalog from the indexed segment bytes, plus empty incomplete archives. Non-empty groups without that complete proof are preserved with a warning. |
-| expired checkpoints | Omits checkpoints whose valid millisecond timestamp is strictly earlier than the planning time (`now > timestamp`) from the copy, so their content is never carried into the fresh generation. A missing or malformed timestamp is not selected by expiry and produces a warning, though the separate opt-in unreferenced policy can still select it. |
+| expired checkpoints | Omits checkpoints whose valid millisecond timestamp is strictly earlier than the planning time (`now > timestamp`) from the copy, so their content is never carried into the fresh generation. A missing or malformed timestamp is not selected by expiry and produces a warning, though the separate opt-in unreferenced policy can still select it. `--keep-expired-checkpoints` disables this one stage, for the operator who needs a run that reclaims space without touching checkpoint lifetimes. |
 | stale temporaries | Removes only recognized interrupted-operation files whose contents are provably redundant. An ambiguous or non-redundant staging file is retained with a warning. |
 
 Because expiry is realized by omission rather than by a second head update,
@@ -381,7 +472,11 @@ the residue a format limit forces is always visible.
 
 ## Opt-in behavior
 
-Three things are intentionally outside what every run does.
+Five things are intentionally outside what every run does. Two are
+documented above — the [orphaned-version-history
+purge](#orphaned-version-histories), because it is the run's one content
+mutation, and `--always-copy`, because it overrides [the convergence
+gate](#the-convergence-gate) — and three follow here.
 
 ### Repairing index-less archives
 
@@ -401,14 +496,15 @@ $ froe compact /path/to/segmentstore \
 
 Four things about it differ from the rest of the run.
 
-**The plan arrives in two stages.** Every index-dependent decision — the
-segment sweep, checkpoint removal — is impossible until the index exists, so
-while a repair is pending the read-only preview names the repairs and stops.
-The full plan appears only at the second, lock-protected confirmation, and the
-banner says so rather than blaming an outside writer. Declining at that second
-prompt does **not** undo the repair: it has already happened, and the CLI says
-that too. `--yes` answers both prompts, so a scripted run authorizes the
-rebuild and everything the replan then finds.
+**The read-only preview is deliberately partial.** Every index-dependent
+decision — the segment sweep, checkpoint removal — is impossible until the
+index exists, so a `--dry-run` with a repair pending names the repairs and
+stops. An apply run performs the rebuilds under the exclusive lock *before*
+planning — passing the flag is the authorization — and then shows the one
+full plan those repaired indexes made possible. Declining the confirmation
+does **not** undo the repairs: they are already durable, and the CLI says
+so, on the cancelled path and even when the repaired store turns out to
+need nothing else.
 
 **The repository grows.** Every generation letter the rebuild reads is retired
 to a `<archive>.bak` name — `<archive>.2.bak` and so on if one exists already —
@@ -432,8 +528,9 @@ however it is retried, and the refusal names the file to move aside. Keep that
 file: it is the only copy of whatever it holds.
 
 The repair itself is reversible — every original is under a `.bak` — but the
-sweep it unblocks is not. To separate the two, repair with `--repair-archive-indexes`,
-decline at the second prompt, run `froe check`, and only then compact.
+sweep it unblocks is not. To separate the two, repair with
+`--repair-archive-indexes`, decline the confirmation (the rebuilds are
+already durable at that point), run `froe check`, and only then compact.
 
 ### Unreferenced checkpoints
 

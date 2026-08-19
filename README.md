@@ -81,6 +81,12 @@ FULL mark/sweep against the generation it just wrote, reclaims every segment
 the new head does not reach, removes superseded archives only after
 reconstructing their full segment graph as proof, drops checkpoints past
 their timestamp, and deletes only staging files it can prove redundant.
+Every plan also reports the orphaned version histories no structural sweep
+can touch — reachable subtrees whose versionables were deleted years ago —
+and `--purge-orphaned-version-histories` removes them in the same run, the
+one content mutation froe has. When a full compaction would only swap a
+generation for an identical one, the plan says the store is already fully
+compacted and drops the pointless copy instead of running it.
 `--dry-run` previews the whole plan without writing a byte or taking the
 lock.
 
@@ -99,8 +105,11 @@ does. `froe digest` answers the question an operator actually has — *did this
 maintenance change my content?* — by rendering the repository canonically:
 every node, property name, type, arity, value and binary checksum, across the
 head and every checkpoint, sorted by name and stripped of the record and
-segment identifiers that compaction legitimately changes. Take one before a
-maintenance run and compare after:
+segment identifiers that compaction legitimately changes.
+`--exclude-subtree` names content subtrees to leave out — and stamps the
+exclusion into the digest itself — so a digest taken before a confirmed
+purge compares against one taken after it with the purge and nothing else
+excused. Take one before a maintenance run and compare after:
 
 ```console
 $ froe digest /path/to/segmentstore --output before.digest
@@ -201,10 +210,11 @@ pending child visits, 250,000 graph rows, and 1,000,000 graph edges.
 Crossing a bound is a typed refusal rather than partial successful output;
 multiple archive arguments are not yet batched under one global work budget.
 
-`froe compact` first prints a strictly read-only plan. When that plan contains
-mutations, it then acquires the repository lock and rebuilds the plan before
-applying it; an empty plan returns without taking the lock. If the locked plan
-changed, it is printed and confirmed again. The conservative defaults preserve
+`froe compact` plans exactly once, under the exclusive repository lock: the
+plan the operator confirms is byte-for-byte the plan that applies, and a
+directory change during the confirmation prompt is refused rather than
+silently replanned. `--dry-run` runs the same planning pass strictly
+read-only, without creating or taking `repo.lock` at all. The conservative defaults preserve
 every readable journal revision while pruning dangling or unreadable journal
 entries, reclaiming eligible segments, removing expired checkpoints, and
 cleaning only proven stale files. See the [compaction guide](docs/compact.md) for

@@ -132,6 +132,19 @@ journal_retention
    │  If this fails: froe's by-policy destruction of reachable history
    │  leaves a store Oak cannot open.
    ▼
+compact_convergence
+   │  the run after a full compaction proves the store fully compacted,
+   │  mutates nothing, and says so; Oak boots the twice-run store
+   │  If this fails: the convergence gate either churns or over-gates.
+   ▼
+version_history_purge
+   │  Oak itself versions two nodes and deletes one; froe detects the
+   │  orphaned history, purges it under a digest with the purge as its
+   │  only exclusion, and Oak boots the result, serves the survivors,
+   │  and checks the surviving versionable in again
+   │  If this fails: the one content mutation maintenance performs is
+   │  not something Oak accepts, or it took more than it named.
+   ▼
 repair
    │  Oak's own JVM is killed with SIGKILL while it holds an archive
    │  open; froe compact --repair-archive-indexes rebuilds the index and
@@ -366,6 +379,34 @@ revision froe kept.
 
 Depends on `generate` only; it uses the Oak-written journal directly, because
 Oak's own history is the thing being retired.
+
+### compact_convergence
+
+The convergence gate's promise is double-sided: a run after a completed full
+compaction must prove the store already fully compacted and mutate nothing —
+byte-identical files, a stated no-op — and it must never hide real work
+behind that verdict. The phase runs `froe compact --yes` twice on a copy of
+the fixture, asserts the first run's forward-looking summary line, the
+second run's verdict and untouched bytes, and then boots Sling against the
+twice-run store, because a gate that quietly broke the store while deciding
+to do nothing would otherwise pass.
+
+### version_history_purge
+
+The purge is maintenance's one *content* mutation, so its Oak evidence has
+to cover both directions: Oak produced the garbage, and Oak accepts its
+removal. Sling creates two `mix:versionable` nodes, checks both in — Oak
+writing the version histories — and deletes one, orphaning its history the
+way real content deletion does. froe's plan then reports exactly that one
+orphan; the purge runs under the digest discipline (before and after
+rendered with one declared exclusion — the orphan's intermediate hash chain
+from the level where it diverges from the live history's, because the purge
+legitimately prunes the emptied intermediates too — compared line for
+line); the purged history is gone from the head while the live one
+survives; and Sling boots the purged store, serves the baseline content,
+and checks the surviving versionable out and in again — a fresh version
+appended to the surviving history being the strongest available proof that
+what survived is a working history rather than a leftover shape.
 
 ### repair
 

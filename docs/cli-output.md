@@ -98,6 +98,30 @@ comparing froe's figure against `du` needs the ambiguity of "GB" gone. The
 implementation is `froe::format_byte_size`, shared by the library warnings and
 the CLI so one rule serves both.
 
+The count grouping is `froe::format_count`, one implementation for the
+library's step conclusions and the reporter's own lines, so the two can never
+group differently.
+
+## Step conclusions
+
+A step that established a fact worth more than its own count reports it as a
+*conclusion*: one short clause the reporter appends to the completion line
+after a semicolon. `predicting the shared binary content` concludes with how
+many pre-existing bulk segments the copy will share in place and their size;
+`tracing segments reachable from the head` concludes with the head's
+composition (node data versus shared binary blocks); `predicting the
+reclamation` concludes with what the sweep removes and rewrites; and
+`checking references into purged histories` concludes with how many purge
+candidates it demoted, when it demoted any. A concluded
+step always leaves its completion line, even when it finished inside the
+announcement delay — the conclusion is a result, not a heartbeat — and
+`--silent` hides it like every other progress line, because the same facts
+reach standard output through the plan.
+
+Conclusions ride `ProgressObserver::step_concluded`, reported at most once
+per step before the step ends. Like every observation they are strictly
+additive: an operation runs identically whether or not anything renders them.
+
 Four renderings deliberately stay unscaled, because their exact integer is the
 thing being reported rather than a size an operator is comparing:
 
@@ -159,9 +183,8 @@ Beyond that:
 
 | Command | Steps |
 | --- | --- |
-| `compact` (plan and locked replan) | `verifying the current head` (nodes), `analyzing journal revisions` (journal lines), `scanning for stale archives` (archives), `tracing segments reachable from the head` and `…from history` (segments), `predicting the shared binary content` (nodes) and `predicting the reclamation` (archives) — the read-only pass that lets the plan name the archives the run will remove or rewrite — `planning residue retirement` (archives, only when an interrupted earlier run left output ahead of the head), `scanning for stale temporary files` (files) |
-| `compact` (apply) | `checking archive indexes for repair` (archives, only with `--repair-archive-indexes`, and before the plan exists; it counts every archive number examined, of which only the damaged ones are rebuilt), `opening archives`, `retiring interrupted-compaction residue` (archives, only when there is any), `removing stale archives` (files), `certifying source archives` (archives), `copying nodes into a fresh generation` (nodes), `reclaiming old generations` (archives), then the reopen / head verification / journal analysis triple — **twice**, once for the journal retirement and once for the final proof — and only then `removing stale temporary files` and `removing old recovery backups` (files), which are deliberately the last mutation of all |
-| `compact` | `opening archives for writing`, `certifying source archives` (archives), `copying nodes into a fresh generation` (nodes), `reclaiming old generations` |
+| `compact` (the one locked plan; `--dry-run` runs the same pass read-only) | `verifying the current head` (nodes — the content tree, pruned at version storage, walked first so every live identifier is seen under live content before anything else is certified), `scanning version storage` (nodes, when the store has one — covering exactly what the pruning left out), `verifying the checkpoints` (nodes — the super-root and every checkpoint snapshot, cheap because the memo already holds what they share with the head), `analyzing journal revisions` (journal lines), `checking references into purged histories` (nodes, only when a purge is selected and has candidates), `scanning for stale archives` (archives), `tracing segments reachable from the head` (segments), `planning residue retirement` (archives, only when an interrupted earlier run left output ahead of the head); then, with a copy selected, `predicting the shared binary content` (nodes) and `predicting the reclamation` (archives) — the pass that lets the plan name the archives the run will remove or rewrite — or, when no copy is selected (no compaction requested, or the convergence gate dropped it), `tracing segments reachable from history` (segments), `planning segment reclamation` (segments), `pricing the journal-history protection` (segments), and `validating the prospective plan` (segments); then `scanning for stale temporary files` (files) |
+| `compact` (apply) | `checking archive indexes for repair` (archives, only with `--repair-archive-indexes`, and before the plan exists; it counts every archive number examined, of which only the damaged ones are rebuilt), `opening archives`; a run without a copy applies its standalone sweep first — `replanning segment reclamation` and `sweeping archives` — then `removing stale archives` (files) and `retiring interrupted-compaction residue` (archives, only when there is any; the residue sweep reuses those same two step names, so a copy run with residue shows them too); with a copy: `certifying source archives` (archives), `copying nodes into a fresh generation` (nodes), `verifying the compacted copy` (nodes — the full walk of the fresh copy through the open session, before the head is published or anything is unlinked, which is the one moment a defect costs nothing), `reclaiming old generations` (archives); the journal rewrite (byte-level checks — after a copy it adds no walk of its own, while a run without one reopens and re-verifies the head as part of the rewrite), then a final reopen / head verification / journal analysis for the closing proof, and only then `removing stale temporary files` and `removing old recovery backups` (files), which are deliberately the last mutation of all |
 | `backup`, `restore` | `opening archives for writing` for the target (archives), `copying nodes` (nodes) |
 | `checkpoint create\|remove\|remove-all\|remove-unreferenced` | `opening archives for writing` (archives) |
 | `recover-journal` | `scanning segments for super-roots` (segments), `probing candidates for consistency` (revisions) |

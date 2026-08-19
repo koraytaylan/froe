@@ -96,6 +96,7 @@ after which a normal AEM start consumes the result cleanly.
 | Offline compaction (deep copy into a fresh generation) | `Compact` + `ClassicCompactor` | `writer::compact` (`CompactionKind::Full` / `Tail`) | **Implemented** |
 | Post-compaction cleanup / reclaim predicate | `Reclaimers`, `DefaultCleanupStrategy`, `FileReaper` | `WritableRepository::reclaim_old_generations` (Oak's `newOldReclaimer` with one retained generation) | **Implemented** |
 | Reclamation and repository hygiene | `FileStore.cleanup`, journal/checkpoint maintenance | `plan_compaction`, `PreparedCompaction`, and `froe compact` (FULL policy with **one** retained generation — Oak's own offline value — unconditional journal retirement, and opt-in backup retention) | **Implemented** (merged into compaction: there is no separate cleanup command) |
+| Orphaned version-history purge | *(none — Oak's `VersionGarbageCollector` is DocumentNodeStore-only; segment stores have no offline equivalent)* | always-on detection in every plan; removal via `froe compact --purge-orphaned-version-histories` (`--purged-history-minimum-age-days` bounds it) | **Implemented** (froe extension; full compaction required, checkpoint snapshots and `nt:configuration` histories kept) |
 | Online GC, estimation, parallel/checkpoint compactors, memory barrier | `GarbageCollector`, `ParallelCompactor` | — | **Planned** (throughput optimizations; the offline deep copy produces an equivalent result) |
 
 ## 3. Tooling (oak-run segment commands)
@@ -144,7 +145,7 @@ introduction above):
 | `froe checkpoints REPOSITORY` | Checkpoint names with creation and expiry times. |
 | `froe export REPOSITORY [--path P] [--depth N] [--format json-lines\|parquet] [--output FILE\|DIRECTORY]` | Export the subtree as JSON lines (default) or Parquet tables. Progress is reported unless the export streams to a terminal's standard output. |
 | `froe check REPOSITORY [--path P]… [--binaries]` | The newest fully consistent revision. |
-| `froe digest REPOSITORY [--output FILE] [--baseline FILE]` | The repository's content rendered canonically — every node, property, type, arity, value and binary checksum, over the head and every checkpoint — for comparing a store before and after an operation. Oak has no equivalent: `oak-run check` answers whether records parse, not whether the content is the content. |
+| `froe digest REPOSITORY [--output FILE] [--baseline FILE] [--exclude-subtree PATH]…` | The repository's content rendered canonically — every node, property, type, arity, value and binary checksum, over the head and every checkpoint — for comparing a store before and after an operation. `--exclude-subtree` omits named content subtrees and stamps the exclusion into the output, so a digest bracketing a confirmed purge excuses the purge and nothing else. Oak has no equivalent: `oak-run check` answers whether records parse, not whether the content is the content. |
 | `froe difference REPOSITORY BEFORE AFTER [--path P]` | Changes between two revisions. |
 | `froe history REPOSITORY PATH` | A node's record across journal revisions. |
 | `froe search-nodes REPOSITORY [--has-property N]… [--value N=V]…` | Nodes matching predicates, over every segment. |
@@ -156,7 +157,7 @@ safely; archive rewrites have the additional hard-link requirement noted below:
 
 | Command | Purpose |
 | --- | --- |
-| `froe compact REPOSITORY [--tail] [--dry-run]` | The one maintenance command: offline full or tail compaction, the reclamation it makes possible, and the journal retirement, in one run. `--dry-run` previews it read-only. Archive rewrites require same-directory hard-link support. |
+| `froe compact REPOSITORY [--tail] [--dry-run] [--purge-orphaned-version-histories]` | The one maintenance command: offline full or tail compaction, the reclamation it makes possible, and the journal retirement, in one run. Every plan reports orphaned version histories, and the purge flag removes them; a full compaction that would only swap identical generations is gated off with `the head is already fully compacted` in the plan (`--always-copy` overrides). `--dry-run` previews it read-only. Archive rewrites require same-directory hard-link support. |
 | `froe backup SOURCE TARGET` | Copy a repository's head into a target store. |
 | `froe restore BACKUP TARGET` | Copy a backup's head into an existing store. |
 | `froe recover-journal REPOSITORY` | Rebuild `journal.log` from the segments. |
@@ -201,13 +202,16 @@ fn main() -> froe::Result<()> {
 Writing (against a stopped repository):
 
 ```rust
-use froe::{compact, CompactionKind, WritableRepository};
+use froe::writer::{CompactionKind, CompactionOptions, compact};
 
 fn main() -> froe::Result<()> {
-    let mut store = WritableRepository::open(std::path::Path::new("/path/to/segmentstore"))?;
-    let outcome = compact(&mut store, CompactionKind::Full)?;
-    println!("reclaimed {} bytes", outcome.size_before - outcome.size_after);
-    store.close()
+    let options = CompactionOptions::new().with_compaction(CompactionKind::Full);
+    let outcome = compact(std::path::Path::new("/path/to/segmentstore"), options)?;
+    println!(
+        "reclaimed {} bytes",
+        outcome.archive_bytes_before - outcome.archive_bytes_after
+    );
+    Ok(())
 }
 ```
 
