@@ -6,6 +6,46 @@ use super::{
     BinaryCheck, DiscardedProgress, Error, HashSet, NodeState, PackedRecordSet, ProgressObserver,
     RecordIdentifier, Result, SegmentProvider, StrideCounter, check_node_shallow, display_relative,
 };
+use crate::content::node::PropertyState;
+
+/// Receives every distinct node a verification walk certifies, exactly once
+/// per walk, with the properties the walk already decoded for its checks.
+///
+/// The walk skips subtrees its certificate memo already holds, so a node is
+/// observed under the path of its *first* visit and never again — which is
+/// exactly the deduplication a census wants, and the reason a collector's
+/// memory is bounded by distinct content rather than by path multiplicity.
+/// Like a [`ProgressObserver`], an implementation is strictly additive: it
+/// can never influence the walk, and it must not mutate the repository.
+pub(crate) trait VerifiedContentObserver {
+    /// One node passed its shallow checks. `path` is relative to the walked
+    /// root — empty for the root itself — and `properties` is the node's
+    /// full decoded property list, synthesized type properties included.
+    /// The provider is the one the walk reads through, so a collector can
+    /// resolve what a property references — binary block lists above all —
+    /// without a provider of its own.
+    fn node_verified(
+        &mut self,
+        provider: &dyn SegmentProvider,
+        path: &str,
+        node: &NodeState<'_>,
+        properties: &[PropertyState],
+    );
+}
+
+/// The observer that ignores every node, for walks that only verify.
+pub(crate) struct DiscardedVerifiedContent;
+
+impl VerifiedContentObserver for DiscardedVerifiedContent {
+    fn node_verified(
+        &mut self,
+        _provider: &dyn SegmentProvider,
+        _path: &str,
+        _node: &NodeState<'_>,
+        _properties: &[PropertyState],
+    ) {
+    }
+}
 
 /// A corrupt location inside a checked subtree: the relative path of the
 /// node where verification failed (empty for the checked node itself)
@@ -99,8 +139,48 @@ impl<'provider> NodeTreeVerifier<'provider> {
         root: RecordIdentifier,
         observer: &mut dyn ProgressObserver,
     ) -> Result<()> {
+        self.verify_collecting_with_progress(root, &mut DiscardedVerifiedContent, observer)
+    }
+
+    /// Verifies exactly like [`NodeTreeVerifier::verify_with_progress`],
+    /// handing every first-visit node to `content` with the properties the
+    /// checks already decoded. A collector therefore sees each distinct node
+    /// exactly once per verifier — the walk's certificate memo is its
+    /// deduplication — at no additional decoding cost.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same certificate-count divergence as
+    /// [`NodeTreeVerifier::verify_with_progress`].
+    pub(crate) fn verify_collecting_with_progress(
+        &mut self,
+        root: RecordIdentifier,
+        content: &mut dyn VerifiedContentObserver,
+        observer: &mut dyn ProgressObserver,
+    ) -> Result<()> {
+        self.verify_collecting_pruned_with_progress(root, content, &[], observer)
+    }
+
+    /// Verifies exactly like
+    /// [`NodeTreeVerifier::verify_collecting_with_progress`], never
+    /// descending into the subtrees whose exact root-relative paths are
+    /// listed. The pruned subtrees stay uncertified and unobserved, so a
+    /// caller can walk them afterwards with a different collector and
+    /// still have every record certified exactly once across its calls.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same certificate-count divergence as
+    /// [`NodeTreeVerifier::verify_with_progress`].
+    pub(crate) fn verify_collecting_pruned_with_progress(
+        &mut self,
+        root: RecordIdentifier,
+        content: &mut dyn VerifiedContentObserver,
+        pruned_subtree_paths: &[&str],
+        observer: &mut dyn ProgressObserver,
+    ) -> Result<()> {
         let mut progress = VerifiedNodeCount::resuming(observer, self.verified_nodes);
-        let verified = verify_subtree_with_cache(
+        let verified = verify_subtree_pruned_with_cache(
             self.provider,
             root,
             SubtreeChecks {
@@ -109,6 +189,8 @@ impl<'provider> NodeTreeVerifier<'provider> {
             },
             &mut self.verified_subtrees,
             &mut progress,
+            content,
+            pruned_subtree_paths,
         );
         progress.finish();
         self.verified_nodes = progress.completed();
@@ -153,7 +235,14 @@ pub(crate) fn verify_subtree(
     verified: &mut PackedRecordSet,
     progress: &mut VerifiedNodeCount<'_>,
 ) -> std::result::Result<(), CorruptLocation> {
-    verify_subtree_with_cache(provider, root, checks, verified, progress)
+    verify_subtree_with_cache(
+        provider,
+        root,
+        checks,
+        verified,
+        progress,
+        &mut DiscardedVerifiedContent,
+    )
 }
 
 /// Counts verified nodes for a [`ProgressObserver`], reporting on a stride
@@ -219,6 +308,7 @@ pub(crate) fn open(
     verified: &PackedRecordSet,
     ancestors: &mut HashSet<RecordIdentifier>,
     path: &str,
+    content: &mut dyn VerifiedContentObserver,
 ) -> std::result::Result<Option<Vec<(String, RecordIdentifier)>>, CorruptLocation> {
     let corrupt_here = |reason: String| CorruptLocation {
         path: path.to_owned(),
@@ -240,12 +330,15 @@ pub(crate) fn open(
     ancestors.insert(record);
     // Not `map_err(corrupt_here)`: different clippy versions disagree
     // about the borrow there, and an explicit struct keeps both quiet.
-    if let Err(reason) = check_node_shallow(provider, record, checks.binaries) {
-        return Err(CorruptLocation {
-            path: path.to_owned(),
-            reason,
-        });
-    }
+    let properties = match check_node_shallow(provider, record, checks.binaries) {
+        Ok(properties) => properties,
+        Err(reason) => {
+            return Err(CorruptLocation {
+                path: path.to_owned(),
+                reason,
+            });
+        }
+    };
     let node = NodeState::new(provider, record);
     if checks.stable_identifiers
         && let Err(error) = node.stable_identifier_bytes()
@@ -255,6 +348,9 @@ pub(crate) fn open(
             reason: error.to_string(),
         });
     }
+    // Observed only after every shallow check passed, so a collector never
+    // counts content the walk is about to refuse.
+    content.node_verified(provider, path, &node, &properties);
     let mut children: Vec<(String, RecordIdentifier)> = node
         .child_node_entries()
         .map_err(|error| corrupt_here(error.to_string()))?
@@ -280,10 +376,40 @@ pub(crate) fn verify_subtree_with_cache(
     checks: SubtreeChecks,
     verified: &mut PackedRecordSet,
     progress: &mut VerifiedNodeCount<'_>,
+    content: &mut dyn VerifiedContentObserver,
+) -> std::result::Result<(), CorruptLocation> {
+    verify_subtree_pruned_with_cache(provider, root, checks, verified, progress, content, &[])
+}
+
+/// Verifies exactly like [`verify_subtree_with_cache`], never descending
+/// into the subtrees whose exact root-relative paths are listed — which
+/// therefore also stay uncertified and unobserved, for a caller that walks
+/// them separately with a different collector.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the walk's one loop needs every one of these, and a builder for a crate-private function would only move the list"
+)]
+pub(crate) fn verify_subtree_pruned_with_cache(
+    provider: &dyn SegmentProvider,
+    root: RecordIdentifier,
+    checks: SubtreeChecks,
+    verified: &mut PackedRecordSet,
+    progress: &mut VerifiedNodeCount<'_>,
+    content: &mut dyn VerifiedContentObserver,
+    pruned_subtree_paths: &[&str],
 ) -> std::result::Result<(), CorruptLocation> {
     let mut ancestors = HashSet::new();
     let mut path = String::new();
-    let Some(children) = open(provider, root, checks, verified, &mut ancestors, &path)? else {
+    let Some(children) = open(
+        provider,
+        root,
+        checks,
+        verified,
+        &mut ancestors,
+        &path,
+        content,
+    )?
+    else {
         return Ok(());
     };
     let mut stack = vec![VerificationFrame {
@@ -302,7 +428,19 @@ pub(crate) fn verify_subtree_with_cache(
             let parent_path_length = path.len();
             path.push('/');
             path.push_str(&name);
-            match open(provider, child, checks, verified, &mut ancestors, &path)? {
+            if pruned_subtree_paths.contains(&path.as_str()) {
+                path.truncate(parent_path_length);
+                continue;
+            }
+            match open(
+                provider,
+                child,
+                checks,
+                verified,
+                &mut ancestors,
+                &path,
+                content,
+            )? {
                 Some(children) => stack.push(VerificationFrame {
                     record: child,
                     pending_children: children,

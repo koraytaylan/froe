@@ -38,15 +38,17 @@ pub struct PreparedCompaction {
 
 impl PreparedCompaction {
     /// Resolves the repository path once to its canonical absolute target,
-    /// validates it without mutation, acquires `repo.lock`, and rebuilds an
-    /// authoritative plan while holding that lock.
+    /// validates it, acquires `repo.lock`, runs any selected archive-index
+    /// repairs, and builds the one authoritative plan while holding that
+    /// lock — so the plan a caller shows is exactly the plan [`Self::apply`]
+    /// executes. With repairs selected, preparation itself mutates: the
+    /// rebuilds are durable whether or not the plan is ever applied.
     pub fn prepare(directory: &Path, options: CompactionOptions) -> Result<Self> {
         Self::prepare_with_progress(directory, options, &mut DiscardedProgress)
     }
 
     /// Prepares exactly like [`PreparedCompaction::prepare`], reporting the
-    /// authoritative replan — the slow part, repeated under the lock — to
-    /// `observer`.
+    /// planning walks — the slow part — to `observer`.
     pub fn prepare_with_progress(
         directory: &Path,
         options: CompactionOptions,

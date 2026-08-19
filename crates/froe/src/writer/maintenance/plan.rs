@@ -183,9 +183,9 @@ pub enum CompactionAction {
     /// Reported by the read-only preview, which cannot do more than name the
     /// work: the repair itself happens under the repository lock, and every
     /// index-dependent decision — the segment sweep, checkpoint removal —
-    /// can only be planned once it has. The authoritative plan the CLI
-    /// re-confirms is therefore always larger than the preview that named
-    /// this.
+    /// can only be planned once it has. The one locked plan the operator
+    /// confirms is therefore always larger than a dry-run preview that
+    /// named this.
     RepairArchiveIndex {
         /// Archive file name the rebuilt archive is installed under: the
         /// lowest non-empty generation letter of its number.
@@ -270,6 +270,17 @@ pub enum CompactionAction {
         /// Physical journal lines present before the run, all of which are
         /// replaced by the single line naming the compacted head.
         revisions: usize,
+    },
+    /// Omit orphaned version histories from the copy — the run's one
+    /// content mutation, listed so confirmation covers it explicitly.
+    PurgeOrphanedVersionHistories {
+        /// Histories the copy omits.
+        histories: u64,
+        /// Nodes those histories hold.
+        nodes: u64,
+        /// Checkpoints the run retains, whose snapshots keep the purged
+        /// histories' storage alive until they expire.
+        retained_checkpoints: u64,
     },
     /// Retire the output an interrupted earlier compaction left behind.
     ///
@@ -357,6 +368,88 @@ pub(super) struct HistoryProtection {
     pub(super) would_be_reclaimable_bytes: u64,
 }
 
+/// The external binaries the verified head references, counted while the
+/// planning walk was reading every property anyway.
+///
+/// Compaction can never touch these bytes — they live in the blob store —
+/// and a plan that says nothing about them invites the operator to expect
+/// blob-store savings from a segment-store tool. Distinctness is tracked
+/// per blob identifier (hash-keyed for identifier formats that carry no
+/// content hash of their own), and bytes are summed from the length suffix
+/// Oak's file blob stores embed in their identifiers; an identifier without
+/// one is counted but cannot contribute bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExternalBinaryFootprint {
+    /// Distinct external blob identifiers the head references.
+    pub distinct_references: u64,
+    /// Bytes summed over the identifiers that carry a length suffix.
+    pub measured_bytes: u64,
+    /// Distinct identifiers without a parsable length suffix.
+    pub unmeasured_references: u64,
+}
+
+/// What the planner established about orphaned version histories:
+/// `nt:versionHistory` subtrees whose `jcr:versionableUuid` matches no live
+/// `jcr:uuid` outside version storage. Reachable content — so no structural
+/// sweep may touch them — yet garbage by the only definition that matters
+/// once the versionable is gone, and the figures here are what they pin.
+/// Detection runs on every plan; removal is the separate, explicitly
+/// selected purge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OrphanedVersionHistoryReport {
+    /// Histories whose versionables no longer exist.
+    pub orphaned_histories: u64,
+    /// Nodes those histories hold, the history nodes included.
+    pub orphaned_nodes: u64,
+    /// Inline binary bytes stored in their properties.
+    pub inline_binary_bytes: u64,
+    /// External binary references stored in their properties — bytes that
+    /// live in the blob store and return only through blob-store garbage
+    /// collection once a purge unreferences them.
+    pub external_references: u64,
+    /// Bulk segments a purge would stop referencing — an upper bound on
+    /// what it releases, not a promise. Attribution is per certified
+    /// record, so a record shared between a purged history and one the
+    /// store keeps (Oak's writer dedups identical frozen subtrees into
+    /// shared records) keeps its blocks alive without this figure knowing,
+    /// and a retained checkpoint's snapshot can pin blocks until it
+    /// expires. The sweep that follows the copy frees exactly what is
+    /// actually unreferenced, whatever this predicted.
+    pub released_bulk_segments: u64,
+    /// Indexed bytes of those bulk segments — the same upper-bound
+    /// semantics as [`Self::released_bulk_segments`].
+    pub released_bulk_bytes: u64,
+    /// The orphans' share of the copy's node records, scaled from the
+    /// head's average bytes per node. An estimate for the plan, realized
+    /// and reported exactly by the copy that runs.
+    pub node_record_bytes_estimate: u64,
+    /// Histories whose `jcr:versionableUuid` did not parse and therefore
+    /// could not be classified.
+    pub malformed_identifiers: u64,
+    /// Checkpoints the run retains. Their snapshots can pin some of the
+    /// released bulk until they expire — pinning the walks cannot see when
+    /// the snapshot shares the head's version-storage records — so a
+    /// nonzero count is the caveat on [`Self::released_bulk_bytes`].
+    pub retained_checkpoints: u64,
+}
+
+/// The purge the plan carries when one is selected: the subtree roots the
+/// copy omits, and the counts the summary restates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct VersionHistoryPurge {
+    pub(super) omitted_records: Vec<RecordIdentifier>,
+    /// The ancestors on the path from the content root down to each omitted
+    /// record. Their rewritten form depends on the scope — the head's copy
+    /// loses the omitted subtrees, a checkpoint snapshot's keeps them — so
+    /// the copy memoizes them per scope rather than globally.
+    pub(super) context_dependent_records: Vec<RecordIdentifier>,
+    pub(super) histories: u64,
+    pub(super) nodes: u64,
+    /// Checkpoints the run retains, whose snapshots keep the purged
+    /// histories' storage alive until they expire.
+    pub(super) retained_checkpoints: u64,
+}
+
 /// A strictly read-only cleanup analysis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactionPlan {
@@ -383,6 +476,20 @@ pub struct CompactionPlan {
     pub(super) reference_generation: GarbageCollectionGeneration,
     pub(super) protected_history_segments: HashSet<SegmentIdentifier>,
     pub(super) manifest_upgrade: bool,
+    /// What the planned copy is expected to write into the fresh
+    /// generation, when a copy is planned and the head closure was traced.
+    pub(super) predicted_copy_output_bytes: Option<u64>,
+    /// The external binaries the verified head references.
+    pub(super) external_binary_footprint: ExternalBinaryFootprint,
+    /// The compaction this run will actually perform: the selected kind,
+    /// unless the convergence gate proved the copy pointless and dropped it.
+    pub(super) effective_compaction_kind: Option<CompactionKind>,
+    /// Whether the planner proved the head already fully compacted.
+    pub(super) already_fully_compacted: bool,
+    /// What the planner established about orphaned version histories.
+    pub(super) orphaned_version_histories: OrphanedVersionHistoryReport,
+    /// The purge this run performs, when one is selected and non-empty.
+    pub(super) version_history_purge: Option<VersionHistoryPurge>,
 }
 
 impl CompactionPlan {
@@ -435,6 +542,58 @@ impl CompactionPlan {
     #[must_use]
     pub fn estimated_reclaimable_bytes(&self) -> u64 {
         self.estimated_reclaimable_bytes
+    }
+
+    /// The bytes the planned copy is expected to write into the fresh
+    /// generation, when a copy is planned and the head closure was traced.
+    ///
+    /// This is the head closure's indexed data bytes — exact for a head a
+    /// previous compaction wrote (the deterministic copy is a fixed point),
+    /// an upper bound for a fragmented head (the dense copy writes less),
+    /// and slightly low only for the first compaction of a store another
+    /// writer produced, whose nodes gain stable-identifier blocks in the
+    /// copy. Reported so an estimate can state the run's net effect rather
+    /// than only its reclaimed side: a swap that removes one generation and
+    /// writes an equal one has a net effect of nothing, and an estimate
+    /// that hides the written side over-promises by exactly this figure.
+    #[must_use]
+    pub fn predicted_copy_output_bytes(&self) -> Option<u64> {
+        self.predicted_copy_output_bytes
+    }
+
+    /// The compaction this run will actually perform. `None` either because
+    /// none was selected or because the convergence gate proved the head is
+    /// already fully compacted and dropped the selected copy — in which
+    /// case [`Self::already_fully_compacted`] says so.
+    #[must_use]
+    pub fn effective_compaction_kind(&self) -> Option<CompactionKind> {
+        self.effective_compaction_kind
+    }
+
+    /// Whether the planner proved every data segment the head reaches
+    /// already carries the head's own compacted generation triple, with no
+    /// checkpoint to omit, no version history selected for purge, and the
+    /// journal already retired — the state a completed full compaction
+    /// leaves, in which a repeat copy would only replace a generation with
+    /// an identical one.
+    #[must_use]
+    pub fn already_fully_compacted(&self) -> bool {
+        self.already_fully_compacted
+    }
+
+    /// What the planner established about orphaned version histories.
+    #[must_use]
+    pub fn orphaned_version_histories(&self) -> OrphanedVersionHistoryReport {
+        self.orphaned_version_histories
+    }
+
+    /// The external binaries the verified head references — blob-store
+    /// content compaction can never reclaim, reported so an operator's
+    /// blob-store expectations land on blob-store garbage collection
+    /// rather than on this run.
+    #[must_use]
+    pub fn external_binary_footprint(&self) -> ExternalBinaryFootprint {
+        self.external_binary_footprint
     }
 
     /// Sum of the current source-file sizes for archives that will be

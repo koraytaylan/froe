@@ -484,3 +484,149 @@ pub(crate) fn the_full_flag_applies_only_to_parquet() {
         String::from_utf8_lossy(&refused.stderr)
     );
 }
+
+/// The plan's external-binary census, checked against an independent
+/// oracle: the JSON-lines export of the same store. The export renders
+/// every external reference verbatim, so distinct identifiers, measured
+/// bytes from `#length` suffixes, and unmeasured references can all be
+/// derived without the census's own arithmetic — and the compact plan
+/// must print exactly those figures.
+/// Four `nt:file` nodes referencing external binaries: one blob shared by
+/// two, one distinct, and one identifier without a length suffix.
+fn write_external_binary_store(store: &std::path::Path) {
+    use froe::writer::{
+        ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, WritableRepository,
+    };
+    let repository = WritableRepository::open(store).expect("bootstrap the store");
+    let generation = repository.writing_generation().expect("generation");
+    let mut writer = repository.record_writer(generation);
+    let mut children = Vec::new();
+    for (name, identifier) in [
+        (
+            "first",
+            "00b6d84c92565b98a45f1bb0a9fef2eff804239ba1b96e4ae4e29e0e4222829a#1000",
+        ),
+        (
+            "second",
+            "00b6d84c92565b98a45f1bb0a9fef2eff804239ba1b96e4ae4e29e0e4222829a#1000",
+        ),
+        (
+            "third",
+            "cafe84c92565b98a45f1bb0a9fef2eff804239ba1b96e4ae4e29e0e4222829ab#2048",
+        ),
+        ("fourth", "custom-blob-store-identifier-without-length"),
+    ] {
+        let reference = writer
+            .write_external_binary_identifier(identifier)
+            .expect("write the reference");
+        let node = writer
+            .write_node(
+                Some("nt:file"),
+                &[],
+                &ChildNodesToWrite::Zero,
+                &[PropertyToWrite {
+                    name: "jcr:data".to_owned(),
+                    property_type: froe::PropertyType::Binary,
+                    values: PropertyValuesToWrite::Single(reference),
+                }],
+            )
+            .expect("write the file node");
+        children.push((name.to_owned(), node));
+    }
+    let content = writer
+        .write_node(
+            Some("nt:unstructured"),
+            &[],
+            &ChildNodesToWrite::Many(children),
+            &[],
+        )
+        .expect("write the content");
+    let root = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "content".to_owned(),
+                node: content,
+            },
+            &[],
+        )
+        .expect("write the root");
+    let head = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "root".to_owned(),
+                node: root,
+            },
+            &[],
+        )
+        .expect("write the super root");
+    writer.finish().expect("finish");
+    let previous = repository.head();
+    assert!(repository.compare_and_set_head(previous, head));
+    repository.flush().expect("flush");
+    repository.close().expect("close");
+}
+
+#[test]
+pub(crate) fn the_external_binary_census_matches_the_export() {
+    let directory = TestDirectory::new("export-census-oracle");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    write_external_binary_store(&store);
+
+    let export = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["export", store.to_str().expect("path")])
+        .output()
+        .expect("run the export");
+    assert!(export.status.success(), "the export must succeed");
+    let rendered = String::from_utf8_lossy(&export.stdout);
+
+    // The oracle: every `binary_reference` value in the export, verbatim.
+    let mut references: Vec<&str> = Vec::new();
+    for line in rendered.lines() {
+        let mut remainder = line;
+        while let Some(start) = remainder.find("\"binary_reference\":\"") {
+            let value = &remainder[start + "\"binary_reference\":\"".len()..];
+            let end = value.find('"').expect("the reference value closes");
+            references.push(&value[..end]);
+            remainder = &value[end..];
+        }
+    }
+    assert_eq!(
+        references.len(),
+        4,
+        "four referencing properties: {rendered}"
+    );
+    let distinct: std::collections::BTreeSet<&str> = references.iter().copied().collect();
+    let mut measured_bytes = 0_u64;
+    let mut unmeasured = 0_u64;
+    for reference in &distinct {
+        match reference
+            .rsplit_once('#')
+            .and_then(|(_, length)| length.parse::<u64>().ok())
+        {
+            Some(length) => measured_bytes += length,
+            None => unmeasured += 1,
+        }
+    }
+
+    let plan = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--dry-run"])
+        .output()
+        .expect("run the dry-run plan");
+    assert!(plan.status.success(), "the dry-run must succeed");
+    let stdout = String::from_utf8_lossy(&plan.stdout);
+    let expected = format!(
+        "content references {} external binaries (about {}; length unknown for {}) in the blob store",
+        froe::format_count(distinct.len() as u64),
+        froe::format_byte_size(measured_bytes),
+        froe::format_count(unmeasured),
+    );
+    assert!(
+        stdout.contains(&expected),
+        "the census must print the oracle's figures.\nexpected: {expected}\nstdout:\n{stdout}"
+    );
+}

@@ -102,6 +102,9 @@ pub struct CompactionOptions {
     pub(super) journal_revision_retention: Option<NonZeroUsize>,
     pub(super) archive_rewrite_policy: ArchiveRewritePolicy,
     pub(super) compaction_kind: Option<CompactionKind>,
+    pub(super) always_copy: bool,
+    pub(super) purge_orphaned_version_histories: bool,
+    pub(super) purged_history_minimum_age: Option<std::time::Duration>,
 }
 
 impl Default for CompactionOptions {
@@ -123,6 +126,9 @@ impl Default for CompactionOptions {
             // move it is the defect this default fixes.
             archive_rewrite_policy: ArchiveRewritePolicy::EveryReclaimableArchive,
             compaction_kind: None,
+            always_copy: false,
+            purge_orphaned_version_histories: false,
+            purged_history_minimum_age: None,
         }
     }
 }
@@ -228,6 +234,59 @@ impl CompactionOptions {
     #[must_use]
     pub fn compaction_kind(&self) -> Option<CompactionKind> {
         self.compaction_kind
+    }
+
+    /// Copies the head into a fresh generation even when the planner proves
+    /// the store is already fully compacted and the swap would net nothing.
+    ///
+    /// Never needed for space: the convergence gate only ever drops a copy
+    /// whose output would replace an identical generation byte for byte.
+    /// This exists for the operator who wants a rewrite anyway — after
+    /// suspected mapping-level damage, for example — and for proving the
+    /// gate itself in tests.
+    #[must_use]
+    pub fn with_copy_when_already_compacted(mut self) -> Self {
+        self.always_copy = true;
+        self
+    }
+
+    /// Whether the convergence gate is overridden.
+    #[must_use]
+    pub fn copies_when_already_compacted(&self) -> bool {
+        self.always_copy
+    }
+
+    /// Omits every confirmed orphaned version history from the copy — the
+    /// one content mutation maintenance can perform, and therefore an
+    /// explicit opt-in with its own plan lines and confirmation.
+    ///
+    /// Detection runs on every plan regardless; this selects removal.
+    /// Removal is permanent, and forfeits the re-attachment a versionable
+    /// recreated with its old identifier would otherwise get. Requires a
+    /// full compaction: tail reclamation retains the shared full
+    /// generation, so the released records could survive the very run that
+    /// promised to remove them.
+    #[must_use]
+    pub fn with_orphaned_version_history_purge(mut self) -> Self {
+        self.purge_orphaned_version_histories = true;
+        self
+    }
+
+    /// Whether orphaned version histories are selected for removal.
+    #[must_use]
+    pub fn purges_orphaned_version_histories(&self) -> bool {
+        self.purge_orphaned_version_histories
+    }
+
+    /// Purges only histories whose newest version was created at least this
+    /// long ago, guarding the mistaken-recent-delete window: content
+    /// deleted moments ago and about to be restored from a package
+    /// re-attaches its history by identifier, and an age bound keeps such
+    /// histories out of the purge without hand-curated identifiers.
+    #[must_use]
+    pub fn with_purged_history_minimum_age(mut self, minimum_age: std::time::Duration) -> Self {
+        self.purged_history_minimum_age = Some(minimum_age);
+        self
     }
 
     /// Carries checkpoints whose valid timestamp has passed into the fresh

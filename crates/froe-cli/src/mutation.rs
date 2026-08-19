@@ -81,37 +81,20 @@ fn confirm(action: &str, confirmation: Confirmation, reporter: &Reporter) -> boo
     })
 }
 
-/// Introduces the lock-protected plan, attributing why it differs.
-///
-/// When repairs were selected the plan changed because cleanup itself
-/// rebuilt the indexes under the lock — that is the task working, not an
-/// outside writer, and saying otherwise sends the operator hunting for a
-/// process that does not exist.
-fn announce_authoritative_plan(plan: &froe::CompactionPlan, repaired: usize) {
-    if repaired == 0 {
-        eprintln!(
-            "froe: repository state changed before the lock was acquired; authoritative plan:"
-        );
-    } else {
-        eprintln!(
-            "froe: rebuilt the index of {repaired} archive(s) under the repository lock, \
-             retaining the originals under .bak names; everything below could only be planned \
-             once that was done:"
-        );
-    }
-    print_cleanup_plan(plan);
-}
-
 /// `froe compact`: the one maintenance command — offline full or tail
-/// compaction, with a read-only preview, a lock-protected replan,
-/// confirmation, application, and a fresh final verification.
+/// compaction, planned once under the exclusive lock, confirmed, applied,
+/// and proven by a fresh final verification.
 ///
-/// Plans read-only first and prints the plan, because the operator's evidence
-/// for authorizing a destructive run has to exist before the run does. With
-/// `--dry-run` that is the whole command. Otherwise the plan is confirmed, the
-/// exclusive lock taken, the plan rebuilt from disk under it, and — if the
-/// authoritative plan differs from what was confirmed — shown and confirmed
-/// again before anything is touched.
+/// With `--dry-run` the command plans read-only, prints the plan, and takes
+/// no lock. Otherwise the lock is acquired *first* and the one plan is built
+/// under it, so the plan the operator confirms is byte-for-byte the plan
+/// that applies: nothing can change the store between the evidence and the
+/// decision, and an accidentally started Oak cannot open the store while
+/// the operator is reading. Index repairs selected with
+/// `--repair-archive-indexes` run under the same lock before planning, so
+/// even a repairing run shows exactly one plan. The store is offline by
+/// precondition, which is what makes holding the lock through the prompt a
+/// strengthening rather than a discourtesy.
 pub(crate) fn run_compact(
     repository: &Path,
     options: CompactionOptions,
@@ -122,71 +105,83 @@ pub(crate) fn run_compact(
     reporter.status(
         "note: archive rewrites require same-directory hard-link and directory-fsync support; an unsupported filesystem fails safely with source archives retained",
     );
-    let preview = plan_compaction_with_progress(repository, &options, &mut reporter.clone())?;
-    // The plan is the operator's evidence for a destructive decision: end
-    // every report before a single line of it is written.
-    reporter.finish();
-    print_cleanup_plan(&preview);
     if run_mode == CompactionRun::PlanOnly {
+        let preview = plan_compaction_with_progress(repository, &options, &mut reporter.clone())?;
+        // The plan is the operator's evidence: end every report before a
+        // single line of it is written.
+        reporter.finish();
+        print_cleanup_plan(&preview);
         println!("dry-run: repository was not modified");
         return Ok(true);
     }
-    if preview.is_empty() {
-        println!("no maintenance mutations are needed; review any warnings above");
+
+    let prepared =
+        PreparedCompaction::prepare_with_progress(repository, options, &mut reporter.clone())?;
+    reporter.finish();
+    print_cleanup_plan(prepared.plan());
+    if prepared.plan().is_empty() {
+        if prepared.plan().already_fully_compacted() {
+            println!("the store is already fully compacted; nothing to do");
+        } else {
+            println!("no maintenance mutations are needed; review any warnings above");
+        }
+        let repaired = prepared.repaired_archives();
+        if repaired != 0 {
+            // "Nothing to do" must not read as "nothing happened": index
+            // rebuilds run before planning and are already durable.
+            println!(
+                "note: {repaired} archive index rebuild(s) above were already applied; \
+                 the originals remain under .bak names"
+            );
+        }
         return Ok(true);
     }
     if !confirm(
         &format!(
             "about to apply this compaction plan to {}",
-            crate::output::sanitize_terminal_path(preview.directory())
+            crate::output::sanitize_terminal_path(prepared.plan().directory())
         ),
         confirmation,
         reporter,
     ) {
         eprintln!("froe: compaction cancelled");
+        let repaired = prepared.repaired_archives();
+        if repaired != 0 {
+            // The repair is already durable. Saying "cancelled" alone
+            // would imply the store is untouched, and it is not.
+            eprintln!(
+                "froe: note: the {repaired} archive index rebuild(s) above were already \
+                 applied and are not undone by cancelling; the originals remain under \
+                 .bak names"
+            );
+        }
         return Ok(false);
     }
-
-    let prepared = PreparedCompaction::prepare_with_progress(
-        preview.directory(),
-        options,
-        &mut reporter.clone(),
-    )?;
-    if prepared.plan() != &preview {
-        reporter.finish();
-        let repaired = prepared.repaired_archives();
-        announce_authoritative_plan(prepared.plan(), repaired);
-        if !confirm(
-            "about to apply the changed authoritative compaction plan",
-            confirmation,
-            reporter,
-        ) {
-            eprintln!("froe: compaction cancelled");
-            if repaired != 0 {
-                // The repair is already durable. Saying "cancelled" alone
-                // would imply the store is untouched, and it is not.
-                eprintln!(
-                    "froe: note: the {repaired} archive index rebuild(s) above were already \
-                     applied and are not undone by cancelling; the originals remain under \
-                     .bak names"
-                );
-            }
-            return Ok(false);
-        }
-    }
-    // The preview has served its only purpose — the comparison above — and
-    // holds a second copy of every store-wide set the plan carries. Release
-    // it before the apply rather than pinning both plans through the phase
-    // that needs the memory.
-    drop(preview);
-    // Captured from the authoritative plan before it is consumed: the
-    // preview's figures can be stale, and the operator reads the summary
+    // Captured before the plan is consumed: the operator reads the summary
     // after minutes of progress output has scrolled the warnings away.
     let retention = RetentionSummary::of(prepared.plan());
+    let full_copy_planned =
+        prepared.plan().effective_compaction_kind() == Some(froe::CompactionKind::Full);
+    let purge_summary = purge_summary_of(prepared.plan());
     let outcome = prepared.apply_with_progress(&mut reporter.clone())?;
     reporter.finish();
     let complete = outcome.is_complete();
     print_cleanup_summary(&outcome, retention);
+    if complete
+        && let Some((histories, purged_nodes, head_nodes_before)) = purge_summary
+        && let Some(compacted) = outcome.compacted
+    {
+        println!(
+            "nodes: {} -> {} (removed {} orphaned version histories holding {} nodes)",
+            crate::progress::format_count(head_nodes_before),
+            crate::progress::format_count(compacted.nodes),
+            crate::progress::format_count(histories),
+            crate::progress::format_count(purged_nodes),
+        );
+    }
+    if complete && full_copy_planned && outcome.compacted.is_some() {
+        println!("the store is now fully compacted; a repeat run will report nothing to do");
+    }
     for failure in outcome.deletion_failures() {
         eprintln!("{}", cleanup_deletion_warning(failure));
     }
@@ -194,6 +189,28 @@ pub(crate) fn run_compact(
         eprintln!("{}", cleanup_partial_summary(outcome.deletion_failures()));
     }
     Ok(complete)
+}
+
+/// The purge the confirmed plan carries, as `(histories, nodes, head
+/// nodes before)`, so the summary can state the content delta after the
+/// progress output has scrolled the plan away.
+fn purge_summary_of(plan: &froe::CompactionPlan) -> Option<(u64, u64, u64)> {
+    let mut purge = None;
+    let mut head_nodes_before = 0;
+    for action in plan.actions() {
+        match action {
+            CompactionAction::PurgeOrphanedVersionHistories {
+                histories, nodes, ..
+            } => {
+                purge = Some((*histories, *nodes));
+            }
+            CompactionAction::CopyHeadIntoFreshGeneration { head_nodes, .. } => {
+                head_nodes_before = *head_nodes;
+            }
+            _ => {}
+        }
+    }
+    purge.map(|(histories, nodes)| (histories, nodes, head_nodes_before))
 }
 
 /// What the applied plan identified as reclaimable and then kept.
@@ -457,6 +474,27 @@ fn print_store_action(action: &CompactionAction) {
                 froe::format_byte_size(*bytes)
             );
         }
+        CompactionAction::PurgeOrphanedVersionHistories {
+            histories,
+            nodes,
+            retained_checkpoints,
+        } => {
+            println!(
+                "  purge {} orphaned version histories ({} nodes) by omitting them from the copy",
+                crate::progress::format_count(*histories),
+                crate::progress::format_count(*nodes),
+            );
+            println!("    their versionables no longer exist; removal is permanent");
+            println!(
+                "    a versionable recreated with its old identifier will no longer re-attach a purged history"
+            );
+            if *retained_checkpoints != 0 {
+                println!(
+                    "    {} retained checkpoints keep their own snapshots of these histories; that storage returns when the checkpoints expire",
+                    crate::progress::format_count(*retained_checkpoints)
+                );
+            }
+        }
         CompactionAction::RetireJournalHistory { revisions } => {
             println!(
                 "  retire all {} journal lines, keeping only the compacted head",
@@ -481,6 +519,78 @@ fn print_store_action(action: &CompactionAction) {
     }
 }
 
+/// Where the content's external binaries live, so blob-store expectations
+/// land on blob-store garbage collection rather than on this run. Silent
+/// when the store references none: a line about an absent blob store would
+/// only raise the question it exists to answer.
+fn print_external_binary_footprint(footprint: froe::ExternalBinaryFootprint) {
+    if footprint.distinct_references == 0 {
+        return;
+    }
+    let count = crate::progress::format_count(footprint.distinct_references);
+    let size = match (footprint.measured_bytes, footprint.unmeasured_references) {
+        (0, _) => String::new(),
+        (bytes, 0) => format!(" (about {})", froe::format_byte_size(bytes)),
+        (bytes, unmeasured) => format!(
+            " (about {}; length unknown for {})",
+            froe::format_byte_size(bytes),
+            crate::progress::format_count(unmeasured)
+        ),
+    };
+    println!(
+        "content references {count} external binaries{size} in the blob store; compaction never affects those bytes, which return only through blob-store garbage collection after content deletion"
+    );
+}
+
+/// The always-on orphaned-version-history report: what the semantically
+/// dead histories hold, and how to purge them. Printed whenever there is
+/// something to say, so the flag that removes them gets discovered from
+/// the very plan that surfaces them.
+fn print_orphaned_version_history_report(report: froe::OrphanedVersionHistoryReport) {
+    if report.orphaned_histories == 0 && report.malformed_identifiers == 0 {
+        return;
+    }
+    println!(
+        "orphaned version histories: {} (their versionables no longer exist)",
+        crate::progress::format_count(report.orphaned_histories)
+    );
+    if report.orphaned_histories != 0 {
+        println!(
+            "  holding {} nodes, {} of inline binary content, and {} external binary references",
+            crate::progress::format_count(report.orphaned_nodes),
+            froe::format_byte_size(report.inline_binary_bytes),
+            crate::progress::format_count(report.external_references),
+        );
+        // A ceiling, not a promise: a record shared between a purged
+        // history and one the store keeps retains its blocks (Oak's writer
+        // dedups identical frozen subtrees into shared records), and a
+        // retained checkpoint's snapshot can pin blocks until it expires.
+        let checkpoint_caveat = if report.retained_checkpoints == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {} retained checkpoints may pin some until they expire",
+                crate::progress::format_count(report.retained_checkpoints)
+            )
+        };
+        println!(
+            "  a purge releases up to {} bulk segments ({}{checkpoint_caveat}) and about {} of node records (realized by the copy)",
+            crate::progress::format_count(report.released_bulk_segments),
+            froe::format_byte_size(report.released_bulk_bytes),
+            froe::format_byte_size(report.node_record_bytes_estimate),
+        );
+        println!(
+            "  purge with --purge-orphaned-version-histories; removal is permanent and is listed above when selected"
+        );
+    }
+    if report.malformed_identifiers != 0 {
+        println!(
+            "  {} histories carry versionable identifiers that do not parse and were not classified",
+            crate::progress::format_count(report.malformed_identifiers)
+        );
+    }
+}
+
 /// The plan's totals: what it would reclaim, what it deliberately keeps,
 /// and what the rewrites cost while they run.
 fn print_plan_totals(plan: &CompactionPlan) {
@@ -498,10 +608,53 @@ fn print_plan_totals(plan: &CompactionPlan) {
             "index rebuilds need {repair_size} of transient space and leave {repair_size} of .bak files: the repository grows until those are retired"
         );
     }
-    println!(
-        "estimated reclaimable: {}",
-        froe::format_byte_size(plan.estimated_reclaimable_bytes())
-    );
+    // A run that copies has two sides, and an estimate that states only the
+    // reclaimed one over-promises by the size of the generation it writes:
+    // a swap that removes one generation and writes an equal one nets
+    // nothing. The net line says which way the store actually moves.
+    if let Some(copy_output) = plan.predicted_copy_output_bytes() {
+        let reclaimable = plan.estimated_reclaimable_bytes();
+        let target_generation = plan.actions().iter().find_map(|action| match action {
+            CompactionAction::CopyHeadIntoFreshGeneration {
+                target_generation, ..
+            } => Some(*target_generation),
+            _ => None,
+        });
+        match target_generation {
+            Some(generation) => println!(
+                "the copy writes about {} into generation ({},{},compacted)",
+                froe::format_byte_size(copy_output),
+                generation.generation,
+                generation.full_generation,
+            ),
+            None => println!(
+                "the copy writes about {} into the fresh generation",
+                froe::format_byte_size(copy_output)
+            ),
+        }
+        println!(
+            "the sweep reclaims about {} of archives and entries",
+            froe::format_byte_size(reclaimable)
+        );
+        if reclaimable >= copy_output {
+            println!(
+                "estimated net change: about {} reclaimed",
+                froe::format_byte_size(reclaimable - copy_output)
+            );
+        } else {
+            println!(
+                "estimated net change: about {} of growth (the fresh generation exceeds what the sweep removes)",
+                froe::format_byte_size(copy_output - reclaimable)
+            );
+        }
+    } else {
+        println!(
+            "estimated reclaimable: {}",
+            froe::format_byte_size(plan.estimated_reclaimable_bytes())
+        );
+    }
+    print_external_binary_footprint(plan.external_binary_footprint());
+    print_orphaned_version_history_report(plan.orphaned_version_histories());
     // A zero estimate has two very different meanings — "no garbage" and
     // "garbage this run declined to move" — and the run used to print the
     // same line for both. These two say which one it is.
@@ -526,6 +679,20 @@ fn print_cleanup_plan(plan: &CompactionPlan) {
         crate::output::sanitize_terminal_path(plan.directory()),
         plan.current_head()
     );
+    // The convergence verdict comes before the actions, because it explains
+    // an absence: an operator who selected a compaction and sees no copy
+    // line must learn it was proven unnecessary, not lost.
+    if plan.already_fully_compacted() {
+        if plan.effective_compaction_kind().is_some() {
+            println!(
+                "  the head is already fully compacted; --always-copy forces the copy regardless"
+            );
+        } else {
+            println!(
+                "  the head is already fully compacted; the selected copy would replace this generation with an identical one and was dropped from the plan"
+            );
+        }
+    }
     if plan.actions().is_empty() {
         println!("  no mutations");
     }

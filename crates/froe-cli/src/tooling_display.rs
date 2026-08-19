@@ -13,7 +13,7 @@ use froe::tooling::archive_debug::{
     ArchiveDebugState, ArchiveGraphReferences, ArchivePathReference, debug_archive,
 };
 use froe::tooling::diff::{NodeDifference, PropertyChange};
-use froe::tooling::digest::{DigestSummary, compare_digests, digest_repository};
+use froe::tooling::digest::{DigestSummary, compare_digests, digest_repository_excluding};
 use froe::tooling::search::SearchQuery;
 use froe::tooling::{
     BinaryCheck, check_consistency_with_progress, diff_revisions_with_progress, dump_segment,
@@ -303,6 +303,7 @@ pub(crate) fn print_digest(
     repository_path: &Path,
     output_path: Option<&Path>,
     baseline_path: Option<&Path>,
+    exclude_subtrees: &[String],
 ) -> froe::Result<bool> {
     let repository = Repository::open(repository_path)?;
 
@@ -312,7 +313,7 @@ pub(crate) fn print_digest(
     // — and the common case, taking a digest before a maintenance run, has
     // no baseline to compare against yet.
     let Some(baseline_path) = baseline_path else {
-        let Some(summary) = stream_digest(&repository, output_path)? else {
+        let Some(summary) = stream_digest(&repository, output_path, exclude_subtrees)? else {
             // The consumer closed the pipe partway through, so there is no
             // complete digest and no verdict to give.
             return Ok(true);
@@ -322,7 +323,7 @@ pub(crate) fn print_digest(
     };
 
     let mut rendered = Vec::new();
-    let summary = digest_repository(&repository, &mut rendered)?;
+    let summary = digest_repository_excluding(&repository, exclude_subtrees, &mut rendered)?;
     let digest = String::from_utf8(rendered).map_err(|error| froe::Error::InvalidFormat {
         details: format!("the digest is not valid UTF-8: {error}"),
     })?;
@@ -383,10 +384,11 @@ pub(crate) fn print_digest(
 fn stream_digest(
     repository: &Repository,
     output_path: Option<&Path>,
+    exclude_subtrees: &[String],
 ) -> froe::Result<Option<DigestSummary>> {
     if let Some(path) = output_path {
         let mut file = io::BufWriter::new(std::fs::File::create(path)?);
-        let summary = digest_repository(repository, &mut file)?;
+        let summary = digest_repository_excluding(repository, exclude_subtrees, &mut file)?;
         file.flush()?;
         return Ok(Some(summary));
     }
@@ -394,7 +396,11 @@ fn stream_digest(
     let mut locked = io::BufWriter::new(stdout.lock());
     let mut summary = None;
     write_diagnostic_handling_observed_broken_pipe(&mut locked, |output| {
-        summary = Some(digest_repository(repository, output)?);
+        summary = Some(digest_repository_excluding(
+            repository,
+            exclude_subtrees,
+            output,
+        )?);
         Ok(())
     })?;
     Ok(summary)

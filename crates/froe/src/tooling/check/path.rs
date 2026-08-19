@@ -104,11 +104,13 @@ pub(crate) fn display_relative(relative_path: &str) -> &str {
 
 /// Checks one node without recursing: every property is decoded, and —
 /// when asked — every inline binary is read, exactly Java's `checkNode`.
+/// Returns the decoded properties, which the walk already paid for, so a
+/// caller collecting content facts never decodes a node twice.
 pub(crate) fn check_node_shallow(
     provider: &dyn SegmentProvider,
     record: RecordIdentifier,
     binary_check: BinaryCheck,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Vec<crate::content::node::PropertyState>, String> {
     let node = NodeState::new(provider, record);
     let properties = node.properties().map_err(|error| error.to_string())?;
     if binary_check == BinaryCheck::EveryBlock {
@@ -125,7 +127,7 @@ pub(crate) fn check_node_shallow(
             }
         }
     }
-    Ok(())
+    Ok(properties)
 }
 
 /// Resolves a content path under its root: the head's content root, or a

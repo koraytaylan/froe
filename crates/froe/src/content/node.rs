@@ -685,7 +685,7 @@ mod tests {
             .map(|(index, name)| (1 + index as u32, 4, small_string_record(name)))
             .collect();
         for (index, name) in names.iter().enumerate() {
-            records.push((10 + index as u32, 4, small_string_record(*name)));
+            records.push((10 + index as u32, 4, small_string_record(name)));
         }
         let mut name_bucket = Vec::new();
         for record_number in 1..=4u32 {

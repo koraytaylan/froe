@@ -186,6 +186,17 @@ pub(crate) fn run_absence_child(directory: &Path, scenario: &str, cutpoint: &str
 
 pub(crate) fn scenario_options(scenario: &str) -> CompactionOptions {
     let task = match scenario {
+        COMPACTION_PUBLICATION_SCENARIO => {
+            return CompactionOptions::default()
+                .with_tasks([MaintenanceTask::Segments])
+                .with_compaction(CompactionKind::Full);
+        }
+        PURGING_PUBLICATION_SCENARIO => {
+            return CompactionOptions::default()
+                .with_tasks([MaintenanceTask::Segments])
+                .with_compaction(CompactionKind::Full)
+                .with_orphaned_version_history_purge();
+        }
         CHECKPOINT_SCENARIO | MANIFEST_SCENARIO => MaintenanceTask::UnreferencedCheckpoints,
         SWEEP_SCENARIO => MaintenanceTask::Segments,
         JOURNAL_SCENARIO => MaintenanceTask::Journal,
@@ -389,6 +400,83 @@ pub(crate) const REMOVAL_SCENARIO: &str = "removal";
 pub(crate) const STALE_ARCHIVE_SCENARIO: &str = "stale-archive";
 
 pub(crate) const POSTCOMPACTION_SWEEP_SCENARIO: &str = "postcomp-sweep";
+
+pub(crate) const COMPACTION_PUBLICATION_SCENARIO: &str = "compaction-publication";
+
+pub(crate) const PURGING_PUBLICATION_SCENARIO: &str = "purging-publication";
+
+/// A repository carrying one orphaned version history, so a purging run has
+/// a real omission to perform when a probe interrupts it.
+pub(crate) fn write_orphaned_history_fixture(directory: &Path) {
+    use crate::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
+    let store = WritableRepository::open(directory).expect("bootstrap the purge fixture");
+    let generation = store.writing_generation().expect("writing generation");
+    let mut writer = store.record_writer(generation);
+    let versionable = writer
+        .write_string("bbbbbbbb-2222-4222-8222-222222222222")
+        .expect("versionable identifier");
+    let history = writer
+        .write_node(
+            Some("nt:versionHistory"),
+            &[],
+            &ChildNodesToWrite::Zero,
+            &[PropertyToWrite {
+                name: "jcr:versionableUuid".to_owned(),
+                property_type: crate::content::property::PropertyType::String,
+                values: PropertyValuesToWrite::Single(versionable),
+            }],
+        )
+        .expect("history");
+    let version_storage = writer
+        .write_node(
+            Some("rep:versionStorage"),
+            &[],
+            &ChildNodesToWrite::One {
+                name: "bbbbbbbb-2222-4222-8222-222222222222".to_owned(),
+                node: history,
+            },
+            &[],
+        )
+        .expect("version storage");
+    let jcr_system = writer
+        .write_node(
+            Some("rep:system"),
+            &[],
+            &ChildNodesToWrite::One {
+                name: "jcr:versionStorage".to_owned(),
+                node: version_storage,
+            },
+            &[],
+        )
+        .expect("jcr:system");
+    let root = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "jcr:system".to_owned(),
+                node: jcr_system,
+            },
+            &[],
+        )
+        .expect("root");
+    let head = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "root".to_owned(),
+                node: root,
+            },
+            &[],
+        )
+        .expect("super root");
+    writer.finish().expect("finish");
+    let previous = store.head();
+    assert!(store.compare_and_set_head(previous, head));
+    store.flush().expect("flush");
+    store.close().expect("close the purge fixture");
+}
 
 pub(crate) const JOURNAL_SCENARIO: &str = "journal";
 

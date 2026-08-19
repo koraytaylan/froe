@@ -206,11 +206,62 @@ pub fn deep_copy_super_root_sharing<Sink: SegmentSink>(
     bulk_sharing: BulkBlockSharing,
     observer: &mut dyn ProgressObserver,
 ) -> Result<(RecordIdentifier, u64)> {
+    deep_copy_super_root_omitting_subtrees(
+        source,
+        writer,
+        super_root,
+        omitted_checkpoints,
+        &SubtreeOmissions {
+            omitted_subtree_records: &std::collections::HashSet::new(),
+            context_dependent_records: &std::collections::HashSet::new(),
+        },
+        bulk_sharing,
+        observer,
+    )
+}
+
+/// The subtree omissions a purging copy applies outside checkpoint
+/// snapshots: the roots it declines to enter, and the ancestors whose
+/// rewritten form therefore depends on the scope.
+pub struct SubtreeOmissions<'omissions> {
+    /// The records the copy never enters outside checkpoint snapshots.
+    pub omitted_subtree_records: &'omissions std::collections::HashSet<RecordIdentifier>,
+    /// The ancestors on the path from the content root down to each omitted
+    /// record, memoized per scope because the head's copy and a checkpoint
+    /// snapshot's copy of them differ.
+    pub context_dependent_records: &'omissions std::collections::HashSet<RecordIdentifier>,
+}
+
+/// Deep-copies a super-root, additionally omitting whole subtrees by their
+/// root records — outside checkpoint snapshots, which keep everything they
+/// froze. This is the confirmed version-history purge's entry point: the
+/// omitted subtrees simply never enter the fresh generation, exactly the
+/// mechanism checkpoint retirement uses, and the reclaim pass that follows
+/// the copy is what turns the omission into reclaimed space.
+///
+/// # Panics
+///
+/// Panics on the same copy-once violations as [`deep_copy_tree_with_progress`].
+pub fn deep_copy_super_root_omitting_subtrees<Sink: SegmentSink>(
+    source: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    super_root: RecordIdentifier,
+    omitted_checkpoints: &std::collections::BTreeSet<String>,
+    omissions: &SubtreeOmissions<'_>,
+    bulk_sharing: BulkBlockSharing,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(RecordIdentifier, u64)> {
     let source_root = super_root;
     let mut copier = Compactor {
         source,
         writer,
         omitted_checkpoints,
+        omitted_subtree_records: omissions.omitted_subtree_records,
+        context_dependent_records: omissions.context_dependent_records,
+        scoped_rewrites: [
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        ],
         bulk_sharing,
         segments: SegmentInterner::new(),
         rewritten_nodes: RewrittenNodes::new(),
@@ -227,8 +278,14 @@ pub fn deep_copy_super_root_sharing<Sink: SegmentSink>(
     // growth that lost entries. One pass over the slots at the end of a copy
     // that took minutes.
     let memoized = copier.rewritten_nodes.occupied_slots();
+    let scoped: usize = copier
+        .scoped_rewrites
+        .iter()
+        .map(std::collections::HashMap::len)
+        .sum();
     assert_eq!(
-        copier.compacted_nodes, memoized as u64,
+        copier.compacted_nodes,
+        (memoized + scoped) as u64,
         "copied node count diverged from the number of memoized nodes"
     );
     assert_eq!(

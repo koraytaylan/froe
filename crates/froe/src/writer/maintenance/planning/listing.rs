@@ -18,6 +18,9 @@ pub(crate) struct PlanFindings<'findings> {
     pub(crate) recovery_backups: &'findings [PlannedFileRemoval],
     pub(crate) manifest_upgrade: bool,
     pub(crate) head_nodes: u64,
+    /// The selected purge's `(histories, nodes, retained checkpoints)`,
+    /// when one is selected.
+    pub(crate) version_history_purge: Option<(u64, u64, u64)>,
 }
 
 /// The ordered action list an operator confirms, with the totals that
@@ -241,6 +244,7 @@ pub(crate) fn list_file_removal_actions(
 /// into a fresh generation, and the journal history that copy retires.
 pub(crate) fn list_head_moving_actions(
     options: &crate::writer::maintenance::options::CompactionOptions,
+    effective_compaction_kind: Option<super::CompactionKind>,
     checkpoints: &CheckpointPlan,
     journal_analysis: &JournalAnalysis,
     raw_journal: &RawJournal,
@@ -253,7 +257,7 @@ pub(crate) fn list_head_moving_actions(
             unreferenced: checkpoints.unreferenced,
         });
     }
-    if options.compaction_kind.is_some() {
+    if effective_compaction_kind.is_some() {
         // Every revision goes, whether or not it still resolves: the run keeps
         // only the line naming the head it is about to write. This is the
         // irreversible half of a maintenance run, so the plan states it plainly
@@ -292,6 +296,7 @@ pub(crate) fn list_planned_actions(
         recovery_backups,
         manifest_upgrade,
         head_nodes,
+        version_history_purge,
     } = findings;
     let RepositoryState {
         raw_journal,
@@ -307,6 +312,7 @@ pub(crate) fn list_planned_actions(
         residue_sweep,
         predicted_sweep,
         residue_segments,
+        effective_compaction_kind,
         ..
     } = segment_work;
     let (reference_generation, residue_segments) = (*reference_generation, *residue_segments);
@@ -329,7 +335,14 @@ pub(crate) fn list_planned_actions(
             segments: residue_segments,
         });
     }
-    if let Some(kind) = options.compaction_kind {
+    if let Some((histories, nodes, retained_checkpoints)) = version_history_purge {
+        actions.push(CompactionAction::PurgeOrphanedVersionHistories {
+            histories,
+            nodes,
+            retained_checkpoints,
+        });
+    }
+    if let Some(kind) = *effective_compaction_kind {
         actions.push(CompactionAction::CopyHeadIntoFreshGeneration {
             head_nodes,
             target_generation: compaction_target_generation(reference_generation, kind),
@@ -357,6 +370,7 @@ pub(crate) fn list_planned_actions(
     }
     list_head_moving_actions(
         options,
+        *effective_compaction_kind,
         checkpoints,
         journal_analysis,
         raw_journal,

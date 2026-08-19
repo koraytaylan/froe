@@ -40,15 +40,16 @@ pub use commit::{
     replace_content_root,
 };
 pub use compaction::{
-    CompactionKind, deep_copy_super_root_sharing, deep_copy_super_root_with_progress,
-    deep_copy_tree, deep_copy_tree_across_stores_with_progress, deep_copy_tree_with_progress,
+    CompactionKind, SubtreeOmissions, deep_copy_super_root_omitting_subtrees,
+    deep_copy_super_root_sharing, deep_copy_super_root_with_progress, deep_copy_tree,
+    deep_copy_tree_across_stores_with_progress, deep_copy_tree_with_progress,
 };
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};
 pub use maintenance::{
     CompactedGeneration, CompactionAction, CompactionOptions, CompactionOutcome, CompactionPlan,
-    FileDeletionFailure, JournalLineRemoval, JournalRemovalReason, PreparedCompaction,
-    RecoveryBackupPolicy, StaleArchiveReason, compact, compact_with_progress, plan_compaction,
-    plan_compaction_with_progress,
+    ExternalBinaryFootprint, FileDeletionFailure, JournalLineRemoval, JournalRemovalReason,
+    OrphanedVersionHistoryReport, PreparedCompaction, RecoveryBackupPolicy, StaleArchiveReason,
+    compact, compact_with_progress, plan_compaction, plan_compaction_with_progress,
 };
 pub use record_writer::{
     BulkBlockSharing, ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter,

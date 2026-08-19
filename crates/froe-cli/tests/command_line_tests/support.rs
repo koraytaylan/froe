@@ -207,6 +207,125 @@ impl Drop for InteractiveCleanup {
     }
 }
 
+/// Populates a store carrying one orphaned version history — a
+/// `nt:versionHistory` whose `jcr:versionableUuid` matches no live
+/// `jcr:uuid` — beside ordinary live content.
+pub(crate) fn populate_with_orphaned_history(directory: &std::path::Path) {
+    let store = WritableRepository::open(directory).expect("open");
+    let generation = store.writing_generation().expect("generation");
+    let mut writer = store.record_writer(generation);
+    let jcr_system = write_orphaned_history_system(&mut writer);
+    let content = writer
+        .write_node(Some("nt:unstructured"), &[], &ChildNodesToWrite::Zero, &[])
+        .expect("content");
+    let root = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(vec![
+                ("content".to_owned(), content),
+                ("jcr:system".to_owned(), jcr_system),
+            ]),
+            &[],
+        )
+        .expect("root");
+    let head = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "root".to_owned(),
+                node: root,
+            },
+            &[],
+        )
+        .expect("super root");
+    writer.finish().expect("finish");
+    let previous = store.head();
+    assert!(store.compare_and_set_head(previous, head));
+    store.flush().expect("flush");
+    store.close().expect("close");
+}
+
+/// The `jcr:system` subtree holding one orphaned version history.
+fn write_orphaned_history_system(
+    writer: &mut froe::writer::record_writer::RecordWriter<
+        impl froe::writer::record_writer::SegmentSink,
+    >,
+) -> froe::RecordIdentifier {
+    let orphan_versionable = "bbbbbbbb-2222-4222-8222-222222222222";
+    let string_property = |writer: &mut froe::writer::record_writer::RecordWriter<_>,
+                           name: &str,
+                           property_type: froe::PropertyType,
+                           text: &str| {
+        let value = writer.write_string(text).expect("property value");
+        froe::writer::record_writer::PropertyToWrite {
+            name: name.to_owned(),
+            property_type,
+            values: froe::writer::record_writer::PropertyValuesToWrite::Single(value),
+        }
+    };
+    let created = string_property(
+        writer,
+        "jcr:created",
+        froe::PropertyType::Date,
+        "2020-01-01T00:00:00.000Z",
+    );
+    let version_identifier = string_property(
+        writer,
+        "jcr:uuid",
+        froe::PropertyType::String,
+        "bbbbbbbb-2222-4222-8222-aaaaaaaaaaaa",
+    );
+    let root_version = writer
+        .write_node(
+            Some("nt:version"),
+            &[],
+            &ChildNodesToWrite::Zero,
+            &[version_identifier, created],
+        )
+        .expect("root version");
+    let versionable = string_property(
+        writer,
+        "jcr:versionableUuid",
+        froe::PropertyType::String,
+        orphan_versionable,
+    );
+    let history = writer
+        .write_node(
+            Some("nt:versionHistory"),
+            &[],
+            &ChildNodesToWrite::One {
+                name: "jcr:rootVersion".to_owned(),
+                node: root_version,
+            },
+            &[versionable],
+        )
+        .expect("history");
+    let version_storage = writer
+        .write_node(
+            Some("rep:versionStorage"),
+            &[],
+            &ChildNodesToWrite::One {
+                name: orphan_versionable.to_owned(),
+                node: history,
+            },
+            &[],
+        )
+        .expect("version storage");
+    writer
+        .write_node(
+            Some("rep:system"),
+            &[],
+            &ChildNodesToWrite::One {
+                name: "jcr:versionStorage".to_owned(),
+                node: version_storage,
+            },
+            &[],
+        )
+        .expect("jcr:system")
+}
+
 /// Writes a store whose content tree is `/content`.
 pub(crate) fn populate(directory: &std::path::Path) {
     let store = WritableRepository::open(directory).expect("open");

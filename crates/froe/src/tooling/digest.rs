@@ -146,16 +146,54 @@ pub fn digest_repository<Output: Write + ?Sized>(
     repository: &Repository,
     output: &mut Output,
 ) -> Result<DigestSummary> {
+    digest_repository_excluding(repository, &[], output)
+}
+
+/// Digests exactly like [`digest_repository`], omitting the content
+/// subtrees under the given path prefixes — the mechanism that lets a
+/// digest taken before a confirmed version-history purge be compared
+/// against one taken after it, with the purge and nothing else excused.
+///
+/// The exclusions apply to the head's content tree only, never to
+/// checkpoint snapshots: a purge preserves those, so their sections must
+/// stay byte-identical. A digest with exclusions opens by naming them —
+/// `#excluded`, a tab, and each prefix — so two digests are never compared blind; the
+/// comparison helpers treat that header as a line like any other, which
+/// makes a full digest and an excluding one deliberately incomparable.
+pub fn digest_repository_excluding<Output: Write + ?Sized>(
+    repository: &Repository,
+    excluded_content_prefixes: &[String],
+    output: &mut Output,
+) -> Result<DigestSummary> {
     let mut summary = DigestSummary::default();
     let mut renderer = Renderer {
         repository,
         buffer: vec![0u8; BINARY_BUFFER_BYTES],
         binary_checksums: BoundedCache::new(BINARY_CHECKSUM_CACHE_BUDGET_BYTES),
     };
+    if !excluded_content_prefixes.is_empty() {
+        let mut sorted: Vec<&String> = excluded_content_prefixes.iter().collect();
+        sorted.sort();
+        let mut header = String::from("#excluded");
+        for prefix in sorted {
+            header.push('\t');
+            header.push_str(&escape(prefix));
+        }
+        header.push('\n');
+        output
+            .write_all(header.as_bytes())
+            .map_err(Error::InputOutput)?;
+    }
 
     // The content tree first, so the commonest diff — a content change —
     // appears at the top of the output rather than after the checkpoints.
-    renderer.walk(&repository.content_root()?, "", output, &mut summary)?;
+    renderer.walk_excluding(
+        &repository.content_root()?,
+        "",
+        excluded_content_prefixes,
+        output,
+        &mut summary,
+    )?;
 
     // The super-root's own properties. Its children are `root` and
     // `checkpoints`, both rendered separately, so only the line is emitted.
@@ -171,7 +209,7 @@ pub fn digest_repository<Output: Write + ?Sized>(
         checkpoint_names.insert(name.clone());
         summary.checkpoints += 1;
         let path = format!("{CHECKPOINT_PATH_PREFIX}/{}", escape(name));
-        renderer.walk(node, &path, output, &mut summary)?;
+        renderer.walk_excluding(node, &path, &[], output, &mut summary)?;
     }
 
     summary.dangling_async_checkpoints = dangling_async_checkpoints(repository, &checkpoint_names)?;
@@ -215,11 +253,20 @@ enum Step<'provider> {
     },
 }
 
+/// Whether `path` lies under any of the excluded prefixes (or is one).
+fn excluded(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        path.strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
 impl Renderer<'_> {
-    fn walk<Output: Write + ?Sized>(
+    fn walk_excluding<Output: Write + ?Sized>(
         &mut self,
         root: &NodeState<'_>,
         root_path: &str,
+        excluded_prefixes: &[String],
         output: &mut Output,
         summary: &mut DigestSummary,
     ) -> Result<()> {
@@ -270,6 +317,9 @@ impl Renderer<'_> {
                     }
                     for (name, child) in entries.into_iter().rev() {
                         let child_path = format!("{path}/{}", escape(&name));
+                        if excluded(&child_path, excluded_prefixes) {
+                            continue;
+                        }
                         stack.push(Step::Visit {
                             node: child,
                             path: child_path,

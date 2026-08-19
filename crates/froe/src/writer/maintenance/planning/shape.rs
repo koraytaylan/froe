@@ -35,6 +35,25 @@ pub(in crate::writer::maintenance) struct FileFingerprint {
 }
 
 pub(in crate::writer::maintenance) fn validate_options(options: &CompactionOptions) -> Result<()> {
+    // The purge rides the copy: its removals become real when the copy
+    // declines to carry the histories, and only a *full* compaction then
+    // reclaims their generation — tail reclamation retains the shared full
+    // generation, which could leave every released record on disk after a
+    // run that promised to remove them.
+    if options.purge_orphaned_version_histories
+        && options.compaction_kind != Some(crate::writer::compaction::CompactionKind::Full)
+    {
+        return Err(Error::InvalidFormat {
+            details: "purging orphaned version histories requires a full compaction".to_owned(),
+        });
+    }
+    if options.purged_history_minimum_age.is_some() && !options.purge_orphaned_version_histories {
+        return Err(Error::InvalidFormat {
+            details:
+                "a purged-history minimum age needs the orphaned-version-history purge selected"
+                    .to_owned(),
+        });
+    }
     if options.contains(MaintenanceTask::RecoveryBackups)
         && options.recovery_backup_policy.is_none()
     {

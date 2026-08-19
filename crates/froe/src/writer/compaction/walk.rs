@@ -22,6 +22,26 @@ pub(crate) struct Compactor<'writer, Sink: SegmentSink> {
     /// Children of the super-root's `checkpoints` container this copy never
     /// enters. Empty for every copy that is not a maintenance run's.
     pub(crate) omitted_checkpoints: &'writer std::collections::BTreeSet<String>,
+    /// Subtree roots this copy never enters *outside checkpoint snapshots*
+    /// — the confirmed version-history purge. The checkpoint scoping is the
+    /// point: a checkpoint's snapshot keeps its own version storage, so the
+    /// same record reached through a retained checkpoint is still copied,
+    /// and only the head loses the subtree. Empty for every copy that is
+    /// not a purging maintenance run's.
+    pub(crate) omitted_subtree_records:
+        &'writer std::collections::HashSet<crate::segment::record::RecordIdentifier>,
+    /// Records whose subtree contains an omission point — the ancestors on
+    /// the path from the content root down to each omitted record. Their
+    /// rewritten form depends on the scope: the head's copy loses the
+    /// omitted subtrees, a checkpoint snapshot's copy keeps them. They are
+    /// therefore memoized per scope rather than globally, so a copy shared
+    /// through the memo can never leak one scope's shape into the other —
+    /// whichever order the walk reaches them in.
+    pub(crate) context_dependent_records:
+        &'writer std::collections::HashSet<crate::segment::record::RecordIdentifier>,
+    /// The per-scope memos for context-dependent records, keyed like the
+    /// global memo: `[head scope, checkpoint scope]`.
+    pub(crate) scoped_rewrites: [std::collections::HashMap<u64, u64>; 2],
     /// Interns the segments both the memo and the path set name.
     pub(crate) segments: SegmentInterner,
     /// Source record to its rewritten copy — exact, so each distinct node is
@@ -55,6 +75,9 @@ pub(crate) struct CompactionFrame {
     /// The name this node has in its parent, so the rewritten record can be
     /// attached when the frame pops. `None` for the root.
     pub(crate) name_in_parent: Option<String>,
+    /// Whether this node lies inside a checkpoint snapshot, where subtree
+    /// omissions never apply.
+    pub(crate) within_checkpoints: bool,
     /// Remaining children to descend into, in reverse order so the next one
     /// is a `pop`.
     pub(crate) pending_children: Vec<(String, RecordIdentifier)>,
@@ -75,7 +98,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         &mut self,
         source_root: RecordIdentifier,
     ) -> Result<RecordIdentifier> {
-        let mut stack = match self.enter(source_root)? {
+        let mut stack = match self.enter(source_root, false)? {
             Entered::Fresh(root) => vec![root],
             Entered::Memoized(rewritten) => return Ok(rewritten),
         };
@@ -87,7 +110,17 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
                 .pending_children
                 .pop();
             if let Some((name, child)) = next {
-                match self.enter(child)? {
+                let parent = stack.last().expect("the parent frame is on the stack");
+                let within_checkpoints =
+                    parent.within_checkpoints || (stack.len() == 1 && name == "checkpoints");
+                // The purge: an omitted subtree root is simply never
+                // entered, exactly like a retired checkpoint — except
+                // inside a checkpoint snapshot, which keeps everything it
+                // froze.
+                if !within_checkpoints && self.omitted_subtree_records.contains(&child) {
+                    continue;
+                }
+                match self.enter(child, within_checkpoints)? {
                     Entered::Fresh(mut frame) => {
                         // The `checkpoints` container directly under the
                         // super-root is the one node whose child *names* this
@@ -106,6 +139,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
                             });
                         }
                         frame.name_in_parent = Some(name);
+                        frame.within_checkpoints = within_checkpoints;
                         stack.push(frame);
                     }
                     Entered::Memoized(rewritten) => stack
@@ -120,6 +154,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
             let rewritten = self.emit(
                 finished.source,
                 finished.packed,
+                finished.within_checkpoints,
                 finished.rewritten_children,
             )?;
             match stack.last_mut() {
@@ -134,11 +169,28 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         }
     }
 
-    /// Resolves one node: either the memo already holds its rewritten copy,
+    /// Which memo serves a record: the global one for the shared majority,
+    /// a per-scope one for the ancestors of omission points.
+    fn scope_index(within_checkpoints: bool) -> usize {
+        usize::from(within_checkpoints)
+    }
+
+    /// Resolves one node: either a memo already holds its rewritten copy,
     /// or a frame to descend into.
-    pub(crate) fn enter(&mut self, source_node: RecordIdentifier) -> Result<Entered> {
+    pub(crate) fn enter(
+        &mut self,
+        source_node: RecordIdentifier,
+        within_checkpoints: bool,
+    ) -> Result<Entered> {
         let packed = self.segments.pack(source_node);
-        if let Some(rewritten) = self.rewritten_nodes.get(packed) {
+        if self.context_dependent_records.contains(&source_node) {
+            if let Some(rewritten) = self.scoped_rewrites[Self::scope_index(within_checkpoints)]
+                .get(&packed)
+                .copied()
+            {
+                return Ok(Entered::Memoized(self.segments.unpack(rewritten)));
+            }
+        } else if let Some(rewritten) = self.rewritten_nodes.get(packed) {
             return Ok(Entered::Memoized(self.segments.unpack(rewritten)));
         }
         // A node reachable from itself is corruption — valid records only
@@ -165,6 +217,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
             source: source_node,
             packed,
             name_in_parent: None,
+            within_checkpoints: false,
             pending_children,
             rewritten_children: Vec::new(),
         }))
@@ -175,6 +228,7 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         &mut self,
         source_node: RecordIdentifier,
         packed_source: u64,
+        within_checkpoints: bool,
         mut child_entries: Vec<(String, RecordIdentifier)>,
     ) -> Result<RecordIdentifier> {
         let node = NodeState::new(self.source, source_node);
@@ -209,7 +263,12 @@ impl<Sink: SegmentSink> Compactor<'_, Sink> {
         )?;
         self.nodes_on_path.remove(&packed_source);
         let packed_rewritten = self.segments.pack(rewritten);
-        self.rewritten_nodes.insert(packed_source, packed_rewritten);
+        if self.context_dependent_records.contains(&source_node) {
+            self.scoped_rewrites[Self::scope_index(within_checkpoints)]
+                .insert(packed_source, packed_rewritten);
+        } else {
+            self.rewritten_nodes.insert(packed_source, packed_rewritten);
+        }
         self.compacted_nodes += 1;
         if self.compacted_nodes - self.reported_nodes >= COPIED_NODE_REPORT_STRIDE {
             self.reported_nodes = self.compacted_nodes;

@@ -29,6 +29,7 @@ pub use check::{
     BinaryCheck, ConsistencyReport, NodeTreeVerifier, PathVerdict, check_consistency,
     check_consistency_with_progress, verify_node_tree,
 };
+pub(crate) use check::{DiscardedVerifiedContent, VerifiedContentObserver};
 pub use diff::{
     NodeDifference, PropertyChange, diff_revisions, diff_revisions_visiting,
     diff_revisions_with_progress,

@@ -186,9 +186,14 @@ pub(crate) fn run_diagnostic_command(
             repository,
             output,
             baseline,
+            exclude_subtrees,
         } => {
-            if !tooling_display::print_digest(&repository, output.as_deref(), baseline.as_deref())?
-            {
+            if !tooling_display::print_digest(
+                &repository,
+                output.as_deref(),
+                baseline.as_deref(),
+                &exclude_subtrees,
+            )? {
                 return Ok(ExitCode::FAILURE);
             }
         }
@@ -243,6 +248,9 @@ pub(crate) fn run_compaction_command(
         Command::Compact {
             repository,
             tail,
+            always_copy,
+            purge_orphaned_version_histories,
+            purged_history_minimum_age_days,
             dry_run,
             yes,
             repair_archive_indexes,
@@ -258,6 +266,20 @@ pub(crate) fn run_compaction_command(
                 froe::CompactionKind::Full
             };
             let mut options = froe::CompactionOptions::default().with_compaction(kind);
+            if always_copy {
+                options = options.with_copy_when_already_compacted();
+            }
+            if purge_orphaned_version_histories {
+                options = options.with_orphaned_version_history_purge();
+            }
+            if let Some(days) = purged_history_minimum_age_days {
+                let Some(seconds) = days.checked_mul(24 * 60 * 60) else {
+                    eprintln!("froe: --purged-history-minimum-age-days is too large");
+                    return Ok(ExitCode::FAILURE);
+                };
+                options = options
+                    .with_purged_history_minimum_age(std::time::Duration::from_secs(seconds));
+            }
             if archive_rewrite_policy == ArchiveRewritePolicyArgument::OakSavingsGate {
                 options = options.with_oak_savings_gate();
             }

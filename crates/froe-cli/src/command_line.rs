@@ -182,6 +182,13 @@ pub(crate) enum Command {
         /// that differ. Exits non-zero when anything differs.
         #[arg(long)]
         baseline: Option<PathBuf>,
+        /// Omit a content subtree from the rendering; repeatable. The
+        /// digest then opens with a header naming every exclusion, so it
+        /// can never be compared blind against a full one. This is how a
+        /// digest taken before a version-history purge is compared against
+        /// one taken after it, with the purge and nothing else excused.
+        #[arg(long = "exclude-subtree")]
+        exclude_subtrees: Vec<String>,
     },
     /// Show the differences between two revisions (read-only).
     Difference {
@@ -258,6 +265,37 @@ pub(crate) enum Command {
         /// Run a tail compaction instead of a full one.
         #[arg(long)]
         tail: bool,
+        /// Copy the head into a fresh generation even when the store is
+        /// already fully compacted and the swap would net nothing.
+        ///
+        /// Never needed for space: the convergence gate only ever drops a
+        /// copy whose output would replace an identical generation. This is
+        /// for the operator who wants a rewrite anyway, for example after
+        /// suspected mapping-level damage.
+        #[arg(long)]
+        always_copy: bool,
+        /// Omit every confirmed orphaned version history from the copy: the
+        /// nt:versionHistory subtrees whose jcr:versionableUuid matches no
+        /// live jcr:uuid, which pin the version payloads and binaries of
+        /// everything ever deleted.
+        ///
+        /// Detection runs and is reported on every plan regardless; this
+        /// flag selects removal, which the plan then lists for
+        /// confirmation. Removal is permanent, and forfeits the
+        /// re-attachment a versionable recreated with its old identifier —
+        /// a content package reinstall — would otherwise get. Histories
+        /// that freeze nt:configuration versionables, and histories that
+        /// REFERENCE or WEAKREFERENCE values outside version storage still
+        /// point into, are kept with a warning. Requires a full compaction,
+        /// so it cannot combine with --tail.
+        #[arg(long, conflicts_with = "tail")]
+        purge_orphaned_version_histories: bool,
+        /// Purge only histories whose newest version was created at least
+        /// this many days ago, guarding the window where content deleted
+        /// moments ago is about to be restored from a package. A history
+        /// without a parsable version creation date is kept.
+        #[arg(long, requires = "purge_orphaned_version_histories")]
+        purged_history_minimum_age_days: Option<u64>,
         /// Print the complete plan and exit without taking repo.lock or
         /// writing a byte.
         #[arg(long)]
@@ -272,9 +310,9 @@ pub(crate) enum Command {
         /// Not a default: it rewrites an archive, and a store damaged in the
         /// middle rather than at the tail is a case to look at before
         /// authorizing. Every other stage is blocked until this has run, so a
-        /// store in that state plans only the repair until you opt in, and the
-        /// full plan is shown again under the lock before anything else is
-        /// touched.
+        /// store in that state plans only the repair until you opt in. The
+        /// repair runs under the lock before the one plan is built, so the
+        /// plan you confirm already reflects the rebuilt indexes.
         #[arg(long)]
         repair_archive_indexes: bool,
         /// Copy checkpoints whose valid timestamp has passed into the fresh
@@ -612,6 +650,9 @@ mod tests {
         let Command::Compact {
             repository,
             tail,
+            always_copy,
+            purge_orphaned_version_histories,
+            purged_history_minimum_age_days,
             dry_run,
             yes,
             repair_archive_indexes,
@@ -628,6 +669,12 @@ mod tests {
         assert!(dry_run);
         assert!(!yes);
         assert!(!tail, "a full compaction is the default");
+        assert!(!always_copy, "the convergence gate is on by default");
+        assert!(
+            !purge_orphaned_version_histories,
+            "the purge is an explicit opt-in"
+        );
+        assert!(purged_history_minimum_age_days.is_none());
         assert_eq!(backup_minimum_age_days, Some(30));
         assert_eq!(backup_keep_latest, Some(3));
         assert_eq!(

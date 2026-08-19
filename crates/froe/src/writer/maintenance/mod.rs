@@ -36,8 +36,9 @@ mod temporaries;
 pub(crate) use self::options::MaintenanceTask;
 pub use self::options::{CompactionOptions, RecoveryBackupPolicy};
 pub use self::plan::{
-    CompactedGeneration, CompactionAction, CompactionOutcome, CompactionPlan, FileDeletionFailure,
-    JournalLineRemoval, JournalRemovalReason, StaleArchiveReason,
+    CompactedGeneration, CompactionAction, CompactionOutcome, CompactionPlan,
+    ExternalBinaryFootprint, FileDeletionFailure, JournalLineRemoval, JournalRemovalReason,
+    OrphanedVersionHistoryReport, StaleArchiveReason,
 };
 pub use self::prepared::{
     PreparedCompaction, compact, compact_with_progress, plan_compaction,

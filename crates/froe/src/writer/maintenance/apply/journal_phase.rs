@@ -10,9 +10,12 @@ use super::{
 
 /// Rewrites the journal for whatever this run changed.
 ///
-/// No step wraps this phase: the head verification and the journal
-/// analysis inside it report steps of their own, and a step around them
-/// would mix nodes and journal lines into one count.
+/// No step wraps this phase: the journal-task branch's head verification
+/// and journal analysis report steps of their own, and a step around them
+/// would mix nodes and journal lines into one count. The compaction branch
+/// is pure file work — its verification happened before the head was
+/// published and happens again after this rewrite, where each proves
+/// something this phase cannot.
 pub(crate) fn rewrite_journal_for_run(
     directory: &Path,
     plan: &CompactionPlan,
@@ -23,8 +26,14 @@ pub(crate) fn rewrite_journal_for_run(
 ) -> Result<JournalRewriteOutcome> {
     let journal_outcome = if let Some(compaction) = &compaction_outcome {
         repository_lock.validate_path_identity(directory)?;
-        let repository = Repository::open_with_progress(directory, observer)?;
-        verify_exact_super_root(&repository, compaction.head_after, observer)?;
+        // Byte-level checks only, deliberately: the compacted head was
+        // fully walked through the writable session before it was
+        // published, and the final verification walks the published store
+        // through fresh mappings after this rewrite. A third full walk
+        // here defended nothing the numbered `journal.log.bak` does not —
+        // by this point the superseded generation is already reclaimed, so
+        // the retired lines are dead history either way — and cost minutes
+        // per run on a real store.
         let raw = scan_raw_journal(directory)?;
         let retained = retained_compacted_head_line(&raw, compaction.head_after)?;
         verify_retained_journal_lines(&raw, &[raw.lines()[retained].content_bytes().to_vec()])?;

@@ -78,6 +78,68 @@ pub(crate) fn compact_dry_run_plans_the_whole_pipeline_without_taking_the_lock_o
     assert_eq!(after, before);
 }
 
+/// The plan states both sides of the copy-and-reclaim trade and each
+/// prediction step concludes with its result, so an operator reads what the
+/// run will actually change rather than only what it removes. The field
+/// motivation: two 41-minute runs whose "estimated reclaimable: 6.9 GiB"
+/// concealed that each wrote a generation as large as the one it removed.
+#[test]
+pub(crate) fn compact_plan_states_the_copy_cost_the_net_change_and_the_step_conclusions() {
+    let directory = TestDirectory::new("cleanup-plan-net-change");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+    std::fs::remove_file(store.join("repo.lock")).expect("remove bootstrap lock inode");
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "compact",
+            store.to_str().expect("path"),
+            "--dry-run",
+            "--progress",
+            "always",
+        ])
+        .output()
+        .expect("run cleanup dry-run");
+
+    assert!(
+        run.status.success(),
+        "dry-run must succeed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("the copy writes about "),
+        "the plan must state what the copy costs: {stdout}"
+    );
+    assert!(
+        stdout.contains("the sweep reclaims about "),
+        "the plan must state what the sweep removes: {stdout}"
+    );
+    assert!(
+        stdout.contains("estimated net change: about "),
+        "the plan must state the net direction: {stdout}"
+    );
+    assert!(
+        !stdout.contains("estimated reclaimable:"),
+        "a copying plan replaces the one-sided estimate with the net form: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("tracing segments reachable from the head:")
+            && stderr.contains("; the head reaches "),
+        "the trace must conclude with the head's composition: {stderr}"
+    );
+    assert!(
+        stderr.contains("; no pre-existing bulk segments will be shared in place"),
+        "the sharing prediction must conclude even when it shares nothing: {stderr}"
+    );
+    assert!(
+        stderr.contains("predicting the reclamation:") && stderr.contains("; the sweep "),
+        "the reclamation prediction must conclude with the sweep's totals: {stderr}"
+    );
+}
+
 #[test]
 pub(crate) fn compact_yes_applies_the_locked_plan_and_reopens_healthy() {
     let directory = TestDirectory::new("cleanup-apply");
@@ -121,45 +183,154 @@ pub(crate) fn compact_yes_applies_the_locked_plan_and_reopens_healthy() {
     froe::Repository::open(&store).expect("repository remains healthy");
 }
 
+/// The field scenario that motivated the convergence gate, in miniature:
+/// the first run copies and says the store is now fully compacted; the
+/// second proves it and does nothing — no 6.34 GiB swap, no archive churn,
+/// a byte-identical store — and `--always-copy` still forces a copy for the
+/// operator who wants one.
 #[test]
-pub(crate) fn compact_reconfirms_and_accepts_a_changed_authoritative_plan() {
-    let directory = TestDirectory::new("cleanup-reconfirmation");
+pub(crate) fn a_second_run_on_a_compacted_store_does_nothing_unless_forced() {
+    let directory = TestDirectory::new("cleanup-convergence");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
     populate(&store);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(store.join("journal.log"))
-        .expect("open journal")
-        .write_all(b"first-parser-skipped\n")
-        .expect("append first removable line");
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--yes"])
+        .output()
+        .expect("run the first compaction");
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first.status.success(), "{first_stdout}");
+    assert!(
+        first_stdout
+            .contains("the store is now fully compacted; a repeat run will report nothing to do"),
+        "the first run must state the convergence it produced: {first_stdout}"
+    );
+
+    let before: Vec<(std::ffi::OsString, Vec<u8>)> = {
+        let mut files: Vec<_> = std::fs::read_dir(&store)
+            .expect("read store")
+            .map(|entry| {
+                let entry = entry.expect("entry");
+                (
+                    entry.file_name(),
+                    std::fs::read(entry.path()).expect("read file"),
+                )
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    };
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--yes"])
+        .output()
+        .expect("run the second compaction");
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second.status.success(),
+        "{second_stdout}
+{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        second_stdout.contains("the head is already fully compacted"),
+        "the plan must state the gate's verdict: {second_stdout}"
+    );
+    assert!(
+        second_stdout.contains("the store is already fully compacted; nothing to do"),
+        "the second run must be a stated no-op: {second_stdout}"
+    );
+    assert!(
+        !second_stdout.contains("copy the head into generation"),
+        "the gate must drop the pointless copy: {second_stdout}"
+    );
+    let mut after: Vec<_> = std::fs::read_dir(&store)
+        .expect("read store")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name(),
+                std::fs::read(entry.path()).expect("read file"),
+            )
+        })
+        .collect();
+    after.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(after, before, "a gated run must not touch the store");
+
+    let forced = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "compact",
+            store.to_str().expect("path"),
+            "--yes",
+            "--always-copy",
+        ])
+        .output()
+        .expect("run the forced compaction");
+    let forced_stdout = String::from_utf8_lossy(&forced.stdout);
+    assert!(
+        forced.status.success(),
+        "{forced_stdout}
+{}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        forced_stdout.contains("--always-copy forces the copy regardless")
+            && forced_stdout.contains("copy the head into generation"),
+        "the override must name itself and plan the copy: {forced_stdout}"
+    );
+    assert!(
+        forced_stdout.contains("compaction complete"),
+        "{forced_stdout}"
+    );
+    froe::Repository::open(&store).expect("the forced store reopens");
+}
+
+/// The one plan the operator confirms is built under the held lock, so a
+/// non-cooperating change during the prompt cannot be silently replanned —
+/// it is refused before a single planned mutation, and the store is left
+/// byte-identical.
+#[test]
+pub(crate) fn a_change_during_confirmation_is_refused_rather_than_replanned() {
+    let directory = TestDirectory::new("cleanup-change-during-prompt");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
 
     let mut child = InteractiveCleanup::spawn(&store);
     child.expect_prompt(
-        "initial confirmation prompt",
+        "confirmation prompt",
         &["about to apply this compaction plan"],
     );
 
-    // The first preview is complete and the command is blocked on confirmation,
-    // so this simulates a non-cooperating change before it acquires repo.lock.
+    // The plan is complete and the command is blocked on confirmation. This
+    // simulates a non-cooperating writer appending to the journal while the
+    // operator is reading the plan.
     std::fs::OpenOptions::new()
         .append(true)
         .open(store.join("journal.log"))
         .expect("reopen journal")
-        .write_all(b"second-parser-skipped\n")
-        .expect("append second removable line");
-    let journal_before_rewrite =
-        std::fs::read(store.join("journal.log")).expect("capture the exact pre-rewrite journal");
-    child.send(b"y\n", "initial affirmative answer");
-
-    child.expect_prompt(
-        "changed-plan confirmation prompt",
-        &[
-            "repository state changed before the lock was acquired",
-            "about to apply the changed authoritative compaction plan",
-        ],
-    );
-    child.send(b"yes\n", "authoritative-plan affirmative answer");
+        .write_all(b"appended-during-prompt\n")
+        .expect("append during the prompt");
+    let files_after_change: Vec<(std::ffi::OsString, Vec<u8>)> = {
+        let mut files: Vec<_> = std::fs::read_dir(&store)
+            .expect("read store")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name() != "repo.lock")
+            })
+            .map(|entry| {
+                let entry = entry.expect("entry");
+                (
+                    entry.file_name(),
+                    std::fs::read(entry.path()).expect("read file"),
+                )
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    };
+    child.send(b"y\n", "affirmative answer after the change");
     let output = child.finish();
     let diagnostic = format!(
         "stdout:\n{}\nstderr:\n{}",
@@ -168,62 +339,100 @@ pub(crate) fn compact_reconfirms_and_accepts_a_changed_authoritative_plan() {
     );
 
     assert!(
-        output.status.success(),
-        "interactive cleanup failed with {}\n{diagnostic}",
-        output.status
+        !output.status.success(),
+        "a stale plan must be refused, not applied\n{diagnostic}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the repository changed after the authoritative cleanup plan was built"),
+        "the refusal must name the change\n{diagnostic}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The preview and the reconfirmed authoritative plan each state the
-    // retirement, and the second sees one more line than the first because the
-    // fixture appends one between them — which is exactly the change the
-    // reconfirmation exists to surface.
-    for expected in [
-        "retire all 2 journal lines",
-        "retire all 3 journal lines",
-        "compaction complete",
-    ] {
-        assert!(
-            stdout.contains(expected),
-            "missing {expected:?}\n{diagnostic}"
-        );
-    }
-    let journal = std::fs::read(store.join("journal.log")).expect("read rewritten journal");
-    assert!(
-        !journal
-            .windows(b"first-parser-skipped".len())
-            .any(|window| window == b"first-parser-skipped"),
-        "first removable line survived\n{diagnostic}"
-    );
-    assert!(
-        !journal
-            .windows(b"second-parser-skipped".len())
-            .any(|window| window == b"second-parser-skipped"),
-        "second removable line survived\n{diagnostic}"
-    );
-    let backup = std::fs::read(store.join("journal.log.bak.000"))
-        .unwrap_or_else(|error| panic!("read journal recovery backup: {error}\n{diagnostic}"));
-    // The backup is the journal as it stood immediately before the rewrite.
-    // A merged run appends the compacted head's line first, so the backup is
-    // the pre-run journal plus exactly that one line — which is what makes it
-    // a usable recovery artefact rather than a stale snapshot.
-    assert!(
-        backup.starts_with(&journal_before_rewrite),
-        "journal recovery backup must extend the pre-run journal\n{diagnostic}"
-    );
-    let appended = &backup[journal_before_rewrite.len()..];
     assert_eq!(
-        appended.split_inclusive(|byte| *byte == b'\n').count(),
+        stdout.matches("compaction plan for ").count(),
         1,
-        "exactly the compacted head's line was appended before the rewrite\n{diagnostic}"
+        "exactly one plan is ever shown\n{diagnostic}"
     );
-    let retained = String::from_utf8(journal.clone()).expect("the journal stays UTF-8");
+    let mut files_after_refusal: Vec<_> = std::fs::read_dir(&store)
+        .expect("read store")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.file_name() != "repo.lock")
+        })
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name(),
+                std::fs::read(entry.path()).expect("read file"),
+            )
+        })
+        .collect();
+    files_after_refusal.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(
-        retained.lines().count(),
-        1,
-        "a completed compaction retires every earlier revision\n{diagnostic}"
+        files_after_refusal, files_after_change,
+        "a refused apply must not touch the store\n{diagnostic}"
     );
-    froe::Repository::open(&store)
-        .unwrap_or_else(|error| panic!("repository did not reopen: {error}\n{diagnostic}"));
+}
+
+/// The apply pipeline's verification budget: one full walk while planning,
+/// one walk of the fresh copy before it is published, one walk of the
+/// published store through fresh mappings — and no more. The copy walk is
+/// the safety addition; the missing fourth walk is the redundancy the
+/// restructure removed.
+#[test]
+pub(crate) fn an_apply_run_walks_the_head_three_times_with_the_copy_checked_before_publication() {
+    let directory = TestDirectory::new("cleanup-verification-budget");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "compact",
+            store.to_str().expect("path"),
+            "--yes",
+            "--progress",
+            "always",
+        ])
+        .output()
+        .expect("run confirmed cleanup");
+
+    let diagnostic = format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.status.success(), "apply must succeed\n{diagnostic}");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(
+        stderr.matches("froe: verifying the current head:").count(),
+        2,
+        "one walk while planning, one for the published store\n{diagnostic}"
+    );
+    assert_eq!(
+        stderr
+            .matches("froe: verifying the compacted copy:")
+            .count(),
+        1,
+        "the fresh copy is walked exactly once, before publication\n{diagnostic}"
+    );
+    assert_eq!(
+        stderr.matches("froe: verifying the checkpoints:").count(),
+        1,
+        "lock-first means one planning pass: the plan shown is the plan applied\n{diagnostic}"
+    );
+    let copy_position = stderr
+        .find("froe: verifying the compacted copy:")
+        .expect("copy verification line");
+    let reclaim_position = stderr
+        .find("froe: reclaiming old generations:")
+        .expect("reclaim line");
+    assert!(
+        copy_position < reclaim_position,
+        "the copy is verified before anything is unlinked\n{diagnostic}"
+    );
+    froe::Repository::open(&store).expect("the compacted store reopens");
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -354,5 +563,87 @@ pub(crate) fn compact_preview_names_every_omitted_checkpoint_before_confirmation
     assert!(
         stdout.contains(&format!("checkpoint {checkpoint:?}")),
         "the destructive preview must name the exact checkpoint: {stdout}"
+    );
+}
+
+/// The orphan report is on every plan; the purge is opt-in, listed for
+/// confirmation, and the summary states the content delta — the operator's
+/// observation 2 answered in one line.
+#[test]
+pub(crate) fn a_purge_is_reported_selected_and_summarized() {
+    let directory = TestDirectory::new("cleanup-purge");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate_with_orphaned_history(&store);
+
+    let detection = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--dry-run"])
+        .output()
+        .expect("run the detection dry-run");
+    let detection_stdout = String::from_utf8_lossy(&detection.stdout);
+    assert!(detection.status.success(), "{detection_stdout}");
+    assert!(
+        detection_stdout
+            .contains("orphaned version histories: 1 (their versionables no longer exist)"),
+        "detection reports without the flag: {detection_stdout}"
+    );
+    assert!(
+        detection_stdout.contains("purge with --purge-orphaned-version-histories"),
+        "the report names the flag: {detection_stdout}"
+    );
+    assert!(
+        !detection_stdout.contains("purge 1 orphaned version histories"),
+        "no purge is selected without the flag: {detection_stdout}"
+    );
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "compact",
+            store.to_str().expect("path"),
+            "--yes",
+            "--purge-orphaned-version-histories",
+        ])
+        .output()
+        .expect("run the purge");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "purge 1 orphaned version histories (2 nodes) by omitting them from the copy"
+        ),
+        "the purge is a listed action: {stdout}"
+    );
+    assert!(
+        stdout.contains("removal is permanent"),
+        "the irreversibility is stated: {stdout}"
+    );
+    assert!(
+        stdout.contains("(removed 1 orphaned version histories holding 2 nodes)"),
+        "the summary states the content delta: {stdout}"
+    );
+    froe::Repository::open(&store).expect("the purged store reopens");
+
+    let repeat = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "compact",
+            store.to_str().expect("path"),
+            "--yes",
+            "--purge-orphaned-version-histories",
+        ])
+        .output()
+        .expect("run the repeat");
+    let repeat_stdout = String::from_utf8_lossy(&repeat.stdout);
+    assert!(repeat.status.success(), "{repeat_stdout}");
+    assert!(
+        !repeat_stdout.contains("orphaned version histories:"),
+        "nothing is left to report: {repeat_stdout}"
+    );
+    assert!(
+        repeat_stdout.contains("the store is already fully compacted; nothing to do"),
+        "the purge converges with the gate: {repeat_stdout}"
     );
 }

@@ -20,6 +20,8 @@ mod journal;
 #[cfg(unix)]
 mod manifest;
 #[cfg(unix)]
+mod publication;
+#[cfg(unix)]
 mod session;
 #[cfg(unix)]
 mod sweep;

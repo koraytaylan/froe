@@ -24,7 +24,7 @@ use super::stale_archives::{
     unrepairable_archive_names,
 };
 use super::temporaries::{plan_stale_temporaries, temporary_kind};
-use crate::content::provider::SegmentProvider as _;
+use crate::content::node::NodeState;
 use crate::error::{Error, Result};
 use crate::progress::{ProgressObserver, Step, WorkUnit};
 use crate::segment::identifier::SegmentIdentifier;
@@ -49,13 +49,17 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+mod content_census;
 mod listing;
 mod segments;
 mod shape;
+mod version_storage;
 
+pub(crate) use content_census::*;
 pub(crate) use listing::*;
 pub(crate) use segments::*;
 pub(in crate::writer::maintenance) use shape::*;
+pub(crate) use version_storage::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct JournalPlan {
@@ -410,21 +414,317 @@ pub(crate) fn decide_manifest_upgrade(
     Ok(manifest_upgrade)
 }
 
-pub(super) fn build_plan_collecting(
+/// Proves the directory is byte-identical to the fingerprint planning
+/// started from, returning the fresh fingerprint the plan will carry.
+fn require_directory_unchanged(
+    directory: &Path,
+    fingerprint_before: &DirectoryFingerprint,
+) -> Result<DirectoryFingerprint> {
+    let fingerprint_after = directory_fingerprint(directory)?;
+    if *fingerprint_before != fingerprint_after {
+        return Err(Error::InvalidFormat {
+            details:
+                "the repository changed while cleanup was planning; retry against a quiescent store"
+                    .to_owned(),
+        });
+    }
+    Ok(fingerprint_after)
+}
+
+/// Decides the manifest upgrade and reserves the journal staging names a
+/// journal-pruning run will need, in one pass over the survey's facts.
+fn decide_manifest_upgrade_and_reserve_journal_names(
+    directory: &Path,
+    options: &CompactionOptions,
+    state: &RepositoryState,
+    segment_plan: Option<&StandaloneSegmentCompactionPlan>,
+) -> Result<bool> {
+    let manifest_upgrade = decide_manifest_upgrade(
+        directory,
+        options,
+        &state.pending_repairs,
+        &state.checkpoints,
+        segment_plan,
+    )?;
+    if options.contains(MaintenanceTask::Journal) && state.journal_analysis.plan.removed_lines != 0
+    {
+        ensure_numbered_name_available(directory, "journal.log.cleaning")?;
+        ensure_numbered_name_available(directory, "journal.log.bak")?;
+    }
+    Ok(manifest_upgrade)
+}
+
+/// Selects the version-history purge when one is requested: the orphans,
+/// minus configurations, minus anything younger than the age bound, minus
+/// the advisory reference demotions — the last computed by its own pass,
+/// which only runs when there are candidates to check.
+fn select_version_history_purge(
+    repository: &Repository,
+    options: &CompactionOptions,
+    current_head: RecordIdentifier,
+    census: &PlanningContentCensus,
+    now: SystemTime,
+    warnings: &mut Vec<String>,
+    observer: &mut dyn ProgressObserver,
+) -> Result<Option<PurgeSelection>> {
+    if !options.purges_orphaned_version_histories() {
+        return Ok(None);
+    }
+    let now_epoch_seconds = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        });
+    let preliminary = select_purge(
+        &census.version_storage,
+        options.purged_history_minimum_age,
+        now_epoch_seconds,
+        &HashSet::new(),
+    );
+    let demoted = if preliminary.histories == 0 {
+        HashSet::new()
+    } else {
+        let content_root = repository
+            .node(current_head)
+            .child_node("root")?
+            .ok_or_else(|| Error::InvalidFormat {
+                details: format!("journal root {current_head} has no content \"root\" child node"),
+            })?;
+        let version_storage_record = content_root
+            .child_node("jcr:system")?
+            .map(|system| system.child_node("jcr:versionStorage"))
+            .transpose()?
+            .flatten()
+            .map(|storage| storage.record_identifier());
+        let candidates = candidate_internal_identifiers(
+            &census.version_storage,
+            &preliminary.selected_identifiers,
+        );
+        demoted_by_inbound_references(
+            repository,
+            content_root.record_identifier(),
+            version_storage_record,
+            &candidates,
+            observer,
+        )?
+    };
+    let selection = select_purge(
+        &census.version_storage,
+        options.purged_history_minimum_age,
+        now_epoch_seconds,
+        &demoted,
+    );
+    if selection.kept_configurations != 0 {
+        warnings.push(format!(
+            "{} orphaned version histories kept: they freeze nt:configuration versionables, which this purge does not touch",
+            selection.kept_configurations
+        ));
+    }
+    if selection.kept_by_age != 0 {
+        warnings.push(format!(
+            "{} orphaned version histories kept by the age bound (younger than the minimum, or without a parsable version creation date)",
+            selection.kept_by_age
+        ));
+    }
+    if selection.kept_by_references != 0 {
+        warnings.push(format!(
+            "{} orphaned version histories kept: REFERENCE or WEAKREFERENCE values outside version storage still name records inside them",
+            selection.kept_by_references
+        ));
+    }
+    if census.version_storage.malformed_identifiers != 0 {
+        warnings.push(format!(
+            "{} version histories carry versionable identifiers that do not parse and were not classified",
+            census.version_storage.malformed_identifiers
+        ));
+    }
+    Ok(Some(selection))
+}
+
+/// The plan's two version-history parts: the always-on report, and the
+/// purge when a non-empty one is selected.
+fn version_history_plan_parts(
+    repository: &Repository,
+    current_head: RecordIdentifier,
+    census: &PlanningContentCensus,
+    head_nodes: u64,
+    closure_indexed_bytes: Option<(u64, u64)>,
+    retired_checkpoints: u64,
+    selection: Option<PurgeSelection>,
+) -> Result<(
+    crate::writer::maintenance::plan::OrphanedVersionHistoryReport,
+    Option<crate::writer::maintenance::plan::VersionHistoryPurge>,
+)> {
+    let mut report = orphaned_version_history_report(
+        repository,
+        census,
+        selection.as_ref(),
+        head_nodes,
+        closure_indexed_bytes,
+    );
+    report.retained_checkpoints =
+        crate::progress::count(repository.checkpoints()?.len()).saturating_sub(retired_checkpoints);
+    let Some(selection) = selection.filter(|selection| selection.histories != 0) else {
+        return Ok((report, None));
+    };
+    // The ancestors whose rewritten form depends on the scope: the chain
+    // from the content root down to version storage, plus every partially
+    // emptied intermediate the selection identified.
+    let mut context_dependent_records = selection.context_dependent_intermediates;
+    let mut chain = repository.node(current_head).child_node("root")?;
+    context_dependent_records.extend(chain.as_ref().map(NodeState::record_identifier));
+    for name in ["jcr:system", "jcr:versionStorage"] {
+        chain = match &chain {
+            Some(node) => node.child_node(name)?,
+            None => None,
+        };
+        context_dependent_records.extend(chain.as_ref().map(NodeState::record_identifier));
+    }
+    Ok((
+        report,
+        Some(crate::writer::maintenance::plan::VersionHistoryPurge {
+            omitted_records: selection.omitted_records,
+            context_dependent_records,
+            histories: selection.histories,
+            nodes: selection.nodes,
+            retained_checkpoints: report.retained_checkpoints,
+        }),
+    ))
+}
+
+/// Assembles the always-on orphan report from what the walks established.
+fn orphaned_version_history_report(
+    repository: &Repository,
+    census: &PlanningContentCensus,
+    selection: Option<&PurgeSelection>,
+    head_nodes: u64,
+    closure_indexed_bytes: Option<(u64, u64)>,
+) -> crate::writer::maintenance::plan::OrphanedVersionHistoryReport {
+    let mut report = crate::writer::maintenance::plan::OrphanedVersionHistoryReport {
+        malformed_identifiers: census.version_storage.malformed_identifiers,
+        ..Default::default()
+    };
+    let mut orphan_bulk: HashSet<SegmentIdentifier> = HashSet::new();
+    let mut kept_orphan_bulk: HashSet<SegmentIdentifier> = HashSet::new();
+    let mut released_nodes = 0_u64;
+    for (identifier, facts) in census.version_storage.orphans() {
+        report.orphaned_histories += 1;
+        report.orphaned_nodes += facts.nodes;
+        report.inline_binary_bytes = report
+            .inline_binary_bytes
+            .saturating_add(facts.inline_binary_bytes);
+        report.external_references += facts.external_references;
+        // Released bulk describes what the *selected* purge frees; without
+        // a selection it describes a purge of every orphan. A block a kept
+        // orphan still references is not released.
+        let released_by_this_run = selection.is_none_or(|selection| {
+            selection.histories == 0 || selection.selected_identifiers.contains(identifier)
+        });
+        if released_by_this_run {
+            released_nodes += facts.nodes;
+            orphan_bulk.extend(facts.bulk_segments.iter().copied());
+        } else {
+            kept_orphan_bulk.extend(facts.bulk_segments.iter().copied());
+        }
+    }
+    // Bulk a purge releases: what only the purged histories reference. A
+    // block shared with the head, a checkpoint's own content, a live
+    // history, or a kept orphan stays, so this is a subtraction, not a
+    // sum. Blocks a retained checkpoint's *shared* snapshot pins cannot be
+    // seen here, which is why the printed figure carries a checkpoint
+    // caveat whenever checkpoints are retained.
+    for live in census
+        .live_bulk
+        .iter()
+        .chain(census.version_storage.live_history_bulk.iter())
+        .chain(kept_orphan_bulk.iter())
+    {
+        orphan_bulk.remove(live);
+    }
+    report.released_bulk_segments = crate::progress::count(orphan_bulk.len());
+    let (_, bulk_bytes) =
+        crate::writer::maintenance::reclamation::indexed_bytes_by_kind(repository, &orphan_bulk);
+    report.released_bulk_bytes = bulk_bytes;
+    // The released histories' node-record share, scaled from the head's
+    // average bytes per node: an estimate the copy realizes. Scoped like
+    // the bulk figure — a kept orphan's nodes are not a saving this run
+    // delivers.
+    if let (Some((data_bytes, _)), true) = (closure_indexed_bytes, head_nodes != 0) {
+        report.node_record_bytes_estimate = data_bytes / head_nodes * released_nodes
+            + (data_bytes % head_nodes) * released_nodes / head_nodes;
+    }
+    report
+}
+
+/// The journal's contribution to the convergence gate, read from the raw
+/// journal the survey already scanned: a completed compaction leaves
+/// exactly one line naming its head, so anything else means history this
+/// run still has to retire.
+fn journal_convergence_of(
+    raw_journal: &RawJournal,
+    current_head: RecordIdentifier,
+) -> JournalConvergence {
+    JournalConvergence {
+        single_line_naming_head: raw_journal.lines().len() == 1
+            && matches!(
+                raw_journal.lines()[0].classification(),
+                crate::writer::maintenance::journal::RawJournalLineClassification::Record(record)
+                    if record.record_identifier == current_head
+            ),
+    }
+}
+
+/// Verifies the exact head while the content census rides the same walk,
+/// so the plan's content facts cost no second pass.
+fn verify_head_and_census(
+    repository: &Repository,
+    current_head: RecordIdentifier,
+    options: &CompactionOptions,
+    observer: &mut dyn ProgressObserver,
+) -> Result<(u64, PlanningContentCensus)> {
+    let mut content_census = PlanningContentCensus::default();
+    let head_nodes = verify_head_for_planning(
+        repository,
+        current_head,
+        &mut content_census,
+        options.purges_orphaned_version_histories(),
+        observer,
+    )?;
+    Ok((head_nodes, content_census))
+}
+
+/// Everything a plan is assembled from, gathered by the walks and surveys
+/// in their one required order.
+struct GatheredPlanFacts {
+    repository: Repository,
+    current_head: RecordIdentifier,
+    head_nodes: u64,
+    content_census: PlanningContentCensus,
+    state: RepositoryState,
+    version_history_purge_selection: Option<PurgeSelection>,
+    segment_work: SegmentWork,
+    temporaries: Vec<PlannedFileRemoval>,
+    recovery_backups: Vec<PlannedFileRemoval>,
+    manifest_upgrade: bool,
+}
+
+/// Opens, verifies, surveys, selects, and predicts — every read the plan
+/// needs, none of the assembly.
+fn gather_plan_facts(
     directory: &Path,
     options: &CompactionOptions,
     now: SystemTime,
     observer: &mut dyn ProgressObserver,
     warnings: &mut Vec<String>,
-) -> Result<CompactionPlan> {
-    let fingerprint_before = directory_fingerprint(directory)?;
+) -> Result<GatheredPlanFacts> {
     let repository = Repository::open_with_progress(directory, observer)?;
     let current_head = repository.head_record_identifier();
 
     // Repository::open deliberately binds by segment existence, matching
     // Oak. Cleanup's gate is stronger: the exact selected record and every
     // descendant (including binary blocks and checkpoints) must traverse.
-    let head_nodes = verify_exact_super_root_counting_nodes(&repository, current_head, observer)?;
+    let (head_nodes, content_census) =
+        verify_head_and_census(&repository, current_head, options, observer)?;
 
     let state = survey_repository_state(
         directory,
@@ -435,14 +735,30 @@ pub(super) fn build_plan_collecting(
         warnings,
         observer,
     )?;
-    let segment_work = plan_segment_work(
-        directory,
+    let version_history_purge_selection = select_version_history_purge(
         &repository,
         options,
         current_head,
-        state.index_available,
-        &state.checkpoints,
-        &state.journal_analysis,
+        &content_census,
+        now,
+        warnings,
+        observer,
+    )?;
+    let journal_convergence = journal_convergence_of(&state.raw_journal, current_head);
+    let segment_work = plan_segment_work(
+        &SegmentWorkInputs {
+            directory,
+            repository: &repository,
+            options,
+            current_head,
+            index_available: state.index_available,
+            checkpoints: &state.checkpoints,
+            journal_analysis: &state.journal_analysis,
+            journal_convergence: &journal_convergence,
+            purge_selected: version_history_purge_selection
+                .as_ref()
+                .is_some_and(|selection| selection.histories != 0),
+        },
         warnings,
         observer,
     )?;
@@ -456,18 +772,55 @@ pub(super) fn build_plan_collecting(
         warnings,
         observer,
     )?;
-    let manifest_upgrade = decide_manifest_upgrade(
+    let manifest_upgrade = decide_manifest_upgrade_and_reserve_journal_names(
         directory,
         options,
-        &state.pending_repairs,
-        &state.checkpoints,
+        &state,
         segment_work.segment_plan.as_ref(),
     )?;
-    if options.contains(MaintenanceTask::Journal) && state.journal_analysis.plan.removed_lines != 0
-    {
-        ensure_numbered_name_available(directory, "journal.log.cleaning")?;
-        ensure_numbered_name_available(directory, "journal.log.bak")?;
-    }
+    Ok(GatheredPlanFacts {
+        repository,
+        current_head,
+        head_nodes,
+        content_census,
+        state,
+        version_history_purge_selection,
+        segment_work,
+        temporaries,
+        recovery_backups,
+        manifest_upgrade,
+    })
+}
+
+pub(super) fn build_plan_collecting(
+    directory: &Path,
+    options: &CompactionOptions,
+    now: SystemTime,
+    observer: &mut dyn ProgressObserver,
+    warnings: &mut Vec<String>,
+) -> Result<CompactionPlan> {
+    let fingerprint_before = directory_fingerprint(directory)?;
+    let GatheredPlanFacts {
+        repository,
+        current_head,
+        head_nodes,
+        content_census,
+        state,
+        version_history_purge_selection,
+        segment_work,
+        temporaries,
+        recovery_backups,
+        manifest_upgrade,
+    } = gather_plan_facts(directory, options, now, observer, warnings)?;
+    let (orphaned_version_histories, version_history_purge) = version_history_plan_parts(
+        &repository,
+        current_head,
+        &content_census,
+        head_nodes,
+        segment_work.closure_indexed_bytes,
+        crate::progress::count(state.checkpoints.names.len()),
+        version_history_purge_selection,
+    )?;
     let PlanListing {
         actions,
         estimated_reclaimable_bytes,
@@ -483,17 +836,13 @@ pub(super) fn build_plan_collecting(
             recovery_backups: &recovery_backups,
             manifest_upgrade,
             head_nodes,
+            version_history_purge: version_history_purge
+                .as_ref()
+                .map(|purge| (purge.histories, purge.nodes, purge.retained_checkpoints)),
         },
         warnings,
     )?;
-    let fingerprint_after = directory_fingerprint(directory)?;
-    if fingerprint_before != fingerprint_after {
-        return Err(Error::InvalidFormat {
-            details:
-                "the repository changed while cleanup was planning; retry against a quiescent store"
-                    .to_owned(),
-        });
-    }
+    let fingerprint_after = require_directory_unchanged(directory, &fingerprint_before)?;
 
     let mut plan = CompactionPlan {
         directory: directory.to_owned(),
@@ -519,6 +868,29 @@ pub(super) fn build_plan_collecting(
         reference_generation: segment_work.reference_generation,
         protected_history_segments: segment_work.protected_history_segments,
         manifest_upgrade,
+        // Known exactly when the trace ran and a copy is selected: the copy
+        // rewrites the closure's data bytes and shares its bulk bytes in
+        // place, so the data figure bounds what the fresh generation costs.
+        // A selected purge omits its histories from that rewrite, so its
+        // node-record share comes off the prediction.
+        predicted_copy_output_bytes: match (
+            segment_work.effective_compaction_kind,
+            segment_work.closure_indexed_bytes,
+        ) {
+            (Some(_), Some((data_bytes, _))) => Some(data_bytes.saturating_sub(
+                if version_history_purge.is_some() {
+                    orphaned_version_histories.node_record_bytes_estimate
+                } else {
+                    0
+                },
+            )),
+            _ => None,
+        },
+        external_binary_footprint: content_census.external_binaries.footprint(),
+        effective_compaction_kind: segment_work.effective_compaction_kind,
+        already_fully_compacted: segment_work.already_fully_compacted,
+        orphaned_version_histories,
+        version_history_purge,
     };
     append_apply_identity_preview_warning(directory, &mut plan);
     plan.warnings.sort();

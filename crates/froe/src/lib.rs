@@ -108,9 +108,10 @@ pub use store::Repository;
 pub use units::{format_byte_size, format_count};
 pub use writer::{
     ArchiveRewritePolicy, CompactedGeneration, CompactionAction, CompactionKind, CompactionOptions,
-    CompactionOutcome, CompactionPlan, FileDeletionFailure, JournalLineRemoval,
-    JournalRemovalReason, PreparedCompaction, RecoveryBackupPolicy, RecoveryOutcome,
-    StaleArchiveReason, WritableRepository, backup, backup_with_progress, compact,
-    compact_with_progress, plan_compaction, plan_compaction_with_progress, recover_journal,
-    recover_journal_with_progress, restore, restore_with_progress,
+    CompactionOutcome, CompactionPlan, ExternalBinaryFootprint, FileDeletionFailure,
+    JournalLineRemoval, JournalRemovalReason, OrphanedVersionHistoryReport, PreparedCompaction,
+    RecoveryBackupPolicy, RecoveryOutcome, StaleArchiveReason, WritableRepository, backup,
+    backup_with_progress, compact, compact_with_progress, plan_compaction,
+    plan_compaction_with_progress, recover_journal, recover_journal_with_progress, restore,
+    restore_with_progress,
 };

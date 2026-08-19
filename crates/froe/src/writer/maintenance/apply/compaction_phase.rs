@@ -90,21 +90,50 @@ pub(in crate::writer::maintenance) fn apply_compaction_phase(
     let archive_bytes_before = archive_file_bytes(directory)?;
     let omitted_checkpoints: std::collections::BTreeSet<String> =
         plan.checkpoints.names.iter().cloned().collect();
+    // The confirmed purge, as the subtree roots the copy declines to enter.
+    // Empty when none was selected, which makes this exactly the plain copy.
+    let omitted_subtree_records: std::collections::HashSet<RecordIdentifier> = plan
+        .version_history_purge
+        .as_ref()
+        .map(|purge| purge.omitted_records.iter().copied().collect())
+        .unwrap_or_default();
+    let context_dependent_records: std::collections::HashSet<RecordIdentifier> = plan
+        .version_history_purge
+        .as_ref()
+        .map(|purge| purge.context_dependent_records.iter().copied().collect())
+        .unwrap_or_default();
     let mut writer = store.record_writer_with_identifier(target_generation, "c");
     let (new_head, copied_nodes) = crate::progress::observe(
         observer,
         &Step::new("copying nodes into a fresh generation", WorkUnit::Nodes),
         |observer| {
-            crate::writer::compaction::deep_copy_super_root_with_progress(
+            crate::writer::compaction::deep_copy_super_root_omitting_subtrees(
                 &store,
                 &mut writer,
                 plan.current_head,
                 &omitted_checkpoints,
+                &crate::writer::compaction::SubtreeOmissions {
+                    omitted_subtree_records: &omitted_subtree_records,
+                    context_dependent_records: &context_dependent_records,
+                },
+                crate::writer::record_writer::BulkBlockSharing::WithinOneStore,
                 observer,
             )
         },
     )?;
     writer.finish()?;
+
+    // The one window in which a defective copy costs nothing: the fresh
+    // segments are readable through the open session, the head has not
+    // moved, the journal has not been touched, and not one source archive
+    // has been unlinked. A refusal here leaves the store exactly as it was
+    // plus some orphan output a later run retires as residue — whereas the
+    // first full walk after the sweep, where verification used to happen,
+    // would discover the same defect only once the generation that could
+    // repair it is gone.
+    verify_compacted_copy(&store, new_head, observer)?;
+    #[cfg(test)]
+    probe_compacted_copy_publication_boundary("cleanup.before-compacted-head-publication")?;
 
     if !store.compare_and_set_head(plan.current_head, new_head) {
         return Err(Error::InvalidFormat {
@@ -160,6 +189,44 @@ pub(in crate::writer::maintenance) fn apply_compaction_phase(
         sweep,
         garbage_collection_entry,
     })
+}
+
+/// Walks the fresh copy through the open writable session, before the head
+/// moves and before a single unlink, so a copy defect refuses the run while
+/// recovery is trivial. The walk is the same full node-tree proof the final
+/// verification performs — every record, stable identifier, and inline
+/// binary block, plus the super-root's shape — read through the session's
+/// own segment view rather than a reopen, because the copy is not published
+/// yet and exists nowhere else.
+fn verify_compacted_copy(
+    store: &WritableRepository,
+    compacted_head: RecordIdentifier,
+    observer: &mut dyn ProgressObserver,
+) -> Result<()> {
+    crate::progress::observe(
+        observer,
+        &Step::new("verifying the compacted copy", WorkUnit::Nodes),
+        |observer| {
+            let mut verifier = crate::tooling::NodeTreeVerifier::new(store);
+            crate::writer::maintenance::planning::verify_exact_super_root_collecting_with_verifier(
+                store,
+                compacted_head,
+                &mut verifier,
+                &mut crate::tooling::DiscardedVerifiedContent,
+                observer,
+            )
+        },
+    )
+}
+
+/// The durability boundary between a verified copy and its publication,
+/// for the fault probes: everything before it is additive and disposable,
+/// everything after it is the published store.
+#[cfg(test)]
+fn probe_compacted_copy_publication_boundary(cutpoint: &str) -> Result<()> {
+    crate::writer::fault_injection::fail_if_armed(cutpoint)?;
+    crate::writer::fault_injection::crash_if_armed(cutpoint);
+    Ok(())
 }
 
 /// `gc.log` records completed compaction cycles and nothing else.
@@ -291,7 +358,7 @@ pub(crate) fn run_compaction_phase(
 ) -> Result<(u64, Option<CompactionPhaseOutcome>, RecordIdentifier)> {
     let mut expected_head_after = plan.current_head;
     let mut compaction_outcome: Option<CompactionPhaseOutcome> = None;
-    let removed_checkpoints = if let Some(kind) = options.compaction_kind {
+    let removed_checkpoints = if let Some(kind) = plan.effective_compaction_kind {
         // The head moves exactly once, and the checkpoints this run retires
         // are simply never carried into the fresh generation. Removing them
         // from the live head first would move the head twice, append a second

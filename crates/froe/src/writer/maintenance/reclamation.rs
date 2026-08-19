@@ -186,6 +186,19 @@ pub(super) fn predict_shared_bulk_segments(
                 }
             }
             traced.finish(observer);
+            // The single number that explains a store whose binaries live
+            // inline: how much of it the copy will not touch. Stated even
+            // when it is nothing, so its absence is a fact and not a gap.
+            if shared.is_empty() {
+                observer.step_concluded("no pre-existing bulk segments will be shared in place");
+            } else {
+                let (_, bulk_bytes) = indexed_bytes_by_kind(repository, &shared);
+                observer.step_concluded(&format!(
+                    "{} pre-existing bulk segments ({}) will be shared in place and retained",
+                    crate::units::format_count(crate::progress::count(shared.len())),
+                    crate::units::format_byte_size(bulk_bytes),
+                ));
+            }
             Ok(shared)
         },
     )
@@ -322,6 +335,34 @@ pub(super) fn active_index_generations(
         }
     }
     Ok(generations)
+}
+
+/// Sums the indexed entry sizes of `segments`, split into data and bulk
+/// bytes. One pass over every archive index rather than one lookup per
+/// member: the indexes are already resident, and the pass is linear in the
+/// store's segment count whatever the set's size.
+pub(in crate::writer::maintenance) fn indexed_bytes_by_kind(
+    repository: &Repository,
+    segments: &HashSet<SegmentIdentifier>,
+) -> (u64, u64) {
+    let mut data_bytes = 0u64;
+    let mut bulk_bytes = 0u64;
+    for archive in repository.archives() {
+        for identifier in archive.segment_identifiers() {
+            if !segments.contains(&identifier) {
+                continue;
+            }
+            let Some(entry) = archive.index_entry(identifier) else {
+                continue;
+            };
+            if identifier.is_data_segment() {
+                data_bytes = data_bytes.saturating_add(u64::from(entry.size));
+            } else {
+                bulk_bytes = bulk_bytes.saturating_add(u64::from(entry.size));
+            }
+        }
+    }
+    (data_bytes, bulk_bytes)
 }
 
 pub(super) fn extend_segment_closure(
