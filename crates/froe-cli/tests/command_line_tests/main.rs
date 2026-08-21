@@ -7,6 +7,7 @@ use froe::writer::record_writer::ChildNodesToWrite;
 use froe::writer::store_writer::WritableRepository;
 
 mod compaction;
+mod compaction_decisions;
 mod diagnostics;
 mod export;
 mod reporting;

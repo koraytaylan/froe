@@ -147,7 +147,7 @@ version_history_purge
    ▼
 repair
    │  Oak's own JVM is killed with SIGKILL while it holds an archive
-   │  open; froe compact --repair-archive-indexes rebuilds the index and
+   │  open; an authorized froe compact rebuilds the index and
    │  Oak boots against the result
    │  If this fails: froe cannot repair the state a crashed Oak leaves,
    │  or Oak will not read what froe rebuilt.
@@ -418,10 +418,11 @@ authentic artifact of a crash rather than a simulated one.
 
 Then, read-only until the repair runs, because every froe *write* command
 rebuilds a missing index on open and would heal the fixture: `froe archives`
-confirms the damage, and `froe compact --dry-run` without the task confirms
-the refusal names `--repair-archive-indexes`. The repair itself runs through
-`froe compact --yes` with that task selected, and the original is asserted
-present under its `.bak` name.
+confirms the damage, and `froe compact --dry-run
+--skip-repairing-archive-indexes` confirms the refusal points at
+authorizing the repair. The repair itself runs through `froe compact
+--yes` — the rebuild is part of the confirmed default run — and the
+original is asserted present under its `.bak` name.
 
 The assertion that makes this phase worth having is the last one: Oak boots
 against the rebuilt archive, serves the byte-identical baseline tree, and logs

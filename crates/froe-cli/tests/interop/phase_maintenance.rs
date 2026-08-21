@@ -644,19 +644,14 @@ pub(crate) fn version_history_purge() {
     eprintln!("  content digest before the purge, orphan excluded");
     let digest_before = digest_store_excluding(&versioned_store, &[&purge_exclusion]);
 
-    eprintln!("  froe compact --yes --purge-orphaned-version-histories");
-    let purge = froe(&[
-        "compact",
-        versioned_store.to_str().unwrap(),
-        "--yes",
-        "--purge-orphaned-version-histories",
-    ]);
+    eprintln!("  froe compact --yes (the purge is part of the default full run)");
+    let purge = froe(&["compact", versioned_store.to_str().unwrap(), "--yes"]);
     assert!(
-        purge.contains("purge 1 orphaned version histories"),
+        purge.contains("purge 1 orphaned version history ("),
         "the purge is a listed action: {purge}"
     );
     assert!(
-        purge.contains("removed 1 orphaned version histories holding"),
+        purge.contains("purged: 1 orphaned version history ("),
         "the summary states the content delta: {purge}"
     );
 

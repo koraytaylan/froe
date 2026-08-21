@@ -46,10 +46,12 @@ pub use compaction::{
 };
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};
 pub use maintenance::{
-    CompactedGeneration, CompactionAction, CompactionOptions, CompactionOutcome, CompactionPlan,
-    ExternalBinaryFootprint, FileDeletionFailure, JournalLineRemoval, JournalRemovalReason,
-    OrphanedVersionHistoryReport, PreparedCompaction, RecoveryBackupPolicy, StaleArchiveReason,
-    compact, compact_with_progress, plan_compaction, plan_compaction_with_progress,
+    ArchiveIndexSurvey, CompactedGeneration, CompactionAction, CompactionOptions,
+    CompactionOutcome, CompactionPlan, ExternalBinaryFootprint, FileDeletionFailure,
+    JournalLineRemoval, JournalRemovalReason, OrphanedVersionHistoryReport, PreparedCompaction,
+    RecoveryBackupPolicy, RecoveryBackupSurvey, StaleArchiveReason, compact, compact_with_progress,
+    plan_compaction, plan_compaction_with_progress, survey_archive_indexes,
+    survey_recovery_backups,
 };
 pub use record_writer::{
     BulkBlockSharing, ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter,

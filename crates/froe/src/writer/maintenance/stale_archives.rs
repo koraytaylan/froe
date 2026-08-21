@@ -12,9 +12,8 @@ use crate::tar_archive::archive::TarArchiveReader;
 use crate::tar_archive::file_name::{ArchiveFileName, group_file_generations_newest_first};
 use crate::writer::segment_builder::GarbageCollectionGeneration;
 use crate::writer::store_writer::certify_active_archive;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::path::Path;
 
 pub(super) fn plan_stale_archives(
@@ -232,113 +231,6 @@ pub(super) fn reject_duplicate_active_segments_across(
     Ok(())
 }
 
-/// The refusal an index-less active archive earns.
-///
-/// Naming only the first offender cannot separate a writer killed before it
-/// closed its newest archive — benign, and repaired by any froe write
-/// command — from a store damaged throughout, and that is exactly the call
-/// the operator has to make before touching the repository. So every
-/// archive is counted, and whether the newest one is affected is stated
-/// rather than left to be inferred from a file name.
-///
-/// Counting is by archive *number*, not by open reader. When no letter of a
-/// number carries a valid index the reader serves every non-empty letter of
-/// it, so counting readers would report one damaged number as two or three
-/// damaged archives — and the warning carried alongside this refusal already
-/// speaks in archive numbers.
-/// The census of index-less active archives a refusal is written from.
-#[derive(Clone, Copy)]
-pub(super) struct IndexlessCensus<'census> {
-    /// Active archive numbers in the store.
-    pub(super) total_numbers: usize,
-    /// How many of those numbers carry no valid index.
-    pub(super) indexless_numbers: usize,
-    /// Each offending archive's file name with the reason its index was
-    /// rejected.
-    pub(super) offenders: &'census [(&'census str, &'census str)],
-    pub(super) newest_is_indexless: bool,
-    /// Whether any offender's recovery scan read no segment at all, which
-    /// is residue no repair can rebuild.
-    pub(super) any_scan_is_empty: bool,
-}
-
-pub(super) fn indexless_archive_refusal(census: IndexlessCensus<'_>) -> String {
-    const NAMES_SHOWN: usize = 5;
-    let IndexlessCensus {
-        total_numbers,
-        indexless_numbers,
-        offenders: indexless,
-        newest_is_indexless,
-        any_scan_is_empty,
-    } = census;
-    let mut names = indexless
-        .iter()
-        .take(NAMES_SHOWN)
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if indexless.len() > NAMES_SHOWN {
-        let _ = write!(names, ", and {} more", indexless.len() - NAMES_SHOWN);
-    }
-    // Reasons are deduplicated rather than listed per archive: a store
-    // damaged one way is damaged that way throughout far more often than
-    // not, and the shape of the failure is what decides the response. Where
-    // they genuinely differ, saying so is itself the finding.
-    let distinct_reasons: BTreeSet<&str> = indexless.iter().map(|(_, reason)| *reason).collect();
-    let reasons = distinct_reasons
-        .iter()
-        .copied()
-        .collect::<Vec<_>>()
-        .join("; ");
-    let subject = if indexless_numbers == 1 {
-        format!("1 of {total_numbers} active archive numbers has no index metadata")
-    } else {
-        format!(
-            "{indexless_numbers} of {total_numbers} active archive numbers have no index metadata"
-        )
-    };
-    // The remedy is stated conditionally, because the two shapes deserve
-    // different advice. A writer killed before it closed its newest archive
-    // left a complete archive missing only its trailer, and rebuilding the
-    // index from a scan of it loses nothing. An index-less archive in the
-    // middle of the store was closed once and stopped validating since, so
-    // a scan may legitimately fail to read segments that were there —
-    // repairing before looking would make that permanent in everything but
-    // the `.bak`.
-    let ordinality = if newest_is_indexless {
-        "the newest active archive is among them, which is what a writer killed before it \
-         closed its archive leaves behind"
-    } else {
-        "the newest active archive is not among them, so this is not simply a writer killed \
-         before it closed its archive"
-    };
-    // Whether a repair would even succeed is knowable here, so it is not
-    // guessed: a recovery-scanned archive reports the segments the scan
-    // read, and one that read none is residue the write open refuses rather
-    // than rebuilds. Advising a write command for it would send the operator
-    // to a refusal, which is the circularity this branch exists to avoid.
-    let remedy = if any_scan_is_empty {
-        "at least one of them holds no segment the recovery scan can read, so nothing can rebuild \
-         it — move that file aside to proceed, and keep it, it is the only copy of whatever it \
-         holds"
-    } else if newest_is_indexless {
-        "rerun with `--repair-archive-indexes` to rebuild the missing index from the \
-         archive's own entries, retaining the original bytes under a `.bak` name"
-    } else {
-        // A closed archive that stopped validating is not a missing trailer;
-        // a scan of it may read fewer segments than it holds, and repairing
-        // makes that the served truth in everything but the `.bak`.
-        "inspect before repairing: `--repair-archive-indexes` would rebuild the missing \
-         indexes from a recovery scan, which retains the original bytes under a `.bak` name but \
-         cannot recover a segment the scan cannot read"
-    };
-    format!(
-        "{subject} ({names}); the index was rejected because {reasons}; {ordinality}. Refusing \
-         this cleanup run; no archive, journal, or checkpoint has been changed. Run \
-         `froe archives` on this repository to see every archive's index state; {remedy}."
-    )
-}
-
 /// The repairs an index-less store needs, one per archive *number*.
 ///
 /// Named from the same census the refusal uses, so an operator who opts in
@@ -450,7 +342,6 @@ pub(super) fn planned_archive_repairs(repository: &Repository) -> Vec<Compaction
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::store::Repository;
     use crate::tar_archive::archive::TarArchiveReader;
     use crate::writer::maintenance::options::*;
@@ -460,139 +351,13 @@ mod tests {
 
     use crate::writer::maintenance::test_support::*;
 
-    #[test]
-    fn a_refusal_names_the_offenders_and_agrees_in_number() {
-        let one = indexless_archive_refusal(IndexlessCensus {
-            total_numbers: 43,
-            indexless_numbers: 1,
-            offenders: &[("data00042a.tar", MAGIC_REASON)],
-            newest_is_indexless: true,
-            any_scan_is_empty: false,
-        });
-        assert!(
-            one.contains("1 of 43 active archive numbers has no index metadata (data00042a.tar)"),
-            "singular subject names the archive and the total: {one}"
-        );
-        assert!(
-            one.contains(MAGIC_REASON),
-            "the reason the index was rejected reaches the operator: {one}"
-        );
-        assert!(
-            one.contains("no archive, journal, or checkpoint has been changed"),
-            "the refusal states precisely what is untouched: {one}"
-        );
-
-        let two = indexless_archive_refusal(IndexlessCensus {
-            total_numbers: 3,
-            indexless_numbers: 2,
-            offenders: &[
-                ("data00001a.tar", CHECKSUM_REASON),
-                ("data00000a.tar", CHECKSUM_REASON),
-            ],
-            newest_is_indexless: false,
-            any_scan_is_empty: false,
-        });
-        assert!(
-            two.contains("2 of 3 active archive numbers have no index metadata"),
-            "plural subject agrees: {two}"
-        );
-        assert_eq!(
-            two.matches(CHECKSUM_REASON).count(),
-            1,
-            "one shared reason is stated once, not repeated per archive: {two}"
-        );
-    }
-    /// The census counts every offender even though only five are named,
-    /// so an operator cannot read the shown list as the whole damage.
-    #[test]
-    fn a_refusal_counts_the_offenders_it_does_not_name() {
-        let many: Vec<String> = (0..8)
-            .map(|index| format!("data0000{index}a.tar"))
-            .collect();
-        let borrowed: Vec<(&str, &str)> = many.iter().map(|n| (n.as_str(), MAGIC_REASON)).collect();
-
-        let truncated = indexless_archive_refusal(IndexlessCensus {
-            total_numbers: 40,
-            indexless_numbers: 8,
-            offenders: &borrowed,
-            newest_is_indexless: true,
-            any_scan_is_empty: false,
-        });
-
-        assert!(
-            truncated.contains("8 of 40 active archive numbers"),
-            "the count is the whole census, not the shown names: {truncated}"
-        );
-        assert!(
-            truncated.contains("and 3 more"),
-            "the omitted names are counted rather than silently dropped: {truncated}"
-        );
-    }
-    /// The remedy is the branch an operator acts on, and the three shapes
-    /// need different advice: a killed writer can be repaired, mid-store
-    /// damage should be inspected first, and an archive whose scan reads
-    /// nothing cannot be repaired at all.
-    #[test]
-    fn a_refusal_advises_the_remedy_that_fits_the_damage() {
-        let killed_writer = indexless_archive_refusal(IndexlessCensus {
-            total_numbers: 43,
-            indexless_numbers: 1,
-            offenders: &[("data00042a.tar", MAGIC_REASON)],
-            newest_is_indexless: true,
-            any_scan_is_empty: false,
-        });
-        assert!(
-            killed_writer.contains("the newest active archive is among them"),
-            "a killed writer is distinguishable from damage: {killed_writer}"
-        );
-        assert!(
-            killed_writer.contains("--repair-archive-indexes"),
-            "a killed writer is pointed at the task that repairs it: {killed_writer}"
-        );
-
-        let mid_store = indexless_archive_refusal(IndexlessCensus {
-            total_numbers: 3,
-            indexless_numbers: 2,
-            offenders: &[
-                ("data00001a.tar", CHECKSUM_REASON),
-                ("data00000a.tar", CHECKSUM_REASON),
-            ],
-            newest_is_indexless: false,
-            any_scan_is_empty: false,
-        });
-        assert!(
-            mid_store.contains("the newest active archive is not among them"),
-            "mid-store damage is not reported as a killed writer: {mid_store}"
-        );
-        assert!(
-            mid_store.contains("inspect before repairing"),
-            "mid-store damage does not get the unconditional repair advice: {mid_store}"
-        );
-
-        // An archive whose scan read nothing cannot be rebuilt, and the
-        // write open refuses it. Advising a write command would be circular.
-        let unrecoverable = indexless_archive_refusal(IndexlessCensus {
-            total_numbers: 2,
-            indexless_numbers: 1,
-            offenders: &[("data00009a.tar", MAGIC_REASON)],
-            newest_is_indexless: true,
-            any_scan_is_empty: true,
-        });
-        assert!(
-            !unrecoverable.contains("--repair-archive-indexes"),
-            "an unrecoverable archive must not be sent to a command that will refuse it: \
-             {unrecoverable}"
-        );
-        assert!(
-            unrecoverable.contains("move that file aside"),
-            "an unrecoverable archive gets the remedy that actually works: {unrecoverable}"
-        );
-    }
-
     /// The production refusal, end to end. Before the census this reported
     /// the first offending segment of the first offending archive and
-    /// nothing else — no count, no ordinality, no remedy — and discarded
-    /// the stale-archive warning the same run had already established.
+    /// nothing else — no count, no ordinality, no remedy. The census is
+    /// now also raised *early*: right after the archives open, before the
+    /// head verification that costs minutes on a real store, so the
+    /// refusal must be complete on its own rather than leaning on warnings
+    /// later scans would have established.
     #[test]
     fn cleanup_refuses_an_index_less_active_archive_with_a_full_census() {
         let directory = TestDirectory::new("index-less-census");
@@ -622,8 +387,9 @@ mod tests {
             "the refusal states precisely what is untouched: {details}"
         );
         assert!(
-            details.contains("has no valid indexed generation"),
-            "the stale-archive warning established before the refusal is carried out with it: {details}"
+            !details.contains("Also established before the refusal"),
+            "the early refusal is raised before any scan establishes warnings, and must not \
+             carry a redundant restatement of its own census: {details}"
         );
         assert_eq!(
             file_bytes(&directory.path),
@@ -644,12 +410,13 @@ mod tests {
         }
         break_index_magic(&directory.path.join("data00000a.tar"));
 
-        // Without the task, the default set still refuses and points at it.
+        // Without the task, the default set still refuses and points at
+        // authorizing the repair that fixes it.
         let refusal = plan_compaction(&directory.path, &CompactionOptions::default())
             .expect_err("the default set must still refuse");
         assert!(
-            refusal.to_string().contains("--repair-archive-indexes"),
-            "the refusal names the task that fixes it: {refusal}"
+            refusal.to_string().contains("authorize the repair"),
+            "the refusal names the remedy that fixes it: {refusal}"
         );
 
         // With it, the preview names the repair and nothing else yet.

@@ -83,8 +83,8 @@ reconstructing their full segment graph as proof, drops checkpoints past
 their timestamp, and deletes only staging files it can prove redundant.
 Every plan also reports the orphaned version histories no structural sweep
 can touch — reachable subtrees whose versionables were deleted years ago —
-and `--purge-orphaned-version-histories` removes them in the same run, the
-one content mutation froe has. When a full compaction would only swap a
+and every confirmed full run purges them, the one content mutation froe
+has (`--skip-purging-orphaned-version-histories` keeps them). When a full compaction would only swap a
 generation for an identical one, the plan says the store is already fully
 compacted and drops the pointless copy instead of running it.
 `--dry-run` previews the whole plan without writing a byte or taking the
@@ -223,9 +223,13 @@ When a planned checkpoint removal, segment-archive rewrite, or archive-index
 repair needs to write version-two state, the plan also shows the one-way
 `store.version=1` to `2` manifest upgrade before apply.
 
-The opt-in `--repair-archive-indexes` rebuilds the index of an archive a killed
-Oak left untrailered — the state that otherwise blocks every generation-
-dependent task — retaining each original under a `.bak` name.
+A confirmed run also rebuilds the index of an archive a killed Oak left
+untrailered — the state that otherwise blocks every generation-dependent
+task — retaining each original under a `.bak` name, and removes the
+recovery backups earlier runs left behind. Each of these is a yes/no
+question: `--yes` answers them all, an interactive run asks, and
+`--skip-repairing-archive-indexes` / `--skip-removing-recovery-backups`
+turn them off.
 
 Every mutating command takes `repo.lock`. If that file is absent, froe first
 creates and fsyncs a mode-`0600` staging inode, then publishes it with an

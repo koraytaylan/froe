@@ -164,6 +164,11 @@ pub(crate) fn silence_never_hides_the_destructive_confirmation_prompt() {
 
     let mut child = InteractiveCleanup::spawn_with(&store, &["--silent"]);
     child.expect_prompt(
+        "the purge question of a silenced cleanup",
+        &["purge orphaned version histories, if any are found?"],
+    );
+    child.send(b"n\n", "declining the purge");
+    child.expect_prompt(
         "the confirmation prompt of a silenced cleanup",
         &[
             "about to apply this compaction plan",

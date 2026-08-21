@@ -131,12 +131,18 @@ pub(super) fn attach_completed_repairs(
         .iter()
         .map(|archive| archive.file_name.as_str())
         .collect();
+    let rebuilds = if repaired.len() == 1 {
+        "1 archive index rebuild, which is already durable".to_owned()
+    } else {
+        format!(
+            "{} archive index rebuilds, which are already durable",
+            repaired.len()
+        )
+    };
     Error::InvalidFormat {
         details: format!(
-            "{error} This refusal came after {} archive index rebuild(s), which are already \
-             durable: {}. The originals are retained under `.bak` names, and those archives \
-             need no second attempt.",
-            repaired.len(),
+            "{error} This refusal came after {rebuilds}: {}. The originals are retained under \
+             `.bak` names, and those archives need no second attempt.",
             names.join(", ")
         ),
     }
@@ -518,6 +524,23 @@ fn gather_plan_facts(
 ) -> Result<GatheredPlanFacts> {
     let repository = Repository::open_with_progress(directory, observer)?;
     let current_head = repository.head_record_identifier();
+
+    // An index-less active archive blocks every generation decision, and
+    // the segment-sweep gate refuses it regardless. Refusing only there
+    // means a large store walks its whole head — minutes of verification —
+    // before hearing a refusal this census can raise seconds after the
+    // archives open, so when a generation decision is selected and no
+    // repair is going to fix the state, it is raised here first. The late
+    // gate stays, failing closed for a combination this condition does not
+    // cover. A stale-archives-only run is deliberately not gated: it
+    // preserves such archives as recovery evidence, with a warning.
+    if !options.contains(MaintenanceTask::RepairArchives)
+        && (options.compaction_kind().is_some() || options.contains(MaintenanceTask::Segments))
+        && let Some(details) =
+            super::indexless_refusal::indexless_active_archive_refusal(&repository)
+    {
+        return Err(Error::InvalidFormat { details });
+    }
 
     // Repository::open deliberately binds by segment existence, matching
     // Oak. Cleanup's gate is stronger: the exact selected record and every

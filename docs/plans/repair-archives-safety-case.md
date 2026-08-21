@@ -1,5 +1,12 @@
 # Safety case: `--repair-archive-indexes`
 
+> Authorization surface as of the `--skip-*` rework: the repair is part of
+> every run that needs one, gated by its own yes/no question (`--yes`
+> answers it, `--skip-repairing-archive-indexes` declines it), and
+> `--repair-archive-indexes` lives on as a hidden pre-authorizing
+> compatibility spelling. The mechanism, ordering, and guarantees analyzed
+> below are unchanged.
+
 The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for
 the opt-in `--repair-archive-indexes` stage, which rebuilds the index of an active archive that
 has none. In scope because it introduces destructive behavior on a path that

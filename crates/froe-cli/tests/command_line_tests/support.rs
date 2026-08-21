@@ -40,7 +40,10 @@ pub(crate) struct CapturedOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
-pub(crate) const CLEANUP_PROMPT_END: &[u8] = b"Continue? [y/N] ";
+// Every question compact asks ends with this suffix — the per-cleanup
+// yes/no questions and the final plan confirmation alike — so one framing
+// token serves the whole interactive conversation.
+pub(crate) const CLEANUP_PROMPT_END: &[u8] = b"[y/N] ";
 
 /// Drains stderr completely while framing each prompt with only the bytes
 /// received since the preceding prompt. The returned transcript remains
@@ -324,6 +327,24 @@ fn write_orphaned_history_system(
             &[],
         )
         .expect("jcr:system")
+}
+
+/// Overwrites an archive's index magic number in place: the smallest
+/// damage that makes the index invalid while every entry stays readable —
+/// the shape a killed Oak writer leaves, which the repair rebuilds from
+/// the archive's own entries.
+pub(crate) fn break_index_magic(path: &std::path::Path) {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let length = std::fs::metadata(path).expect("archive metadata").len();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open archive for damage");
+    file.seek(SeekFrom::Start(length - 1028))
+        .expect("seek to the index magic");
+    file.write_all(&[0xde, 0xad, 0xbe, 0xef])
+        .expect("overwrite the index magic");
 }
 
 /// Writes a store whose content tree is `/content`.

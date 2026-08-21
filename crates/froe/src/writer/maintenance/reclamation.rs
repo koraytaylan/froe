@@ -6,9 +6,10 @@
 /// would call the observer millions of times on a large store.
 const SEGMENT_TRACE_REPORT_STRIDE: u64 = 256;
 
+use super::indexless_refusal::indexless_active_archive_refusal;
 use super::plan::RetainedReclaimable;
 use super::planning::add_estimate;
-use super::stale_archives::{IndexlessCensus, generation_from_header, indexless_archive_refusal};
+use super::stale_archives::generation_from_header;
 use crate::content::provider::SegmentProvider;
 use crate::content::template::{Template, read_template};
 use crate::content::value::read_string;
@@ -20,7 +21,6 @@ use crate::segment::record::RecordIdentifier;
 use crate::segment::record::RecordType;
 use crate::segment::view::SegmentView;
 use crate::store::Repository;
-use crate::tar_archive::file_name::ArchiveFileName;
 use crate::tooling::NodeTreeVerifier;
 use crate::writer::compaction::CompactionKind;
 use crate::writer::segment_builder::GarbageCollectionGeneration;
@@ -29,7 +29,7 @@ use crate::writer::store_writer::{
     planned_unavailable_segments,
 };
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -252,63 +252,8 @@ pub(super) fn segments_ahead_of_the_head(
 pub(super) fn active_index_generations(
     repository: &Repository,
 ) -> Result<HashMap<SegmentIdentifier, GarbageCollectionGeneration>> {
-    // Census before refusal. `Repository::archives()` is ordered newest
-    // archive number first, so this preserves that order and the newest
-    // served archive is affected exactly when it is the first element.
-    let indexless: Vec<(&str, &str)> = repository
-        .archives()
-        .iter()
-        .filter_map(|archive| {
-            archive
-                .recovery_reason()
-                .map(|reason| (archive.file_name(), reason))
-        })
-        .collect();
-    if !indexless.is_empty() {
-        // By number, not by reader: an unindexed number is served through
-        // every one of its non-empty letters, and reporting those letters as
-        // separate damaged archives would overstate the damage.
-        let number_of =
-            |file_name: &str| ArchiveFileName::parse(file_name).map(|n| n.archive_number);
-        let indexless_numbers: BTreeSet<u32> = indexless
-            .iter()
-            .filter_map(|(name, _)| number_of(name))
-            .collect();
-        let total_numbers: BTreeSet<u32> = repository
-            .archives()
-            .iter()
-            .filter_map(|archive| number_of(archive.file_name()))
-            .collect();
-        let newest_is_indexless = repository
-            .archives()
-            .first()
-            .is_some_and(|newest| newest.index().is_none());
-        // `segment_count()` on a recovery-scanned archive is what the scan
-        // actually read, which is exactly what a rebuild would work from —
-        // summed per archive *number*, because the rebuild merges every
-        // letter of a number. A letter that scans empty beside one that does
-        // not is still repairable, and reporting it as unrepairable withholds
-        // the task that would fix the store and sends the operator to
-        // hand-edit a damaged production directory instead.
-        let mut scanned_segments: BTreeMap<u32, usize> = BTreeMap::new();
-        for archive in repository.archives() {
-            if archive.index().is_some() {
-                continue;
-            }
-            if let Some(number) = number_of(archive.file_name()) {
-                *scanned_segments.entry(number).or_default() += archive.segment_count();
-            }
-        }
-        let any_scan_is_empty = scanned_segments.values().any(|count| *count == 0);
-        return Err(Error::InvalidFormat {
-            details: indexless_archive_refusal(IndexlessCensus {
-                total_numbers: total_numbers.len(),
-                indexless_numbers: indexless_numbers.len(),
-                offenders: &indexless,
-                newest_is_indexless,
-                any_scan_is_empty,
-            }),
-        });
+    if let Some(details) = indexless_active_archive_refusal(repository) {
+        return Err(Error::InvalidFormat { details });
     }
     let mut generations = HashMap::new();
     for archive in repository.archives() {

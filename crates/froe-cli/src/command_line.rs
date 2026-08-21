@@ -239,8 +239,16 @@ pub(crate) enum Command {
     /// own offline compact tool does (SegmentGCOptions.setOffline sets
     /// retainedGenerations = 1).
     ///
+    /// A full run is the default. Three further cleanups are part of it, each
+    /// gated by its own yes/no question on an interactive run and all answered
+    /// at once by --yes: purging orphaned version histories, rebuilding a
+    /// missing archive index (what a killed writer leaves behind), and
+    /// removing recovery backups left by earlier runs. Each has a --skip-*
+    /// flag that removes it from the run entirely.
+    ///
     /// --dry-run is strictly read-only: it writes no bytes, creates no files,
-    /// and does not create or acquire repo.lock. Applying is Unix-only offline
+    /// and does not create or acquire repo.lock; it previews the full default
+    /// run, honoring the --skip-* flags. Applying is Unix-only offline
     /// maintenance: stop Oak/AEM, run as the operating-system owner of
     /// journal.log (normally the service account, not sudo), and keep a
     /// recoverable copy of important stores. The repository argument is
@@ -251,7 +259,9 @@ pub(crate) enum Command {
     /// journal.log holds exactly one line, naming the compacted head. The
     /// removed history is not recoverable from the store afterwards;
     /// journal.log is copied to a numbered .bak first. Recovery backups are
-    /// retained unless an explicit age/count policy is supplied.
+    /// retained by a run that also repairs an archive index, by
+    /// --skip-removing-recovery-backups, and by the
+    /// --backup-minimum-age-days / --backup-keep-latest retention window.
     ///
     /// Reclamation publishes validated successor TARs with absent-only,
     /// same-directory hard links. A filesystem without hard-link or durable
@@ -262,7 +272,9 @@ pub(crate) enum Command {
     Compact {
         /// The segment store directory.
         repository: PathBuf,
-        /// Run a tail compaction instead of a full one.
+        /// Run a tail compaction instead of a full one. A tail run keeps the
+        /// shared full generation, so it never purges orphaned version
+        /// histories; that waits for a full compaction.
         #[arg(long)]
         tail: bool,
         /// Copy the head into a fresh generation even when the store is
@@ -274,47 +286,51 @@ pub(crate) enum Command {
         /// suspected mapping-level damage.
         #[arg(long)]
         always_copy: bool,
-        /// Omit every confirmed orphaned version history from the copy: the
+        /// Keep every orphaned version history instead of purging them: the
         /// nt:versionHistory subtrees whose jcr:versionableUuid matches no
         /// live jcr:uuid, which pin the version payloads and binaries of
         /// everything ever deleted.
         ///
-        /// Detection runs and is reported on every plan regardless; this
-        /// flag selects removal, which the plan then lists for
-        /// confirmation. Removal is permanent, and forfeits the
-        /// re-attachment a versionable recreated with its old identifier —
-        /// a content package reinstall — would otherwise get. Histories
-        /// that freeze nt:configuration versionables, and histories that
-        /// REFERENCE or WEAKREFERENCE values outside version storage still
-        /// point into, are kept with a warning. Requires a full compaction,
-        /// so it cannot combine with --tail.
-        #[arg(long, conflicts_with = "tail")]
-        purge_orphaned_version_histories: bool,
+        /// The purge is otherwise part of every full compaction, after its
+        /// own confirmation (--yes confirms it), and the plan lists it with
+        /// exact counts before anything is applied. Detection runs and is
+        /// reported on every plan regardless. Removal is permanent, and
+        /// forfeits the re-attachment a versionable recreated with its old
+        /// identifier — a content package reinstall — would otherwise get.
+        /// Histories that freeze nt:configuration versionables, and
+        /// histories that REFERENCE or WEAKREFERENCE values outside version
+        /// storage still point into, are always kept with a warning.
+        #[arg(long)]
+        skip_purging_orphaned_version_histories: bool,
         /// Purge only histories whose newest version was created at least
         /// this many days ago, guarding the window where content deleted
         /// moments ago is about to be restored from a package. A history
-        /// without a parsable version creation date is kept.
-        #[arg(long, requires = "purge_orphaned_version_histories")]
+        /// without a parsable version creation date is kept. Passing this
+        /// selects the purge without asking.
+        #[arg(long, conflicts_with_all = ["skip_purging_orphaned_version_histories", "tail"])]
         purged_history_minimum_age_days: Option<u64>,
         /// Print the complete plan and exit without taking repo.lock or
         /// writing a byte.
         #[arg(long)]
         dry_run: bool,
-        /// Proceed without the interactive confirmation.
+        /// Answer yes to every question: the plan confirmation, and the
+        /// per-cleanup questions an interactive run asks first.
         #[arg(long)]
         yes: bool,
-        /// Rebuild the index of an active archive that has none — what a
-        /// killed Oak writer leaves behind — keeping the original under a
-        /// .bak name.
+        /// Never rebuild the index of an active archive that has none — the
+        /// state a killed Oak writer leaves behind. Nothing index-dependent
+        /// can be planned in that state, so a damaged store is then refused
+        /// with nothing changed.
         ///
-        /// Not a default: it rewrites an archive, and a store damaged in the
-        /// middle rather than at the tail is a case to look at before
-        /// authorizing. Every other stage is blocked until this has run, so a
-        /// store in that state plans only the repair until you opt in. The
-        /// repair runs under the lock before the one plan is built, so the
-        /// plan you confirm already reflects the rebuilt indexes.
+        /// The rebuild is otherwise part of every run that needs one, after
+        /// its own confirmation (--yes confirms it): it runs under the lock
+        /// before the one plan is built, keeps the original bytes under a
+        /// .bak name, and the plan you confirm already reflects the rebuilt
+        /// indexes. A store damaged in the middle rather than at the tail is
+        /// still worth looking at before authorizing — the question and the
+        /// refusal both say which case this store is.
         #[arg(long)]
-        repair_archive_indexes: bool,
+        skip_repairing_archive_indexes: bool,
         /// Copy checkpoints whose valid timestamp has passed into the fresh
         /// generation instead of dropping them.
         ///
@@ -328,16 +344,37 @@ pub(crate) enum Command {
         /// a backup is unreferenced by that rule.
         #[arg(long)]
         remove_unreferenced_checkpoints: bool,
-        /// Remove recovery backups at least this old; with
-        /// --backup-keep-latest this enables recovery-backup retirement,
-        /// which is otherwise never performed.
-        #[arg(long, requires = "backup_keep_latest")]
+        /// Keep every recovery backup — journal.log.bak.NNN and the archive
+        /// .bak spellings — instead of removing them.
+        ///
+        /// Removal is otherwise part of every run, after its own
+        /// confirmation (--yes confirms it), and always as the run's last
+        /// mutation, once the store has verified. A run that repairs an
+        /// archive index keeps them regardless: the repair writes the .bak
+        /// files a removal could otherwise delete in the same run, so their
+        /// removal waits for the next one.
+        #[arg(long, conflicts_with_all = ["backup_minimum_age_days", "backup_keep_latest"])]
+        skip_removing_recovery_backups: bool,
+        /// Remove only recovery backups at least this many days old.
+        /// Without it age protects nothing; future-dated backups are never
+        /// old enough.
+        #[arg(long)]
         backup_minimum_age_days: Option<u64>,
-        /// Retain at least this many newest backups per target (all mtime ties
-        /// at the boundary are kept); with --backup-minimum-age-days this
-        /// enables recovery-backup retirement.
-        #[arg(long, requires = "backup_minimum_age_days")]
+        /// Retain at least this many newest backups per original target
+        /// (all modification-time ties at the boundary are kept). Without it
+        /// no backup is retained by count.
+        #[arg(long)]
         backup_keep_latest: Option<usize>,
+        /// The spelling from when the purge was opt-in rather than default:
+        /// passing it selects the purge without asking, exactly as it
+        /// always did. Hidden compatibility flag.
+        #[arg(long, hide = true, conflicts_with_all = ["skip_purging_orphaned_version_histories", "tail"])]
+        purge_orphaned_version_histories: bool,
+        /// The spelling from when the repair was opt-in rather than
+        /// default: passing it authorizes the rebuild without asking,
+        /// exactly as it always did. Hidden compatibility flag.
+        #[arg(long, hide = true, conflicts_with = "skip_repairing_archive_indexes")]
+        repair_archive_indexes: bool,
         /// Which archives holding reclaimable segments may be rewritten.
         ///
         /// every-reclaimable-archive, the default, rewrites any archive that
@@ -651,15 +688,18 @@ mod tests {
             repository,
             tail,
             always_copy,
-            purge_orphaned_version_histories,
+            skip_purging_orphaned_version_histories,
             purged_history_minimum_age_days,
             dry_run,
             yes,
-            repair_archive_indexes,
+            skip_repairing_archive_indexes,
             keep_expired_checkpoints,
             remove_unreferenced_checkpoints,
+            skip_removing_recovery_backups,
             backup_minimum_age_days,
             backup_keep_latest,
+            purge_orphaned_version_histories,
+            repair_archive_indexes,
             archive_rewrite_policy,
         } = parsed.command
         else {
@@ -671,8 +711,10 @@ mod tests {
         assert!(!tail, "a full compaction is the default");
         assert!(!always_copy, "the convergence gate is on by default");
         assert!(
-            !purge_orphaned_version_histories,
-            "the purge is an explicit opt-in"
+            !skip_purging_orphaned_version_histories
+                && !skip_repairing_archive_indexes
+                && !skip_removing_recovery_backups,
+            "nothing is skipped unless asked"
         );
         assert!(purged_history_minimum_age_days.is_none());
         assert_eq!(backup_minimum_age_days, Some(30));
@@ -683,8 +725,8 @@ mod tests {
             "reclaiming every identified segment is the default"
         );
         assert!(
-            !repair_archive_indexes,
-            "rewriting a damaged archive stays opt-in"
+            !purge_orphaned_version_histories && !repair_archive_indexes,
+            "the hidden compatibility spellings default off"
         );
         assert!(
             !keep_expired_checkpoints,
@@ -696,10 +738,11 @@ mod tests {
         );
     }
 
-    /// Either retention flag alone is refused before froe opens the store:
-    /// an age with no count, or a count with no age, is not a policy.
+    /// Each retention flag stands alone now that backup removal is a
+    /// default rather than something the pair enables: an age bound
+    /// without a count, or a count without an age, is a valid narrowing.
     #[test]
-    fn a_lone_backup_retention_flag_is_refused_at_parse_time() {
+    fn a_lone_backup_retention_flag_parses() {
         for arguments in [
             vec![
                 "froe",
@@ -711,8 +754,132 @@ mod tests {
             vec!["froe", "compact", "/store", "--backup-keep-latest", "3"],
         ] {
             assert!(
-                CommandLine::try_parse_from(arguments.clone()).is_err(),
-                "half a retention policy is not a policy: {arguments:?}"
+                CommandLine::try_parse_from(arguments.clone()).is_ok(),
+                "a lone retention bound narrows the default removal: {arguments:?}"
+            );
+        }
+    }
+
+    /// A skip flag contradicts the flags that tune what it skips, and the
+    /// contradiction is refused before froe opens the store.
+    #[test]
+    fn skip_flags_conflict_with_what_they_skip() {
+        for arguments in [
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--skip-removing-recovery-backups",
+                "--backup-minimum-age-days",
+                "30",
+            ],
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--skip-removing-recovery-backups",
+                "--backup-keep-latest",
+                "3",
+            ],
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--skip-purging-orphaned-version-histories",
+                "--purged-history-minimum-age-days",
+                "30",
+            ],
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--tail",
+                "--purged-history-minimum-age-days",
+                "30",
+            ],
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--skip-purging-orphaned-version-histories",
+                "--purge-orphaned-version-histories",
+            ],
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--skip-repairing-archive-indexes",
+                "--repair-archive-indexes",
+            ],
+            vec![
+                "froe",
+                "compact",
+                "/store",
+                "--tail",
+                "--purge-orphaned-version-histories",
+            ],
+        ] {
+            let parsed = CommandLine::try_parse_from(arguments.clone());
+            let Err(error) = parsed else {
+                panic!("contradictory flags must be refused: {arguments:?}");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{arguments:?}"
+            );
+        }
+    }
+
+    /// The spellings from when the purge and the repair were opt-in stay
+    /// parseable — they now authorize without asking — and stay out of the
+    /// help text.
+    #[test]
+    fn the_pre_default_authorization_spellings_parse_and_stay_undocumented() {
+        let parsed = CommandLine::try_parse_from([
+            "froe",
+            "compact",
+            "/store",
+            "--purge-orphaned-version-histories",
+            "--repair-archive-indexes",
+            "--dry-run",
+        ])
+        .expect("the compatibility spellings must keep parsing");
+        let Command::Compact {
+            purge_orphaned_version_histories,
+            repair_archive_indexes,
+            ..
+        } = parsed.command
+        else {
+            panic!("compact must dispatch");
+        };
+        assert!(purge_orphaned_version_histories);
+        assert!(repair_archive_indexes);
+
+        let mut command = <CommandLine as clap::CommandFactory>::command();
+        let compact = command
+            .find_subcommand_mut("compact")
+            .expect("compact subcommand");
+        let mut help = Vec::new();
+        compact.write_long_help(&mut help).expect("render help");
+        let help = String::from_utf8(help).expect("valid UTF-8");
+        for hidden in [
+            "--purge-orphaned-version-histories",
+            "--repair-archive-indexes",
+        ] {
+            assert!(
+                !help.contains(hidden),
+                "the compatibility spelling {hidden} must stay undocumented: {help}"
+            );
+        }
+        for documented in [
+            "--skip-purging-orphaned-version-histories",
+            "--skip-repairing-archive-indexes",
+            "--skip-removing-recovery-backups",
+        ] {
+            assert!(
+                help.contains(documented),
+                "help must document {documented}: {help}"
             );
         }
     }

@@ -127,7 +127,7 @@ impl PreparedCompaction {
                 &survey.unrepairable,
             ));
         }
-        if survey.repairable == 0 {
+        if survey.repairable.is_empty() {
             return Ok(Vec::new());
         }
         // Duplicate `(number, letter)` pairs before the upgrade, not after:

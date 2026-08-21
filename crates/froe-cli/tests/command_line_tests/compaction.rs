@@ -184,10 +184,10 @@ pub(crate) fn compact_yes_applies_the_locked_plan_and_reopens_healthy() {
 }
 
 /// The field scenario that motivated the convergence gate, in miniature:
-/// the first run copies and says the store is now fully compacted; the
-/// second proves it and does nothing — no 6.34 GiB swap, no archive churn,
-/// a byte-identical store — and `--always-copy` still forces a copy for the
-/// operator who wants one.
+/// the first run copies and says what remains; the second proves the
+/// compaction converged and does nothing — no 6.34 GiB swap, no archive
+/// churn, a byte-identical store — and `--always-copy` still forces a copy
+/// for the operator who wants one.
 #[test]
 pub(crate) fn a_second_run_on_a_compacted_store_does_nothing_unless_forced() {
     let directory = TestDirectory::new("cleanup-convergence");
@@ -202,9 +202,10 @@ pub(crate) fn a_second_run_on_a_compacted_store_does_nothing_unless_forced() {
     let first_stdout = String::from_utf8_lossy(&first.stdout);
     assert!(first.status.success(), "{first_stdout}");
     assert!(
-        first_stdout
-            .contains("the store is now fully compacted; a repeat run will report nothing to do"),
-        "the first run must state the convergence it produced: {first_stdout}"
+        first_stdout.contains(
+            "the store is now fully compacted; a repeat run has only recovery backups left to remove"
+        ),
+        "the first run wrote a journal backup and must say that is all a repeat would touch: {first_stdout}"
     );
 
     let before: Vec<(std::ffi::OsString, Vec<u8>)> = {
@@ -221,8 +222,15 @@ pub(crate) fn a_second_run_on_a_compacted_store_does_nothing_unless_forced() {
         files.sort_by(|left, right| left.0.cmp(&right.0));
         files
     };
+    // With backup removal skipped, the repeat proves the compaction itself
+    // converged: byte-identical store, nothing to do.
     let second = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args(["compact", store.to_str().expect("path"), "--yes"])
+        .args([
+            "compact",
+            store.to_str().expect("path"),
+            "--yes",
+            "--skip-removing-recovery-backups",
+        ])
         .output()
         .expect("run the second compaction");
     let second_stdout = String::from_utf8_lossy(&second.stdout);
@@ -297,6 +305,11 @@ pub(crate) fn a_change_during_confirmation_is_refused_rather_than_replanned() {
     populate(&store);
 
     let mut child = InteractiveCleanup::spawn(&store);
+    child.expect_prompt(
+        "the purge question",
+        &["purge orphaned version histories, if any are found?"],
+    );
+    child.send(b"n\n", "declining the purge");
     child.expect_prompt(
         "confirmation prompt",
         &["about to apply this compaction plan"],
@@ -557,7 +570,7 @@ pub(crate) fn compact_preview_names_every_omitted_checkpoint_before_confirmation
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("omit 1 checkpoints from the copy"),
+        stdout.contains("omit 1 checkpoint from the copy (1 unreferenced)"),
         "{stdout}"
     );
     assert!(
@@ -566,43 +579,60 @@ pub(crate) fn compact_preview_names_every_omitted_checkpoint_before_confirmation
     );
 }
 
-/// The orphan report is on every plan; the purge is opt-in, listed for
-/// confirmation, and the summary states the content delta — the operator's
-/// observation 2 answered in one line.
+/// The orphan report is on every plan and the purge is part of every full
+/// run: the plan lists it with exact counts, the skip flag keeps the
+/// histories with a stated reason, and the summary restates what was
+/// purged.
 #[test]
-pub(crate) fn a_purge_is_reported_selected_and_summarized() {
+pub(crate) fn a_purge_is_reported_selected_by_default_and_summarized() {
     let directory = TestDirectory::new("cleanup-purge");
     let store = directory.path.join("segmentstore");
     std::fs::create_dir_all(&store).expect("create store directory");
     populate_with_orphaned_history(&store);
 
-    let detection = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
-        .args(["compact", store.to_str().expect("path"), "--dry-run"])
-        .output()
-        .expect("run the detection dry-run");
-    let detection_stdout = String::from_utf8_lossy(&detection.stdout);
-    assert!(detection.status.success(), "{detection_stdout}");
-    assert!(
-        detection_stdout
-            .contains("orphaned version histories: 1 (their versionables no longer exist)"),
-        "detection reports without the flag: {detection_stdout}"
-    );
-    assert!(
-        detection_stdout.contains("purge with --purge-orphaned-version-histories"),
-        "the report names the flag: {detection_stdout}"
-    );
-    assert!(
-        !detection_stdout.contains("purge 1 orphaned version histories"),
-        "no purge is selected without the flag: {detection_stdout}"
-    );
-
-    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+    let skipped = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
         .args([
             "compact",
             store.to_str().expect("path"),
-            "--yes",
-            "--purge-orphaned-version-histories",
+            "--dry-run",
+            "--skip-purging-orphaned-version-histories",
         ])
+        .output()
+        .expect("run the skipping dry-run");
+    let skipped_stdout = String::from_utf8_lossy(&skipped.stdout);
+    assert!(skipped.status.success(), "{skipped_stdout}");
+    assert!(
+        skipped_stdout
+            .contains("orphaned version histories: 1 (their versionables no longer exist)"),
+        "detection reports even when the purge is skipped: {skipped_stdout}"
+    );
+    assert!(
+        skipped_stdout.contains("kept, as --skip-purging-orphaned-version-histories requests"),
+        "the report states why nothing is purged: {skipped_stdout}"
+    );
+    assert!(
+        !skipped_stdout.contains("purge 1 orphaned version history ("),
+        "no purge is selected under the skip flag: {skipped_stdout}"
+    );
+
+    let preview = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--dry-run"])
+        .output()
+        .expect("run the default dry-run");
+    let preview_stdout = String::from_utf8_lossy(&preview.stdout);
+    assert!(preview.status.success(), "{preview_stdout}");
+    assert!(
+        preview_stdout
+            .contains("purge 1 orphaned version history (2 nodes) by omitting it from the copy"),
+        "the default plan lists the purge, singular and all: {preview_stdout}"
+    );
+    assert!(
+        preview_stdout.contains("this run purges all of them, as listed in the plan above"),
+        "the report says what this very run does instead of advising a flag: {preview_stdout}"
+    );
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--yes"])
         .output()
         .expect("run the purge");
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -612,9 +642,7 @@ pub(crate) fn a_purge_is_reported_selected_and_summarized() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(
-        stdout.contains(
-            "purge 1 orphaned version histories (2 nodes) by omitting them from the copy"
-        ),
+        stdout.contains("purge 1 orphaned version history (2 nodes) by omitting it from the copy"),
         "the purge is a listed action: {stdout}"
     );
     assert!(
@@ -622,7 +650,7 @@ pub(crate) fn a_purge_is_reported_selected_and_summarized() {
         "the irreversibility is stated: {stdout}"
     );
     assert!(
-        stdout.contains("(removed 1 orphaned version histories holding 2 nodes)"),
+        stdout.contains("purged: 1 orphaned version history (2 nodes omitted from the copy)"),
         "the summary states the content delta: {stdout}"
     );
     froe::Repository::open(&store).expect("the purged store reopens");
@@ -632,7 +660,7 @@ pub(crate) fn a_purge_is_reported_selected_and_summarized() {
             "compact",
             store.to_str().expect("path"),
             "--yes",
-            "--purge-orphaned-version-histories",
+            "--skip-removing-recovery-backups",
         ])
         .output()
         .expect("run the repeat");

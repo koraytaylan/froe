@@ -10,6 +10,9 @@
 //! lock, so they must only be run against a *stopped* repository and ask for
 //! confirmation first. `compact --dry-run` is strictly read-only.
 
+mod compaction;
+mod compaction_report;
+mod compaction_summary;
 mod content_display;
 mod inspection;
 mod mutation;
@@ -26,7 +29,7 @@ use froe::progress::ProgressObserver as _;
 use froe::store::Repository;
 use froe::tooling::BinaryCheck;
 
-use crate::mutation::{CheckpointRemoval, CompactionRun, Confirmation};
+use crate::mutation::{CheckpointRemoval, Confirmation};
 use crate::progress::{ProgressWhen, Reporter};
 
 mod command_line;
@@ -249,75 +252,39 @@ pub(crate) fn run_compaction_command(
             repository,
             tail,
             always_copy,
-            purge_orphaned_version_histories,
+            skip_purging_orphaned_version_histories,
             purged_history_minimum_age_days,
             dry_run,
             yes,
-            repair_archive_indexes,
+            skip_repairing_archive_indexes,
             keep_expired_checkpoints,
             remove_unreferenced_checkpoints,
+            skip_removing_recovery_backups,
             backup_minimum_age_days,
             backup_keep_latest,
+            purge_orphaned_version_histories,
+            repair_archive_indexes,
             archive_rewrite_policy,
         } => {
-            let kind = if tail {
-                froe::CompactionKind::Tail
-            } else {
-                froe::CompactionKind::Full
+            let command_line = compaction::CompactionCommandLine {
+                tail,
+                always_copy,
+                dry_run,
+                assume_yes: yes,
+                skip_purging_orphaned_version_histories,
+                purge_preauthorized: purge_orphaned_version_histories,
+                purged_history_minimum_age_days,
+                skip_repairing_archive_indexes,
+                repair_preauthorized: repair_archive_indexes,
+                skip_removing_recovery_backups,
+                backup_minimum_age_days,
+                backup_keep_latest,
+                keep_expired_checkpoints,
+                remove_unreferenced_checkpoints,
+                oak_savings_gate: archive_rewrite_policy
+                    == ArchiveRewritePolicyArgument::OakSavingsGate,
             };
-            let mut options = froe::CompactionOptions::default().with_compaction(kind);
-            if always_copy {
-                options = options.with_copy_when_already_compacted();
-            }
-            if purge_orphaned_version_histories {
-                options = options.with_orphaned_version_history_purge();
-            }
-            if let Some(days) = purged_history_minimum_age_days {
-                let Some(seconds) = days.checked_mul(24 * 60 * 60) else {
-                    eprintln!("froe: --purged-history-minimum-age-days is too large");
-                    return Ok(ExitCode::FAILURE);
-                };
-                options = options
-                    .with_purged_history_minimum_age(std::time::Duration::from_secs(seconds));
-            }
-            if archive_rewrite_policy == ArchiveRewritePolicyArgument::OakSavingsGate {
-                options = options.with_oak_savings_gate();
-            }
-            if keep_expired_checkpoints {
-                options = options.keeping_expired_checkpoints();
-            }
-            if remove_unreferenced_checkpoints {
-                options = options.with_unreferenced_checkpoint_removal();
-            }
-            if repair_archive_indexes {
-                options = options.with_archive_index_repair();
-            }
-            match (backup_minimum_age_days, backup_keep_latest) {
-                (Some(days), Some(keep_latest)) => {
-                    let Some(seconds) = days.checked_mul(24 * 60 * 60) else {
-                        eprintln!("froe: --backup-minimum-age-days is too large");
-                        return Ok(ExitCode::FAILURE);
-                    };
-                    options = options.with_recovery_backup_policy(froe::RecoveryBackupPolicy::new(
-                        std::time::Duration::from_secs(seconds),
-                        keep_latest,
-                    ));
-                }
-                (None, None) => {}
-                _ => {
-                    eprintln!(
-                        "froe: --backup-minimum-age-days and --backup-keep-latest must be supplied together"
-                    );
-                    return Ok(ExitCode::FAILURE);
-                }
-            }
-            if !mutation::run_compact(
-                &repository,
-                options,
-                CompactionRun::from_dry_run_flag(dry_run),
-                Confirmation::from_assume_yes_flag(yes),
-                reporter,
-            )? {
+            if !compaction::run_compact(&repository, &command_line, reporter)? {
                 return Ok(ExitCode::FAILURE);
             }
         }

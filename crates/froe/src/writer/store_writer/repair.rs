@@ -77,8 +77,9 @@ pub(crate) fn repair_target_names(directory: &Path) -> Result<Vec<String>> {
 /// which hold bytes no scan can read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IndexlessSurvey {
-    /// Numbers a rebuild would succeed on.
-    pub(crate) repairable: usize,
+    /// Install-target file names of numbers a rebuild would succeed on,
+    /// lowest number first.
+    pub(crate) repairable: Vec<String>,
     /// File names of numbers a rebuild would refuse, lowest number first.
     pub(crate) unrepairable: Vec<String>,
 }
@@ -110,7 +111,11 @@ pub(crate) fn survey_indexless_archive_numbers(directory: &Path) -> Result<Index
             continue;
         }
         if any_recoverable_segment(directory, &generations) {
-            survey.repairable += 1;
+            survey.repairable.push(
+                install_target_generation(directory, &generations)
+                    .file_name
+                    .clone(),
+            );
         } else {
             survey.unrepairable.push(
                 install_target_generation(directory, &generations)
@@ -125,16 +130,24 @@ pub(crate) fn survey_indexless_archive_numbers(directory: &Path) -> Result<Index
 /// The refusal an unrepairable archive number earns, raised before anything
 /// is authorized rather than after a rewrite has been paid for.
 pub(crate) fn unrepairable_archives_refusal(unrepairable: &[String]) -> Error {
-    Error::InvalidFormat {
-        details: format!(
-            "{} active archive(s) have no valid index and no segment any recovery scan can read: \
+    let details = if let [only] = unrepairable {
+        format!(
+            "active archive {only} has no valid index and no segment any recovery scan can \
+             read. Repair would refuse it, so this run cannot complete however it is retried; \
+             move that file aside to proceed, and keep it — it is the only copy of whatever \
+             it holds"
+        )
+    } else {
+        format!(
+            "{} active archives have no valid index and no segment any recovery scan can read: \
              {}. Repair would refuse them, so this run cannot complete however it is retried; \
              move those files aside to proceed, and keep them — they are the only copy of \
              whatever they hold",
             unrepairable.len(),
             unrepairable.join(", ")
-        ),
-    }
+        )
+    };
+    Error::InvalidFormat { details }
 }
 
 /// Rebuilds the index of every archive number that has none, and does

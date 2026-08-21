@@ -7,10 +7,9 @@
 //! gone, and on a long-lived store they pin the version payloads and inline
 //! binaries of everything ever deleted. The planner therefore detects them
 //! on every run and reports what they hold; removing them is a separate,
-//! explicitly confirmed decision (`--purge-orphaned-version-histories`),
-//! because a versionable recreated with its old identifier — a content
-//! package reinstall — re-attaches the surviving history, and purging
-//! forfeits that.
+//! explicitly confirmed decision the caller selects, because a versionable
+//! recreated with its old identifier — a content package reinstall —
+//! re-attaches the surviving history, and purging forfeits that.
 //!
 //! Detection is two ordered passes so the memory bound never depends on
 //! tree-visit order: a pre-scan of the version-storage subtree collects

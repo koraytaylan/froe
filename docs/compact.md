@@ -122,7 +122,10 @@ the run performs the standalone sweep instead, so garbage never hides behind
 the gate; a run with nothing at all left prints
 `the store is already fully compacted; nothing to do` and mutates nothing. A
 completed full compaction states the consequence in its summary:
-`the store is now fully compacted; a repeat run will report nothing to do`.
+`the store is now fully compacted; a repeat run will report nothing to do` —
+or, when recovery backups remain on disk (the run's own journal backup
+included), `… a repeat run has only recovery backups left to remove`,
+because removing them is exactly what the next default run would do.
 `--always-copy` overrides the gate for the operator who wants a rewrite
 anyway; it is never needed for space.
 
@@ -157,12 +160,16 @@ checkpoint's snapshot can pin blocks until it expires (the line names the
 checkpoint count when that applies). The sweep that follows the copy frees
 exactly what is actually unreferenced.
 
-Removal is `--purge-orphaned-version-histories`: the run's one *content*
-mutation, listed as its own plan action with the same irreversibility
-warning the journal retirement carries, and confirmed with everything else.
-The copy simply declines to enter the confirmed subtrees — the mechanism
-checkpoint retirement already uses — and the reclaim pass that follows
-turns the omission into reclaimed space. Deliberate boundaries:
+Removal is part of every full compaction: the run's one *content*
+mutation, so it is gated by its own yes/no question — an interactive run
+asks up front, `--yes` answers it, and
+`--skip-purging-orphaned-version-histories` keeps the histories with the
+reason stated in the report. The selected purge is listed as its own plan
+action with the same irreversibility warning the journal retirement
+carries, and confirmed with everything else. The copy simply declines to
+enter the confirmed subtrees — the mechanism checkpoint retirement already
+uses — and the reclaim pass that follows turns the omission into reclaimed
+space. Deliberate boundaries:
 
 * **Checkpoint snapshots keep everything they froze.** A purged history
   still resolves through a retained checkpoint, whose own copy of version
@@ -181,31 +188,57 @@ turns the omission into reclaimed space. Deliberate boundaries:
   histories whose newest version is younger than the bound, or carries no
   parsable creation date — the guard for content deleted moments ago and
   about to be restored from a package, whose recreated versionable would
-  otherwise have re-attached the history by identifier.
+  otherwise have re-attached the history by identifier. Passing the bound
+  selects the purge without asking.
 * **A full compaction is required**: tail reclamation retains the shared
   full generation, which could leave every released record on disk after a
-  run that promised to remove them, so the flag refuses `--tail`.
+  run that promised to remove them, so a `--tail` run never purges and its
+  report says so.
 
-The summary states the content delta —
-`nodes: 18,796,598 -> 18,184,000 (removed 31,473 orphaned version histories …)` —
+The summary restates the purge —
+`purged: 31,473 orphaned version histories (524,086 nodes omitted from the copy)` —
 and `froe digest --exclude-subtree <path>` renders a digest with named
 exclusions, so a before-digest can be compared against an after-digest with
 the purge and nothing else excused.
 
+One figure needs its explanation, and gets it in the plan, the summary,
+and here. When retained checkpoints keep their snapshots of the purged
+histories, the head's rewritten version storage stops sharing records with
+those snapshots: every hash-bucket node on the path to a purged history
+now exists in a head shape (without the history) and a checkpoint shape
+(with it), where before the purge one shared record served both. The copy
+therefore can write *more* node records than the pre-purge head reached —
+on a real AEM store, a purge of 31,473 histories under 2 retained
+checkpoints raised the copied node count from 18,796,595 to 18,816,318 —
+and most of the purge's node-record saving is deferred until the
+checkpoints expire, which the report's `(mostly deferred …)` clause
+states. This is deliberate: rewriting a checkpoint's snapshot would make
+an async indexer diff miss the deletions, leaving stale index entries
+behind.
+
 ## Applying a plan
 
-Without `--dry-run`, the command plans exactly once, under the lock:
+Without `--dry-run`, the command settles its questions first and then
+plans exactly once, under the lock:
 
-1. It acquires the exclusive Oak-compatible repository lock, runs any
-   selected index repairs, and builds the one plan from disk while holding
-   it — so the plan the operator confirms is byte-for-byte the plan that
-   applies, and nothing can change the store between the evidence and the
-   decision.
-2. It prints that plan and asks for confirmation while still holding the
+1. It surveys the store read-only — do any active archives lack an index,
+   and are there recovery backups on disk — and settles the three default
+   cleanups: the archive-index repair, the orphaned-version-history purge,
+   and the recovery-backup removal. `--yes` answers yes to each; an
+   interactive run asks each applicable question; each `--skip-*` flag
+   answers no. A run that repairs never also removes backups: the repair
+   writes the very `.bak` files a removal could otherwise delete, so their
+   removal waits for the next run, and the run says so.
+2. It acquires the exclusive Oak-compatible repository lock, runs any
+   authorized index repairs, and builds the one plan from disk while
+   holding it — so the plan the operator confirms is byte-for-byte the
+   plan that applies, and nothing can change the store between the
+   evidence and the decision.
+3. It prints that plan and asks for confirmation while still holding the
    lock. The store is offline by precondition, so holding the lock through
    the prompt is a strengthening, not a discourtesy: an accidentally started
    Oak cannot open the store while the operator is reading.
-3. It re-fingerprints the directory before the first mutation — a
+4. It re-fingerprints the directory before the first mutation — a
    non-cooperating change during the prompt is refused, never silently
    replanned — applies the plan, verifies the fresh copy in full through the
    open session *before* the head is published or a single archive is
@@ -216,8 +249,12 @@ A plan with no mutations reports that result and releases the lock without
 applying anything; `--dry-run` remains the way to preview without creating
 or taking `repo.lock` at all.
 
-`--yes` answers the confirmation automatically; it does not bypass the lock,
-fingerprint, validation, copy verification, or final verification.
+`--yes` answers every question — the per-cleanup ones and the final
+confirmation; it does not bypass the lock, fingerprint, validation, copy
+verification, or final verification. A run scripted without `--yes` (no
+answers arriving on standard input) plans but applies nothing: it is
+cancelled at the final confirmation, and the cancellation names the flag
+that would have answered.
 Lock acquisition fails immediately if Oak/AEM or another writer is using the
 repository. As with Oak's own repository lock, safety assumes every other
 writer cooperates with the persistent `repo.lock` inode and does not unlink or
@@ -225,10 +262,11 @@ replace it behind the lock holder; the run rechecks that inode between mutation
 phases, but cannot make an actively hostile process obey an advisory lock.
 
 ```console
-# Interactive application
+# Interactive application: one question per applicable cleanup, then the
+# plan and its confirmation.
 $ froe compact /path/to/segmentstore
 
-# The same checks and application without interactive questions
+# The same checks and application with every question answered yes.
 $ froe compact /path/to/segmentstore --yes
 ```
 
@@ -383,19 +421,22 @@ a recovery scan; the generation decisions the run makes are not allowed to rest
 on a scan, because a scan silently drops what it cannot read and generation
 froe deletes on the strength of it.
 
-Without `--repair-archive-indexes`, the run refuses, and the refusal counts
-*every* affected archive number, states why the index was rejected, and says
-whether the newest one is among them — the distinction between a killed
-writer, where the bytes are all still there, and damage in the middle of a
-store, where they may not be. The refusal happens while planning: no archive,
-journal, or checkpoint is changed. It is raised before the lock on the
-read-only preview path, and under it when a caller prepares directly, in which
-case `repo.lock` itself may have been created — that file is the only thing a
-refusing run can leave behind.
+Without an authorized repair — `--skip-repairing-archive-indexes`, a
+declined prompt, or a scripted run with no answers — the run refuses, and
+the refusal counts *every* affected archive number, states why the index
+was rejected, and says whether the newest one is among them — the
+distinction between a killed writer, where the bytes are all still there,
+and damage in the middle of a store, where they may not be. The refusal is
+raised as soon as the archives are open, before the minutes-long
+verification walks, and changes no archive, journal, or checkpoint. It
+comes before the lock on the read-only preview path, and under it when a
+caller prepares directly, in which case `repo.lock` itself may have been
+created — that file is the only thing a refusing run can leave behind.
 
-Passing [`--repair-archive-indexes`](#repairing-index-less-archives) makes the
-run rebuild those indexes instead. `froe archives` reports each archive's index
-state read-only, without the lock and without changing anything.
+An authorized run — `--yes`, or yes at the prompt — [rebuilds those
+indexes instead](#repairing-index-less-archives). `froe archives` reports
+each archive's index state read-only, without the lock and without
+changing anything.
 
 An empty `dataNNNNN*.tar` is a related but separate artifact: it is the file a
 writer creates just before it starts filling it, so a kill inside that window
@@ -470,28 +511,34 @@ repository, not on every garbage-collection run. An archive that does reach
 `z` is deferred, named in a warning, and counted on the run's summary line, so
 the residue a format limit forces is always visible.
 
-## Opt-in behavior
+## The questions and their skip flags
 
-Five things are intentionally outside what every run does. Two are
-documented above — the [orphaned-version-history
-purge](#orphaned-version-histories), because it is the run's one content
-mutation, and `--always-copy`, because it overrides [the convergence
-gate](#the-convergence-gate) — and three follow here.
+Every run performs the same sequence; three of its cleanups are settled as
+yes/no questions first, and two flags stay opt-in overrides. The opt-ins
+are documented above — `--always-copy`, because it overrides [the
+convergence gate](#the-convergence-gate), and
+`--remove-unreferenced-checkpoints` below. The questions — the
+[orphaned-version-history purge](#orphaned-version-histories), the
+archive-index repair, and the recovery-backup removal — are answered by
+`--yes`, interactively at a prompt, or negatively by their `--skip-*`
+flags; a scripted run without `--yes` receives no answers and applies
+nothing.
 
 ### Repairing index-less archives
 
-`--repair-archive-indexes` rebuilds the index of an active archive that has
-none, which is the state described under [the safety
-gate](#an-active-archive-with-no-index-metadata). It is not a default because
-it rewrites an archive, and because a store damaged in the middle rather than
-at the tail is a case worth looking at before authorizing. Its full safety
-case — scope, mutation ordering, interruption prefixes, resource bounds, and
+An authorized run rebuilds the index of an active archive that has none,
+which is the state described under [the safety
+gate](#an-active-archive-with-no-index-metadata). It asks first (`--yes`
+answers; `--skip-repairing-archive-indexes` never repairs) because it
+rewrites an archive, and because a store damaged in the middle rather than
+at the tail is a case worth looking at before authorizing — the question
+and the refusal both say which case this store is. Its full safety case —
+scope, mutation ordering, interruption prefixes, resource bounds, and
 known gaps — is
 [`plans/repair-archives-safety-case.md`](plans/repair-archives-safety-case.md).
 
 ```console
-$ froe compact /path/to/segmentstore \
-    --repair-archive-indexes
+$ froe compact /path/to/segmentstore --yes
 ```
 
 Four things about it differ from the rest of the run.
@@ -500,19 +547,20 @@ Four things about it differ from the rest of the run.
 decision — the segment sweep, checkpoint removal — is impossible until the
 index exists, so a `--dry-run` with a repair pending names the repairs and
 stops. An apply run performs the rebuilds under the exclusive lock *before*
-planning — passing the flag is the authorization — and then shows the one
-full plan those repaired indexes made possible. Declining the confirmation
-does **not** undo the repairs: they are already durable, and the CLI says
-so, on the cancelled path and even when the repaired store turns out to
-need nothing else.
+planning — the answered question is the authorization — and then shows the
+one full plan those repaired indexes made possible. Declining the final
+confirmation does **not** undo the repairs: they are already durable, and
+the CLI says so, on the cancelled path and even when the repaired store
+turns out to need nothing else.
 
 **The repository grows.** Every generation letter the rebuild reads is retired
 to a `<archive>.bak` name — `<archive>.2.bak` and so on if one exists already —
 so a repaired archive costs its own size again on disk, transiently twice.
-The plan states the figure. Retiring the backups is a *separate, later* run of
-the recovery-backup retention flags, deliberately: repair and those backups are
-refused together, because the run that made the only copy of unrecoverable
-bytes must not be the run that deletes it.
+The plan states the figure. Retiring the backups is the *next* run's work,
+deliberately: repair and backup removal are never combined, because the run
+that made the only copy of unrecoverable bytes must not be the run that
+deletes it. A repairing run therefore keeps every recovery backup, states
+the deferral, and the next run removes them once the store verifies.
 
 **A version-1 store is raised to version 2.** A rebuilt archive carries a
 version-2 binary-references trailer, so the manifest is upgraded first — but
@@ -528,8 +576,8 @@ however it is retried, and the refusal names the file to move aside. Keep that
 file: it is the only copy of whatever it holds.
 
 The repair itself is reversible — every original is under a `.bak` — but the
-sweep it unblocks is not. To separate the two, repair with
-`--repair-archive-indexes`, decline the confirmation (the rebuilds are
+sweep it unblocks is not. To separate the two, run interactively, answer
+yes to the repair, decline the final confirmation (the rebuilds are
 already durable at that point), run `froe check`, and only then compact.
 
 ### Unreferenced checkpoints
@@ -547,17 +595,20 @@ $ froe compact /path/to/segmentstore \
 
 ### Recovery backups
 
-Existing `journal.log.bak.NNN` and archive recovery backups named
-`<archive>.bak`, `<archive>.N.bak`, `<archive>.ro.bak`, or
-`<archive>.N.ro.bak` are never deleted by default. Removing them requires both
-an age floor and a per-target count floor. `NNN` is exactly three ASCII digits;
-an archive `N` is canonical decimal from 2 through 2147483647, without leading
-zeroes:
+`journal.log.bak.NNN` and archive recovery backups named `<archive>.bak`,
+`<archive>.N.bak`, `<archive>.ro.bak`, or `<archive>.N.ro.bak` are removed
+by every run once its own question is answered — always as the run's last
+mutation, after the store has verified — except by a run that also repairs
+an archive index, which keeps them all and defers to the next run. `NNN`
+is exactly three ASCII digits; an archive `N` is canonical decimal from 2
+through 2147483647, without leading zeroes. `--skip-removing-recovery-backups`
+keeps every backup, and the two retention flags narrow what the removal
+may touch:
 
 ```console
-# Backups only: keep the newest 3 per original target and consider only
-# backups at least 30 days old.
-$ froe compact /path/to/segmentstore \
+# Keep the newest 3 per original target, and only ever remove backups at
+# least 30 days old.
+$ froe compact /path/to/segmentstore --yes \
     --backup-minimum-age-days 30 \
     --backup-keep-latest 3
 ```
@@ -568,11 +619,11 @@ and grows the directory while reporting the archive total as unchanged, so the
 summary states the bytes those retained backups still hold whenever any exist.
 
 A backup is removable only if it is at least the requested age *and* falls
-outside the newest count for the same original target. All four archive forms
-above are grouped under that original archive and compete for the same slots,
-ordered by modification time; the unnumbered forms have no special priority.
-The two policy flags must be supplied together, and supplying them is what
-enables recovery-backup retirement at all; no run performs it otherwise. Future-dated backups
+outside the newest count for the same original target; both default to
+zero, so a plain authorized run removes every backup it can. All four
+archive forms above are grouped under that original archive and compete
+for the same slots, ordered by modification time; the unnumbered forms
+have no special priority. Either retention flag stands alone. Future-dated backups
 are never old; if modification times tie at the count boundary, the entire tie
 is retained because numbered suffixes cannot safely establish creation order.
 Any matching recovery-backup name denotes a managed file, so a directory,
@@ -583,8 +634,8 @@ including during `--dry-run`; froe does not follow or remove it.
 
 The run has a narrow managed-file allowlist:
 
-- Existing recovery backups are retained (although a journal rewrite creates
-  a new numbered backup).
+- The journal backup a run writes is retained by that run (the next run's
+  authorized removal may retire it).
 - `gc.log` is only ever appended to, by the single line described above; it is
   never truncated, rewritten, or removed.
 - Applying acquires `repo.lock` and may create the empty lock file if

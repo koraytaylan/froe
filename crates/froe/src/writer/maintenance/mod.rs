@@ -18,6 +18,7 @@ mod apply;
 mod apply_identity;
 mod checkpoints;
 mod file_removal;
+mod indexless_refusal;
 /// Everything maintenance does with the journal: classifying its lines,
 /// and rewriting the file that holds them.
 mod journal;
@@ -29,6 +30,7 @@ mod prepared;
 mod reclamation;
 mod recovery_backups;
 mod stale_archives;
+mod surveys;
 mod temporaries;
 
 #[cfg(test)]
@@ -43,4 +45,7 @@ pub use self::plan::{
 pub use self::prepared::{
     PreparedCompaction, compact, compact_with_progress, plan_compaction,
     plan_compaction_with_progress,
+};
+pub use self::surveys::{
+    ArchiveIndexSurvey, RecoveryBackupSurvey, survey_archive_indexes, survey_recovery_backups,
 };

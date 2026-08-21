@@ -9,8 +9,8 @@ use super::*;
 /// simulated: the JVM is killed with SIGKILL while it holds an archive open,
 /// which is what an OOM kill or a yanked host does and what leaves the
 /// newest archive complete but without its `.gph`, `.brf` and index
-/// trailers. Every other froe command refuses such a store;
-/// `--repair-archive-indexes` rebuilds it.
+/// trailers. A read-only froe command serves such a store through a
+/// recovery scan; an authorized `froe compact --yes` rebuilds the index.
 ///
 /// This phase exists because a froe-to-froe round trip is not evidence for a
 /// format-writing feature — `CONTRIBUTING.md` says so in as many words. The
@@ -78,12 +78,17 @@ pub(crate) fn repair() {
         .to_owned();
     eprintln!("  Oak left {damaged} untrailered");
 
-    // A run must still refuse, and name the flag that fixes it.
-    eprintln!("  froe compact without the repair flag must refuse");
-    let refusal = froe_failure(&["compact", repair_store.to_str().unwrap(), "--dry-run"]);
+    // A run whose repair is skipped must still refuse, and name the remedy.
+    eprintln!("  froe compact --skip-repairing-archive-indexes must refuse");
+    let refusal = froe_failure(&[
+        "compact",
+        repair_store.to_str().unwrap(),
+        "--dry-run",
+        "--skip-repairing-archive-indexes",
+    ]);
     assert!(
-        refusal.contains("--repair-archive-indexes"),
-        "the refusal points at the flag that repairs it: {refusal}"
+        refusal.contains("authorize the repair"),
+        "the refusal points at the authorization that repairs it: {refusal}"
     );
 
     // Read-only, so it does not heal the fixture the way a write command
@@ -92,16 +97,10 @@ pub(crate) fn repair() {
     // before-image.
     let digest_before = digest_store(&repair_store);
 
-    eprintln!("  froe compact --repair-archive-indexes");
-    let output = froe(&[
-        "compact",
-        repair_store.to_str().unwrap(),
-        "--yes",
-        "--repair-archive-indexes",
-    ]);
+    eprintln!("  froe compact --yes (the repair is part of the default run)");
+    let output = froe(&["compact", repair_store.to_str().unwrap(), "--yes"]);
     assert!(
-        parse_count(&output, " (originals retained") > 0
-            || output.contains("archive indexes rebuilt"),
+        output.contains("archive indexes rebuilt"),
         "the run reports the rebuild: {output}"
     );
     assert!(
@@ -430,8 +429,8 @@ pub(crate) fn write_run_record() {
          \x20             result and served the exact baseline tree from the single\n\
          \x20             revision froe kept\n\
          \x20 repair      Oak's own JVM was killed with SIGKILL while it held an archive\n\
-         \x20             open, leaving it without its trailers; froe compact\n\
-         \x20             --repair-archive-indexes rebuilt the index, and Oak then served\n\
+         \x20             open, leaving it without its trailers; an authorized froe\n\
+         \x20             compact rebuilt the index, and Oak then served\n\
          \x20             the exact baseline tree from the rebuilt archive\n\
          \x20 backup      Oak served the exact baseline tree after backup and restore\n\
          \x20 recover     Oak served the exact baseline tree after journal recovery\n\

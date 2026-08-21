@@ -118,6 +118,15 @@ pub(crate) fn quote_terminal_text(text: &str) -> String {
     quoted
 }
 
+/// Formats a count with its noun, choosing the singular or the plural
+/// form, with the same thousands grouping every other count carries.
+/// `count_noun(1, "journal line", "journal lines")` is `"1 journal line"`;
+/// a count of 4,366 picks the plural.
+pub(crate) fn count_noun(count: u64, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{} {noun}", crate::progress::format_count(count))
+}
+
 /// Formats milliseconds since the Unix epoch as an ISO-8601 UTC timestamp,
 /// or `"unknown"` for the -1 sentinel the journal reader produces.
 pub(crate) fn format_timestamp(milliseconds: i64) -> String {
