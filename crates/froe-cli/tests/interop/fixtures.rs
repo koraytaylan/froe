@@ -98,7 +98,7 @@ pub(crate) fn assert_first_compaction_rewrites_a_partial_archive(clean_store: &P
     ]);
     let archives_after_first = archive_names(clean_store);
     assert!(
-        parse_count(&first_compaction, " rewritten") >= 1,
+        parse_count_on_line_starting_with(&first_compaction, "archives: ", " rewritten") >= 1,
         "the first compaction rewrote at least one partially dead archive: {first_compaction}"
     );
     let rewritten_pairs: Vec<String> = archives_before_first
@@ -132,10 +132,21 @@ pub(crate) fn assert_first_compaction_rewrites_a_partial_archive(clean_store: &P
 /// template and is printed even when the count is zero. Parsing the number
 /// is what makes a zero-count run fail.
 pub(crate) fn assert_cleanup_counts_and_journal(cleanup_output: &str, clean_store: &Path) {
-    let removed_segments = parse_count(cleanup_output, " orphan segments removed");
-    let removed_stale = parse_count(cleanup_output, " stale removed");
-    let removed_checkpoints = parse_count(cleanup_output, " checkpoints and");
-    let removed_journal_lines = parse_count(cleanup_output, " journal lines removed");
+    // Parsed from the summary's own lines, in the singular. The summary
+    // pluralizes by count, so a plural-only suffix would miss the run that
+    // removed exactly one — which is what this fixture always produces —
+    // and searching the whole output would hit the plan's own restatement
+    // of the same figures before the summary's: the plan prints `omit 1
+    // checkpoint from the copy` and its own orphan-segment figures on the
+    // archive lines it means to remove.
+    let removed_segments =
+        parse_count_on_line_starting_with(cleanup_output, "archives: ", " orphan segment");
+    let removed_stale =
+        parse_count_on_line_starting_with(cleanup_output, "archives: ", " stale removed");
+    let removed_checkpoints =
+        parse_count_on_line_starting_with(cleanup_output, "compaction complete", " checkpoint");
+    let removed_journal_lines =
+        parse_count_on_line_starting_with(cleanup_output, "compaction complete", " journal line");
     assert!(
         removed_segments > 0,
         "the run reclaimed orphan segments, not zero: {cleanup_output}"

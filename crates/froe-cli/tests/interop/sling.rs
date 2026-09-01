@@ -8,11 +8,20 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 /// Create content nodes via the `SlingPostServlet`.
+///
+/// Asserted rather than ignored: every phase copies the fixture this
+/// builds, so a post that silently failed poisons a *later* phase — the
+/// Aug 20 run whose binary upload never landed recorded a 14-entry
+/// baseline instead of 21 and failed 90 s later in `read` as
+/// `tree shows nt:file`, attributed to the wrong operation. `--fail`
+/// turns an HTTP error into a curl exit status, which the assertion
+/// turns into a `generate` failure naming the path that did not land.
 pub(crate) fn sling_post(port: u16, path: &str, primary_type: &str, title: &str) {
     let url = format!("http://localhost:{port}{path}");
-    let _ = Command::new("curl")
+    let status = Command::new("curl")
         .args([
             "-s",
+            "--fail",
             "-o",
             "/dev/null",
             "-u",
@@ -25,6 +34,7 @@ pub(crate) fn sling_post(port: u16, path: &str, primary_type: &str, title: &str)
         ])
         .status()
         .expect("curl POST");
+    assert!(status.success(), "posting {path} failed");
 }
 
 /// Churn content: create subtrees, then delete them. Produces orphaned
@@ -106,9 +116,10 @@ pub(crate) fn populate_content(port: u16) {
             .repeat(16_384),
     )
     .expect("write binary.txt");
-    let _ = Command::new("curl")
+    let status = Command::new("curl")
         .args([
             "-s",
+            "--fail",
             "-o",
             "/dev/null",
             "-u",
@@ -121,6 +132,11 @@ pub(crate) fn populate_content(port: u16) {
         ])
         .status()
         .expect("curl upload binary");
+    assert!(
+        status.success(),
+        "uploading the binary fixture to /content/interop/files failed; the phases \
+         that assert the binary round-trips would fail later without it"
+    );
 }
 
 /// Fetch the content tree JSON from Sling for verification.

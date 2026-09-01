@@ -532,8 +532,9 @@ they answer different questions:
   a weekly cadence added nothing the push filter did not already cover.
 - **Manual dispatch**, for re-verifying deliberately.
 
-A failing run opens or comments on an `interop`-labelled issue, because a
-scheduled failure produces no pull request and would otherwise sit unnoticed.
+A failing run shows on the Actions tab and carries the run-record artifact;
+the repository has issues disabled, so there is no failure-reporting job
+that would file one.
 
 `.github/workflows/release.yml` runs the suite as a release gate: the release
 notes assert that maintenance is verified against a named Oak build, so the

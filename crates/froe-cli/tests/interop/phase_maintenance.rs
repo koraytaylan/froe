@@ -474,7 +474,11 @@ pub(crate) fn journal_retention() {
 
     eprintln!("  froe compact --yes");
     let output = froe(&["compact", retention_store.to_str().unwrap(), "--yes"]);
-    let removed_lines = parse_count(&output, " journal lines removed");
+    // Parsed from the "compaction complete:" summary line, in the singular:
+    // the summary pluralizes by count, and the plan section above repeats
+    // journal-line figures of its own.
+    let removed_lines =
+        parse_count_on_line_starting_with(&output, "compaction complete", " journal line");
     assert!(
         removed_lines > 0,
         "the run retired journal revisions, not zero: {output}"
@@ -534,14 +538,32 @@ pub(crate) fn compact_convergence() {
 
     eprintln!("  first froe compact --yes");
     let first = froe(&["compact", convergence_store.to_str().unwrap(), "--yes"]);
+    // Stated either way the run names the convergence it produced. The
+    // narrow form is what a store with no recovery backups left gets; the
+    // broad form would be a false promise when this run's own journal
+    // backup remains, so af418bd's summary policy narrows the wording to
+    // "has only recovery backups left to remove" exactly then.
     assert!(
-        first.contains("the store is now fully compacted; a repeat run will report nothing to do"),
+        first.contains("the store is now fully compacted; a repeat run ")
+            && (first.contains("will report nothing to do")
+                || first.contains("has only recovery backups left to remove")),
         "the first run must state the convergence it produced: {first}"
     );
 
     let files_before = store_file_snapshot(&convergence_store);
     eprintln!("  second froe compact --yes");
-    let second = froe(&["compact", convergence_store.to_str().unwrap(), "--yes"]);
+    // The first run leaves its own journal backup, which the default second
+    // run legitimately removes. To observe the gate as a *no-op* — the byte
+    // identity the phase exists to prove — the repeat must be asked to leave
+    // backups in place, as the CLI test of the same gate does; otherwise the
+    // run is a real mutation and the strongest assertion below is
+    // unsatisfiable.
+    let second = froe(&[
+        "compact",
+        convergence_store.to_str().unwrap(),
+        "--yes",
+        "--skip-removing-recovery-backups",
+    ]);
     assert!(
         second.contains("the head is already fully compacted"),
         "the second run must state the gate's verdict: {second}"

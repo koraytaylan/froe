@@ -27,6 +27,31 @@ pub(crate) fn parse_count(output: &str, suffix: &str) -> u64 {
         .unwrap_or_else(|_| panic!("an integer precedes {suffix:?} in: {output}"))
 }
 
+/// The integer immediately preceding `suffix` on the one line of `output`
+/// that starts with `line_prefix`.
+///
+/// Anchoring to the line first is load-bearing twice over. The plan `froe
+/// compact` prints before applying itself repeats the summary's phrases with
+/// its own figures — `omit 1 checkpoint from the copy`, `1 orphan segment,
+/// 114.5 KiB` — so a whole-output search for a count phrase matches the
+/// plan's copy and parses the wrong number. And the completion line
+/// pluralizes by count (`1 checkpoint`, `2 checkpoints`), so a suffix
+/// written only in the plural misses the run that removed exactly one —
+/// which is what the cleanup fixture always does. Suffixes here are
+/// therefore written in the singular, which either plurality contains as a
+/// prefix, and parsed on the summary line alone.
+pub(crate) fn parse_count_on_line_starting_with(
+    output: &str,
+    line_prefix: &str,
+    suffix: &str,
+) -> u64 {
+    let line = output
+        .lines()
+        .find(|line| line.starts_with(line_prefix))
+        .unwrap_or_else(|| panic!("output has a line starting with {line_prefix:?}: {output}"));
+    parse_count(line, suffix)
+}
+
 /// The head revision froe reports, so a phase can prove which revision Oak
 /// resolved rather than assuming it was the one froe wrote.
 pub(crate) fn froe_head(store: &Path) -> String {
