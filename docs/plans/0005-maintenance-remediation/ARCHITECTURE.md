@@ -1,10 +1,42 @@
-# Maintenance remediation: closing every gap the sgcp-aem-0001 runs exposed
+# Architecture — Plan 0005
+
+## 0005 — Maintenance Remediation
+
+### Record of a landed range
+
+This plan landed before `docs/plans` adopted the Makina layout. It was restructured into that layout on 2026-09-02 so that every plan in this directory reads the same way: the tasks under `tasks/` were reconstructed from the commits that landed them, each closed with `status: done` and its landing commit in `merged_as`, and the original document is carried below as the frozen record. Nothing here is executable input; the range is history.
+
+### Design summary
+
+**Verification where it protects.** The four full walks of the old apply path included none between the copy and the reclamation, the only window in which a defective copy is still fully recoverable. As built the walk of the fresh copy runs before the head swap itself, stronger than the reviewed draft, so a copy defect refuses while the journal still names the old head.
+
+**Semantic garbage, named and confirmed.** Orphaned version histories are reachable, so no structural collector may touch them, yet they are garbage by the only definition the operator cares about. Detection runs content first (certifying version storage first let a shared record be memo-skipped out of the live walk), is bounded by the history count, and every printed figure is exact or carries its bound direction. The purge reuses the checkpoint-omission mechanism, memoizes context-dependent ancestors per scope, demotes any history an inbound reference reaches, and refuses `--tail`.
+
+**Convergence by triple equality.** The gate compares generation triples, never orders them, because version-1 indexes synthesize generations far ahead of the real ones and arithmetic wraps; killed-run residue stamped ahead of the head neither blocks the gate nor survives it.
+
+**What the plan decided and what superseded it.** Decision point 1 chose an opt-in purge flag; `af418bd` two days later made every extra cleanup a default-on question with a `--skip-*` opt-out, and the repository memory records that as the standing rule.
+
+### Task graph
+
+```
+0501 skip the second map walk ──▶ 0502 progress steps conclude with results ──▶ 0503 plan once, gate no-op copies, purge orphaned histories
+   ──▶ 0504 prove the gate and the purge against Oak ──▶ 0505 state the as-built contracts (v0.11.0) ──▶ 0506 split the files the line gate refuses
+   ──▶ 0507 extra cleanups are default-on questions ──▶ 0508 survive pluralization and a failed Sling post
+```
+
+### The frozen document
+
+The plan document below was committed in `fa6486e` after two adversarial review passes and states the as-built contracts. It is carried here verbatim apart from heading levels and relative links.
+
+---
+
+## Maintenance remediation: closing every gap the sgcp-aem-0001 runs exposed
 
 Status: reviewed — two adversarial passes (21 findings) incorporated · Date: 2026-08-19 ·
 Root-cause analysis: `/tmp/froe-compaction-rca.md`
 (field runs of froe 0.10.0 against a 21.8 GiB AEM segment store; ten numbered observations).
 
-## 1. What this plan must resolve
+### 1. What this plan must resolve
 
 Two consecutive `froe compact --yes` runs on a production AEM store delivered ~0 savings in
 ~41 minutes each, while the operator knew the store carried tens of gigabytes of version-storage
@@ -36,7 +68,7 @@ Constraints this plan honors:
 * Every phase ends with acceptance criteria phrased as observable behavior, most of them against
   the sgcp-aem-0001 store shape, which the reproduction fixture models.
 
-## 2. Shape of the work
+### 2. Shape of the work
 
 Five phases, each independently shippable and testable, ordered so that the cheap
 observability wins land first, the pipeline gets simpler before it gets a new feature, and the
@@ -52,13 +84,13 @@ one content-mutating feature arrives last on top of the cleaned-up structure.
 
 ---
 
-## Phase 1 — Say what the run knows
+### Phase 1 — Say what the run knows
 
 The analysis already computes every number the operator needed; it prints none of them. This
 phase is output-only: no store-touching behavior changes, so it ships first and de-risks
 everything after it (all later acceptance criteria read these lines).
 
-### 1.1 Step results
+#### 1.1 Step results
 
 * `predict_shared_bulk_segments` (`crates/froe/src/writer/maintenance/reclamation.rs:123`)
   returns a set today. Print its summary when the step completes:
@@ -70,7 +102,7 @@ everything after it (all later acceptance criteria read these lines).
   Print its totals when the step completes:
   `predicting the reclamation: … ; the sweep removes 26 archives (6.3 GiB) and rewrites 0 archives (0 bytes of entries)`.
 
-### 1.2 An honest estimate
+#### 1.2 An honest estimate
 
 `estimated_reclaimable_bytes` (`maintenance/planning/listing.rs:144-209`) sums removals and
 rewrite-eligible entry bytes and never subtracts the generation the copy writes. Replace the
@@ -91,7 +123,7 @@ dense head the copy additionally writes stable-identifier blocks (≈24 bytes pe
 line prints `≈` and the bound direction rather than pretending precision. Keep `estimated_reclaimable_bytes` as an
 internal field; the printed contract becomes the three-line form.
 
-### 1.3 The external blob store, named
+#### 1.3 The external blob store, named
 
 The operator's 121 GiB expectation lived in the datastore, which compaction can never touch, and
 nothing in the output said so. During the planning verification walk (which already reads every
@@ -101,7 +133,7 @@ where it does not. Print once in the plan footer:
 
 `content references 31,404 external binaries (≈118.7 GiB) in the blob store; compaction never affects those bytes — that space is reclaimed by blob-store garbage collection after content deletion`
 
-### 1.4 Documentation and tests
+#### 1.4 Documentation and tests
 
 * `docs/cli-output.md` gains every new line with its stability contract.
 * CLI tests assert each line against fixtures where the numbers are known exactly
@@ -116,9 +148,9 @@ the growth fixture and names the blob store explicitly.
 
 ---
 
-## Phase 2 — One lock, one plan, verification where it protects
+### Phase 2 — One lock, one plan, verification where it protects
 
-### 2.1 Problem
+#### 2.1 Problem
 
 The apply path runs the full analysis twice (read-only preview, then authoritative replan under
 the lock: `froe-cli/src/mutation.rs:124` and `:150`) and verifies the head four times (preview,
@@ -126,7 +158,7 @@ replan, journal phase `apply/journal_phase.rs:28`, final state `apply/compaction
 On sgcp-aem-0001 that is ~10.5 minutes of a ~41-minute run re-deriving what the same locked
 process derived minutes earlier. Five archive opens are the visible symptom.
 
-### 2.2 Design
+#### 2.2 Design
 
 * **Apply acquires the lock first, plans once, confirms while holding it.** The preview/replan
   split existed to avoid holding the lock during operator think-time, but the store is offline by
@@ -158,7 +190,7 @@ Target pipeline per apply run: open (plan, under lock) → `verifying the curren
 fresh reopen → `verifying the current head` (walk #3) → summary. Three opens, three full walks,
 each with a distinct job.
 
-### 2.3 Safety-case changes
+#### 2.3 Safety-case changes
 
 `docs/compact.md` §"After taking the lock and rebuilding the authoritative plan…" is rewritten:
 there is no rebuilt plan; the section instead states that planning, confirmation and apply happen
@@ -171,7 +203,7 @@ whose interrupted copy must leave every history resolvable. The journal-truncati
 its existing probes: after the rewrite the store is already the final store, so a crash before
 the final verification loses only the verification, which the next open performs anyway.
 
-### 2.4 Acceptance
+#### 2.4 Acceptance
 
 On the reproduction store, an apply run's `--progress always` transcript contains exactly three
 `opening archives` lines (four when a manifest upgrade adds its pre-apply certification pass,
@@ -184,9 +216,9 @@ close; observation 7's discarded re-computation is structurally gone.
 
 ---
 
-## Phase 3 — Convergence: a run with nothing to do does nothing
+### Phase 3 — Convergence: a run with nothing to do does nothing
 
-### 3.1 Problem
+#### 3.1 Problem
 
 Full compaction unconditionally copies the head and reclaims the previous generation. On an
 already-compact store that is a 6.34 GiB, ~22-minute no-op that then *presents* one generation of
@@ -194,7 +226,7 @@ already-compact store that is a 6.34 GiB, ~22-minute no-op that then *presents* 
 no-copy path (`options.compaction_kind == None` routes to `plan_standalone_segments`,
 `planning/segments.rs:222`); nothing selects it automatically.
 
-### 3.2 Design
+#### 3.2 Design
 
 Introduce a planner decision, `compaction_disposition`, computed from state the planner already
 holds:
@@ -233,7 +265,7 @@ Escape hatch: `--always-copy` forces a fresh generation regardless (operator wan
 for example after suspected mapping-level corruption). Flag documented as never needed for
 space.
 
-### 3.3 What the gate must never do
+#### 3.3 What the gate must never do
 
 The gate skips only the *copy*. Any store where today's planner produces a non-swap action
 (rewrite, removal, stale letter, temporary, backup, journal retirement beyond one line,
@@ -242,7 +274,7 @@ corpus of fixture stores, plan-with-gate equals plan-without-gate minus exactly 
 {copy, previous-generation sweep, journal single-line rewrite} triple, and only when the four
 conditions hold. The reclaim-reference invariant continues to run in both dispositions.
 
-### 3.4 Acceptance
+#### 3.4 Acceptance
 
 Second run on the reproduction store: no mutation, exit 0, the fully-compacted line, ~7 minutes
 on sgcp-aem-0001 (analysis and verification only — verification is the product's assurance and
@@ -251,9 +283,9 @@ forward-looking statement. Observation 9 closes; observation 1's churn half clos
 
 ---
 
-## Phase 4 — Semantic garbage collection: orphaned version histories
+### Phase 4 — Semantic garbage collection: orphaned version histories
 
-### 4.1 Problem and stance
+#### 4.1 Problem and stance
 
 31,473 `nt:versionHistory` subtrees under `/jcr:system/jcr:versionStorage` have a
 `jcr:versionableUuid` that matches no live `jcr:uuid`. They are reachable, so no structural
@@ -262,7 +294,7 @@ definition the operator cares about, and they pin ~15 GiB of shared binary block
 blob references. If `froe compact` is the one maintenance command, this belongs in it as a
 *named, confirmed, explicitly semantic* phase — not smuggled into structural GC.
 
-### 4.2 Detection (always on, both dry-run and apply)
+#### 4.2 Detection (always on, both dry-run and apply)
 
 Detection is two ordered passes, so the memory bound holds regardless of tree-visit order.
 As built the *content* pass runs first — adversarial review found that certifying version
@@ -284,7 +316,7 @@ out of the live walk, silently orphaning a live history — so the order is:
   Resident memory is therefore bounded by the *history* count — 16 bytes plus map overhead per
   history, ≈40 MiB per million histories — never by the store's referenceable-node count. The
   bounded-memory safety case
-  (`docs/plans/bounded-memory-and-journal-retention-safety-case.md`) gains a paragraph stating
+  (`docs/plans/0002-bounded-memory-and-journal-retention/ARCHITECTURE.md`) gains a paragraph stating
   this bound. Malformed identifier strings are skipped and counted into a warning.
 
 What remains after the walk is the orphan set. The plan always reports it, and every figure in
@@ -331,7 +363,7 @@ those records no more. Instead:
   figure does not need; the scaled estimate serves the same plan-time purpose and the summary
   reports the realized delta).
 
-### 4.3 Removal (explicit opt-in)
+#### 4.3 Removal (explicit opt-in)
 
 `--purge-orphaned-version-histories` adds plan lines naming the action with counts and the same
 irreversibility warning style the journal retirement uses. With `--dry-run` the combination
@@ -366,7 +398,7 @@ package reinstall) re-attaches the surviving history by identifier match; purgin
 re-attachment. That behavior difference is invisible to a structural check, so the operator must
 choose it. The plan report (4.2) is always printed precisely so the flag gets discovered.
 
-### 4.4 Safety rails
+#### 4.4 Safety rails
 
 * **Advisory inbound-reference scan.** Purge candidates are only known when the main walk ends,
   so intersecting them with inbound references cannot ride that walk without retaining every
@@ -392,7 +424,7 @@ choose it. The plan report (4.2) is always printed precisely so the flag gets di
   warning for it, just as there is none for any other content the purge never visits. Retention
   pruning of *live* histories (keep the last N versions) is future work, not this plan.
 
-### 4.5 Contract changes
+#### 4.5 Contract changes
 
 * `docs/compact.md`'s digest sentence — "every node, property name, type, arity, value and
   binary checksum must be unchanged outside the checkpoints the run is meant to retire" — becomes
@@ -406,7 +438,7 @@ choose it. The plan report (4.2) is always printed precisely so the flag gets di
 * The summary reports the content delta the operator asked about in observation 2:
   `nodes: 18,796,598 -> 18,184,000 (removed 31,473 orphaned version histories holding 612,598 nodes)`.
 
-### 4.6 Tests
+#### 4.6 Tests
 
 * **Independent-implementation oracle:** on a fixture with versionables created and then
   partially deleted, the planner's orphan set must equal the field query's logic implemented a
@@ -427,7 +459,7 @@ choose it. The plan report (4.2) is always printed precisely so the flag gets di
   opens at the old head with all histories present (the copy is additive until publish — inherited
   argument, now tested for the purge path).
 
-### 4.7 Acceptance
+#### 4.7 Acceptance
 
 On the sgcp-shaped fixture: detection always prints the orphan report when there is anything to
 report; with the flag, node count drops by the orphans' node count, the store shrinks by at
@@ -440,9 +472,9 @@ close; observation 1's savings half closes.
 
 ---
 
-## Phase 5 — Field validation and the sgcp-aem-0001 runbook
+### Phase 5 — Field validation and the sgcp-aem-0001 runbook
 
-### 5.1 Interop gaps this store exposed
+#### 5.1 Interop gaps this store exposed
 
 `docs/compact.md` lists "external blob stores, and Adobe AEM itself" as unverified. The field
 store is exactly that shape. Add a fixture whose content mixes inline binaries (bulk segments,
@@ -450,7 +482,7 @@ some shared, some dead) with external references carrying `#<length>` suffixes, 
 Phase 1's composition and blob-store lines plus Phase 4's release of newly unshared bulk against
 it. AEM-proper remains out of scope for automation; the runbook below is its manual counterpart.
 
-### 5.2 Runbook (the plan for the actual server)
+#### 5.2 Runbook (the plan for the actual server)
 
 1. Upgrade froe on sgcp-aem-0001 to the release carrying Phases 1–4.
 2. `sudo systemctl stop aem6`, then `froe compact <store> --dry-run`: confirm the report shows
@@ -467,7 +499,7 @@ it. AEM-proper remains out of scope for automation; the runbook below is its man
 5. Optional proof: a repeat `froe compact` reports `nothing to do` in ≈7 minutes and mutates
    nothing — observation 9's counter-demonstration.
 
-### 5.3 Release mechanics
+#### 5.3 Release mechanics
 
 Planned as a 0.11.0 / 0.12.0 split; as built, all five phases land together as 0.11.0 — the
 purge was implemented, reviewed, and interop-proven in the same range, so holding it back would
@@ -479,7 +511,7 @@ the feature map updated in the phase that changes them.
 
 ---
 
-## 6. Decision points (recommendation first)
+### 6. Decision points (recommendation first)
 
 1. **Purge default:** opt-in flag (recommended, §4.3) versus default-on-with-confirmation. The
    report is always-on either way; only removal needs the flag.
@@ -491,7 +523,7 @@ the feature map updated in the phase that changes them.
    blob-store garbage collection discovers them independently. Revisit if operators want
    targeted datastore verification.
 
-## 7. Risk register
+### 7. Risk register
 
 | Risk | Mitigation |
 |------|------------|
@@ -506,7 +538,7 @@ the feature map updated in the phase that changes them.
 | Purge under tail rules strands released bytes | The flag refuses `--tail` outright (§4.3). |
 | A just-deleted versionable is purged moments before its restore | Optional age bound on the purge set (§4.3), plus the opt-in default. |
 
-## 8. The matrix: every observation, its fix, its proof
+### 8. The matrix: every observation, its fix, its proof
 
 | # | Mechanism | Phase | Proof |
 |---|-----------|-------|-------|
@@ -521,7 +553,7 @@ the feature map updated in the phase that changes them.
 | 9 | Convergence gate; forward-looking summary line | 3 | Second run: `nothing to do`, zero mutations |
 | 10 | Semantic detection always on; confirmed purge; digest-modulo-exclusions; interop proof | 4 | Orphan set equals the export-SQL oracle; Oak boots the purged store |
 
-## 9. Explicitly out of scope
+### 9. Explicitly out of scope
 
 Blob-store garbage collection itself (Oak/AEM runs it); retention pruning of live version
 histories; online operation; changes to index version 1 generation synthesis (verified during

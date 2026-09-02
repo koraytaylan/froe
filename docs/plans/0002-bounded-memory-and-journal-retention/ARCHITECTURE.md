@@ -1,9 +1,41 @@
-# Safety case: bounded memory and `--retain-journal-revisions`
+# Architecture — Plan 0002
+
+## 0002 — Bounded Memory and Journal Retention
+
+### Record of a landed range
+
+This plan landed before `docs/plans` adopted the Makina layout. It was restructured into that layout on 2026-09-02 so that every plan in this directory reads the same way: the tasks under `tasks/` were reconstructed from the commits that landed them, each closed with `status: done` and its landing commit in `merged_as`, and the original document is carried below as the frozen record. Nothing here is executable input; the range is history.
+
+### Design summary
+
+**Budgets against the resource consumed.** Every read cache, the writer's base-segment cache, the session read-back cache, the recovery memo and the SQLite dictionary got a byte ceiling enforced by `BoundedCache::evict_to_budget`, and tests assert residency (`writing_more_segments_does_not_make_a_session_hold_more_bytes`) rather than merely correct results. Planning stayed store-proportional by necessity and is stated as such.
+
+**A session proves what it wrote by CRC.** The write session stopped retaining payload bytes once they were durable in an archive; `validate_finalized_session_semantics` compares recorded checksums, and the certificate fingerprints archives by identity and metadata, which removed the `EMFILE` a large compaction reached after its work was done. The one new boundary, reopening an archive after rotation, is read-only and prefix-safe in both directions.
+
+**Retention as policy.** `--retain-journal-revisions` was the first option that made reachable bytes unreachable by design. It reaches all three `analyze_journal` call sites so preview and apply share the predicate, it requires the journal task in the same run, and it counts only revisions that resolve. The interop phase for it is the load-bearing evidence: Oak's own fixture carried three revisions, froe kept one, and Sling served the exact baseline tree from it. Plan 0004 later made that retirement unconditional.
+
+**Footprints.** The `touches` below are the paths at landing time; plan 0004's module splits moved `cleanup.rs`, `compaction.rs`, `store_writer.rs`, `backup.rs` and the interop suite into module directories.
+
+### Task graph
+
+```
+0201 report and bound the journal ──▶ 0202 bound every cache ──▶ 0203 loosen the survivor check ──▶ 0204 safety case
+   ──▶ 0205 arm the loosened refusal ──▶ 0206 prove retention against Oak ──▶ 0207 make the review gate performable (v0.8.0)
+   ──▶ 0208 reuse records, share bulk segments ──▶ 0209 size the memo for the tree
+```
+
+### The frozen document
+
+The safety case below was committed in `fe84b38` and revised through `aabf152` (plan 0003), `7b491de` and `e35e8e8` (plan 0004) and `fa6486e` (plan 0005). It is carried here verbatim apart from heading levels and relative links; its superseded-note at the top is part of the record.
+
+---
+
+## Safety case: bounded memory and `--retain-journal-revisions`
 
 > **Superseded in two places, and historical in a third.** This document is
 > the frozen evidence for its own range, ending at `v0.9.0`. The range after
 > it — see
-> [`merged-maintenance-command-safety-case.md`](merged-maintenance-command-safety-case.md)
+> [`0004-merged-maintenance-command/ARCHITECTURE.md`](../0004-merged-maintenance-command/ARCHITECTURE.md)
 > — inverted two of its conclusions: journal history is no longer retained by
 > default but retired on every run, and one generation is retained rather than
 > two. The CLI surface named throughout (`--task`, `--retain-journal-revisions`)
@@ -11,7 +43,7 @@
 > `with_journal_revision_retention` does. Read the statements below as evidence
 > about the code as it stood, not as a description of the shipped command.
 
-The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for the
+The artifact [`high-risk-changes.md`](../../high-risk-changes.md) requires for the
 range `bdcbe55..HEAD`, extended after `v0.8.0` by record reuse in the writer,
 binary value sharing in compaction, an exact compaction sharing memo replacing
 the evicting one, and the removal of every depth limit — which rewrote all six
@@ -28,7 +60,7 @@ Covers `crates/froe/src/cache.rs`, `crates/froe/src/store.rs`,
 `crates/froe/src/writer/{backup,maintenance,compaction,store_writer}.rs`, and
 `crates/froe-export/src/{refresh,sqlite}.rs`.
 
-## Scope and retention
+### Scope and retention
 
 **Must survive, unconditionally.** The content root and every checkpoint
 reachable from the persisted head; the binary content behind them; the
@@ -56,7 +88,7 @@ unchanged.)*
 once they are durable in an archive. They were retained before; they are the
 defect this range removes.
 
-## Authoritative state
+### Authoritative state
 
 Unchanged by this range as written; a successor range then removed the
 advisory preview entirely — apply now acquires the lock first and builds its
@@ -71,7 +103,7 @@ journal root against locked state are as before. Two additions bind to it:
 * `history_protected_reclaimable` is measured by replanning the sweep with the
   veto lifted. It is **reporting only**; it never feeds a mutation decision.
 
-## Mutation and publication order
+### Mutation and publication order
 
 | Boundary / cutpoint | Preconditions | Published or durable change | Returned-error state | Abrupt-exit state | Reconciliation |
 | --- | --- | --- | --- | --- | --- |
@@ -88,7 +120,7 @@ appended the journal line for an archive that is itself complete. A zero-byte
 file cannot reach it — `close()` returns `false` and the function returns
 early.
 
-## Guards
+### Guards
 
 | Guard and production callers | Named regression | Neutralization | Observed failing result |
 | --- | --- | --- | --- |
@@ -107,7 +139,7 @@ early.
 Neutralizations ran serially against an isolated target directory, each
 followed by restoring the pristine source and rerunning the original test.
 
-## Resources
+### Resources
 
 The point of the range. Every cache below is a function of configuration
 rather than of repository size — with three deliberate exceptions, all stated
@@ -158,7 +190,7 @@ records. Compaction no longer copies binary content at all when the source
 blocks live in bulk segments, which on a store written by Oak is most of the
 bytes.
 
-### The two store-proportional memos
+#### The two store-proportional memos
 
 The compaction sharing memo used to be an evicting FIFO under a 256 MiB
 budget. A miss did not cost one duplicated subtree; it re-walked the subtree,
@@ -210,7 +242,7 @@ Termination no longer rests on the depth bound either. A self-referential
 record graph is refused exactly, by an ancestor set, at the record that closes
 the cycle (`a_cyclic_source_is_refused_at_the_record_that_closes_the_cycle`).
 
-### What removing the depth caps costs
+#### What removing the depth caps costs
 
 Every walk over records — compaction, the verifier, the recovery gate, the
 content traversal, the diff, and the map enumerator — now carries its own
@@ -265,7 +297,7 @@ compaction memo's per-node figure is pinned as table occupancy for that reason:
 resident size tracked it within a few bytes a node when measured in isolation,
 but varies with allocator reuse when measured alongside other tests.
 
-## Interoperability
+### Interoperability
 
 Closed for this range. `cargo test -p froe-cli --features interop -- --ignored
 --test-threads=1 interop_full`, exit 0, 428 s, against
@@ -305,7 +337,7 @@ Oak evidence — it is the only one that destroys *reachable* history by policy
 rather than by Oak's generation predicate, so froe agreeing with its own
 reachability rules would have proved nothing about it.
 
-## Verification report
+### Verification report
 
 Each claim binds to one command and that command's own exit status. Linux
 x86-64 host; MSRV `1.89.0` from `Cargo.toml`.
@@ -327,7 +359,7 @@ sentinel**. No test runs as root; identities are synthetic. Fault coverage is
 true write-ordering under power loss. `interop_full` is **real Oak
 interoperability**, not a froe-to-froe round trip.
 
-## Known gaps
+### Known gaps
 
 1. **Record reuse and value sharing have no neutralization evidence.** Both
    guards are asserted by tests that pass or fail on identity rather than on a

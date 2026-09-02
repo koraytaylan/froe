@@ -1,4 +1,32 @@
-# Safety case: `--repair-archive-indexes`
+# Architecture — Plan 0001
+
+## 0001 — Archive Index Repair
+
+### Record of a landed range
+
+This plan landed before `docs/plans` adopted the Makina layout. It was restructured into that layout on 2026-09-02 so that every plan in this directory reads the same way: the tasks under `tasks/` were reconstructed from the commits that landed them, each closed with `status: done` and its landing commit in `merged_as`, and the original document is carried below as the frozen record. Nothing here is executable input; the range is history.
+
+### Design summary
+
+**Ordering is the argument.** A rebuild never overwrites in place: the replacement is staged as `<archive>.recovering`, validated by reopening it, and installed while every original letter is retired to `.bak`, with the install target's own original preserved through a hard link so a `.tar` under the target name exists at every instant. The manifest upgrade to `store.version=2` is the last durable change and happens only when a rebuild is about to become visible. Every prefix of an interrupted run therefore keeps the original bytes under some name, and the repair's own damage is always reversible by renaming a `.bak` back; the segment sweep it unblocks is not, which is why it stayed a separate task selection.
+
+**One predicate, stated once.** "Is this archive number repairable" is derived by the preview from the open readers and by the locked path from the physical listing, both from the same scan's entry count. An earlier revision let the two disagree, and the divergence made a doomed run pay for durable rewrites first; the shared derivation is the fix and the reason the safety case states the predicate once.
+
+**Footprints.** The `touches` below are the paths at landing time. Plan 0004's module splits moved most of them: `crates/froe/src/writer/cleanup.rs` became `crates/froe/src/writer/maintenance/**`, `store_writer.rs` became `crates/froe/src/writer/store_writer/**`, and the interop suite moved from `crates/froe-cli/tests/interop.rs` to `crates/froe-cli/tests/interop/`.
+
+### Task graph
+
+```
+0101 rebuild index-less archives ──▶ 0102 keep it building on Windows ──▶ 0103 close the interop gate, write the safety case
+```
+
+### The frozen document
+
+The safety case below was committed in `eaf3308` and amended in `af418bd` (plan 0005), which recorded the authorization surface after the `--skip-*` rework. It is carried here verbatim apart from heading levels and relative links.
+
+---
+
+## Safety case: `--repair-archive-indexes`
 
 > Authorization surface as of the `--skip-*` rework: the repair is part of
 > every run that needs one, gated by its own yes/no question (`--yes`
@@ -7,7 +35,7 @@
 > compatibility spelling. The mechanism, ordering, and guarantees analyzed
 > below are unchanged.
 
-The artifact [`high-risk-changes.md`](../high-risk-changes.md) requires for
+The artifact [`high-risk-changes.md`](../../high-risk-changes.md) requires for
 the opt-in `--repair-archive-indexes` stage, which rebuilds the index of an active archive that
 has none. In scope because it introduces destructive behavior on a path that
 previously refused, and because it unblocks segment reclamation on stores that
@@ -17,7 +45,7 @@ Covers `crates/froe/src/writer/maintenance.rs` and
 `crates/froe/src/writer/store_writer.rs` as of the commit introducing this
 file.
 
-## Scope and retention
+### Scope and retention
 
 **What must survive.** Every content root reachable from the persisted head;
 every readable journal revision and its closure; every checkpoint; every
@@ -50,7 +78,7 @@ unrecoverable bytes cannot also delete it.
 **Unknown files.** Untouched. Repair reads only names matching Oak's archive
 pattern; `.bak`, `.recovering`, and unrelated `*.tar` files are not inputs.
 
-## Authoritative state
+### Authoritative state
 
 **Lock boundary.** `RepositoryLock::acquire` in
 `PreparedCompaction::prepare_with_progress`. Every mutation in this task happens
@@ -79,7 +107,7 @@ apply environment, apply identity, lock path identity, duplicate
 `(number, letter)` pairs, repair-target ownership, and the repairability
 survey — all after the lock and before the first rewrite.
 
-## Mutation and publication order
+### Mutation and publication order
 
 Checks that can be computed without mutating are all performed before the
 first transition they protect. The one check that cannot — the full plan —
@@ -109,7 +137,7 @@ retires the `.bak` files. The plan states that figure, and it is not a proxy —
 it is the sum of the letters that will be retired. Exhaustion during a rebuild
 leaves the staging file, which the next run refuses on and the operator clears.
 
-## Guards
+### Guards
 
 | Guard and production callers | Named regression | Neutralization | Observed failing result |
 | --- | --- | --- | --- |
@@ -122,10 +150,10 @@ leaves the staging file, which the next run refuses on and the operator clears.
 | Staging residue not clobbered (`existing_staging_residue`) | `a_failed_repair_reports_the_rebuilds_it_already_completed` | Not neutralized — see gaps | — |
 | Zero-length letters skipped for selection and install (`select_writable_generation`, `install_target_generation`) | `an_empty_archive_file_does_not_break_opening_for_writing`, `an_empty_archive_file_is_never_deleted_by_opening_for_writing`, `an_empty_archive_number_is_never_reallocated_over_its_own_residue` | Not neutralized — see gaps | — |
 
-## Interoperability
+### Interoperability
 
 Closed, and it is the evidence this case rests on most. The `repair` phase of
-the interoperability suite ([`interop.md`](../interop.md)) kills Oak's own JVM
+the interoperability suite ([`interop.md`](../../interop.md)) kills Oak's own JVM
 with `SIGKILL` while it holds an archive open, asserts the container exited
 137, confirms exactly one archive has no index, repairs it with this task, and
 then boots a real Oak against the result — which serves the byte-identical
@@ -142,7 +170,7 @@ the baseline tree.
 Not covered by that loop, unchanged from the rest of the suite:
 `store.version=1` stores, external blob stores, and Adobe AEM itself.
 
-## Known gaps
+### Known gaps
 
 * **No guard-neutralization evidence.** The table above names a regression per
   guard but does not record a disabled-guard run for each, which

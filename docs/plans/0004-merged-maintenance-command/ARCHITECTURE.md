@@ -1,9 +1,41 @@
-# Safety case: the merged maintenance command
+# Architecture — Plan 0004
+
+## 0004 — Merged Maintenance Command
+
+### Record of a landed range
+
+This plan landed before `docs/plans` adopted the Makina layout. It was restructured into that layout on 2026-09-02 so that every plan in this directory reads the same way: the tasks under `tasks/` were reconstructed from the commits that landed them, each closed with `status: done` and its landing commit in `merged_as`, and the original document is carried below as the frozen record. Nothing here is executable input; the range is history.
+
+### Design summary
+
+**The copy is additive until the head moves.** The copy opens a certified archive number above every physical archive name, so it creates files rather than extending them; a failure anywhere before `compare_and_set_head` leaves the store as the pre-copy phase left it plus orphan archives a later run retires. `apply_pre_copy_mutations` runs before that and does unlink stale archives and a killed run's residue, which is why residue retirement is ordered first: a retry converges instead of accumulating one more orphan generation.
+
+**Certification went wide.** Certifying a segment reads the record table and payload bytes of the archive holding it, so the shared provider is consulted only to follow a blob identifier out of the segment; that let the pass parallelize over `std::thread::scope` with no added dependency, measured near-linear to eight threads.
+
+**Evidence that sees content.** `segments_unreachable_from_the_journal` is a reachability oracle written from the storage format alone; `froe digest` renders what froe reads; and every interop phase declares the delta its two digests may differ by. The review pass recorded what it did not cover: the fifty refactors were judged by outcome, and the Windows break lived in exactly those commits.
+
+**Hash concordance.** The frozen document cites commits from before the history rewrite recorded in the repository memory: `e109662` is now `c108f1f`, `5dd93dc` is `400cb47`, `abf2104` is `bc377d0`, and `ec8d2ec` is `0fae52a`. The range `52fa39d..e109662` is `52fa39d..c108f1f` in the current history, and `f0f2d7c` recorded the Windows break after it.
+
+### Task graph
+
+```
+0401 make compact the one command ──▶ 0402 fix the two write-path defects ──▶ 0403 add froe digest ──▶ 0404 declared interop deltas
+   ──▶ 0405 craft standards and module splits ──▶ 0406 every binary copy names its store ──▶ 0407 SIGPIPE fixture race (v0.10.0)
+   ──▶ 0408 write the safety case ──▶ 0409 restore the Windows build
+```
+
+### The frozen document
+
+The safety case below was committed in `7b491de` and amended in `f0f2d7c`. It is carried here verbatim apart from heading levels and relative links; the commit hashes it cites are mapped in the concordance above.
+
+---
+
+## Safety case: the merged maintenance command
 
 For the range `52fa39d..e109662` — `v0.9.0` through the version bump and the
-fixes that follow it — under the rules in [`high-risk-changes.md`](../high-risk-changes.md).
+fixes that follow it — under the rules in [`high-risk-changes.md`](../../high-risk-changes.md).
 It succeeds
-[`bounded-memory-and-journal-retention-safety-case.md`](bounded-memory-and-journal-retention-safety-case.md),
+[`0002-bounded-memory-and-journal-retention/ARCHITECTURE.md`](../0002-bounded-memory-and-journal-retention/ARCHITECTURE.md),
 which remains the case for the write session, the caches, and the walks, and
 which this range supersedes on exactly two points: journal history is no
 longer retained by default, and the retained-generation count is one rather
@@ -34,7 +66,7 @@ Covers `crates/froe/src/writer/maintenance/**`,
 `crates/froe/src/writer/record_writer/nodes.rs`,
 `crates/froe/src/tooling/digest.rs`, and `crates/froe-cli/src/mutation.rs`.
 
-## Scope and retention
+### Scope and retention
 
 **Must survive, unconditionally.** The content root and every checkpoint the
 run does not retire; the binary content behind them; the `manifest`;
@@ -66,7 +98,7 @@ is still copied through the live root
 **Deliberately not retained.** Generations older than the one the copy just
 wrote, without a savings gate on the archives that hold them.
 
-## Authoritative state
+### Authoritative state
 
 The preview is advisory and discarded. `PreparedCompaction::prepare` takes
 `repo.lock`, replans from disk, and `reject_changed_directory` refuses a
@@ -92,7 +124,7 @@ against locked state rather than carried from the preview:
   planned removals**, before a byte moves, and again after the run against a
   freshly reopened store.
 
-## Mutation and publication order
+### Mutation and publication order
 
 The ordering inside the compaction phase is the safety argument. The copy is
 purely additive: it opens a certified archive number above every physical
@@ -123,7 +155,7 @@ converges instead of accumulating one more orphan generation.
 | Applied-state verification (`verify_applied_state`) | every mutation above returned | None — fresh reopen and proof | Reports the mismatch; store already in its final state | Not applicable | Rerun the preview |
 | Residue retirement (`retire_run_residue`) | applied state verified | Recovery and staging material unlinked | Typed partial outcome | Names lie outside active archive discovery, so no prefix can invalidate the verified state | Next run retires the remainder |
 
-## Guards
+### Guards
 
 | Guard and production callers | Named regression | Neutralization | Observed failing result |
 | --- | --- | --- | --- |
@@ -146,7 +178,7 @@ binds the preview to that same oracle, and
 `a_generation_z_archive_reports_the_residue_it_cannot_reclaim` pins what the
 format forces the run to leave.
 
-## Fault and subprocess tests
+### Fault and subprocess tests
 
 Cutpoints armed around the merged path, each by a named test in
 `crates/froe/src/writer/fault_injection/`: `sweep.{before,after}-publish-link`,
@@ -163,7 +195,7 @@ publication, where the previous case's rows all covered a sweep that ran
 before one. Each fault test freshly reopens the store and asserts the exact
 on-disk prefix, journal readability, and the typed partial outcome.
 
-## Resources
+### Resources
 
 Certification went wide rather than deep. Certifying a segment now reads the
 record table and payload bytes of the archive holding it, so the shared
@@ -187,7 +219,7 @@ Memo residency, cache budgets, and walk state are unchanged by this range and
 remain covered by the previous case. The one addition is digest's 16 MiB
 insertion-order cache of inline-binary checksums, recorded there.
 
-## Interoperability
+### Interoperability
 
 Closed for this range. `scripts/interop-fixture.sh`, exit 0, 383.84 s, against
 `docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9`,
@@ -212,7 +244,7 @@ Every mutating phase is additionally held to a `froe digest` rendering taken
 before and after, with each line that differs required to fall inside the
 delta the phase declares.
 
-## Verification report
+### Verification report
 
 Each claim binds to one command and that command's own exit status. Linux
 x86-64 host; stable `1.97.1`; MSRV `1.89.0` from `Cargo.toml`. Run against the
@@ -276,7 +308,7 @@ not and an import not gated where the item is. Fixed in `5dd93dc` and
 stand in for the matrix, and fifty commits is far too long to leave it
 unpushed.
 
-## Known gaps
+### Known gaps
 
 1. **A journal retention bound is accepted and ignored under a compaction.**
    `rewrite_journal_for_run` reads `options.journal_revision_retention` only
@@ -324,7 +356,7 @@ unpushed.
    stores, native Windows execution, and Adobe AEM itself, which ships its own
    Oak build.
 
-## Review
+### Review
 
 **An automated adversarial pass, not a second person.** Performed 2026-08-18
 over `52fa39d..e109662` with a clean worktree, by an assistant that did not

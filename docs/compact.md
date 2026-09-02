@@ -10,7 +10,7 @@ or bootstraps a repository.
 
 Its safety case — scope, mutation ordering, guards, fault coverage, resource
 bounds, and known gaps — is
-[`plans/merged-maintenance-command-safety-case.md`](plans/merged-maintenance-command-safety-case.md).
+[`plans/0004-merged-maintenance-command/ARCHITECTURE.md`](plans/0004-merged-maintenance-command/ARCHITECTURE.md).
 
 Compaction and reclamation are one command because they are one decision. A
 sweep alone works at *segment* granularity, so a segment holding one live
@@ -535,7 +535,7 @@ at the tail is a case worth looking at before authorizing — the question
 and the refusal both say which case this store is. Its full safety case —
 scope, mutation ordering, interruption prefixes, resource bounds, and
 known gaps — is
-[`plans/repair-archives-safety-case.md`](plans/repair-archives-safety-case.md).
+[`plans/0001-repair-archives/ARCHITECTURE.md`](plans/0001-repair-archives/ARCHITECTURE.md).
 
 ```console
 $ froe compact /path/to/segmentstore --yes

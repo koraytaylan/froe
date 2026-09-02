@@ -1,10 +1,40 @@
-# Exact sharing and exact termination in compaction
+# Architecture — Plan 0003
+
+## 0003 — Exact Compaction Sharing Memo
+
+### Record of a landed range
+
+This plan landed before `docs/plans` adopted the Makina layout. It was restructured into that layout on 2026-09-02 so that every plan in this directory reads the same way: the tasks under `tasks/` were reconstructed from the commits that landed them, each closed with `status: done` and its landing commit in `merged_as`, and the original document is carried below as the frozen record. Nothing here is executable input; the range is history.
+
+### Design summary
+
+**Interning and packing are load-bearing.** A plain `HashMap<RecordIdentifier, RecordIdentifier>` buys the count invariant and re-buys the memory problem that motivated eviction: measured at 104 to 115 bytes a node, about 2.1 GB on the 18.8M-node head. The interned table measured 44 bytes a node at a million entries and 35 at four million, 512 MiB for that head. The rejected alternative was measured, not reasoned about.
+
+**Why the caps went together.** `record_writer_with_identifier` runs mid-copy, after segments have streamed to the sink, and the compacted head is journal-visible before the verifier walks it. Lifting compaction's bound alone would have converted a free pre-flight refusal into a full duplicate write, a durable head move, and then the same refusal from the verifier; so all six limits were removed in one range.
+
+**The trade, stated.** Residency became proportional to the tree for the memo and the verifier's certificate set, and walk state became proportional to depth. Both are recorded in plan 0002's safety case as the deliberate store-proportional structures, with the measurement harness `measure_deep_chain_walk_footprint` and the open ceiling named.
+
+**Footprints.** The `touches` below are the paths at landing time; plan 0004 later split `compaction.rs` into `crates/froe/src/writer/compaction/` and `check.rs` into `crates/froe/src/tooling/check/`.
+
+### Task graph
+
+```
+0301 design the exact memo ──▶ 0302 make the memo exact ──▶ 0303 pin the copy-once invariant ──▶ 0304 drop every depth limit ──▶ 0305 reconcile the plans with what landed
+```
+
+### The frozen document
+
+The design document below was committed in `01132c8`, revised through `aabf152`, and touched again by plan 0004's `4798418`. It is carried here verbatim apart from heading levels and relative links.
+
+---
+
+## Exact sharing and exact termination in compaction
 
 Landed. The rule below is repository-wide, and every walk over records now
 follows it: the compaction memo is exact, and no walk imposes a depth limit.
 What that traded away is listed at the end as open work.
 
-## The rule
+### The rule
 
 A walk over records read from a repository needs three guarantees, and each
 needs its own instrument. Fusing any two into one number, or into one cache,
@@ -43,7 +73,7 @@ this document describes for compaction. `NodeTreeVerifier` now uses the same
 exact, unbudgeted `PackedRecordSet` and counts at the certificate-issue site,
 so the reported number equals the certificate count by construction.
 
-## What compaction had, and why it was wrong
+### What compaction had, and why it was wrong
 
 `rewritten_nodes` was a `BoundedCache` carrying two responsibilities:
 
@@ -66,7 +96,7 @@ placed between the two references, because the memo inserts on *completion*, so
 a parent's second reference finds the newest entry. At zero the shape is
 brutal: a 20-level chain of 22 distinct nodes copied 2,097,152.
 
-## What landed
+### What landed
 
 **An exact set of records on the path.** `nodes_on_path`, tested before the
 memo probe, cleared before the memo insert. A repeat is refused as
@@ -83,7 +113,7 @@ growth at 70% load, no eviction.
 `compacted_nodes` now equals the number of distinct node records reachable
 from the head, at any tree shape.
 
-## Measured cost
+### Measured cost
 
 | memo | bytes/node | 18.8M-node head |
 |---|---|---|
@@ -102,10 +132,10 @@ rejected, not reasoned about.
 
 Residency is now proportional to the tree. That is a deliberate trade against
 the bounded-memory claim in
-[`bounded-memory-and-journal-retention-safety-case.md`](bounded-memory-and-journal-retention-safety-case.md),
+[`0002-bounded-memory-and-journal-retention/ARCHITECTURE.md`](../0002-bounded-memory-and-journal-retention/ARCHITECTURE.md),
 recorded there as the one store-proportional cache.
 
-## No knob replaces the budget
+### No knob replaces the budget
 
 `--memo-budget-mb`, `compact_with_memo_budget` and
 `COMPACTION_MEMO_BYTES_PER_NODE` were removed — a semver break, and a compile
@@ -128,7 +158,7 @@ journal-visible. Lifting compaction's bound alone would have converted a free
 pre-flight refusal into a full duplicate write, a durable head move, and then
 the same refusal from the verifier.
 
-## Tests
+### Tests
 
 - `a_deep_copy_copies_each_distinct_node_exactly_once` — the invariant on a
   store with a checkpoint sharing the live root. Replaces a test that asserted
@@ -157,7 +187,7 @@ is what lets it catch a growth that loses entries. Both were verified by
 mutation — dropping one entry on rehash and making the memo miss one key in
 three each fail the suite, the duplicate-key assertion firing first.
 
-## The invariant, adversarially tested
+### The invariant, adversarially tested
 
 Five agents attacked `compacted_nodes == distinct reachable node records`
 along separate angles — packing collisions, table mechanics, tree shapes,
@@ -185,7 +215,7 @@ Three findings from that exercise are worth keeping:
   uses. A defect there would make the walk, the oracle, and any re-read agree
   on the same wrong number. Nothing here is independent of that function.
 
-## No depth limits anywhere
+### No depth limits anywhere
 
 Every walk over records now carries its own stack on the heap and imposes no
 depth limit. Depth is a property of the repository, not something this code
@@ -225,7 +255,7 @@ what a wide corrupt DAG exhausts while staying shallow, and unlike a depth cap
 they cannot refuse a valid store. `descent_limit` and the CLI's `--depth` stay
 too: those are asked for by the caller, not invented.
 
-## Still open
+### Still open
 
 - **The depth-proportional term has no ceiling.** Removing the caps replaced a
   constant-bounded amount of walk state with one proportional to depth.
@@ -255,7 +285,7 @@ too: those are asked for by the caller, not invented.
   `NodeState::child_node_entries()`, the same call the walks use. A defect
   there would make walk, oracle and re-read agree on the same wrong number.
 
-## Divergence from Oak
+### Divergence from Oak
 
 Whether Oak's compactor bounds recursion depth is **unsettled**. There is no
 Java source in this repository, and `docs/analysis/README.md` is explicit that
