@@ -14,6 +14,7 @@ touches:
   - crates/froe/src/index/lucene/analysis/unicode/block.rs
   - crates/froe/src/index/lucene/analysis/unicode/general_category.rs
   - crates/froe/src/index/lucene/analysis/unicode/lower_case.rs
+  - crates/froe/src/index/lucene/analysis/unicode/character_class.rs
   - crates/froe/src/index/lucene/analysis/standard_tokenizer.rs
   - crates/froe/src/index/lucene/analysis/lower_case.rs
   - crates/froe/src/index/lucene/analysis/word_delimiter.rs
@@ -29,13 +30,14 @@ touches:
   - crates/froe/tests/fixtures/oak-analyzer-vectors-ancestors.tsv
   - crates/froe/tests/fixtures/oak-analyzer-vectors-suggest.tsv
   - crates/froe/tests/fixtures/java-lower-case-table.tsv
+  - crates/froe/tests/fixtures/java-character-class-table.tsv
   - crates/froe/tests/fixtures/oak-analyzer-corpus.txt
   - crates/froe-cli/tests/interop/judge/Analyze.java
   - crates/froe/src/index/lucene/mod.rs
   - crates/froe/src/index/lucene/analysis/numeric.rs
   - crates/froe/src/index/lucene/documents/mod.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "6c03ed6"
 ---
 # Implement Oak's Analyzers With Token-Level Conformance
 
