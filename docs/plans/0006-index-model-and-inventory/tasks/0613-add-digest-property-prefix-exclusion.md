@@ -16,8 +16,8 @@ touches:
   - docs/compact.md
   - docs/cli-output.md
   - README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "dd04fe7ad16a93222910558ff6aafb9ea127504a"
 ---
 # Add A Property-Prefix Exclusion To The Digest
 
