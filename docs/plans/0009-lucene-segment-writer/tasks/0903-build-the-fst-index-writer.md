@@ -10,8 +10,8 @@ touches:
   - crates/froe/tests/lucene_fst_tests.rs
   - crates/froe-cli/tests/interop/judge/FstCheck.java
   - crates/froe/tests/fixtures/lucene-fst-corpus.tsv
-status: planned
-merged_as: ""
+status: done
+merged_as: "708de88"
 ---
 # Build A Minimal FST Writer For The Terms Index
 
