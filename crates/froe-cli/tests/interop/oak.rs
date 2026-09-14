@@ -22,6 +22,40 @@ pub(crate) const OAK_REPAIR_MARKERS: &[&str] = &[
     "Regenerating tar file",
 ];
 
+/// Lines Oak logs when it decides to rebuild an index itself.
+///
+/// The reindex phase asserts these absent after booting Sling on a store
+/// froe rebuilt. Their presence would mean Oak did not accept froe's index
+/// as current and rebuilt it — at which point every query comparison
+/// afterwards is a comparison against Oak's own rebuild, not against
+/// froe's, and passes for the wrong reason.
+pub(crate) const OAK_REINDEX_MARKERS: &[&str] = &["Reindexing will be performed"];
+
+/// Asserts Oak accepted the indexes in the store as they were written.
+///
+/// The same positive control as `assert_oak_consumed_store_as_written`, and
+/// for the same reason: a scan for absent markers passes trivially on an
+/// empty log.
+pub(crate) fn assert_oak_did_not_reindex(container: &str, phase: &str) {
+    let logs = container_logs(container);
+    assert!(
+        logs.contains(SLING_BOOT_MARKER),
+        "{phase}: the log of {container} does not contain {SLING_BOOT_MARKER:?}, so the \
+         reindex-marker scan below would be looking at nothing"
+    );
+    let rebuilds: Vec<&str> = OAK_REINDEX_MARKERS
+        .iter()
+        .filter(|marker| logs.contains(**marker))
+        .copied()
+        .collect();
+    assert!(
+        rebuilds.is_empty(),
+        "{phase}: Oak rebuilt an index instead of accepting the one froe wrote \
+         ({rebuilds:?}). Every query comparison after this would be comparing Oak's own \
+         rebuild with itself.\nlogs:\n{logs}"
+    );
+}
+
 /// Read the `oak-segment-tar` version out of the running container and assert
 /// it is the build this suite claims to verify against. Returns the version so
 /// the run record can name it.

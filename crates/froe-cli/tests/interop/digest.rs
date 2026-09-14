@@ -19,6 +19,30 @@ pub(crate) fn digest_store_excluding(store: &Path, excluded: &[&str]) -> String 
     froe(&arguments)
 }
 
+/// Digests with content subtrees *and* property prefixes excluded.
+///
+/// The reindex oracle needs `--exclude-property-prefix :count_`: the
+/// approximate counters Oak's mirror strategy keeps are seeded from a
+/// random number, so two rebuilds of the same content disagree on them by
+/// construction. Everything else about the rebuilt index must match to the
+/// byte, and does.
+pub(crate) fn digest_store_excluding_properties(
+    store: &Path,
+    subtrees: &[&str],
+    prefixes: &[&str],
+) -> String {
+    let mut arguments = vec!["digest", store.to_str().unwrap()];
+    for prefix in subtrees {
+        arguments.push("--exclude-subtree");
+        arguments.push(prefix);
+    }
+    for prefix in prefixes {
+        arguments.push("--exclude-property-prefix");
+        arguments.push(prefix);
+    }
+    froe(&arguments)
+}
+
 /// The canonical content rendering of a store.
 ///
 /// This is what makes damage attributable rather than merely detectable.
@@ -43,6 +67,10 @@ pub(crate) enum ExpectedDigestDelta {
     /// byte-identical. Used where the operation retires checkpoints by
     /// design.
     CheckpointsOnly,
+    /// Only these path prefixes may change. Used where an operation rewrites
+    /// a named part of the tree on purpose — a reindex rewrites
+    /// `/oak:index` and must leave everything else alone.
+    Subtrees(&'static [&'static str]),
 }
 
 /// Splits a digest into `path -> properties`.
@@ -98,6 +126,18 @@ pub(crate) fn assert_digest_delta(
                     .split_once(' ')
                     .map_or("", |(_, rest)| rest.lines().next().unwrap_or(""));
                 !path.starts_with("#checkpoint") && !path.starts_with("#super-root")
+            })
+            .collect(),
+        // The super-root's own line names its children, so it moves
+        // whenever anything below it does.
+        ExpectedDigestDelta::Subtrees(allowed) => differences
+            .iter()
+            .filter(|difference| {
+                let path = difference
+                    .split_once(' ')
+                    .map_or("", |(_, rest)| rest.lines().next().unwrap_or(""));
+                !path.starts_with("#super-root")
+                    && !allowed.iter().any(|prefix| path.starts_with(prefix))
             })
             .collect(),
     };

@@ -106,6 +106,7 @@ use froe::writer::record_writer::{
 use froe::writer::store_writer::WritableRepository;
 
 mod content;
+mod definition_edits;
 mod digest;
 mod environment;
 mod fixtures;
@@ -115,6 +116,7 @@ mod phase_baseline;
 mod phase_index_inventory;
 mod phase_judge;
 mod phase_maintenance;
+mod phase_property_reindex;
 mod phase_recovery;
 mod phase_writing;
 mod podman;
