@@ -33,8 +33,10 @@
 //! * **`refresh` is not copied from the file.** froe refreshes the stored
 //!   definition by cloning it, which is what the refresh means.
 
+pub mod apply;
 pub mod drift;
 pub mod plan;
+pub mod prepared;
 
 pub use drift::{DriftVerdict, REWRITTEN_PROPERTY_NAMES};
 pub use plan::{LuceneImportOptions, LuceneImportPlan, PlannedImport, plan_lucene_import};
