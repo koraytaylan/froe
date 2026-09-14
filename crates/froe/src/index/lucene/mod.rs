@@ -8,6 +8,7 @@
 //! Lucene 4.7.2 format.
 
 pub mod check;
+pub mod codec;
 pub mod codec_header;
 pub mod compound;
 pub mod directory;
