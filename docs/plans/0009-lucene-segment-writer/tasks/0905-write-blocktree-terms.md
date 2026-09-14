@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe/src/index/lucene/codec/terms.rs
   - crates/froe/tests/lucene_terms_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "f2d3d45"
 ---
 # Write The BlockTree Terms Dictionary
 
