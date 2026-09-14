@@ -1,6 +1,8 @@
 //! Writing a value record: the size classes, the block list a long value
 //! is assembled from, and the external blob identifier.
 
+use std::io::Read;
+
 use super::{
     BuiltSegment, BulkBlockSharing, Error, GarbageCollectionGeneration, MAXIMUM_SEGMENT_SIZE,
     RecordIdentifier, RecordType, RecordWriter, Result, SegmentSink, new_bulk_segment_identifier,
@@ -61,6 +63,83 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
     /// Writes an inline binary value record and returns its identifier.
     pub fn write_binary_content(&mut self, content: &[u8]) -> Result<RecordIdentifier> {
         self.write_value_bytes(content)
+    }
+
+    /// Writes a binary value by streaming `reader`, without holding the
+    /// whole binary in memory.
+    ///
+    /// A Lucene index file can be gigabytes, and the import copies one file
+    /// at a time: this is what bounds the import's residency at one block
+    /// rather than at the largest file. Short and medium values are
+    /// materialized — they are at most ~16 KiB by definition — and anything
+    /// longer becomes block records indexed by an uncounted list, which is
+    /// exactly the shape [`copy_binary_value`](Self::copy_binary_value)
+    /// produces.
+    ///
+    /// `pub(crate)` because the directory writer is the only caller; the
+    /// public blob-creation surface is unchanged.
+    pub(crate) fn write_binary_stream(
+        &mut self,
+        mut reader: impl Read,
+    ) -> Result<RecordIdentifier> {
+        // Read up to the medium limit first. If the source ends inside it,
+        // the value is short or medium and takes the materialized path.
+        let mut head = Vec::new();
+        let mut probe = (&mut reader).take(MEDIUM_VALUE_LIMIT as u64);
+        probe.read_to_end(&mut head)?;
+        if head.len() < MEDIUM_VALUE_LIMIT {
+            return self.write_value_bytes(&head);
+        }
+
+        // Long: blocks of exactly `BLOCK_SIZE` until the stream ends, and
+        // one short block at the end.
+        //
+        // The head cannot simply be chunked and emitted: `MEDIUM_VALUE_LIMIT`
+        // is 16512 and `BLOCK_SIZE` is 4096, so chunking it directly leaves a
+        // 128-byte block *in the middle*. The reader locates a position by
+        // dividing by the block size, which assumes every block but the last
+        // is full — a short block in the middle silently misplaces every byte
+        // after it. So the head seeds a pending buffer instead, and blocks are
+        // emitted only when that buffer is full.
+        let mut block_identifiers = Vec::new();
+        let mut length = 0u64;
+        let mut pending = head;
+        let mut chunk = vec![0u8; BLOCK_SIZE];
+        loop {
+            while pending.len() >= BLOCK_SIZE {
+                let rest = pending.split_off(BLOCK_SIZE);
+                block_identifiers.push(self.write_block(&pending)?);
+                length += pending.len() as u64;
+                pending = rest;
+            }
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            pending.extend_from_slice(&chunk[..read]);
+        }
+        if !pending.is_empty() {
+            block_identifiers.push(self.write_block(&pending)?);
+            length += pending.len() as u64;
+        }
+
+        let body =
+            self.write_list_body(&block_identifiers)?
+                .ok_or_else(|| Error::InvalidFormat {
+                    details: "a long binary always has at least one block".to_owned(),
+                })?;
+        let record = self.allocate(RecordType::Value, 8 + 6, &[body])?;
+        let stored = (length - MEDIUM_VALUE_LIMIT as u64) | (0b11 << 62);
+        self.current.record_bytes_mut(record)[0..8].copy_from_slice(&stored.to_be_bytes());
+        self.write_identifier_at(record, 8, body);
+        Ok(self.identifier_of(record))
+    }
+
+    /// One block record holding `bytes`.
+    fn write_block(&mut self, bytes: &[u8]) -> Result<RecordIdentifier> {
+        let record = self.allocate(RecordType::Block, bytes.len(), &[])?;
+        self.current.record_bytes_mut(record)[..bytes.len()].copy_from_slice(bytes);
+        Ok(self.identifier_of(record))
     }
 
     /// Copies an inline binary value from `source` into a fresh value

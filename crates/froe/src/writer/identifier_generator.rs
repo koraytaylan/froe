@@ -126,8 +126,28 @@ fn draw_uuid_halves() -> (u64, u64) {
 ///
 /// # Panics
 ///
+/// Fills `target` with operating-system entropy.
+///
 /// As [`new_data_segment_identifier`]: the store verifies the source at
-/// open and refuses rather than proceeding without it.
+/// open and refuses rather than proceeding without it. A Lucene index
+/// file's `uniqueKey` must be unpredictable, so an unavailable source is a
+/// refusal rather than a weaker draw.
+pub(crate) fn random_bytes(target: &mut [u8]) -> Result<()> {
+    with_entropy_buffer(|buffer| buffer.try_fill(target)).map_err(|error| Error::InvalidFormat {
+        details: format!(
+            "the operating system entropy source is unavailable: {error}; a Lucene \
+                 index file's uniqueKey must be unpredictable, and a predictable one is \
+                 worse than a refusal"
+        ),
+    })
+}
+
+/// A random 32-bit value, for a counter seed.
+///
+/// # Panics
+///
+/// When the operating system entropy source fails. A seed drawn from
+/// anything weaker is worse than a refusal.
 #[must_use]
 pub fn random_u32() -> u32 {
     let mut bytes = [0u8; 4];

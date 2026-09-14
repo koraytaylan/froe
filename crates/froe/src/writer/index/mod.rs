@@ -28,6 +28,7 @@ use std::path::PathBuf;
 pub mod apply;
 pub mod counter_builder;
 pub mod definition_update;
+pub mod lucene_directory;
 pub mod plan;
 pub mod prepared;
 pub mod property_builder;
@@ -43,6 +44,7 @@ pub mod selection;
 // therefore errors under the `-D warnings` gate.
 // The operation's public surface, mirroring `compact`'s.
 pub use apply::{DefinitionReport, ReindexOutcome};
+pub use lucene_directory::{DEFAULT_BLOB_SIZE, DirectoryListing, OakDirectoryWriter};
 pub use plan::{NoWorkReason, ReindexAction, ReindexPlan, ReindexWarning};
 pub use prepared::{
     PreparedReindex, plan_reindex, plan_reindex_with_progress, reindex, reindex_with_progress,
