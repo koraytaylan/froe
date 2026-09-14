@@ -25,15 +25,13 @@
 //! records both as out of scope, and nothing in the consumer needs them.
 
 pub mod data_output;
+pub mod fst;
 pub mod packed;
 
 // The later tasks of plan 0009 own these. Each is declared here so the
 // module tree is the one the specification describes from the start, and so
 // a reader looking for a format finds where it will live rather than
 // wondering whether it exists.
-
-/// The transducer `.tip` stores per field (§7.6). Task 0903.
-pub mod fst {}
 
 /// `.doc`, `.pos` and `.pay` (§6). Task 0904.
 pub mod postings {}

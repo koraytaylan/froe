@@ -1313,7 +1313,22 @@ segment. Neither belongs in an "unread, so anything goes" list.
 | transducer arcs | the fixed-array form (`ARCS_AS_FIXED_ARRAY`, a `VInt` arc count, a `VInt` bytes-per-arc) for a node with ≥5 arcs at depth ≤3 or ≥10 deeper | linear arcs only | the reader dispatches on the flags byte **per node**; linear is slower to seek and correct everywhere |
 | transducer packing | unpacked, from its own terms writer | unpacked | Lucene's own choice here, not a concession |
 
-### 10.4 The raw-bits rule
+### 10.4 A shape Lucene writes and cannot read
+
+**A transducer whose byte store is empty is write-only.** Lucene's builder
+produces one for an automaton accepting only the empty string —
+`Builder.finish` does not bail out when `emptyOutput` is present, and
+`FST.finish` forces the start node to 0 over the empty store — but
+`BytesStore`'s reading constructor then indexes the last block of a store
+that has no blocks and throws `IndexOutOfBoundsException`.
+
+Found by running Lucene's own reader over froe's output during task 0903.
+It costs nothing: the terms writer saves a transducer only under a positive
+term count, so the shape never reaches a `.tip`. froe writes the bytes —
+they are pinned by a unit test, because the serialization is specified — and
+keeps the shape out of the corpus the reader is asked to enumerate.
+
+### 10.5 The raw-bits rule
 
 **A stored float is `Float.floatToIntBits` as a four-byte big-endian `Int`,
 and a stored double is `Double.doubleToLongBits` as an eight-byte
