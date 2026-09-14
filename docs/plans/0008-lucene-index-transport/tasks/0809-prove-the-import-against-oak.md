@@ -10,8 +10,12 @@ touches:
   - crates/froe-cli/tests/interop/judge/OutOfBandBuild.java
   - crates/froe-cli/tests/interop/oak.rs
   - crates/froe-cli/tests/interop/definition_edits.rs
-status: planned
-merged_as: ""
+  - crates/froe-cli/tests/interop/phase_lucene_import.rs
+  - crates/froe-cli/tests/interop/phase_recovery.rs
+  - crates/froe-cli/tests/interop/main.rs
+  - docs/interop.md
+status: done
+merged_as: "2207282, 777b99f, 44d6a61"
 ---
 # Prove The Import Against Oak
 

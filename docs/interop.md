@@ -137,6 +137,14 @@ lucene_dump
    │  Read-only, so its position is free; it runs here because the
    │  fixture's Lucene index reflects the state Sling left.
    ▼
+lucene_import
+   │  Both directions: froe dumps the index, loses it, imports it back and
+   │  the definition must render as it did; and Oak's own editors build one
+   │  out of band at the lane's checkpoint, froe imports that, and a booted
+   │  Oak answers a fulltext query through it
+   │  If this fails: `froe index import` installs something Oak cannot use,
+   │  which is the one thing this command must never do.
+   ▼
 commit
    │  froe adds nodes with typed properties to the content tree via
    │  the library's commit API, then Sling reads them back
@@ -552,6 +560,77 @@ strings misses it. Since the import refuses an incoherent directory before
 copying a byte, `froe index import` would have refused every real Oak index
 whose segments carry deletions. Fixed in
 `docs/analysis/index-lucene-storage.md` §8.8 and `segments.rs`.
+
+### lucene_import
+
+Both directions the import exists for, against the real fixture.
+
+**The round trip.** froe dumps `/oak:index/lucene`, the definition's hidden
+children are removed — the state a lost index actually leaves — and froe
+imports the dump back. The definition must render as it did, and nine files
+must read back out of the store byte-identical to the files on disk.
+
+Three differences are legitimate, and the phase says why rather than
+excluding them quietly:
+
+* `dirListing` is compared as a **set**. Oak stores it in a concurrent hash
+  set's iteration order and reads it back as a set; froe writes it in name
+  order, a deviation recorded at the writer.
+* `reindexCount` is normalized in the digest and asserted exactly on its
+  own, since advancing it is the point.
+* `jcr:data` is compared **by length in the digest and by bytes through the
+  reader**. A stored blob is the file followed by sixteen fresh `uniqueKey`
+  bytes, so two honest imports of one file hash differently — which the
+  task's own list of what is fresh by design does not mention.
+
+`:status` is asserted separately: the fresh `uid` present, and
+`indexedNodes`, `lastUpdated` and `reindexCompletionTimestamp` absent. That
+is the recorded departure from oak-run's importer, which has no post-import
+state to copy them from.
+
+**The out-of-band build.** The judge's `OutOfBandBuild` reproduces
+`IndexerSupport`'s sequence from the classes the image ships, since
+`oak-run-commons` is not one of them: an in-memory copy of the **lane
+checkpoint's** state — the only state an asynchronous definition's lane can
+resume from — the lane switch and `reindex` flag, Oak's own cycle driven as
+a diff under the visible-editor filter, the lanes switched back, and then
+the artefact: Oak's own dumper for the index directory and its
+`index-details.txt`, Oak's own `JsonSerializer` under the printer's
+out-of-band filter for `index-definitions.json`.
+
+*One recorded departure.* oak-run hands the editor provider a filesystem
+directory factory; this lets the provider write into the copy's `:data` as
+it ordinarily would and then runs Oak's own dumper over that copy. The file
+bytes are the same — `lucene_dump` is what says so — and it makes
+`index-details.txt` Oak's own output rather than the judge's guess at its
+format.
+
+The definition is flagged `corrupt` on the copy's head before the build,
+because that is the standard reason to reach for one and it is what makes
+the drift comparison's tolerance load-bearing: the judge builds from the
+lane checkpoint's state, which predates the flag, so its definitions file
+lacks `corrupt` regardless — an acceptance a symmetric ignore set could not
+express. After the import, `reindexCount` is **two** above the original,
+exactly as oak-run's own import leaves it, the flag is cleared, and the
+lane's checkpoint is still there.
+
+**Oak consumption.** A real Oak boots on each imported store, logs no
+reindex and no index failure, and answers a fulltext query over the five
+interop pages with the same rows the pristine store answers, `EXPLAIN`
+naming `lucene:lucene` on both sides. The pristine store is asserted to
+answer five rows through that index first: a comparison against an empty
+answer would pass on a store whose index answers nothing.
+
+**Refusals**, each leaving the store byte-identical: a checkpoint the store
+does not hold, a checkpoint that resolves but is not the attachment state,
+a drifting definitions file, and a definition made synchronous.
+
+**What it found.** The state rule — the precondition the whole import rests
+on — had no refusal that reached it. A checkpoint the store does not hold
+is refused by *resolution*, before the rule is evaluated. The phase now
+takes a checkpoint at the head, which resolves and is not the lane's,
+because every lane cycle commits after taking its checkpoint. With the rule
+neutralized the phase fails; before this it passed.
 
 ### commit
 
