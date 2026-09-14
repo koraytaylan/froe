@@ -380,6 +380,11 @@ pub(crate) fn interop_full() {
     // later phase rewrites the store around it.
     lucene_dump();
     lucene_import();
+    // froe's own Lucene writer against Lucene's, over a corpus of its own:
+    // it reads the fixture not at all and writes only into its work
+    // directory, so its position is free. It runs here because plan 0010's
+    // rebuild installs what this phase proves.
+    lucene_writer_conformance();
     commit();
     checkpoint();
     compact();
@@ -461,7 +466,19 @@ fn run_record_header(seconds_since_epoch: u64, oak_version: &str, store_version:
 }
 
 /// One entry per phase, saying what that phase proved.
+///
+/// Split at the writer's own conformance phase, which is where the record
+/// turns from what froe does to Oak's store to what it does beside it.
 fn run_record_phases(canonical_index: &str, lucene_documents: &str) -> String {
+    format!(
+        "{}{}",
+        run_record_reading_phases(canonical_index, lucene_documents),
+        run_record_writing_phases(),
+    )
+}
+
+/// The phases up to and including the writer's conformance.
+fn run_record_reading_phases(canonical_index: &str, lucene_documents: &str) -> String {
     format!(
         "\x20 generate    Oak wrote the fixture store\n\
          \x20 read        froe read Oak's store (summary, tree, check, search, export)\n\
@@ -524,7 +541,30 @@ fn run_record_phases(canonical_index: &str, lucene_documents: &str) -> String {
          \x20             the rows the pristine store answers and EXPLAIN naming\n\
          \x20             lucene:lucene, logging no reindex and no index failure.\n\
          \x20             Four refusals each left the store byte-identical\n\
-         \x20 commit      Oak served content froe committed\n\
+         \x20 lucene_     A committed corpus of 8,311 documents was written twice:\n\
+         \x20 writer_     by froe's own Lucene writer and by Lucene's own IndexWriter\n\
+         \x20 conformance under the same oakCodec composition. Lucene's CheckIndex\n\
+         \x20             called froe's directory clean, and the two indexes\n\
+         \x20             enumerated identically: every field with its options, every\n\
+         \x20             term with statistics recomputed from live postings, every\n\
+         \x20             posting with frequency, positions and offsets, every stored\n\
+         \x20             value, every doc value beside its has-a-value bitset, every\n\
+         \x20             norm, the document count and the commit file's counter.\n\
+         \x20             Equality of enumerations is equality of **contents**, not\n\
+         \x20             of bytes: froe's recorded choices — PACKED for every bit\n\
+         \x20             width, linear transducer arcs, an ascending value table —\n\
+         \x20             are invisible to a reader that honours what the file says.\n\
+         \x20             It says nothing about merging or deletions either: both\n\
+         \x20             indexes are one segment written in one commit, which is\n\
+         \x20             what froe writes and all it writes. Every transducer in the\n\
+         \x20             committed corpus enumerated back to its exact input map\n"
+    )
+}
+
+/// The phases that write to the store.
+fn run_record_writing_phases() -> String {
+    String::from(
+        "\x20 commit      Oak served content froe committed\n\
          \x20 checkpoint  froe created a checkpoint, listed by name\n\
          \x20 compact     Oak served the exact baseline tree after full compaction\n\
          \x20 compact     Oak served the exact baseline tree after tail compaction\n\

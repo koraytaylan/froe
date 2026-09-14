@@ -145,6 +145,16 @@ lucene_import
    │  If this fails: `froe index import` installs something Oak cannot use,
    │  which is the one thing this command must never do.
    ▼
+lucene_writer_conformance
+   │  A committed corpus is written twice — once by froe's own Lucene
+   │  writer, once by Lucene's under the same oakCodec composition — and the
+   │  two indexes are enumerated and compared line for line, after Lucene's
+   │  own CheckIndex has called froe's clean
+   │  If this fails: froe writes a Lucene index whose contents are not what
+   │  Lucene writes for the same documents, which is what plan 0010's
+   │  rebuild would install. Reads the fixture not at all and writes only
+   │  into its work directory, so its position is free.
+   ▼
 commit
    │  froe adds nodes with typed properties to the content tree via
    │  the library's commit API, then Sling reads them back
@@ -373,8 +383,13 @@ can run against stale classes.
 What the judge can stand in for: Oak's own verdicts about a store or a
 directory — its definition printer, its index printer, its Lucene dumper,
 Lucene's `CheckIndex`, a document count, and a commit through Oak's own index
-update. What it cannot: anything `oak-run` alone does, and anything that
-needs a booted Sling, which is what the container phases are for.
+update. Since plan 0009 it also stands in for Lucene's own *writer*:
+`Corpus` builds the committed writer corpus through Lucene's `IndexWriter`
+under the `oakCodec` composition and enumerates any index into a canonical
+dump, `CodecVectors` replays froe's codec primitives through Lucene's own
+readers, and `FstCheck` enumerates froe's transducers back to the maps they
+were built from. What it cannot: anything `oak-run` alone does, and anything
+that needs a booted Sling, which is what the container phases are for.
 
 One convention runs through it. A class that opens a segment store writes its
 data to a file the caller names, never to standard output, because opening a
@@ -631,6 +646,66 @@ is refused by *resolution*, before the rule is evaluated. The phase now
 takes a checkpoint at the head, which resolves and is not the lane's,
 because every lane cycle commits after taking its checkpoint. With the rule
 neutralized the phase fails; before this it passed.
+
+### lucene_writer_conformance
+
+The plan's oracle for froe's own Lucene writer, and the one phase that
+touches the fixture not at all: it reads a committed corpus, writes it
+twice, and compares.
+
+`crates/froe/tests/fixtures/lucene-writer-corpus.jsonl` describes 8,311
+documents in the writer's own model — already tokenized, already typed —
+chosen to reach the places a writer goes wrong. 8,300 of them carry one
+term, which puts it three skip levels deep under the skip multiplier of 8
+and the interval of 128, and their 8,300 distinct terms floor the
+block-tree dictionary many times over. Beside the bulk are every index
+option, norms and omitted norms, every doc-value type, stored strings,
+binaries, integers and a long beyond a double; several analyzed fields of
+one name and several boosted ones; a trailing increment and offset the next
+value starts past; overlapping tokens; a term above the maximum term
+length; a norms-bearing field whose value yields no token; two documents
+that disagree on a field's index options and one on `omitNorms`; and an
+empty document.
+
+froe writes them with `LuceneIndexWriter`, under a budget small enough that
+the runs spill — the path a real rebuild takes. The judge writes the same
+corpus with Lucene's own `IndexWriter` under the same `oakCodec`
+composition, from a canned token stream that reports the corpus's own end
+state, so the composition rules for several fields of one name are proved
+against Lucene's inverter rather than assumed.
+
+Then:
+
+* **Lucene's own `CheckIndex` over froe's directory**, first, because a
+  dump that matches is worth nothing if the index it came from is
+  malformed.
+* **Both indexes enumerated and compared line for line** — 149,612 lines:
+  every field with its options, every term with statistics recomputed from
+  live postings, every posting with its frequency, positions and offsets,
+  every stored value, every doc value beside its has-a-value bitset, every
+  norm, the document count, and the commit file's `counter`.
+* **Every transducer in task 0903's committed corpus enumerated back** by
+  `fst-check`, the judge's one verdict-only class.
+
+#### What enumeration equality proves, and what it does not
+
+It proves the two indexes have **the same contents**: the same fields with
+the same options, the same terms with the same postings, the same stored
+values, doc values and norms, over the same documents.
+
+It does **not** prove the two indexes are the same bytes, and they are not.
+froe writes `PACKED` for every bit width where Lucene's own selection uses
+`PACKED_SINGLE_BLOCK` for three of them; froe's transducers carry linear
+arcs where Lucene emits a fixed array for a wide node; froe orders a
+`TABLE_COMPRESSED` value table ascending where Lucene leaves it in hash
+order. Each is a choice the reader dispatches on, recorded in §10.3 of the
+codec specification, and each is invisible to the enumeration precisely
+because the reader honours what the file says.
+
+Nor does it say anything about **merging or deletions**: both indexes are
+one segment written in one commit, which is what froe writes and all it
+writes. A segment that Oak later merges, or into which Oak later writes a
+deletions file, is Oak's to produce.
 
 ### commit
 
