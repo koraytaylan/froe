@@ -36,8 +36,4 @@ mod url_encoder;
 pub(crate) use numbers::*;
 pub(crate) use properties::*;
 pub(crate) use split::*;
-#[expect(
-    unused_imports,
-    reason = "the encoder has no production caller until the property-index key derivation lands; `expect` rather than `allow` so the attribute itself fails once one exists"
-)]
 pub(crate) use url_encoder::*;

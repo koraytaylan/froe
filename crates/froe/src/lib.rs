@@ -65,7 +65,8 @@
 //! * [`content`] — decoding records into nodes, properties, and values;
 //! * [`journal`] — the head revision log;
 //! * [`gc_journal`] — optional garbage-collection history;
-//! * [`store`] — the assembled read-only repository.
+//! * [`store`] — the assembled read-only repository;
+//! * [`index`] — Oak's query-index definitions, lanes and storage.
 //!
 //! Long-running operations — opening a large store, planning a compaction,
 //! compacting, checking consistency — have a `_with_progress` twin that
@@ -81,6 +82,7 @@ pub mod content;
 pub mod error;
 pub mod gc_journal;
 pub mod hashing;
+pub mod index;
 mod java;
 pub mod journal;
 pub(crate) mod packed_records;

@@ -26,19 +26,6 @@
 //!
 //! [`docs/analysis/index-property-storage.md`]: ../../../../docs/analysis/index-property-storage.md
 
-// The encoder is specified and pinned against the JDK before its production
-// caller, the property-index key derivation, exists. `expect` rather than
-// `allow` so the attribute itself has to go once one does, and `not(test)`
-// because the module's own tests already reach every item, which would leave
-// the expectation unfulfilled in the test build.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller until the property-index key derivation lands"
-    )
-)]
-
 /// The byte Java's UTF-8 charset encoder substitutes for an unpaired
 /// surrogate, which is the ASCII question mark.
 const UNPAIRED_SURROGATE_REPLACEMENT: u8 = b'?';
