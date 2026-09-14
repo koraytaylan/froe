@@ -22,26 +22,52 @@ pub(crate) struct BookkeepingReset<'a> {
     pub(crate) reindex_count: i64,
 }
 
+/// What an edit does to a definition beyond its `reindex` bookkeeping.
+///
+/// A struct rather than a run of booleans, because the callers combine
+/// them: plan 0008's importer phase loses an index *and* flags it corrupt
+/// to reach the remediation case the drift comparison has to accept.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DefinitionEdit {
+    /// Remove every hidden child — the state an index has before anything
+    /// indexed it, and the state a lost one leaves.
+    pub(crate) drop_hidden: bool,
+    /// Write `corrupt` as a `DATE`, exactly as Oak's async lane writes it
+    /// when a cycle fails against an index, and as Oak's own cycle reads it
+    /// converting before clearing it.
+    pub(crate) flag_corrupt: bool,
+    /// Remove `async`, which is what makes a definition synchronous.
+    pub(crate) remove_async: bool,
+}
+
 /// Re-flags each named definition on `store` and sets its `reindexCount`.
 ///
 /// Every other property and every hidden child is re-attached by identity:
 /// the definition node is written afresh, but its children are the records
 /// the store already holds, so the subtree below it is the same subtree.
 pub(crate) fn reset_reindex_bookkeeping(store: &Path, definitions: &[BookkeepingReset<'_>]) {
-    edit_definitions(store, definitions, false);
+    edit_definitions(store, definitions, DefinitionEdit::default());
 }
 
 /// The same, and additionally removes every hidden child of each named
 /// definition — the state an index has before anything indexed it.
-#[expect(
-    dead_code,
-    reason = "plan 0008's importer phase is the first caller; plan 0010's reindex is the second"
-)]
 pub(crate) fn remove_hidden_children(store: &Path, definitions: &[BookkeepingReset<'_>]) {
-    edit_definitions(store, definitions, true);
+    edit_definitions(
+        store,
+        definitions,
+        DefinitionEdit {
+            drop_hidden: true,
+            ..DefinitionEdit::default()
+        },
+    );
 }
 
-fn edit_definitions(store: &Path, definitions: &[BookkeepingReset<'_>], drop_hidden: bool) {
+/// The general form, for a caller that needs more than one of the edits.
+pub(crate) fn edit_definitions(
+    store: &Path,
+    definitions: &[BookkeepingReset<'_>],
+    edit: DefinitionEdit,
+) {
     let writable = WritableRepository::open(store).expect("open the store for a definition edit");
     let generation = writable.writing_generation().expect("writing generation");
     let head = writable.head();
@@ -55,7 +81,7 @@ fn edit_definitions(store: &Path, definitions: &[BookkeepingReset<'_>], drop_hid
             .node_at_path(&path)
             .expect("resolve the definition")
             .unwrap_or_else(|| panic!("{path} is not in the store"));
-        let record = rewrite_one_definition(&node, &mut writer, definition, drop_hidden);
+        let record = rewrite_one_definition(&node, &mut writer, definition, edit);
         index_edits.insert(definition.name.to_owned(), Some(record));
     }
 
@@ -102,14 +128,29 @@ fn rewrite_one_definition<Sink: SegmentSink>(
     node: &froe::content::node::NodeState<'_>,
     writer: &mut RecordWriter<Sink>,
     reset: &BookkeepingReset<'_>,
-    drop_hidden: bool,
+    edit: DefinitionEdit,
 ) -> RecordIdentifier {
     let mut properties: Vec<PropertyToWrite> = Vec::new();
     for property in node.properties().expect("read the definition's properties") {
         if property.name == "reindex" || property.name == "reindexCount" {
             continue;
         }
+        if edit.remove_async && property.name == "async" {
+            continue;
+        }
         properties.push(rewritten_property(&property, writer));
+    }
+    if edit.flag_corrupt {
+        // A `DATE`, which is the type Oak's async lane writes and the type
+        // its own cycle reads converting before clearing the flag.
+        let flagged = writer
+            .write_string("2026-09-14T12:00:00.000Z")
+            .expect("write the corrupt flag");
+        properties.push(PropertyToWrite {
+            name: "corrupt".to_owned(),
+            property_type: PropertyType::Date,
+            values: PropertyValuesToWrite::Single(flagged),
+        });
     }
     let flagged = writer.write_string("true").expect("write the flag");
     properties.push(PropertyToWrite {
@@ -130,7 +171,7 @@ fn rewrite_one_definition<Sink: SegmentSink>(
         .child_node_entries()
         .expect("read the definition's children")
         .into_iter()
-        .filter(|(name, _)| !(drop_hidden && name.starts_with(':')))
+        .filter(|(name, _)| !(edit.drop_hidden && name.starts_with(':')))
         .map(|(name, child)| (name, child.record_identifier()))
         .collect();
 

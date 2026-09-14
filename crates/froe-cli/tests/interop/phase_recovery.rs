@@ -379,6 +379,7 @@ pub(crate) fn interop_full() {
     // fixture's Lucene index reflects the state Sling left, and every
     // later phase rewrites the store around it.
     lucene_dump();
+    lucene_import();
     commit();
     checkpoint();
     compact();

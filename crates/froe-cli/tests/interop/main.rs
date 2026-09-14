@@ -137,6 +137,7 @@ mod sling;
 mod store;
 
 use content::*;
+use definition_edits::*;
 use digest::*;
 use environment::*;
 use fixtures::*;
