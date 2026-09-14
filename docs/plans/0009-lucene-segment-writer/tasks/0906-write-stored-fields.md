@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe/src/index/lucene/codec/stored_fields.rs
   - crates/froe/tests/lucene_stored_fields_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "c8529cd"
 ---
 # Write Lucene40 Stored Fields
 
