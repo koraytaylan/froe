@@ -108,6 +108,17 @@ written inside the repository. It reads the index's own table of contents on
 the way, so `froe index check` can say whether the files are a coherent
 Lucene index rather than only whether their blobs resolve.
 
+**Put an out-of-band Lucene index back.** `froe index import` installs index
+data built elsewhere into a stopped store — the index directories, and the
+bookkeeping Oak's own importer leaves behind — under the same lock, plan and
+confirmation every mutating froe command uses. Where oak-run brings the
+imported index up to date by replaying commits against a *live* repository,
+froe requires that there is nothing to catch up on: the index must have been
+built at the checkpoint the definition's lane resumes from, and a directory
+built at any other state is refused naming both. Every copied file is read
+back out of the store and compared byte for byte before the head moves.
+Beta until plan 0008's review freezes its evidence.
+
 **Rebuild a flagged index without waiting for Oak to do it.** Oak rebuilds a
 flagged property index synchronously inside the first commit after startup,
 and on a large store that blocks AEM for hours. `froe index reindex` does it

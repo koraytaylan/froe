@@ -30,13 +30,36 @@ fn single<Sink: SegmentSink>(
     }
 }
 
-/// The `:data` child holding two files in the streaming encoding.
+/// The committed sample index's files, written by Oak itself.
+///
+/// They have to be a *coherent* Lucene index rather than plausible bytes:
+/// the import refuses an incoherent directory before it copies one, so a
+/// fixture of invented files could never be imported back.
+fn sample_files() -> Vec<(String, Vec<u8>)> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../froe/tests/fixtures/lucene-4-7-sample-index");
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&directory)
+        .expect("read the sample index")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("read a sample index file"),
+            )
+        })
+        .filter(|(name, _)| name != "README.md")
+        .collect();
+    files.sort();
+    files
+}
+
+/// The `:data` child holding the sample index in the streaming encoding.
 fn write_data_directory<Sink: SegmentSink>(
     writer: &mut RecordWriter<Sink>,
 ) -> froe::RecordIdentifier {
     let mut files = Vec::new();
-    for (name, bytes) in [("segments_1", &b"commit"[..]), ("_0.si", &b"segment"[..])] {
-        let blob = writer.write_binary_content(bytes).expect("write a blob");
+    for (name, bytes) in sample_files() {
+        let blob = writer.write_binary_content(&bytes).expect("write a blob");
         let properties = [
             single(writer, "blobSize", PropertyType::Long, "1047552"),
             PropertyToWrite {
@@ -48,7 +71,7 @@ fn write_data_directory<Sink: SegmentSink>(
         let node = writer
             .write_node(None, &[], &ChildNodesToWrite::Zero, &properties)
             .expect("write a file node");
-        files.push((name.to_owned(), node));
+        files.push((name.clone(), node));
     }
 
     let listing: Vec<_> = files
@@ -357,6 +380,206 @@ pub(crate) fn reporting_never_reaches_the_standard_output_of_a_dump() {
             "--progress {progress} put something before the data: {stdout}"
         );
         for reported in ["dumping index files", "\r"] {
+            assert!(
+                !stdout.contains(reported),
+                "--progress {progress} leaked {reported:?} into standard output: {stdout}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `froe index import`
+// ---------------------------------------------------------------------------
+
+fn froe_import(store: &Path, arguments: &[&str]) -> Run {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_froe"));
+    command.arg("index").arg("import").arg(store);
+    for argument in arguments {
+        command.arg(argument);
+    }
+    let output = command.output().expect("run froe index import");
+    Run {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// A store, and a dump of it to import back.
+fn import_fixture(name: &str) -> (TestDirectory, PathBuf, PathBuf) {
+    let (directory, store, output) = fixture(name);
+    let run = froe_dump(&store, &["--output", output.to_str().expect("utf-8")]);
+    assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
+    let input = output.join("index-dumps");
+    (directory, store, input)
+}
+
+/// A dry run plans read-only: it takes no lock and writes nothing.
+#[test]
+pub(crate) fn a_dry_run_import_takes_no_lock_and_writes_nothing() {
+    let (_directory, store, input) = import_fixture("import-dry-run");
+    let before = directory_snapshot(&store);
+
+    // The `repo.lock` inode is left behind by whoever wrote the store, so
+    // its presence proves nothing. What proves the dry run takes no lock is
+    // that it succeeds while this process holds it.
+    let held = froe::writer::RepositoryLock::acquire(&store).expect("hold the lock");
+    let run = froe_import(
+        &store,
+        &["--input", input.to_str().expect("utf-8"), "--dry-run"],
+    );
+    drop(held);
+
+    assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout.contains("import plan for") && run.stdout.contains("/oak:index/lucene"),
+        "the plan names the store and each definition: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("dry-run: repository was not modified"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(
+        directory_snapshot(&store),
+        before,
+        "a dry run must not write a byte inside the store"
+    );
+}
+
+/// Without `--yes` the prompt is answered by an empty standard input, which
+/// is not a yes, and the store is untouched.
+#[test]
+pub(crate) fn an_unconfirmed_import_changes_nothing() {
+    let (_directory, store, input) = import_fixture("import-cancel");
+    let before = directory_snapshot(&store);
+
+    let run = froe_import(&store, &["--input", input.to_str().expect("utf-8")]);
+
+    assert_ne!(run.status.code(), Some(0));
+    assert!(
+        run.stdout.contains("import plan for"),
+        "the plan is printed before the question: {}",
+        run.stdout
+    );
+    assert_eq!(
+        directory_snapshot(&store),
+        before,
+        "a cancelled import must not write a byte"
+    );
+}
+
+/// `--yes` applies, and the summary is built from the outcome.
+#[test]
+pub(crate) fn a_confirmed_import_applies_and_summarizes_what_happened() {
+    let (_directory, store, input) = import_fixture("import-apply");
+
+    let run = froe_import(
+        &store,
+        &["--input", input.to_str().expect("utf-8"), "--yes"],
+    );
+
+    assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout
+            .contains("imported 1 index at checkpoint checkpoint-1"),
+        "the summary names what was imported and where from: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("head ") && run.stdout.contains(" -> "),
+        "the summary names the head move: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("reindexCount 1"),
+        "the summary names the bookkeeping: {}",
+        run.stdout
+    );
+}
+
+/// A path with no index directory is refused by name rather than silently
+/// producing an empty plan.
+#[test]
+pub(crate) fn a_named_index_with_no_directory_is_refused_by_the_import_command() {
+    let (_directory, store, input) = import_fixture("import-named-missing");
+
+    let run = froe_import(
+        &store,
+        &[
+            "--input",
+            input.to_str().expect("utf-8"),
+            "--index",
+            "/oak:index/absent",
+            "--dry-run",
+        ],
+    );
+
+    assert_ne!(run.status.code(), Some(0));
+    assert!(
+        run.stderr.contains("/oak:index/absent"),
+        "the refusal names the path: {}",
+        run.stderr
+    );
+}
+
+/// A definitions file that describes a different definition is refused,
+/// naming the difference and the remedy.
+#[test]
+pub(crate) fn a_drifting_definitions_file_is_refused_by_the_import_command() {
+    let (_directory, store, input) = import_fixture("import-drift");
+
+    let path = input.join("index-definitions.json");
+    let content = std::fs::read_to_string(&path).expect("read the definitions file");
+    let opening = "\"/oak:index/lucene\": {";
+    let at = content
+        .find(opening)
+        .expect("the file carries the definition")
+        + opening.len();
+    let mut edited = content;
+    edited.insert_str(at, "\n    \"evaluatePathRestrictions\": true,");
+    std::fs::write(&path, edited).expect("rewrite the definitions file");
+
+    let run = froe_import(
+        &store,
+        &["--input", input.to_str().expect("utf-8"), "--dry-run"],
+    );
+
+    assert_ne!(run.status.code(), Some(0));
+    assert!(
+        run.stderr.contains("/evaluatePathRestrictions")
+            && run.stderr.contains("never a definition change"),
+        "the refusal names the difference and the remedy: {}",
+        run.stderr
+    );
+}
+
+/// Progress is a report, and a report never mixes with the plan an operator
+/// reads.
+#[test]
+pub(crate) fn reporting_never_reaches_the_standard_output_of_an_import_plan() {
+    for progress in ["always", "never", "auto"] {
+        let (_directory, store, input) = import_fixture(&format!("import-reporting-{progress}"));
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_froe"));
+        command
+            .arg("--progress")
+            .arg(progress)
+            .arg("index")
+            .arg("import")
+            .arg(&store)
+            .arg("--input")
+            .arg(&input)
+            .arg("--dry-run");
+        let result = command.output().expect("run froe index import");
+        let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+
+        assert!(
+            stdout.starts_with("import plan for"),
+            "--progress {progress} put something before the plan: {stdout}"
+        );
+        for reported in ["copying index files", "\r"] {
             assert!(
                 !stdout.contains(reported),
                 "--progress {progress} leaked {reported:?} into standard output: {stdout}"

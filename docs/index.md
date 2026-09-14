@@ -464,12 +464,143 @@ a file under its real name was written whole. A returned error removes its
 temporary; abrupt death leaves it. Either way the remedy is the same —
 **delete the output directory and rerun**.
 
-## 7. What is not here yet
+## 7. `froe index import`
+
+Lucene index data built out of band, installed back into a **stopped**
+store.
+
+> **Beta.** The round trip and the guards are covered by froe's own tests,
+> and the comparison against Oak's own importer is proven by the interop
+> suite, but the review that freezes that evidence has not run yet.
+
+```
+froe index import REPOSITORY --input DIRECTORY [--index PATH]… [--dry-run] [--yes]
+```
+
+`--input` is a `<…>/index-dumps` directory: the one `froe index dump`
+wrote, or the one an oak-run out-of-band build produced.
+
+The flow is `froe compact`'s. `--dry-run` plans read-only without the lock
+and prints what a run would do. Otherwise the run prepares under the lock,
+prints the plan, asks while still holding the lock, applies, and prints a
+summary built from what happened rather than from what was intended.
+
+### 7.1 The state rule, and why it replaces bring-up-to-date
+
+oak-run's importer brings an imported index up to date by replaying every
+commit made since the index was built, against a **live** repository. froe
+is an offline tool and has no editors to replay with, so it requires
+instead that **there is nothing to catch up on**: the checkpoint named in
+`indexer-info.properties` must resolve to the same state the definition's
+lane will resume from.
+
+Concretely, per definition: the root of the directory's checkpoint must be
+the *same record* as the root of the checkpoint `/:async/<lane>` names. A
+directory built at any other state is refused, naming both checkpoints and
+both roots, and telling you to rebuild at the lane's own checkpoint.
+
+That is a precondition, not a check. It is what lets froe install bytes it
+did not compute and cannot verify semantically: the index is current
+because the state it was built at is the state the lane is at.
+
+**`indexer-info.properties` names one checkpoint for the whole directory**,
+so import one lane at a time — one dump, one import, per lane — exactly as
+you dump one lane at a time.
+
+### 7.2 Building the index out of band, at the right checkpoint
+
+1. Stop AEM. It stays stopped from here through the import: a **running
+   lane releases its previous checkpoint after every cycle**, so a
+   checkpoint name read from a live store can be gone by the time the
+   build finishes.
+2. Read the lane's checkpoint from the stopped store:
+
+   ```
+   froe index list REPOSITORY
+   ```
+
+   which prints each definition's lane and the checkpoint that lane will
+   resume from, or read `/:async/<lane>` directly with
+   `froe node REPOSITORY /:async`.
+3. Build with oak-run, passing that checkpoint name to `--checkpoint`.
+4. `froe index dump REPOSITORY --output BACKUP` — the old index data, so
+   the import is reversible.
+5. `froe index import REPOSITORY --input BUILD/index-dumps`
+6. `froe index check REPOSITORY` — the blobs resolve and the table of
+   contents is coherent.
+7. Start AEM and watch the lane: it must resume without logging a reindex.
+
+### 7.3 The definitions file must agree with the store
+
+`index-definitions.json` is mandatory, and froe compares it against the
+store's own definitions before it copies anything. **froe imports index
+*data*, never a definition change**: make definition changes through
+oak-run or AEM first.
+
+The comparison is Oak's own — the one its index-information provider
+performs over visible clones, which keep hidden properties and drop hidden
+child nodes — extended by the properties an out-of-band build legitimately
+rewrites. These are accepted, each in the one direction it happens:
+
+| Difference | Accepted when |
+| --- | --- |
+| `reindexCount` | always; the file's value is one above the store's for a froe dump and two for an oak-run build |
+| `refresh` | only on the file's side, where the lane revert sets it |
+| `seed` | only when the store lacks one; two *different* seeds are drift, because the counters they drive would disagree |
+| `corrupt`, `indexImportState` | only when the store has them and the file does not, which is the usual reason for an out-of-band build |
+| a `facets` subtree | only when the file has it and the store does not, since the build's document maker persists it |
+
+Anything else — a changed visible property, a removed visible child — is
+drift, and the refusal names the first difference.
+
+### 7.4 What it refuses
+
+* **A synchronous Lucene definition.** oak-run's own importer never
+  completes that case: its catch-up step skips the `sync` lane and leaves
+  the definition on `async = temp-sync`. There is no Oak behaviour to
+  match and no oracle to prove against.
+* **A hybrid definition** — one whose property definitions or `nodeTypeIndex`
+  rule carry `sync` or `unique`. Oak keeps the synchronous half in the
+  hidden child `:property-index`, maintained by its incremental editor, and
+  froe builds none.
+* **A directory that is not a coherent Lucene index** — no commit file, a
+  file a segment names that is absent, a file no segment names, or a header
+  that does not read. Refused before a byte is copied.
+* **A named `--index` path with no directory in the input**, by name.
+
+### 7.5 What it changes, and what it does not
+
+Per imported definition: `:data` (and any other mapped index directory)
+replaced, `:status` replaced with a node carrying a fresh `uid`,
+`:index-definition` replaced with a visible clone of the updated
+definition, `:version` written, `reindex` cleared, `reindexCount` set to
+the file's value plus one, `corrupt` and `indexImportState` removed when
+present, and `:disableIndexesOnNextCycle` written when the definition's
+`supersedes` names an index that is still active — which is where Oak's
+own importer writes it. froe raises that flag and never acts on it:
+disabling a superseded index changes which index answers a query, and that
+is a decision for a running Oak and for you.
+
+Every pre-existing hidden child is dropped, as Oak's own definition updater
+drops them when it installs the file's node wholesale. **A stored
+`:suggest-data` goes and is never re-imported** — Oak's own Lucene writer
+rebuilds the suggestions whenever their `lastUpdated` is missing, so the
+suggester is absent only until the next cycle.
+
+**No checkpoint is released.** oak-run's importer releases the one
+`indexer-info.properties` names as its fourth step; froe does not, because
+the only checkpoint it accepts is a lane's, and the lane owns it.
+
+**The store grows by the index size.** The replaced records stay live
+through every checkpoint that references them and are reclaimed only by a
+`froe compact` run after those are released.
+
+## 8. What is not here yet
 
 | Subcommand | Plan |
 | --- | --- |
 | `froe index reindex` for fulltext-enabled Lucene definitions | 0009 |
-| `froe index import` — oak-run's filesystem transport back into a store | 0010 |
+| Native Lucene index building, so a rebuild needs no oak-run | 0010 |
 
 The read-only set grows in place; the mutating commands get their own
 sections, with the confirmation and locking rules the rest of froe's

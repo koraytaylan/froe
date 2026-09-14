@@ -364,7 +364,8 @@ fn refuse_an_incoherent_directory(index_path: &str, jcr_name: &str, source: &Pat
     };
     Err(Error::InvalidFormat {
         details: format!(
-            "{index_path}'s {jcr_name} in {} is not a coherent Lucene index: {reason};              froe refuses it before copying a byte",
+            "{index_path}'s {jcr_name} in {} is not a coherent Lucene index: {reason}; \
+             froe refuses it before copying a byte",
             source.display()
         ),
     })

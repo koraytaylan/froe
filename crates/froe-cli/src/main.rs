@@ -15,6 +15,7 @@ mod compaction_report;
 mod compaction_summary;
 mod content_display;
 mod index_display;
+mod index_import;
 mod index_reindex;
 mod inspection;
 mod mutation;
@@ -389,6 +390,28 @@ fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode>
             Ok(ExitCode::FAILURE)
         };
     }
+    // The import takes the lock and writes, so it must not go through the
+    // read-only open either.
+    if let IndexAction::Import {
+        input,
+        indexes,
+        dry_run,
+        yes,
+        ..
+    } = action
+    {
+        let command_line = index_import::ImportCommandLine {
+            input,
+            indexes,
+            dry_run,
+            assume_yes: yes,
+        };
+        return if index_import::run_import(&repository_path, &command_line, reporter)? {
+            Ok(ExitCode::SUCCESS)
+        } else {
+            Ok(ExitCode::FAILURE)
+        };
+    }
     let repository = open_repository(&repository_path, reporter)?;
     match action {
         IndexAction::List { indexes, .. } => {
@@ -420,7 +443,9 @@ fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode>
                 reporter,
             )?;
         }
-        IndexAction::Reindex { .. } => unreachable!("handled above, before the read-only open"),
+        IndexAction::Reindex { .. } | IndexAction::Import { .. } => {
+            unreachable!("handled above, before the read-only open")
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

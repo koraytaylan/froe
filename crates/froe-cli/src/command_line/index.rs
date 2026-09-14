@@ -154,6 +154,50 @@ pub(crate) enum IndexAction {
         #[arg(long, value_name = "N")]
         sort_budget_mebibytes: Option<usize>,
     },
+    /// Import Lucene index data built out of band back into a stopped
+    /// store.
+    ///
+    /// The store must be offline: the run holds the repository lock from
+    /// planning through publication, and no Oak instance may be running
+    /// against it.
+    ///
+    /// froe does not bring an imported index up to date, as oak-run does
+    /// by replaying commits against a live repository. It requires instead
+    /// that there is nothing to catch up on: **the index must have been
+    /// built at the checkpoint this store is at**, meaning the checkpoint
+    /// named in `indexer-info.properties` must resolve to the same state
+    /// the definition's lane will resume from. A directory built at any
+    /// other state is refused, naming both checkpoints.
+    ///
+    /// `index-definitions.json` must describe the definitions as this
+    /// store holds them. froe imports index *data*, never a definition
+    /// change: make definition changes through oak-run or AEM first. The
+    /// properties an out-of-band build legitimately rewrites —
+    /// `reindexCount`, `refresh`, a created `seed`, a cleared `corrupt` or
+    /// `indexImportState`, and a `facets` subtree — are accepted in the
+    /// direction they happen.
+    ///
+    /// No checkpoint is released, and `:suggest-data` is never imported:
+    /// Oak's own writer rebuilds the suggestions on its next cycle.
+    Import {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// The directory to import from — oak-run's `index-dumps`, or the
+        /// one `froe index dump` wrote.
+        #[arg(long)]
+        input: PathBuf,
+        /// Restrict to this definition path; repeatable. A path with no
+        /// index directory in the input is refused by name.
+        #[arg(long = "index", value_name = "PATH")]
+        indexes: Vec<String>,
+        /// Plan without taking the lock and without writing anything, then
+        /// print what a run would do.
+        #[arg(long)]
+        dry_run: bool,
+        /// Answer yes to the plan confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 impl IndexAction {
@@ -164,7 +208,8 @@ impl IndexAction {
             | IndexAction::Definitions { repository, .. }
             | IndexAction::Check { repository, .. }
             | IndexAction::Reindex { repository, .. }
-            | IndexAction::Dump { repository, .. } => repository,
+            | IndexAction::Dump { repository, .. }
+            | IndexAction::Import { repository, .. } => repository,
         }
     }
 }
