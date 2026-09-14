@@ -10,8 +10,8 @@ touches:
   - crates/froe/src/writer/maintenance/plan.rs
   - crates/froe-cli/tests/command_line_tests/compaction.rs
   - docs/compact.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "10ebb86b1c0ef1264f2337d34b2ce14824c08d8f"
 ---
 # Warn About Pending Reindexes In The Compaction Plan
 
