@@ -10,8 +10,8 @@ touches:
   - crates/froe-cli/tests/interop/main.rs
   - crates/froe-cli/tests/interop/judge/Corpus.java
   - crates/froe/tests/fixtures/lucene-writer-corpus.jsonl
-status: planned
-merged_as: ""
+status: done
+merged_as: "fc4c798"
 ---
 # Prove Writer Conformance With Lucene's Own Reader
 
