@@ -456,6 +456,12 @@ So: header, version string, document count as a fixed `Int`, the compound
 flag as **one byte** (`YES = 1`, `NO = -1` — not 0), the diagnostics map, the
 file set.
 
+**The version string is `"4.7"`, not `"4.7.2"`.** `si.getVersion()` returns
+what the index writer set, which is `Constants.LUCENE_MAIN_VERSION` —
+major and minor only. The committed sample index Oak itself wrote carries
+`03 34 2e 37` at that position, which is the three bytes `4.7`; the full
+implementation version appears nowhere in a `.si`.
+
 **Two facts about the file set, both invisible from the read side.**
 
 1. **The writer adds its own name first.** `si.addFile(fileName)` runs

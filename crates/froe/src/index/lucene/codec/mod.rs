@@ -24,12 +24,15 @@
 //! transport moves it — and not one froe writes. The feasibility verdict
 //! records both as out of scope, and nothing in the consumer needs them.
 
+pub mod compound;
 pub mod data_output;
 pub mod doc_values;
+pub mod field_infos;
 pub mod fst;
 pub mod norms;
 pub mod packed;
 pub mod postings;
+pub mod segment_info;
 pub mod stored_fields;
 pub mod terms;
 
@@ -37,12 +40,3 @@ pub mod terms;
 // module tree is the one the specification describes from the start, and so
 // a reader looking for a format finds where it will live rather than
 // wondering whether it exists.
-
-/// `.fnm` (§4). Task 0909.
-pub mod field_infos {}
-
-/// The `.si` descriptor and the `segments_N` commit file (§3). Task 0909.
-pub mod segment_info {}
-
-/// `.cfs` and `.cfe` (§9). Task 0909.
-pub mod compound {}
