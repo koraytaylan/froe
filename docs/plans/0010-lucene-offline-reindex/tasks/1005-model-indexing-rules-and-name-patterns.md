@@ -11,13 +11,16 @@ touches:
   - crates/froe/src/index/lucene/documents/name_pattern.rs
   - crates/froe/src/index/lucene/documents/aggregate.rs
   - crates/froe/tests/lucene_rules_tests.rs
+  - crates/froe/tests/lucene_name_pattern_tests.rs
+  - crates/froe/src/index/mod.rs
+  - docs/analysis/lucene-oak-documents.md
   - crates/froe-cli/tests/interop/judge/RegularExpressionVectors.java
   - crates/froe/tests/fixtures/java-regular-expression-vectors.tsv
   - crates/froe/src/index/lucene/documents/document_maker.rs
   - crates/froe/src/index/lucene/documents/facets.rs
   - crates/froe/src/index/lucene/documents/binaries.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "8393466"
 ---
 # Model Indexing Rules, Property Definitions And Name Patterns
 
