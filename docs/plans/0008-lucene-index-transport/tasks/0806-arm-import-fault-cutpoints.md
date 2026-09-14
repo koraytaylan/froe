@@ -11,9 +11,16 @@ touches:
   - crates/froe/src/writer/fault_injection/test_support.rs
   - crates/froe/src/writer/index/lucene_import/apply.rs
   - crates/froe/tests/lucene_import_guard_tests.rs
+  - crates/froe/tests/lucene_import_tests.rs
+  - crates/froe/tests/support/lucene_import_fixtures.rs
+  - crates/froe/tests/support/mod.rs
+  - crates/froe/src/index/lucene/check.rs
+  - crates/froe/src/writer/index/lucene_import/plan.rs
+  - crates/froe/src/writer/index/definition_update.rs
+  - docs/analysis/index-definitions.md
   - docs/plans/0008-lucene-index-transport/ARCHITECTURE.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "3375e37, fd58bbe"
 ---
 # Arm Fault And Process-Death Cutpoints Around The Import
 
