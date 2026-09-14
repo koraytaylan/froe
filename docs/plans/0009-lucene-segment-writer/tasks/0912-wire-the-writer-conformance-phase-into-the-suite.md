@@ -10,8 +10,8 @@ touches:
   - crates/froe-cli/tests/interop/phase_recovery.rs
   - crates/froe-cli/tests/interop/main.rs
   - scripts/interop-fixture.sh
-status: planned
-merged_as: ""
+status: done
+merged_as: "f6ccfc3"
 ---
 # Wire The Writer Conformance Phase Into The Suite
 
