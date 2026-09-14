@@ -13,8 +13,10 @@ touches:
   - crates/froe/tests/lucene_numeric_tests.rs
   - crates/froe/tests/fixtures/lucene-numeric-vectors.tsv
   - crates/froe-cli/tests/interop/judge/NumericVectors.java
-status: planned
-merged_as: ""
+  - crates/froe/src/index/mod.rs
+  - docs/analysis/lucene-oak-analysis.md
+status: done
+merged_as: "b12178f"
 ---
 # Implement Lucene's Numeric Field Encodings
 
