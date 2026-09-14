@@ -9,8 +9,8 @@ touches:
   - crates/froe/src/index/lucene/codec/norms.rs
   - crates/froe/tests/lucene_norms_tests.rs
   - crates/froe/tests/fixtures/lucene-norm-vectors.tsv
-status: planned
-merged_as: ""
+status: done
+merged_as: "80775a8"
 ---
 # Write Lucene42 Norms From The Default Similarity
 
