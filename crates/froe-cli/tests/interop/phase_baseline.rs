@@ -31,6 +31,19 @@ pub(crate) fn generate() {
     eprintln!("  populating content");
     populate_content(8080);
 
+    // The three index shapes plans 0007 onward rebuild, and which the
+    // fixture otherwise lacks: the reference index holds no references at
+    // all, the unique indexes cover only Sling's own system nodes, and no
+    // property index was rebuilt by Oak from existing content — which is the
+    // exact oracle shape plan 0007 compares against. All three go through
+    // Sling, never through froe, so the bytes are authentically Oak's.
+    eprintln!("  adding references, a group with members, and an index to rebuild");
+    populate_references(8080);
+    populate_group_with_members(8080);
+    // Posted last, after the content it indexes exists, so Oak's rebuild has
+    // something to find.
+    populate_rebuilt_property_index(8080);
+
     eprintln!("  churning content to produce orphaned segments");
     churn_content(8080);
 
@@ -80,6 +93,11 @@ pub(crate) fn generate() {
         .expect("store the Oak store path");
     std::fs::write(fixture_pointer_path(), store.to_string_lossy().as_bytes())
         .expect("record the fixture path for later processes");
+
+    // Before the baseline: a fixture missing one of these shapes would
+    // record a digest of the wrong store, and every later phase would
+    // compare correctly against bytes that prove less than they claim.
+    assert_index_fixture_built(&store);
 
     // The baseline every later phase compares its digest against: the
     // content exactly as Oak itself wrote it, before froe has touched
@@ -212,4 +230,68 @@ pub(crate) fn read() {
     assert!(!export.is_empty(), "export produced output");
 
     eprintln!("  read phase passed");
+}
+
+/// Asserts every index shape `generate` added is in the extracted store.
+///
+/// Through `froe node` and the content API rather than through anything this
+/// plan built: the assertion has to be able to fail when a *reader* is wrong,
+/// and a check written against the reader under test cannot do that. It runs
+/// before the digest baseline is recorded, so a fixture that silently lost a
+/// shape fails here rather than three phases later.
+pub(crate) fn assert_index_fixture_built(store: &Path) {
+    let store_path = store.to_str().expect("the store path is UTF-8");
+
+    // The reference index, both hidden children, each with at least one
+    // entry. An empty reference index proves nothing about a reader of one.
+    for child in [":references", ":weakreferences"] {
+        let path = format!("/oak:index/reference/{child}");
+        let tree = froe(&["tree", store_path, &path, "--depth", "2"]);
+        let entries = tree.lines().count();
+        assert!(
+            entries > 1,
+            "{path} holds no entry, so the reference index in the fixture is empty:\n{tree}"
+        );
+    }
+
+    // The group's multi-valued `rep:members` under a `rep:MemberReferences`
+    // node, which is what `repMembers` indexes.
+    let members = froe(&[
+        "tree",
+        store_path,
+        "/oak:index/repMembers/:index",
+        "--depth",
+        "3",
+    ]);
+    assert!(
+        members.lines().count() > 1,
+        "the repMembers index holds no entry, so the fixture has no group \
+         membership to rebuild:\n{members}"
+    );
+
+    // The property index Oak rebuilt from existing content. It cannot still
+    // be flagged: collecting the editors clears the flag in the same commit.
+    let definition = froe(&["node", store_path, "/oak:index/interopTitle"]);
+    assert!(
+        definition.contains("reindex <Boolean> = false"),
+        "the definition is still flagged for reindexing, which Oak clears in \
+         the commit that registers the editor:\n{definition}"
+    );
+    assert!(
+        definition.contains("reindexCount <Long> = 1"),
+        "the definition was not reindexed exactly once:\n{definition}"
+    );
+    let storage = froe(&[
+        "tree",
+        store_path,
+        "/oak:index/interopTitle/:index",
+        "--depth",
+        "2",
+    ]);
+    assert!(
+        storage.lines().count() > 1,
+        "the rebuilt index has an empty :index, so Oak found no content to \
+         index and the oracle would compare two empty trees:\n{storage}"
+    );
+    eprintln!("  index fixture: references, group members and a rebuilt property index");
 }

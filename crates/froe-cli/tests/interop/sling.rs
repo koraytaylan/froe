@@ -248,3 +248,143 @@ pub(crate) fn sling_node_identifier(port: u16, path: &str) -> String {
     assert_eq!(identifier.len(), 36, "identifier shape: {identifier}");
     identifier.to_owned()
 }
+
+// ---------------------------------------------------------------------------
+// The index shapes plans 0007 onward rebuild
+// ---------------------------------------------------------------------------
+
+/// A `SlingPostServlet` post carrying arbitrary fields.
+///
+/// The typed posts above each fix their own property set; this is for the
+/// shapes that need a `@TypeHint`, which is how Sling is told to store a
+/// value as something other than a `STRING`. The distinction is not
+/// cosmetic: Oak's reference index only indexes `REFERENCE` and
+/// `WEAKREFERENCE` properties, and its query planner reads a definition's
+/// `propertyNames` strictly as `NAMES`, so a value that arrived as a
+/// `STRING` produces a fixture that looks right and indexes nothing.
+pub(crate) fn sling_post_fields(port: u16, path: &str, fields: &[(&str, &str)]) {
+    let url = format!("http://localhost:{port}{path}");
+    let mut command = Command::new("curl");
+    command.args(["-s", "--fail", "-o", "/dev/null", "-u", "admin:admin"]);
+    for (name, value) in fields {
+        command.args(["-F", &format!("{name}={value}")]);
+    }
+    command.arg(&url);
+    let status = command.status().expect("curl POST fields");
+    assert!(status.success(), "posting {path} with {fields:?} failed");
+}
+
+/// Adds the reference shapes: a `mix:referenceable` target and a sibling
+/// holding a `REFERENCE` and a `WEAKREFERENCE` to it.
+///
+/// This is what puts an entry in `/oak:index/reference/:references` **and**
+/// in `:weakreferences`. Without it the fixture's reference index is empty,
+/// and an empty index proves nothing about a reader of one.
+///
+/// A second referenceable whose reference lives under
+/// `/jcr:system/jcr:versionStorage` is out of reach through Sling — that
+/// subtree is not writable through the post servlet — and is covered by the
+/// unit tests instead.
+pub(crate) fn populate_references(port: u16) {
+    let target = "/content/interop/references/target";
+    sling_post_fields(
+        port,
+        target,
+        &[
+            ("jcr:primaryType", "nt:unstructured"),
+            ("jcr:mixinTypes", "mix:referenceable"),
+            ("jcr:title", "Reference Target"),
+        ],
+    );
+    let identifier = sling_node_identifier(port, target);
+    sling_post_fields(
+        port,
+        "/content/interop/references/source",
+        &[
+            ("jcr:primaryType", "nt:unstructured"),
+            ("jcr:title", "Reference Source"),
+            ("ref@TypeHint", "Reference"),
+            ("ref", &identifier),
+            ("weakRef@TypeHint", "WeakReference"),
+            ("weakRef", &identifier),
+        ],
+    );
+}
+
+/// Creates a group with two members through Sling's user manager servlet.
+///
+/// This is what puts `rep:members` under a `rep:MemberReferences` node, which
+/// is the one definition in the fixture with a `declaringNodeTypes`
+/// restriction over a *multi-valued* property. Nothing else in the store
+/// exercises that pair.
+pub(crate) fn populate_group_with_members(port: u16) {
+    for member in ["interop-member-one", "interop-member-two"] {
+        sling_user_manager(
+            port,
+            "/system/userManager/user.create.html",
+            &[
+                (":name", member),
+                ("pwd", "interop-secret"),
+                ("pwdConfirm", "interop-secret"),
+            ],
+        );
+    }
+    sling_user_manager(
+        port,
+        "/system/userManager/group.create.html",
+        &[(":name", "interop-group")],
+    );
+    sling_user_manager(
+        port,
+        "/system/userManager/group/interop-group.update.html",
+        &[
+            (":member", "/system/userManager/user/interop-member-one"),
+            (":member", "/system/userManager/user/interop-member-two"),
+        ],
+    );
+}
+
+fn sling_user_manager(port: u16, path: &str, fields: &[(&str, &str)]) {
+    let url = format!("http://localhost:{port}{path}");
+    let mut command = Command::new("curl");
+    command.args(["-s", "--fail", "-o", "/dev/null", "-u", "admin:admin"]);
+    for (name, value) in fields {
+        command.args(["-F", &format!("{name}={value}")]);
+    }
+    command.arg(&url);
+    let status = command.status().expect("curl POST user manager");
+    assert!(status.success(), "posting {path} with {fields:?} failed");
+}
+
+/// Posts a property index definition over `jcr:title` **after** the content
+/// exists, so Oak rebuilds it from that content.
+///
+/// The reindex test is true for the `reindex` flag and for a brand-new
+/// definition alike, under the default `oak.indexUpdate.ignoreReindexFlags=false`:
+/// collecting the editors clears the flag, increments `reindexCount` and
+/// registers the editor, and the cycle then runs that editor from the
+/// missing state to the head before the commit completes. So the fixture
+/// **cannot** carry a definition that is still flagged — a still-flagged one
+/// comes from a synthetic store or from a writer helper on a copy. What it
+/// carries instead is the shape plan 0007's oracle needs: a property index
+/// Oak rebuilt from existing content in one synchronous cycle.
+///
+/// `propertyNames` is posted as `Name[]` deliberately. The editor would
+/// convert a `STRING`, but the query planner reads it strictly and sees a
+/// `STRING`, or a single `NAME`, as empty — so a fixture posted without the
+/// type hint would index correctly and plan as though the index did not
+/// exist.
+pub(crate) fn populate_rebuilt_property_index(port: u16) {
+    sling_post_fields(
+        port,
+        "/oak:index/interopTitle",
+        &[
+            ("jcr:primaryType", "oak:QueryIndexDefinition"),
+            ("type", "property"),
+            ("propertyNames@TypeHint", "Name[]"),
+            ("propertyNames", "jcr:title"),
+            ("reindex@TypeHint", "Boolean"),
+            ("reindex", "true"),
+        ],
+    );
+}
