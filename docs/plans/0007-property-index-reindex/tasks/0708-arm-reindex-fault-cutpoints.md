@@ -11,8 +11,8 @@ touches:
   - crates/froe/src/writer/fault_injection/test_support.rs
   - crates/froe/src/writer/index/apply.rs
   - docs/plans/0007-property-index-reindex/ARCHITECTURE.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "d2862f487137427e6a41c61c8d810027bcde9a77"
 ---
 # Arm Fault And Process-Death Cutpoints Around Publication
 

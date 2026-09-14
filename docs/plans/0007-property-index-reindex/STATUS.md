@@ -6,9 +6,9 @@ The roll-up row in [../STATUS.md](../STATUS.md) must stay in sync with this file
 - **Goal:** `froe index reindex` rebuilds property, unique, node-type, reference and counter indexes offline from the state Oak's own editors would index, in one head move under the lock, with a safety case, fault coverage and Oak-side proof.
 - **Root cause:** Oak rebuilds a flagged property index synchronously inside the first commit after startup and has no offline path that writes the result back; on large stores that blocks AEM for hours.
 - **Approach:** safety case first; bounded external sort and a streaming trie writer; Oak's exact key derivation and bookkeeping from plan 0006's specification; one compare-and-set; fresh-reopen verification; an interop phase whose oracle is Oak's own reindex of the same store, compared with only the randomized approximate counters excused; frozen adversarial review before the beta framing is lifted.
-- **Progress:** 8/15 tasks done; 0 blocked; 0 dropped.
+- **Progress:** 9/15 tasks done; 0 blocked; 0 dropped.
 - **Integration:** `planned`; run —; base `develop` @ `314b9c704fef73636d40f3e7ec5ff2c839aa1870` plus plan 0006 merged; validation base —; mode —; final integration —.
 - **Exceptions:** 0707 split `apply.rs` twice rather than once — into `apply/verification.rs` as well as the `apply/tests.rs` the safety case sanctions — because the operation and its verification tail together exceed the thousand-line gate, and 0708 adds cutpoints to `apply.rs` on top. 0707 also edited two files under `writer/maintenance/` that the safety case assigns to 0715: `gate_observation` was left module-private and `validate_metadata_source_apply_identity` never recorded its own call, so the wiring test 0707 owes could not be written without closing both. (Coordinator-owned blocked/dropped reasons are recorded here.)
 - **Outcome:** `froe index reindex` rebuilds property, unique, node-type, reference and counter indexes offline, from the state Oak's own editors would index, with one head move, a safety case, fault coverage, and an interop phase proving the rebuilt indexes agree with Oak's own reindex and serve Oak's queries.
 
-_Last updated: 2026-09-14, against `develop` @ `e67a589`._
+_Last updated: 2026-09-14, against `develop` @ `d2862f4`._
