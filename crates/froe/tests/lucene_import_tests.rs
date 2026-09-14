@@ -17,7 +17,7 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use froe::index::lucene::dump::{DumpOptions, dump_lucene_indexes};
 use froe::store::Repository;
@@ -25,233 +25,11 @@ use froe::writer::index::lucene_import::{
     LuceneImportOptions, PreparedLuceneImport, lucene_import, plan_lucene_import,
 };
 use support::filesystem_snapshot::directory_snapshot;
-use support::property_index_layout::{Node, Property, write_repository_with_tree};
-
-struct TestDirectory {
-    path: PathBuf,
-}
-
-impl TestDirectory {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "froe-lucene-import-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create the test directory");
-        Self { path }
-    }
-
-    fn store(&self) -> PathBuf {
-        let store = self.path.join("store");
-        std::fs::create_dir_all(&store).expect("create the store directory");
-        store
-    }
-
-    fn dump(&self) -> PathBuf {
-        self.path.join("dump")
-    }
-
-    fn input(&self) -> PathBuf {
-        self.dump().join("index-dumps")
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// The committed sample index's files.
-fn sample_files() -> Vec<(String, Vec<u8>)> {
-    let directory =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lucene-4-7-sample-index");
-    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&directory)
-        .expect("read the sample index")
-        .map(|entry| {
-            let entry = entry.expect("entry");
-            (
-                entry.file_name().to_string_lossy().into_owned(),
-                std::fs::read(entry.path()).expect("read"),
-            )
-        })
-        .filter(|(name, _)| name != "README.md")
-        .collect();
-    files.sort();
-    files
-}
-
-/// A `:data` child holding `files`.
-fn data_directory(files: &[(String, Vec<u8>)]) -> Node {
-    let mut data = Node::new().with(
-        "dirListing",
-        Property::Texts(files.iter().map(|(name, _)| name.clone()).collect()),
-    );
-    for (name, bytes) in files {
-        data = data.with_child(
-            name,
-            Node::new()
-                .with("blobSize", Property::Long(1_047_552))
-                .with("jcr:data", Property::Binary(bytes.clone())),
-        );
-    }
-    data
-}
-
-/// How the definition under test is shaped.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Shape {
-    /// The lane, or `None` for a synchronous definition.
-    lane: Option<&'static str>,
-    /// Whether the lane's checkpoint resolves.
-    checkpoint: bool,
-    /// Whether the definition also lists `sync`, making it hybrid.
-    hybrid: bool,
-    /// The `type` of the index a `supersedes` entry names, or `None` for a
-    /// definition carrying no `supersedes` at all.
-    superseded: Option<&'static str>,
-    /// A `compatMode`, which is the one property that can change the
-    /// `:version` the import writes.
-    compatibility_mode: Option<i64>,
-}
-
-impl Default for Shape {
-    fn default() -> Self {
-        Self {
-            lane: Some("async"),
-            checkpoint: true,
-            hybrid: false,
-            superseded: None,
-            compatibility_mode: None,
-        }
-    }
-}
-
-/// A store with one Lucene definition holding the sample index.
-fn build_store(directory: &TestDirectory, shape: Shape) -> PathBuf {
-    let store = directory.store();
-    let mut definition = Node::new()
-        .with(
-            "jcr:primaryType",
-            Property::Name("oak:QueryIndexDefinition".to_owned()),
-        )
-        .with("type", Property::Text("lucene".to_owned()))
-        .with_child(":data", data_directory(&sample_files()));
-    if let Some(lane) = shape.lane {
-        definition = definition.with(
-            "async",
-            if shape.hybrid {
-                Property::Texts(vec![lane.to_owned(), "sync".to_owned()])
-            } else {
-                Property::Text(lane.to_owned())
-            },
-        );
-    }
-
-    if shape.superseded.is_some() {
-        definition = definition.with(
-            "supersedes",
-            Property::Texts(vec!["/oak:index/old".to_owned()]),
-        );
-    }
-    if let Some(mode) = shape.compatibility_mode {
-        definition = definition.with("compatMode", Property::Long(mode));
-    }
-
-    let content = Node::new().with_child(
-        "page",
-        Node::new().with("jcr:title", Property::Text("Alpha".to_owned())),
-    );
-    let mut definitions = Node::new().with_child("lucene", definition);
-    if let Some(kind) = shape.superseded {
-        definitions = definitions.with_child(
-            "old",
-            Node::new()
-                .with(
-                    "jcr:primaryType",
-                    Property::Name("oak:QueryIndexDefinition".to_owned()),
-                )
-                .with("type", Property::Text(kind.to_owned())),
-        );
-    }
-    let mut root = Node::new()
-        .with_child("content", content.clone())
-        .with_child("oak:index", definitions);
-    if let Some(lane) = shape.lane {
-        root = root.with_child(
-            ":async",
-            Node::new().with(lane, Property::Text("checkpoint-1".to_owned())),
-        );
-    }
-
-    if shape.checkpoint {
-        // The checkpoint's root must be *the content root itself*, because
-        // the state rule compares record identity and a checkpoint shares
-        // the content root's record by construction.
-        support::property_index_layout::write_repository_with_checkpoints(
-            &store,
-            &root,
-            &[("checkpoint-1", root.clone())],
-        );
-    } else {
-        write_repository_with_tree(&store, &root);
-    }
-    store
-}
-
-/// Dumps `store` into the test directory, returning the input path.
-fn dump(directory: &TestDirectory, store: &Path) -> PathBuf {
-    dump_lucene_indexes(
-        &Repository::open(store).expect("open"),
-        &DumpOptions::new(Vec::new(), directory.dump()),
-    )
-    .expect("dump");
-    directory.input()
-}
-
-/// The digest lines under `path`.
-fn digest_lines(store: &Path, path: &str) -> Vec<String> {
-    let repository = Repository::open(store).expect("open");
-    let mut rendered = Vec::new();
-    froe::tooling::digest::digest_repository_excluding(&repository, &[], &[], &mut rendered)
-        .expect("digest");
-    String::from_utf8(rendered)
-        .expect("UTF-8")
-        .lines()
-        .filter(|line| {
-            line.strip_prefix(path).is_some_and(|rest| {
-                rest.is_empty() || rest.starts_with('/') || rest.starts_with('\t')
-            })
-        })
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The `:data` file bytes, read back through the reader.
-fn stored_files(store: &Path) -> Vec<(String, Vec<u8>)> {
-    use std::io::Read as _;
-    let repository = Repository::open(store).expect("open");
-    let node = repository
-        .node_at_path("/oak:index/lucene")
-        .expect("resolve")
-        .expect("exists");
-    let definition = froe::index::IndexDefinition::read(&node, "/oak:index/lucene").expect("model");
-    let directory =
-        froe::index::lucene::OakDirectory::open(&repository, &node, &definition, ":data")
-            .expect("open :data")
-            .expect(":data exists");
-    let mut files = Vec::new();
-    for name in directory.file_names() {
-        let file = directory.file(name).expect("open");
-        let mut bytes = Vec::new();
-        file.reader().read_to_end(&mut bytes).expect("read");
-        files.push((name.clone(), bytes));
-    }
-    files.sort();
-    files
-}
+use support::lucene_import_fixtures::{
+    Shape, TestDirectory, build_store, data_directory, digest_lines, dump, sample_files,
+    stored_files,
+};
+use support::property_index_layout::{Node, Property};
 
 #[test]
 fn a_round_trip_reproduces_the_index_data() {
@@ -398,13 +176,13 @@ fn a_suggest_data_mapping_is_skipped_with_its_reason() {
 }
 
 #[test]
-fn a_mismatched_checkpoint_is_refused_naming_both_roots() {
-    let directory = TestDirectory::new("mismatch");
+fn a_checkpoint_that_does_not_resolve_is_refused() {
+    let directory = TestDirectory::new("dangling");
     let store = build_store(&directory, Shape::default());
     let input = dump(&directory, &store);
 
-    // Point the lane at a different checkpoint than the dump recorded, by
-    // rewriting the properties file.
+    // A checkpoint name the store does not hold at all, which is what an
+    // operator gets from a directory built against a different store.
     let info = input.join("indexer-info.properties");
     std::fs::write(&info, "checkpoint=some-other-checkpoint\n").expect("rewrite");
 
@@ -413,6 +191,44 @@ fn a_mismatched_checkpoint_is_refused_naming_both_roots() {
     assert!(
         error.to_string().contains("does not resolve in this store"),
         "{error}"
+    );
+}
+
+/// The state rule itself: a checkpoint that **resolves**, to a state other
+/// than the one the lane will resume from.
+///
+/// This is the precondition that stands in for oak-run's live
+/// bring-up-to-date. The dangling case above never reaches it — the
+/// resolution fails first — so without this test the rule has no
+/// regression at all.
+#[test]
+fn a_checkpoint_that_resolves_to_another_state_is_refused_naming_both_roots() {
+    let directory = TestDirectory::new("rival");
+    let store = build_store(
+        &directory,
+        Shape {
+            rival_checkpoint: true,
+            ..Shape::default()
+        },
+    );
+    let input = dump(&directory, &store);
+
+    // The directory claims it was built at `checkpoint-2`; the lane will
+    // resume from `checkpoint-1`, and the two pin different roots.
+    let info = input.join("indexer-info.properties");
+    std::fs::write(&info, "checkpoint=checkpoint-2\n").expect("rewrite");
+
+    let error = plan_lucene_import(&store, &LuceneImportOptions::new(input))
+        .expect_err("an index built at another state must be refused")
+        .to_string();
+    assert!(
+        error.contains("was built at checkpoint checkpoint-2")
+            && error.contains("lane async resumes from checkpoint-1"),
+        "the refusal names both checkpoints and both roots: {error}"
+    );
+    assert!(
+        error.contains("rebuild at the lane's own checkpoint"),
+        "the refusal names the remedy: {error}"
     );
 }
 
