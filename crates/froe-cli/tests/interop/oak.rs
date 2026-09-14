@@ -31,6 +31,66 @@ pub(crate) const OAK_REPAIR_MARKERS: &[&str] = &[
 /// froe's, and passes for the wrong reason.
 pub(crate) const OAK_REINDEX_MARKERS: &[&str] = &["Reindexing will be performed"];
 
+/// What Oak logs when an index it was handed is not usable.
+///
+/// Three distinct failures, and the import has to produce none of them:
+/// `IndexNotFoundException` is Lucene's when the directory holds no
+/// commit, `FileNotFoundException` is its when a segment names a file that
+/// is not there, and `CorruptIndexException` is its when the bytes are
+/// there and wrong. A store that boots and answers queries while logging
+/// one of these has an index Oak silently stopped using.
+/// The second element says whether the line must *also* be about an index.
+///
+/// `IndexNotFoundException` and `CorruptIndexException` are Lucene's own
+/// class names and need no qualification. `FileNotFoundException` is
+/// `java.io`'s and fires on a pristine store for reasons that have nothing
+/// to do with indexing — the image's ESAPI logs one at boot, looking for a
+/// properties file — so it counts only on a line that also names Lucene.
+/// Unqualified it would have made this scan fail on every store, froe's
+/// and Oak's alike, which is a marker that proves nothing.
+pub(crate) const OAK_INDEX_FAILURE_MARKERS: &[(&str, bool)] = &[
+    ("IndexNotFoundException", false),
+    ("CorruptIndexException", false),
+    ("FileNotFoundException", true),
+];
+
+/// What makes a line about a Lucene index.
+const LUCENE_CONTEXT: &str = "lucene";
+
+/// Asserts Oak logged none of the index-failure markers.
+///
+/// Takes the same positive control [`assert_oak_consumed_store_as_written`]
+/// does, and for the same reason: a scan for absent markers passes
+/// trivially on an empty log.
+pub(crate) fn assert_oak_reported_no_index_failure(container: &str, phase: &str) {
+    let logs = container_logs(container);
+    assert!(
+        logs.contains(SLING_BOOT_MARKER),
+        "{phase}: the log of {container} does not contain {SLING_BOOT_MARKER:?}, so the \
+         index-failure scan below would be looking at nothing"
+    );
+    // The matching *lines*, not just the marker: a report that names only
+    // the marker cannot be acted on, and this one has already caught a
+    // marker that was too broad rather than a real failure.
+    let failures: Vec<&str> = logs
+        .lines()
+        .filter(|line| {
+            let lowered = line.to_ascii_lowercase();
+            OAK_INDEX_FAILURE_MARKERS
+                .iter()
+                .any(|(marker, needs_index_context)| {
+                    line.contains(marker)
+                        && (!needs_index_context || lowered.contains(LUCENE_CONTEXT))
+                })
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{phase}: Oak reported an index failure against an index froe installed:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// Asserts Oak accepted the indexes in the store as they were written.
 ///
 /// The same positive control as `assert_oak_consumed_store_as_written`, and

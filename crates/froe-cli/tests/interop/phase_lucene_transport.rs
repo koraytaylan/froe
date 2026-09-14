@@ -446,6 +446,7 @@ pub(crate) fn lucene_import() {
 
     round_trip_through_froes_own_dump(&work);
     assert_the_refusals(&work);
+    assert_oak_queries_through_the_imported_index(&work);
     eprintln!("  lucene_import phase passed");
 }
 
@@ -858,4 +859,109 @@ fn store_and_dump(work: &Path, name: &str) -> (PathBuf, PathBuf) {
         IMPORTED_DEFINITION,
     ]);
     (store, dump.join("index-dumps"))
+}
+
+/// The fulltext query the imported index has to answer.
+///
+/// Restricted to the five interop pages, whose `jcr:title` values the
+/// fixture's default definition indexes without Tika. Plan 0010's variant
+/// definition does not cover them, so this stays a question about *this*
+/// index.
+const FULLTEXT_QUERY: &str = "SELECT [jcr:path] FROM [nt:base] WHERE \
+     ISDESCENDANTNODE([/content/interop/pages]) AND CONTAINS(*, 'Page')";
+
+/// How many rows the pristine store answers with.
+///
+/// Asserted rather than merely recorded: a comparison against an empty
+/// answer would pass on a store whose index answers nothing at all.
+const EXPECTED_FULLTEXT_ROWS: usize = 5;
+
+/// Boots Oak on `store` and asks it what it can see through the index.
+///
+/// Returns the sorted rows and the plan. The probe is installed after the
+/// import rather than before, because the query is over content the
+/// fixture already holds: what is under test is whether Oak resolves that
+/// content *through the index froe installed*, and the plan is what says
+/// so.
+fn ask_oak_through_the_index(store: &Path, label: &str, phase: &str) -> (Vec<String>, Vec<String>) {
+    let volume = PodmanVolume::new(&format!("froe-interop-{label}"));
+    let container = format!("froe-{label}");
+
+    // A throwaway boot first, so Sling's own bundle installation is not
+    // part of the store under test — the same bootstrap every phase that
+    // boots on a froe-written store uses.
+    let bootstrap =
+        PodmanContainer::run_detached(&format!("{container}-bootstrap"), 8093, &volume.name);
+    std::thread::sleep(Duration::from_secs(20));
+    drop(bootstrap);
+    store_into_volume(store, &volume.name);
+
+    let sling = PodmanContainer::run_detached(&container, 8093, &volume.name);
+    wait_for_sling(8093, &container);
+
+    assert_oak_consumed_store_as_written(&container, phase);
+    assert_oak_did_not_reindex(&container, phase);
+    assert_oak_reported_no_index_failure(&container, phase);
+
+    sling::sling_install_query_probe(8093);
+    assert_eq!(
+        sling::sling_query(8093, "SELECT * FROM [rep:root]"),
+        vec!["/".to_owned()],
+        "{phase}: the query probe does not answer, so every comparison built on it is vacuous"
+    );
+
+    let mut rows = sling::sling_query(8093, FULLTEXT_QUERY);
+    rows.sort();
+    let plan = sling::sling_query(8093, &format!("EXPLAIN {FULLTEXT_QUERY}"));
+
+    // Read after the queries: a failure raised while answering them is
+    // exactly the failure this is looking for.
+    assert_oak_reported_no_index_failure(&container, phase);
+    drop(sling);
+    (rows, plan)
+}
+
+/// Oak boots on the imported store, logs no failure, and answers the
+/// fulltext query through the index froe installed.
+fn assert_oak_queries_through_the_imported_index(work: &Path) {
+    eprintln!("  Oak answers through the imported index");
+
+    let pristine = work.join("oak-pristine");
+    copy_store(&oak_store(), &pristine);
+    let (expected_rows, expected_plan) =
+        ask_oak_through_the_index(&pristine, "lucene-pristine", "lucene_import pristine");
+    assert_eq!(
+        expected_rows.len(),
+        EXPECTED_FULLTEXT_ROWS,
+        "the pristine store answers {} rows rather than {EXPECTED_FULLTEXT_ROWS}, so the \
+         comparison below would compare nothing",
+        expected_rows.len()
+    );
+    assert!(
+        expected_plan
+            .iter()
+            .any(|line| line.contains("lucene:lucene")),
+        "the pristine store does not answer this query through the lucene index, so the \
+         plan comparison below would prove nothing: {expected_plan:?}"
+    );
+    eprintln!(
+        "    pristine: {} rows through lucene:lucene",
+        expected_rows.len()
+    );
+
+    let imported = work.join("round-trip");
+    let (rows, plan) =
+        ask_oak_through_the_index(&imported, "lucene-imported", "lucene_import imported");
+    assert_eq!(
+        rows, expected_rows,
+        "the imported index answers different rows than the index it replaced"
+    );
+    assert!(
+        plan.iter().any(|line| line.contains("lucene:lucene")),
+        "Oak did not use the imported index to answer the query: {plan:?}"
+    );
+    eprintln!(
+        "    imported: the same {} rows, through lucene:lucene",
+        rows.len()
+    );
 }
