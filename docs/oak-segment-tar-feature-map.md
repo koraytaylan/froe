@@ -132,7 +132,7 @@ proves and the exit codes `froe index check` contracts.
 | `--index-consistency-check` | `IndexConsistencyChecker` | `froe index check` | **Implemented** (Lucene level 1, plus a structural check of the index's own table of contents — `segments_N`, each `.si`, the compound file's entries — that Oak has no equivalent of. Oak's level 2 is Lucene's own `CheckIndex` reading the postings and is **not** ported: the interop suite gets that verdict from `CheckIndex` itself. The property family's check is froe's own: oak-run ignores every definition whose type is not `lucene`.) |
 | `--index-dump` | `LuceneIndexDumper` | `froe index dump` | **Implemented** (beta until plan 0008's review freezes) |
 | `--reindex` | `OutOfBandIndexer`, `IndexUpdate` | `froe index reindex` | **Implemented** for the property family — `property`, `unique`, `reference`, `counter` (beta until plan 0007's review freezes). A froe extension: Oak has no offline reindex that writes the result back, and rebuilds synchronously inside the first commit after startup instead. Fulltext-enabled `lucene` definitions are **Planned** in plans 0009 and 0010. |
-| `--index-import` | `IndexImporter`, `IndexDefinitionUpdater` | — | **Planned** in plan 0010 |
+| `--index-import` | `IndexImporter`, `IndexDefinitionUpdater` | `writer::lucene_import`, `writer::plan_lucene_import` | **Implemented** as a library (beta until plan 0008's review freezes); `froe index import` lands later in plan 0008 |
 
 ### The `froe` command surface
 
@@ -263,6 +263,7 @@ and a content tree that is never rewritten.
 | Reference index rebuild | `ReferenceEditor` | the same entry point, `:references` and `:weakreferences` | **Implemented** (beta) |
 | Counter index rebuild | `NodeCounterEditor`, `SipHash` | the same entry point; a definition with no `seed` gains one | **Implemented** (beta; a counter on an unresolvable lane is reset for Oak's replay rather than rebuilt) |
 | Lucene index rebuild | `LuceneIndexEditor` | — | **Planned** in plan 0010 |
+| Lucene index **transport** — out to the filesystem and back into a stopped store | `LuceneIndexDumper`, `IndexImporter`, `IndexDefinitionUpdater` | `index::lucene::dump_lucene_indexes`, `writer::lucene_import`, `writer::plan_lucene_import`, `writer::PreparedLuceneImport` | **Implemented** (beta until plan 0008's review freezes). The import replaces oak-run's live bring-up-to-date with a precondition: the directory's checkpoint root must equal the definition's lane checkpoint root by identity, so no catch-up is owed. Recorded departures: no checkpoint is released, `:suggest-data` is never imported, and `refresh` is not copied. |
 | Out-of-band indexing to a new store | `OutOfBandIndexer` | — | **Not planned**; froe rebuilds in place under the repository lock |
 | Async lane checkpoint as the indexed state | `AsyncIndexUpdate`, `/:async` | the lane's checkpoint, or the head under `from_head` | **Implemented** |
 

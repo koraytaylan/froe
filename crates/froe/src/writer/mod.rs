@@ -46,6 +46,10 @@ pub use compaction::{
     deep_copy_tree_across_stores_with_progress, deep_copy_tree_with_progress,
 };
 pub use identifier_generator::{new_bulk_segment_identifier, new_data_segment_identifier};
+pub use index::lucene_import::{
+    ImportedIndex, LuceneImportOptions, LuceneImportOutcome, LuceneImportPlan, PlannedImport,
+    PreparedLuceneImport, lucene_import, lucene_import_with_progress, plan_lucene_import,
+};
 pub use index::{
     DefinitionReport, NoWorkReason, PreparedReindex, ReindexAction, ReindexOptions, ReindexOutcome,
     ReindexPlan, ReindexWarning, WorkDirectory, plan_reindex, plan_reindex_with_progress, reindex,
