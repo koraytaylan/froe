@@ -14,8 +14,8 @@ touches:
   - docs/index.md
   - docs/oak-segment-tar-feature-map.md
   - README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "4da0801"
 ---
 # Add The Index Import Command
 
