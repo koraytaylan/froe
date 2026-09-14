@@ -214,7 +214,7 @@ fn run_oaks_printers(judge: &Judge, store: &Path, work: &Path) {
 ///
 /// The judge writes absolute container paths, because that is what Oak's own
 /// API hands it; the mount is the only thing that knows where `/out` is.
-fn host_path_for(host_mount: &Path, container_path: &str) -> PathBuf {
+pub(crate) fn host_path_for(host_mount: &Path, container_path: &str) -> PathBuf {
     let relative = container_path
         .strip_prefix("/out/")
         .unwrap_or_else(|| panic!("the judge reported {container_path}, which is not under /out"));
@@ -228,7 +228,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// A shallow copy: a Lucene directory has no subdirectories.
-fn copy_directory(source: &Path, target: &Path) {
+pub(crate) fn copy_directory(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).expect("create the copy's directory");
     for entry in std::fs::read_dir(source).expect("read the directory to copy") {
         let entry = entry.expect("read an entry");
@@ -238,7 +238,7 @@ fn copy_directory(source: &Path, target: &Path) {
 
 /// Flips one byte in the middle of a file, which is damage no reader can
 /// mistake for a legal state.
-fn corrupt_one_byte(path: &Path) {
+pub(crate) fn corrupt_one_byte(path: &Path) {
     let mut bytes = std::fs::read(path).expect("read the file to corrupt");
     assert!(
         bytes.len() > 16,

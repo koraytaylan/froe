@@ -839,3 +839,54 @@ fn the_sample_indexs_compound_file_lists_the_codec_files_inside_it() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The deletions file is derived from the deletion generation, never listed.
+///
+/// `docs/analysis/index-lucene-storage.md` §8.8. The three branches of
+/// `IndexFileNames.fileNameFromGeneration`, plus the base-36 rendering that
+/// makes a generation above 9 a letter rather than a second digit — which is
+/// where a decimal rendering would silently start naming the wrong file.
+#[test]
+fn a_segments_deletions_file_is_named_from_its_generation() {
+    for (generation, expected) in [
+        (-1i64, None),
+        (0, Some("_0.del".to_owned())),
+        (1, Some("_0_1.del".to_owned())),
+        (9, Some("_0_9.del".to_owned())),
+        (10, Some("_0_a.del".to_owned())),
+        (35, Some("_0_z.del".to_owned())),
+        (36, Some("_0_10.del".to_owned())),
+        (1_295, Some("_0_zz.del".to_owned())),
+        // Lucene asserts `gen > 0` on that branch, so anything else
+        // negative names no file rather than a computed one.
+        (-2, None),
+    ] {
+        let entry = segment_entry_with_deletion_generation("_0", generation);
+        assert_eq!(
+            entry.deletions_file_name(),
+            expected,
+            "deletion generation {generation}"
+        );
+    }
+}
+
+/// A `SegmentEntry` carrying `generation`, over an otherwise empty segment.
+fn segment_entry_with_deletion_generation(
+    name: &str,
+    generation: i64,
+) -> froe::index::lucene::segments::SegmentEntry {
+    froe::index::lucene::segments::SegmentEntry {
+        name: name.to_owned(),
+        codec_name: "oakCodec".to_owned(),
+        deletion_generation: generation,
+        deletion_count: 0,
+        field_infos_generation: -1,
+        info: froe::index::lucene::segments::SegmentInfo {
+            lucene_version: "4.7.2".to_owned(),
+            document_count: 0,
+            compound: true,
+            diagnostics: Vec::new(),
+            files: Vec::new(),
+        },
+    }
+}

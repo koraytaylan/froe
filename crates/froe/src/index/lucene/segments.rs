@@ -68,6 +68,46 @@ impl SegmentEntry {
     pub fn live_document_count(&self) -> i64 {
         i64::from(self.info.document_count) - i64::from(self.deletion_count)
     }
+
+    /// The deletions file this segment's generation names, if any.
+    ///
+    /// `Lucene40LiveDocsFormat.files` through
+    /// `IndexFileNames.fileNameFromGeneration`
+    /// (`docs/analysis/index-lucene-storage.md` §8.8): nothing at `-1`,
+    /// `<segment>.del` at `0`, and `<segment>_<generation in base 36>.del`
+    /// above that. `Character.MAX_RADIX` is 36, the same radix the commit
+    /// file's own generation uses.
+    #[must_use]
+    pub fn deletions_file_name(&self) -> Option<String> {
+        match self.deletion_generation {
+            // `hasDeletions()` is `delGen != -1`.
+            -1 => None,
+            0 => Some(format!("{}.{DELETIONS_EXTENSION}", self.name)),
+            generation if generation > 0 => Some(format!(
+                "{}_{}.{DELETIONS_EXTENSION}",
+                self.name,
+                to_base_36(generation)
+            )),
+            // Lucene asserts `gen > 0` on that branch, so any other
+            // negative generation is malformed rather than nameable.
+            _ => None,
+        }
+    }
+}
+
+/// `Lucene40LiveDocsFormat.DELETES_EXTENSION`.
+const DELETIONS_EXTENSION: &str = "del";
+
+/// `Long.toString(value, Character.MAX_RADIX)` for a positive value.
+fn to_base_36(mut value: i64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut rendered = Vec::new();
+    while value > 0 {
+        rendered.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    rendered.reverse();
+    String::from_utf8(rendered).expect("every digit is ASCII")
 }
 
 /// The `.si` file's content.
@@ -109,11 +149,21 @@ pub struct CommitFile {
 
 impl CommitFile {
     /// Every file this commit refers to, the commit file itself included.
+    ///
+    /// This is `SegmentCommitInfo.files()`, not `SegmentInfo.files()`: a
+    /// segment's deletions file is **derived from its deletion generation**
+    /// and named nowhere in the commit file's strings
+    /// (`docs/analysis/index-lucene-storage.md` §8.8). A reader that
+    /// collected only the strings would call a real Oak index incoherent,
+    /// which is exactly what froe's did against the interop fixture.
     #[must_use]
     pub fn referenced_files(&self) -> Vec<String> {
         let mut files = vec![self.file_name.clone()];
         for segment in &self.segments {
             files.extend(segment.info.files.iter().cloned());
+            if let Some(deletions) = segment.deletions_file_name() {
+                files.push(deletions);
+            }
         }
         files.extend(self.generation_files.iter().cloned());
         files.sort();

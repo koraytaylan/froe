@@ -375,6 +375,10 @@ pub(crate) fn interop_full() {
     // fixture is legitimately short an entry and the oracle would report a
     // difference that says nothing about either rebuild.
     property_reindex();
+    // Read-only, so its position is free; it runs here because the
+    // fixture's Lucene index reflects the state Sling left, and every
+    // later phase rewrites the store around it.
+    lucene_dump();
     commit();
     checkpoint();
     compact();

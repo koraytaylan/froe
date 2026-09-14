@@ -844,9 +844,12 @@ own `CheckIndex`), froe's structural check answers: *is this directory a
 coherent set of Lucene files?*
 
 * every file the segments name exists in the directory listing, and every
-  listed file is named by the segments — allowing by name the `.del` and
-  generation files the commit file itself lists, and `segments.gen`, which no
-  commit's aggregate file set ever names and which may legitimately be absent;
+  listed file is named by the segments — where "named by the segments" is
+  `SegmentCommitInfo.files()`, not `SegmentInfo.files()`: the `.si`'s own set
+  **plus** the deletions file derived from the deletion generation (§8.8)
+  **plus** the field-update generation files the commit file lists as string
+  sets — and `segments.gen`, which no commit's aggregate file set ever names
+  and which may legitimately be absent;
 * every codec header validates;
 * the deletion count of each segment is within its document count (the same
   bound `SegmentInfos.read` enforces);
@@ -855,6 +858,65 @@ coherent set of Lucene files?*
   computes it;
 * the codec name is reported, and reported as unregistered when it is outside
   the set the image's `META-INF/services` registration carries.
+
+### 8.8 The deletions file is derived, never listed
+
+A segment with deletions does not name its `.del` anywhere in the commit
+file's strings. The name is **computed** from the deletion generation, and a
+reader that only collects the strings calls a real Oak index incoherent — as
+froe's did, over a fixture whose `segments_2` names `_0` with a deletion
+generation of 1 and whose directory holds `_0_1.del`.
+
+`SegmentCommitInfo.files()` (Lucene 4.7.2, `lucene/core`,
+`org/apache/lucene/index/SegmentCommitInfo.java`) unions three sets: the
+`.si`'s own `files()`, whatever the codec's live-docs format contributes, and
+the field-update generation files. The live-docs half is
+`Lucene40LiveDocsFormat`:
+
+```java
+static final String DELETES_EXTENSION = "del";
+
+@Override
+public void files(SegmentCommitInfo info, Collection<String> files) throws IOException {
+  if (info.hasDeletions()) {
+    files.add(IndexFileNames.fileNameFromGeneration(info.info.name, DELETES_EXTENSION, info.getDelGen()));
+  }
+}
+```
+
+`hasDeletions()` is `delGen != -1`, and the name comes from
+`IndexFileNames.fileNameFromGeneration` (`lucene/core`,
+`org/apache/lucene/index/IndexFileNames.java`):
+
+```java
+public static String fileNameFromGeneration(String base, String ext, long gen) {
+  if (gen == -1) {
+    return null;
+  } else if (gen == 0) {
+    return segmentFileName(base, "", ext);
+  } else {
+    assert gen > 0;
+    StringBuilder res = new StringBuilder(base.length() + 6 + ext.length())
+        .append(base).append('_').append(Long.toString(gen, Character.MAX_RADIX));
+    if (ext.length() > 0) {
+      res.append('.').append(ext);
+    }
+    return res.toString();
+  }
+}
+```
+
+So, per segment:
+
+| deletion generation | deletions file |
+| --- | --- |
+| `-1` | none |
+| `0` | `<segment>.del` |
+| `n > 0` | `<segment>_<n in base 36>.del` — `Character.MAX_RADIX` is 36, the same radix §8.3's commit-file generation uses |
+
+A negative generation other than `-1` is malformed: `fileNameFromGeneration`
+asserts `gen > 0` on that branch, and froe refuses it rather than computing a
+name Lucene never writes.
 
 ---
 
