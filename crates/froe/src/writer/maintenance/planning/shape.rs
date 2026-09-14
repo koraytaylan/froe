@@ -10,28 +10,28 @@ use super::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::writer::maintenance) struct DirectoryFingerprint {
-    pub(in crate::writer::maintenance) entries: Vec<FileFingerprint>,
+pub(crate) struct DirectoryFingerprint {
+    pub(crate) entries: Vec<FileFingerprint>,
     #[cfg(unix)]
-    pub(in crate::writer::maintenance) device: u64,
+    pub(crate) device: u64,
     #[cfg(unix)]
-    pub(in crate::writer::maintenance) inode: u64,
+    pub(crate) inode: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::writer::maintenance) struct FileFingerprint {
-    pub(in crate::writer::maintenance) name: OsString,
-    pub(in crate::writer::maintenance) kind: u8,
-    pub(in crate::writer::maintenance) length: u64,
-    pub(in crate::writer::maintenance) modified: Option<SystemTime>,
+pub(crate) struct FileFingerprint {
+    pub(crate) name: OsString,
+    pub(crate) kind: u8,
+    pub(crate) length: u64,
+    pub(crate) modified: Option<SystemTime>,
     #[cfg(unix)]
-    pub(in crate::writer::maintenance) device: u64,
+    pub(crate) device: u64,
     #[cfg(unix)]
-    pub(in crate::writer::maintenance) inode: u64,
+    pub(crate) inode: u64,
     #[cfg(unix)]
-    pub(in crate::writer::maintenance) change_time_seconds: i64,
+    pub(crate) change_time_seconds: i64,
     #[cfg(unix)]
-    pub(in crate::writer::maintenance) change_time_nanoseconds: i64,
+    pub(crate) change_time_nanoseconds: i64,
 }
 
 pub(in crate::writer::maintenance) fn validate_options(options: &CompactionOptions) -> Result<()> {
@@ -95,9 +95,7 @@ pub(in crate::writer::maintenance) fn validate_options(options: &CompactionOptio
     Ok(())
 }
 
-pub(in crate::writer::maintenance) fn canonical_repository_directory(
-    directory: &Path,
-) -> Result<PathBuf> {
+pub(crate) fn canonical_repository_directory(directory: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(directory).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             Error::InvalidFormat {
@@ -109,7 +107,8 @@ pub(in crate::writer::maintenance) fn canonical_repository_directory(
     })
 }
 
-pub(in crate::writer::maintenance) fn validate_repository_shape(directory: &Path) -> Result<()> {
+pub(crate) fn validate_repository_shape(directory: &Path) -> Result<()> {
+    crate::writer::maintenance::gate_observation::record("validate_repository_shape", directory);
     let root_metadata = std::fs::symlink_metadata(directory).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             Error::InvalidFormat {
@@ -175,9 +174,7 @@ pub(in crate::writer::maintenance) fn is_managed_name(name: &OsStr) -> bool {
         || recovery_backup_target(name).is_some()
 }
 
-pub(in crate::writer::maintenance) fn directory_fingerprint(
-    directory: &Path,
-) -> Result<DirectoryFingerprint> {
+pub(crate) fn directory_fingerprint(directory: &Path) -> Result<DirectoryFingerprint> {
     let directory_metadata = std::fs::symlink_metadata(directory)?;
     if !directory_metadata.file_type().is_dir() {
         return Err(Error::InvalidFormat {

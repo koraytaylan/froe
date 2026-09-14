@@ -24,7 +24,7 @@ pub mod index;
 /// The one maintenance pipeline: plan, confirm, and apply a compaction and
 /// everything it reclaims. Its surface is re-exported below, so callers name
 /// the operation rather than the module it happens to live in.
-mod maintenance;
+pub(crate) mod maintenance;
 pub mod record_writer;
 pub mod repository_lock;
 pub mod segment_builder;

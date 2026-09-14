@@ -16,6 +16,9 @@
 //!   itself. [`ObservationLog`] checks all three on every call, and every
 //!   test below runs one through a real operation.
 
+#[path = "support/observation_log.rs"]
+mod observation_log;
+
 use froe::progress::{ProgressObserver, Step, WorkUnit};
 use froe::store::Repository;
 use froe::writer::record_writer::ChildNodesToWrite;
@@ -23,6 +26,7 @@ use froe::writer::store_writer::WritableRepository;
 use froe::{
     CompactionOptions, PreparedCompaction, compact, compact_with_progress, plan_compaction,
 };
+use observation_log::{ObservationLog, Reported};
 
 /// A temporary directory removed when the test ends.
 struct TestDirectory(std::path::PathBuf);
@@ -50,129 +54,6 @@ impl TestDirectory {
 impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// One reported call, in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Reported {
-    Began {
-        description: String,
-        unit: WorkUnit,
-        total: Option<u64>,
-    },
-    Advanced(u64),
-    TotalResolved(u64),
-    Ended,
-}
-
-/// Records every call and asserts the sequence's invariants as it goes, so
-/// a malformed report fails at the call that broke it rather than at some
-/// later assertion.
-#[derive(Default)]
-struct ObservationLog {
-    calls: Vec<Reported>,
-    active: Option<(String, Option<u64>)>,
-    last_count: u64,
-}
-
-impl ObservationLog {
-    fn descriptions(&self) -> Vec<&str> {
-        self.calls
-            .iter()
-            .filter_map(|call| match call {
-                Reported::Began { description, .. } => Some(description.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The highest count reported within the step named `description`.
-    fn highest_count_of(&self, description: &str) -> Option<u64> {
-        let mut within = false;
-        let mut highest = None;
-        for call in &self.calls {
-            match call {
-                Reported::Began {
-                    description: began, ..
-                } => within = began == description,
-                Reported::Ended => within = false,
-                Reported::Advanced(count) if within => {
-                    highest = Some(highest.map_or(*count, |previous: u64| previous.max(*count)));
-                }
-                _ => {}
-            }
-        }
-        highest
-    }
-
-    fn began_and_ended_in_pairs(&self) -> bool {
-        let mut open = false;
-        for call in &self.calls {
-            match call {
-                Reported::Began { .. } => open = true,
-                Reported::Ended => open = false,
-                _ => {}
-            }
-        }
-        !open
-    }
-}
-
-impl ProgressObserver for ObservationLog {
-    fn step_began(&mut self, step: &Step<'_>) {
-        assert!(
-            !step.description().is_empty(),
-            "every step names the work it is doing"
-        );
-        self.active = Some((step.description().to_owned(), step.total()));
-        self.last_count = 0;
-        self.calls.push(Reported::Began {
-            description: step.description().to_owned(),
-            unit: step.unit(),
-            total: step.total(),
-        });
-    }
-
-    fn step_advanced(&mut self, completed: u64) {
-        let (description, total) = self
-            .active
-            .as_ref()
-            .expect("an advance outside a step has nothing to advance");
-        assert!(
-            completed >= self.last_count,
-            "{description}: counts must not run backwards ({completed} after {})",
-            self.last_count
-        );
-        if let Some(total) = total {
-            assert!(
-                completed <= *total,
-                "{description}: counted {completed} of a declared {total}"
-            );
-        }
-        self.last_count = completed;
-        self.calls.push(Reported::Advanced(completed));
-    }
-
-    fn step_total_resolved(&mut self, total: u64) {
-        let (description, _) = self
-            .active
-            .as_ref()
-            .expect("a total outside a step belongs to nothing");
-        assert!(
-            total >= self.last_count,
-            "{description}: a resolved total of {total} is below the {} already counted",
-            self.last_count
-        );
-        if let Some(active) = self.active.as_mut() {
-            active.1 = Some(total);
-        }
-        self.calls.push(Reported::TotalResolved(total));
-    }
-
-    fn step_ended(&mut self) {
-        self.active = None;
-        self.calls.push(Reported::Ended);
     }
 }
 

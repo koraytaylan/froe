@@ -59,6 +59,15 @@ pub(crate) use content_census::*;
 pub(crate) use listing::*;
 pub(crate) use segments::*;
 pub(in crate::writer::maintenance) use shape::*;
+
+// The reindex of plan 0007 follows compaction's open protocol step for step,
+// so the gates that protocol is made of are reachable from the crate rather
+// than only from this module tree. Re-exported rather than moved: compaction
+// remains their only production caller until that lands.
+pub(crate) use shape::{
+    DirectoryFingerprint, FileFingerprint, canonical_repository_directory, directory_fingerprint,
+    validate_repository_shape,
+};
 use version_history_plan::{select_version_history_purge, version_history_plan_parts};
 pub(crate) use version_storage::*;
 
@@ -743,7 +752,7 @@ pub(super) fn ensure_numbered_name_available(directory: &Path, stem: &str) -> Re
     })
 }
 
-pub(super) fn available_filesystem_bytes(directory: &Path) -> Option<u64> {
+pub(crate) fn available_filesystem_bytes(directory: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;

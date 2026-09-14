@@ -18,7 +18,8 @@ use crate::writer::store_writer::{
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-pub(super) fn validate_apply_environment(directory: &Path) -> Result<()> {
+pub(crate) fn validate_apply_environment(directory: &Path) -> Result<()> {
+    crate::writer::maintenance::gate_observation::record("validate_apply_environment", directory);
     #[cfg(unix)]
     {
         // Exercise the exact durability primitive before taking the lock or
@@ -37,7 +38,8 @@ pub(super) fn validate_apply_environment(directory: &Path) -> Result<()> {
 }
 
 #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
-pub(super) fn validate_apply_identity(directory: &Path) -> Result<()> {
+pub(crate) fn validate_apply_identity(directory: &Path) -> Result<()> {
+    crate::writer::maintenance::gate_observation::record("validate_apply_identity", directory);
     #[cfg(unix)]
     {
         // SAFETY: geteuid has no preconditions and does not access memory.
@@ -52,7 +54,7 @@ pub(super) fn validate_apply_identity(directory: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub(super) fn validate_apply_identity_for_uid(directory: &Path, effective_uid: u32) -> Result<()> {
+pub(crate) fn validate_apply_identity_for_uid(directory: &Path, effective_uid: u32) -> Result<()> {
     if let Some(issue) = journal_service_user_issue(directory, effective_uid)? {
         return Err(Error::InvalidFormat {
             details: format!(
@@ -196,6 +198,97 @@ pub(super) fn planned_metadata_sources(
         }
     }
     Ok(metadata_sources)
+}
+
+/// Refuses a store whose newest active archive could not be re-owned under
+/// `open_prepared`'s `preserve_file_metadata`, **without a plan**.
+///
+/// `open_prepared` takes its metadata from the first active archive in
+/// newest-number-first order, whatever the caller intends to do afterwards.
+/// Compaction checks that through its plan; an operation with no
+/// `CompactionPlan` — the reindex of plan 0007, the import of plan 0010 —
+/// needs the same gate on the same file.
+///
+/// It matters *when* this runs: `preserve_file_metadata` is called inside
+/// `flush`, so without the gate the failure would surface only after every
+/// record had been written.
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "task 0707's PreparedReindex::prepare is the first production caller"
+    )
+)]
+pub(crate) fn validate_metadata_source_apply_identity(directory: &Path) -> Result<()> {
+    validate_metadata_source_apply_identity_for_credentials(
+        directory,
+        &current_apply_credentials()?,
+    )
+}
+
+/// The same gate against supplied credentials, so a test can model an
+/// identity the process does not have.
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reached through validate_metadata_source_apply_identity, task 0707's"
+    )
+)]
+pub(super) fn validate_metadata_source_apply_identity_for_credentials(
+    directory: &Path,
+    credentials: &ApplyCredentials,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory_metadata = std::fs::symlink_metadata(directory)?;
+    let possible_created_gids = possible_created_group_ids(
+        directory_metadata.gid(),
+        directory_metadata.permissions().mode(),
+        credentials,
+    );
+
+    // The first active archive, which is what `open_prepared` reads its
+    // metadata from. A store with no archive has no metadata source and
+    // nothing to refuse.
+    let Some(archive) = crate::store::open_all_archives(directory)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let path = directory.join(archive.file_name());
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if let Some(details) = metadata_source_apply_identity_issue(
+        &path,
+        metadata.uid(),
+        metadata.gid(),
+        metadata.permissions().mode(),
+        &possible_created_gids,
+        credentials,
+    ) {
+        return Err(Error::InvalidFormat {
+            details: format!("{details}; conservatively refusing before any record is written"),
+        });
+    }
+    Ok(())
+}
+
+/// On a platform without Unix ownership there is nothing to preserve and
+/// nothing to refuse.
+#[cfg(not(unix))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "task 0707's PreparedReindex::prepare is the first production caller"
+    )
+)]
+pub(crate) fn validate_metadata_source_apply_identity(directory: &Path) -> Result<()> {
+    let _ = directory;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -441,6 +534,70 @@ mod tests {
         assert_eq!(file_bytes(&directory.path), before);
         Repository::open(&directory.path).expect("preflight refusal leaves repository healthy");
     }
+    /// The plan-independent gate refuses the same store the plan-bound one
+    /// does, on the same file, without a `CompactionPlan`.
+    ///
+    /// Modelled on `authoritative_plan_rejects_a_foreign_owned_archive_rewrite_before_mutation`
+    /// above, because the property is the same one: `open_prepared` takes
+    /// its metadata from the newest active archive, and an operation that
+    /// cannot re-own it must refuse *before* it writes rather than fail
+    /// inside `flush` with every record already on disk.
+    #[cfg(unix)]
+    #[test]
+    fn the_plan_independent_gate_refuses_a_foreign_owned_metadata_source() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, source_name, _, _) =
+            rewrite_certificate_fixture("foreign-owned-metadata-source");
+        let source = directory.path.join(&source_name);
+        let metadata = std::fs::metadata(&source).expect("source metadata");
+        let owner = metadata.uid();
+        let source_gid = metadata.gid();
+        let different_uid = if owner == u32::MAX {
+            owner - 1
+        } else {
+            owner + 1
+        };
+        let credentials = ApplyCredentials {
+            effective_uid: different_uid,
+            effective_gid: source_gid,
+            group_ids: BTreeSet::from([source_gid]),
+        };
+        let before = file_bytes(&directory.path);
+
+        let error =
+            validate_metadata_source_apply_identity_for_credentials(&directory.path, &credentials)
+                .expect_err("a foreign-owned metadata source must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("conservatively refusing before any record is written"),
+            "the refusal says when it fired: {error}"
+        );
+        assert!(
+            error.to_string().contains(&format!("owned by uid {owner}")),
+            "and names what it found: {error}"
+        );
+        assert_eq!(
+            file_bytes(&directory.path),
+            before,
+            "the gate is a read; it must change nothing"
+        );
+        Repository::open(&directory.path).expect("the refusal leaves the repository healthy");
+    }
+
+    /// The same store passes under the identity that actually owns it, so
+    /// the refusal above is about ownership rather than about the gate
+    /// refusing everything.
+    #[cfg(unix)]
+    #[test]
+    fn the_plan_independent_gate_passes_for_the_owning_identity() {
+        let (directory, _, _, _) = rewrite_certificate_fixture("owned-metadata-source");
+        validate_metadata_source_apply_identity(&directory.path)
+            .expect("the process owns the archive it just wrote");
+    }
+
     #[cfg(unix)]
     #[test]
     fn planned_identity_preflight_uses_the_real_repository_directory_gid_and_mode() {

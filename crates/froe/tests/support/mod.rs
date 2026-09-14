@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use froe::checksum::crc32;
 
 pub(crate) mod filesystem_snapshot;
+pub(crate) mod observation_log;
 pub(crate) mod property_index_layout;
 
 /// The map-entry hash, implemented independently of the production
