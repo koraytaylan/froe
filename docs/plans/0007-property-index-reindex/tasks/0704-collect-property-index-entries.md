@@ -9,8 +9,8 @@ touches:
   - crates/froe/src/writer/index/property_collector.rs
   - crates/froe/src/progress.rs
   - crates/froe/tests/property_index_collector_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "39a6389207d223dde7c1620ef9732c847aba0257"
 ---
 # Collect Property, Node-Type And Reference Entries From Content
 
