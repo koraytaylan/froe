@@ -386,7 +386,7 @@ pub(crate) fn yes_applies_and_the_summary_counts_what_happened() {
 }
 
 #[test]
-pub(crate) fn an_unresolvable_lane_needs_from_head_and_then_resets_the_counter() {
+pub(crate) fn an_unresolvable_lane_refuses_a_counter_with_or_without_from_head() {
     let (_directory, store, work) = fixture("reindex-from-head", Subject::CounterOnAnAbsentLane);
     let work = work.to_str().expect("utf-8").to_owned();
 
@@ -400,24 +400,28 @@ pub(crate) fn an_unresolvable_lane_needs_from_head_and_then_resets_the_counter()
         refused.stdout
     );
 
-    // With it, the counter is reset rather than rebuilt.
-    let reset = froe_reindex(&store, &["--yes", "--from-head", "--work-directory", &work]);
-    assert_eq!(reset.status.code(), Some(0), "{}", reset.stderr);
+    // And **with** it the counter is refused too — the one case
+    // `--from-head` does not authorize. froe will not rebuild a counter
+    // (Oak's own replay would double it) and Oak will not rebuild one on a
+    // lane whose checkpoint is gone, so removing its data would leave an
+    // index nothing restores.
+    let flagged = froe_reindex(&store, &["--yes", "--from-head", "--work-directory", &work]);
+    assert_eq!(flagged.status.code(), Some(0), "{}", flagged.stderr);
     assert!(
-        reset.stdout.contains("reset"),
-        "the plan and summary name the reset: {}",
-        reset.stdout
+        flagged.stdout.contains("nothing to do") && flagged.stdout.contains("/oak:index/subject"),
+        "the refusal names the definition even under --from-head: {}",
+        flagged.stdout
     );
     assert!(
-        reset.stdout.contains(":index"),
-        "the summary names the hidden child it removed: {}",
-        reset.stdout
+        flagged.stdout.contains("does not rebuild a counter"),
+        "the refusal gives the reason: {}",
+        flagged.stdout
     );
-
-    // A rerun of the reset has nothing left to remove.
-    let rerun = froe_reindex(&store, &["--yes", "--from-head", "--work-directory", &work]);
-    assert_eq!(rerun.status.code(), Some(0), "{}", rerun.stderr);
-    assert!(rerun.stdout.contains("nothing to do"), "{}", rerun.stdout);
+    assert!(
+        !flagged.stdout.contains("reset"),
+        "a counter on an unresolvable lane is no longer reset: {}",
+        flagged.stdout
+    );
 }
 
 /// The reporting contract: progress is a report, and a report never mixes

@@ -26,43 +26,42 @@ use support::reindex_fixtures::{
 };
 
 #[test]
-fn a_counter_on_an_unresolvable_lane_is_reset_rather_than_rebuilt() {
-    // Rebuilding would double the counter whether or not froe ran, so the
-    // hidden children go and Oak's own replay rebuilds from scratch.
+fn a_counter_on_an_unresolvable_lane_is_refused_rather_than_reset() {
+    // froe will not rebuild a counter — Oak's own replay would double it —
+    // and Oak will not rebuild one on a lane whose checkpoint is gone:
+    // measured on the pinned image, that lane never completes a cycle, so
+    // the reset this used to perform removed an index nothing restored.
     let directory = TestDirectory::new("reset");
     let store = store_with_a_counter_on_an_absent_lane(&directory);
-    let journal_before = journal_lines(&store);
+    let before = store_contents(&store);
+
+    let plan = plan_reindex(&store, &from_head(&directory)).expect("plan");
+    let rendered = format!("{plan:?}");
+    assert!(
+        rendered.contains("/oak:index/counter") && rendered.contains("CounterOnAnUnresolvableLane"),
+        "the plan must answer the counter by name, with the reason: {rendered}"
+    );
 
     let outcome = reindex(&store, from_head(&directory)).expect("reindex");
-    assert!(outcome.moved_the_head(), "a reset moves the head once");
-    assert_eq!(journal_lines(&store), journal_before + 1);
     assert!(
-        matches!(
-            outcome.definitions.first(),
-            Some((path, DefinitionReport::Reset { removed_hidden_children, .. }))
-                if path == "/oak:index/counter"
-                    && removed_hidden_children == &[":index".to_owned()]
-        ),
-        "{:?}",
-        outcome.definitions
+        !outcome.moved_the_head(),
+        "a refused counter leaves the head where it was"
     );
-
-    // Nothing built, and the visible properties untouched — a reset is not
-    // a rewrite of the definition's model.
-    assert!(
-        digest_lines(&store, "/oak:index/counter/:index").is_empty(),
-        "the hidden child survived the reset"
+    assert_eq!(
+        store_contents(&store),
+        before,
+        "a refused counter must not remove its index"
     );
-    let fields = digest_lines(&store, "/oak:index/counter");
-    let first = fields.first().expect("the definition renders");
     assert!(
-        first.contains("info=String:kept verbatim") && first.contains("async=String:async"),
-        "a reset changed a visible property: {first}"
+        !digest_lines(&store, "/oak:index/counter/:index").is_empty(),
+        "the counter's data must still be there"
     );
 }
 
 #[test]
-fn a_rerun_of_a_reset_has_nothing_to_do_and_never_opens_the_store() {
+fn a_rerun_of_a_refused_counter_still_refuses_and_never_opens_the_store() {
+    // The refusal is stable: a second run answers the same way and writes
+    // no more than the first did, which is nothing.
     let directory = TestDirectory::new("reset-rerun");
     let store = store_with_a_counter_on_an_absent_lane(&directory);
     reindex(&store, from_head(&directory)).expect("the first run");
@@ -75,11 +74,8 @@ fn a_rerun_of_a_reset_has_nothing_to_do_and_never_opens_the_store() {
 
     assert!(!outcome.moved_the_head());
     assert!(
-        matches!(
-            outcome.definitions.first(),
-            Some((_, DefinitionReport::NothingToDo { .. }))
-        ),
-        "{:?}",
+        outcome.definitions.is_empty(),
+        "a refused definition produces no report: {:?}",
         outcome.definitions
     );
     assert_eq!(
@@ -96,7 +92,7 @@ fn a_rerun_of_a_reset_has_nothing_to_do_and_never_opens_the_store() {
 }
 
 #[test]
-fn a_mixed_selection_of_one_rebuild_and_one_reset_moves_the_head_once() {
+fn a_mixed_selection_rebuilds_the_one_it_can_and_refuses_the_counter() {
     let directory = TestDirectory::new("mixed");
     let store = directory.store();
     let root = Node::new()
@@ -152,7 +148,7 @@ fn a_mixed_selection_of_one_rebuild_and_one_reset_moves_the_head_once() {
     assert_eq!(
         journal_lines(&store),
         journal_before + 1,
-        "one rebuild and one reset, still one journal line"
+        "one rebuild and one refusal, still one journal line"
     );
 
     let reports: Vec<&DefinitionReport> = outcome
@@ -167,14 +163,14 @@ fn a_mixed_selection_of_one_rebuild_and_one_reset_moves_the_head_once() {
         "{reports:?}"
     );
     assert!(
-        reports
+        !reports
             .iter()
             .any(|report| matches!(report, DefinitionReport::Reset { .. })),
-        "{reports:?}"
+        "the counter is refused, not reset: {reports:?}"
     );
     assert!(
-        digest_lines(&store, "/oak:index/counter/:index").is_empty(),
-        "the reset arm did not remove its hidden child"
+        !digest_lines(&store, "/oak:index/counter/:index").is_empty(),
+        "the refused counter must keep its data"
     );
     assert!(
         !digest_lines(&store, "/oak:index/title/:index").is_empty(),

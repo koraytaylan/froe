@@ -141,10 +141,11 @@ pub(crate) enum IndexAction {
         /// For a mirror or unique index this is the explicit choice to
         /// index the head instead: the lane's own replay leaves every entry
         /// unchanged, and only the randomized `:count_*` estimates drift.
-        /// For a counter it is the choice to *reset* — the hidden children
-        /// are removed and nothing is built, so Oak's own replay rebuilds
-        /// the counter from scratch. A rebuilt counter would be doubled by
-        /// that replay whether or not froe ran.
+        /// For a counter it authorizes nothing: such a definition is
+        /// refused by name either way. froe will not rebuild one — Oak's
+        /// own replay would double it — and Oak will not rebuild one on a
+        /// lane whose checkpoint is gone, because that lane never
+        /// completes a cycle.
         #[arg(long)]
         from_head: bool,
         /// How much of the sort may stay resident before it spills, in

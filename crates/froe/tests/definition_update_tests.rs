@@ -649,10 +649,10 @@ fn from_head_rebuilds_a_mirror_and_resets_a_counter() {
     assert_eq!(states.get("/oak:index/title"), Some(&IndexingState::Head));
     assert_eq!(
         states.get("/oak:index/counter"),
-        Some(&IndexingState::ResetForReplay {
-            lane: "async".to_owned()
-        }),
-        "a rebuild would double the counter whether or not froe ran"
+        None,
+        "a counter on an unresolvable lane is refused, not selected: froe will not rebuild \
+         one (Oak's replay would double it) and Oak will not rebuild one on a lane whose \
+         checkpoint is gone"
     );
 }
 

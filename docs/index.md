@@ -314,13 +314,8 @@ instead. That is safe: the lane's own replay re-inserts the same entries,
 leaving `match` and `entry` unchanged, and only the randomized `:count_*`
 estimates drift.
 
-For a **counter** it is the choice to *reset*. The hidden children are
-removed, nothing is built, and Oak's own replay rebuilds the counter from
-scratch. That is not a lesser outcome: Oak's replay after a lost checkpoint
-doubles every counter on the lane whether or not froe ran, so a rebuilt
-counter would be wrong and a removed one is right. The visible properties
-are untouched and `reindexCount` is left alone. A rerun reports
-`nothing to do`.
+For a **counter** it authorizes nothing: the definition is **refused**,
+with or without the flag. See §5.8.
 
 ### 5.3 The work directory
 
@@ -425,28 +420,38 @@ of two rebuilds must exclude `:count_*`, froe's against froe's as much as
 froe's against Oak's. That is what `froe digest --exclude-property-prefix`
 is for.
 
-### 5.8 What `--from-head` does to a counter
+### 5.8 Why a counter on an unresolvable lane is refused
 
-For a counter definition whose lane cannot be resolved, `--from-head` is the
-choice to **reset**: froe removes the definition's hidden children, builds
-nothing, and flags it `reindex = true` so Oak's own next cycle rebuilds it
-from scratch. froe does not rebuild a counter itself, because Oak's own
-replay would then double it.
+A counter definition whose lane cannot be resolved is **refused by name**,
+and this is the one case `--from-head` does not authorize.
 
-The flag is not optional. `IndexUpdate.shouldReindex` has two triggers: the
-`reindex` flag, and a definition *absent from the before state's*
-`/oak:index` with no hidden child. A definition your store already holds is
-never absent, so without the flag Oak rebuilds nothing — and a reset would
-be an index removed with nothing to restore it.
+froe does not rebuild a counter: Oak's own replay after a lost checkpoint
+would double every counter on the lane, so a rebuilt one would be wrong.
+And Oak does not rebuild it either — **a lane whose checkpoint is gone
+never completes a cycle.** Measured against the pinned Oak build, on a
+store whose lane checkpoint had been removed:
 
-> **This changed too.** The first version removed the hidden children and
-> left the flag alone. The interop suite's counter-reset scenario is what
-> found it: Oak restarted the lane, logged the lost checkpoint, and left the
-> counter empty.
+| What the store had | Lost-checkpoint errors | Counter reindex attempts | Counter restored |
+| --- | --- | --- | --- |
+| the lane still naming the gone checkpoint | 129 | 129 | no |
+| `/:async/<lane>` cleared | 0 | 59 | no |
+| `/:async/<lane>` and `async-temp` cleared | 0 | 59 | no |
+| *a healthy lane, for comparison* | — | 1 per definition | **yes** |
 
-Oak's rebuild advances `reindexCount` by one and clears the flag. Until it
-finishes, `froe index list` shows the definition flagged with no counter
-data, which is the state it is meant to be in.
+In every failing case Oak logged the reindex, processed the counter's
+entries, and committed nothing — for the counter or for any other index on
+that lane; the store's Lucene index stayed frozen at the same timestamp
+while Oak committed its own content normally.
+
+> **This changed.** froe used to *reset* the counter here: remove its
+> hidden children and leave Oak to rebuild. Oak does not, so the reset
+> removed an index nothing restored. The interop suite's counter-reset
+> scenario had never run to completion before; when it did, this is what it
+> found.
+
+What to do instead: let Oak rebuild the lane from a checkpoint it still
+has, or release the lane's state through Oak so it starts a clean cycle.
+Either way the counter is Oak's to rebuild, not froe's to remove.
 
 ## 6. `froe index dump`
 
