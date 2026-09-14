@@ -14,8 +14,8 @@ touches:
   - crates/froe/tests/lucene_writer_tests.rs
   - docs/oak-segment-tar-feature-map.md
   - docs/storage-format.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "c0218f7"
 ---
 # Build The Document Model And Bounded Inverted Indexer
 
