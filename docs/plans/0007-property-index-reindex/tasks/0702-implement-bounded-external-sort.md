@@ -19,8 +19,8 @@ touches:
   - crates/froe/src/writer/index/plan.rs
   - crates/froe/src/writer/index/prepared.rs
   - crates/froe/src/writer/index/apply.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "6ee2a1c9e9a6d06eedfb27ba0301acb9cebb5543"
 ---
 # Implement The Bounded External Sort For Index Entries
 
