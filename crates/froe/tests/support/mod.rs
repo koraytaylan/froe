@@ -181,12 +181,16 @@ impl SegmentBuilder {
 /// for the given entries, allocating records through `allocate`. Entries
 /// are `(name, key record identifier bytes, value record identifier
 /// bytes)`. Returns the record number of the map root.
+/// How many entries one map leaf holds before the map must branch. Oak's
+/// `MapRecord` limit.
+pub const MAP_LEAF_ENTRY_LIMIT: usize = 32;
+
 pub fn build_child_map(
     builder: &mut SegmentBuilder,
     allocate: &mut impl FnMut() -> u32,
     entries: &[MapEntryFixture],
 ) -> u32 {
-    if entries.len() <= 32 {
+    if entries.len() <= MAP_LEAF_ENTRY_LIMIT {
         let leaf = leaf_map_record(0, entries);
         let record_number = allocate();
         builder.add_record(record_number, TYPE_MAP_LEAF, leaf);
@@ -205,6 +209,21 @@ pub fn build_child_map(
         if bucket.is_empty() {
             continue;
         }
+        // One level of branching only. A bucket over the leaf limit must
+        // itself become a branch in Oak's format, and writing it as a leaf
+        // anyway produces a map no reader can walk — which surfaces as a
+        // *corrupt segment* rather than a wrong comparison, and would let a
+        // future fixture silently compare two wrong things. Refused here
+        // instead, loudly, until a task that needs a wider fixture makes
+        // this recurse.
+        assert!(
+            bucket.len() <= MAP_LEAF_ENTRY_LIMIT,
+            "the fixture builder branches one level only, and bucket {bucket_index} of \
+             {} entries holds {} — over the {MAP_LEAF_ENTRY_LIMIT}-entry leaf limit. \
+             Use a narrower fixture, or make build_child_map recurse.",
+            entries.len(),
+            bucket.len()
+        );
         bitmap |= 1 << bucket_index;
         let record_number = allocate();
         builder.add_record(record_number, TYPE_MAP_LEAF, leaf_map_record(1, bucket));

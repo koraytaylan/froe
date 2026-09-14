@@ -109,6 +109,16 @@ pub enum Error {
         /// Pending visits after the rejected expansion.
         attempted_pending_nodes: u64,
     },
+    /// A unique index's key named more than one node, which Oak refuses to
+    /// commit. Typed rather than a message, because a reindex that hit this
+    /// found a store whose content no longer satisfies a constraint the
+    /// definition declares, and a caller may want to name the paths.
+    DuplicateUniqueKey {
+        /// The key, as it is stored — already URL-encoded.
+        key: String,
+        /// Every content path found under it, in the order they were seen.
+        paths: Vec<String>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -139,74 +149,93 @@ impl fmt::Display for Error {
                 "binary value {value_identifier} is stored in an external blob store; its \
                 identifier is held in record {blob_identifier_record} and was not read"
             ),
-            Error::StringMaterializationBudgetExceeded {
-                maximum_stored_bytes,
-                attempted_stored_bytes,
-                value_identifier,
-            } => write!(
-                formatter,
-                "materializing string {value_identifier} would retain {attempted_stored_bytes} \
+            budget => write_budget_refusal(formatter, budget),
+        }
+    }
+}
+
+/// The budget refusals, which are half the variants and none of the
+/// interesting ones.
+///
+/// Split out so `Display::fmt` stays under the line gate: a match arm per
+/// budget is the clearest way to write them and there are eight.
+fn write_budget_refusal(formatter: &mut fmt::Formatter<'_>, error: &Error) -> fmt::Result {
+    match error {
+        Error::StringMaterializationBudgetExceeded {
+            maximum_stored_bytes,
+            attempted_stored_bytes,
+            value_identifier,
+        } => write!(
+            formatter,
+            "materializing string {value_identifier} would retain {attempted_stored_bytes} \
                  stored bytes, exceeding the limit of {maximum_stored_bytes}"
-            ),
-            Error::TemplatePropertyBudgetExceeded {
-                maximum_properties,
-                attempted_properties,
-            } => write!(
-                formatter,
-                "template declares {attempted_properties} properties, exceeding the parsing \
+        ),
+        Error::TemplatePropertyBudgetExceeded {
+            maximum_properties,
+            attempted_properties,
+        } => write!(
+            formatter,
+            "template declares {attempted_properties} properties, exceeding the parsing \
                  limit of {maximum_properties}"
-            ),
-            Error::MapEntryBudgetExceeded {
-                maximum_entries,
-                attempted_entries,
-            } => write!(
-                formatter,
-                "map enumeration would return {attempted_entries} entries, exceeding the limit \
+        ),
+        Error::MapEntryBudgetExceeded {
+            maximum_entries,
+            attempted_entries,
+        } => write!(
+            formatter,
+            "map enumeration would return {attempted_entries} entries, exceeding the limit \
                  of {maximum_entries}"
-            ),
-            Error::MapTraversalWorkBudgetExceeded {
-                maximum_work_units,
-                attempted_work_units,
-            } => write!(
-                formatter,
-                "map enumeration would consume {attempted_work_units} work units, exceeding the \
+        ),
+        Error::MapTraversalWorkBudgetExceeded {
+            maximum_work_units,
+            attempted_work_units,
+        } => write!(
+            formatter,
+            "map enumeration would consume {attempted_work_units} work units, exceeding the \
                  limit of {maximum_work_units}"
-            ),
-            Error::TraversalSchedulingBudgetExceeded {
-                maximum_scheduled_children,
-                attempted_scheduled_children,
-            } => write!(
-                formatter,
-                "content traversal would schedule {attempted_scheduled_children} children in one \
+        ),
+        Error::TraversalSchedulingBudgetExceeded {
+            maximum_scheduled_children,
+            attempted_scheduled_children,
+        } => write!(
+            formatter,
+            "content traversal would schedule {attempted_scheduled_children} children in one \
                  step, exceeding its budget of {maximum_scheduled_children}"
-            ),
-            Error::TraversalChildNameBudgetExceeded {
-                maximum_stored_child_name_bytes,
-                attempted_stored_child_name_bytes,
-                ..
-            } => write!(
-                formatter,
-                "content traversal would materialize {attempted_stored_child_name_bytes} stored \
+        ),
+        Error::TraversalChildNameBudgetExceeded {
+            maximum_stored_child_name_bytes,
+            attempted_stored_child_name_bytes,
+            ..
+        } => write!(
+            formatter,
+            "content traversal would materialize {attempted_stored_child_name_bytes} stored \
                  child-name bytes in one step, exceeding its budget of \
                  {maximum_stored_child_name_bytes}"
-            ),
-            Error::TraversalSchedulingWorkBudgetExceeded {
-                maximum_scheduling_work,
-                attempted_scheduling_work,
-            } => write!(
-                formatter,
-                "content traversal expansion would consume {attempted_scheduling_work} work \
+        ),
+        Error::TraversalSchedulingWorkBudgetExceeded {
+            maximum_scheduling_work,
+            attempted_scheduling_work,
+        } => write!(
+            formatter,
+            "content traversal expansion would consume {attempted_scheduling_work} work \
                  units, exceeding its budget of {maximum_scheduling_work}"
-            ),
-            Error::TraversalPendingBudgetExceeded {
-                maximum_pending_nodes,
-                attempted_pending_nodes,
-            } => write!(
-                formatter,
-                "content traversal would retain {attempted_pending_nodes} pending node visits, \
+        ),
+        Error::DuplicateUniqueKey { key, paths } => write!(
+            formatter,
+            "the unique index key {key:?} names {} nodes ({}), which Oak refuses \
+                 to commit",
+            paths.len(),
+            paths.join(", ")
+        ),
+        Error::TraversalPendingBudgetExceeded {
+            maximum_pending_nodes,
+            attempted_pending_nodes,
+        } => write!(
+            formatter,
+            "content traversal would retain {attempted_pending_nodes} pending node visits, \
                  exceeding its budget of {maximum_pending_nodes}"
-            ),
-        }
+        ),
+        _ => unreachable!("every non-budget variant is handled by the caller"),
     }
 }
 
@@ -225,7 +254,8 @@ impl std::error::Error for Error {
             | Error::TraversalSchedulingBudgetExceeded { .. }
             | Error::TraversalChildNameBudgetExceeded { .. }
             | Error::TraversalSchedulingWorkBudgetExceeded { .. }
-            | Error::TraversalPendingBudgetExceeded { .. } => None,
+            | Error::TraversalPendingBudgetExceeded { .. }
+            | Error::DuplicateUniqueKey { .. } => None,
         }
     }
 }
