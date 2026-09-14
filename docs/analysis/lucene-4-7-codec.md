@@ -795,3 +795,571 @@ form.
 
 A stored field with no binary, string or numeric value is an
 `IllegalArgumentException`, not an empty record.
+
+---
+
+## 6. Postings — `.doc`, `.pos`, `.pay`
+
+`codecs/lucene41/Lucene41PostingsWriter.java` and its format. This is the
+format `oakCodec` **keeps** — the composition replaces nothing here — and it
+is the largest single piece of the writer.
+
+Four codec names and one version:
+
+```java
+final static String TERMS_CODEC = "Lucene41PostingsWriterTerms";
+final static String DOC_CODEC = "Lucene41PostingsWriterDoc";
+final static String POS_CODEC = "Lucene41PostingsWriterPos";
+final static String PAY_CODEC = "Lucene41PostingsWriterPay";
+
+final static int VERSION_START = 0;
+final static int VERSION_META_ARRAY = 1;
+final static int VERSION_CURRENT = VERSION_META_ARRAY;
+```
+
+Extensions `doc`, `pos`, `pay`; block size **128**
+(`Lucene41PostingsFormat.BLOCK_SIZE`).
+
+Which files exist depends on the field's index options: `.doc` always, `.pos`
+when the field has positions, `.pay` when it has payloads or offsets.
+
+### 6.1 The format table in `.doc`
+
+Immediately after `.doc`'s codec header, `codecs/lucene41/ForUtil.java`
+writes the table that tells a reader how each bit width is packed:
+
+```java
+ForUtil(float acceptableOverheadRatio, DataOutput out) throws IOException {
+  out.writeVInt(PackedInts.VERSION_CURRENT);
+  …
+  for (int bpv = 1; bpv <= 32; ++bpv) {
+    final FormatAndBits formatAndBits = PackedInts.fastestFormatAndBits(
+        BLOCK_SIZE, bpv, acceptableOverheadRatio);
+    …
+    out.writeVInt(formatAndBits.format.getId() << 5 | (formatAndBits.bitsPerValue - 1));
+  }
+}
+```
+
+A `VInt` packed-integer version, then **32 `VInt`s**, one per bits-per-value
+from 1 to 32, each the **format id shifted left five bits** with the
+**bit width less one** beneath it. Five bits hold a width of 1..32 as 0..31,
+and the id above.
+
+**The encoded byte sizes are derived by the reader, never stored.** The
+writer computes `encodedSizes` for itself and does not emit them; a reader
+recomputes them from the format and width it just read. A writer that emits
+sizes produces a table the reader misparses from the second entry on.
+
+froe writes `PACKED` (id 0) for every width, so each entry is
+`bitsPerValue - 1` — the table is the 32 values 0..31. Lucene's own
+`fastestFormatAndBits` under the postings' overhead budget selects
+`PACKED_SINGLE_BLOCK` for some widths, so froe's table differs from Lucene's
+and both are valid: the reader honours whatever the table says. §9 records
+it.
+
+### 6.2 Blocks and the `VInt` tail
+
+Doc deltas and frequencies accumulate into buffers of 128. A full buffer is
+written as a packed block at the width the largest value needs. What remains
+at the end of a term — fewer than 128 values — is written as a **`VInt`
+tail**, and the two are distinguished by position, not by any marker: the
+reader knows the document frequency and therefore knows how many full blocks
+precede the tail.
+
+```java
+// docFreq == 1, don't write the single docid/freq to a separate file along with a pointer to it.
+final int singletonDocID;
+if (state.docFreq == 1) {
+  // pulse the singleton docid into the term dictionary, freq is implicitly totalTermFreq
+  singletonDocID = docDeltaBuffer[0];
+} else {
+  singletonDocID = -1;
+  // vInt encode the remaining doc deltas and freqs:
+  for(int i=0;i<docBufferUpto;i++) {
+    final int docDelta = docDeltaBuffer[i];
+    final int freq = freqBuffer[i];
+    if (!fieldHasFreqs) {
+      docOut.writeVInt(docDelta);
+    } else if (freqBuffer[i] == 1) {
+      docOut.writeVInt((docDelta<<1)|1);
+    } else {
+      docOut.writeVInt(docDelta<<1);
+      docOut.writeVInt(freq);
+    }
+  }
+}
+```
+
+In the tail, when the field has frequencies, **the delta and the frequency
+share a `VInt`**: the delta is shifted left one and bit 0 means "frequency is
+1". Any other frequency follows as a second `VInt`. A field without
+frequencies writes the bare delta, unshifted — the same bytes meaning
+different things depending on a field property the reader already knows.
+
+### 6.3 Pulsing a single-document term
+
+**A term whose document frequency is 1 writes nothing to `.doc` at all.** Its
+single document id is carried in the term's metadata instead
+(`singletonDocID`), and its frequency is implied by `totalTermFreq`, which
+the terms dictionary already stores.
+
+This happens **for every such term, whatever the index options** — it is not
+conditional on frequencies being enabled. In a typical Oak index, where most
+terms occur in one document, this is the majority of terms, and a writer that
+emits a one-entry `VInt` tail for them instead produces a `.doc` that is both
+larger and wrong: the reader will not look for it.
+
+### 6.4 Term metadata
+
+```java
+public void encodeTerm(long[] longs, DataOutput out, FieldInfo fieldInfo, BlockTermState _state, boolean absolute) throws IOException {
+  IntBlockTermState state = (IntBlockTermState)_state;
+  if (absolute) {
+    lastState = emptyState;
+  }
+  longs[0] = state.docStartFP - lastState.docStartFP;
+  if (fieldHasPositions) {
+    longs[1] = state.posStartFP - lastState.posStartFP;
+    if (fieldHasPayloads || fieldHasOffsets) {
+      longs[2] = state.payStartFP - lastState.payStartFP;
+    }
+  }
+  if (state.singletonDocID != -1) {
+    out.writeVInt(state.singletonDocID);
+  }
+  if (fieldHasPositions) {
+    if (state.lastPosBlockOffset != -1) {
+      out.writeVLong(state.lastPosBlockOffset);
+    }
+  }
+  if (state.skipOffset != -1) {
+    out.writeVLong(state.skipOffset);
+  }
+  lastState = state;
+}
+```
+
+The metadata splits in two, and **both halves are written by the terms
+dictionary, not here** — this method fills an array and appends to a byte
+stream the terms writer owns (§7).
+
+**The `longs`** — the three file pointers, as **deltas from the previous
+term**, reset to absolute values at each block start (`absolute`, which sets
+`lastState` to the empty state so the delta *is* the absolute value). How
+many longs a field uses is `longsSize` in the terms directory: one without
+positions, two with, three with payloads or offsets.
+
+**The byte stream**, in exactly this source order:
+
+1. `singletonDocID` as a **`VInt`**, only when not `-1`.
+2. `lastPosBlockOffset` as a **`VLong`**, only for a field with positions and
+   only when not `-1`.
+3. `skipOffset` as a **`VLong`**, only when not `-1`.
+
+Each is *omitted* rather than written as a sentinel, so the reader's ability
+to parse the stream depends entirely on knowing the field's options and the
+term's document frequency. The order is not negotiable and there is no
+framing to recover from getting it wrong.
+
+`lastPosBlockOffset` is set only when `totalTermFreq > BLOCK_SIZE` — the
+offset of the last, partial position block, so a reader can jump to it
+without walking the full ones.
+
+---
+
+## 7. Terms — `.tim` and `.tip`
+
+`codecs/BlockTreeTermsWriter.java`. Two files: the dictionary and the index
+over it.
+
+```java
+public final static int DEFAULT_MIN_BLOCK_SIZE = 25;
+public final static int DEFAULT_MAX_BLOCK_SIZE = 48;
+
+static final int OUTPUT_FLAGS_NUM_BITS = 2;
+static final int OUTPUT_FLAGS_MASK = 0x3;
+static final int OUTPUT_FLAG_IS_FLOOR = 0x1;
+static final int OUTPUT_FLAG_HAS_TERMS = 0x2;
+
+static final String TERMS_EXTENSION = "tim";
+final static String TERMS_CODEC_NAME = "BLOCK_TREE_TERMS_DICT";
+public static final int TERMS_VERSION_CURRENT = TERMS_VERSION_META_ARRAY;   // 2
+
+static final String TERMS_INDEX_EXTENSION = "tip";
+final static String TERMS_INDEX_CODEC_NAME = "BLOCK_TREE_TERMS_INDEX";
+public static final int TERMS_INDEX_VERSION_CURRENT = TERMS_INDEX_VERSION_META_ARRAY;   // 2
+```
+
+### 7.1 What `.tim` opens with
+
+The block-tree header, and then **the postings writer's own header nested
+inside it**: `Lucene41PostingsWriterTerms` at its `VERSION_CURRENT`, followed
+by the block size 128 as a `VInt`. Two codec headers in one file, the second
+belonging to a different format — a reader that stops after the first finds
+the block size where it expects a field count.
+
+### 7.2 Floor blocks, and why the partition is not free
+
+A group of terms sharing a prefix that exceeds the maximum block size is
+split into **floor blocks**. The rule: entries are grouped by the **byte
+following the shared prefix**, a new floor block begins once the accumulated
+count reaches the minimum, and that byte is recorded as the block's **lead
+byte**.
+
+**This is not a free choice.** The `.tip` floor payload keys each following
+block by its lead byte, so a partition that splits one lead byte across two
+floor blocks produces an index Lucene reads *wrongly* rather than refusing —
+the second block becomes unreachable through the index and its terms
+disappear from a seek. A writer may choose different block boundaries from
+Lucene's and still be correct, but it may not split a lead byte.
+
+### 7.3 The two flag bits, and where each lives
+
+The two bits in the block's header **are not both in the block**:
+
+```java
+out.writeVInt((length<<1)|(isLastInFloor ? 1:0));
+…
+out.writeVInt((int) (suffixWriter.getFilePointer() << 1) | (isLeafBlock ? 1:0));
+```
+
+* **`isLastInFloor`** rides the block's **entry-count `VInt`**:
+  `(entryCount << 1) | isLastInFloor`. It is **always set for a non-floor
+  block**, which is the case a writer forgets.
+* **`isLeafBlock`** rides the **suffix-section length `VInt`**:
+  `(suffixBytes << 1) | isLeafBlock`.
+
+Then the stats section and the metadata section (§6.4's `longs` and byte
+stream). A leaf block is one with no sub-blocks, and its entries need no
+per-entry sub-block pointer.
+
+The two *other* flags — `OUTPUT_FLAG_IS_FLOOR` and `OUTPUT_FLAG_HAS_TERMS` —
+live in the `.tip` transducer's outputs, not in the block at all (§7.5).
+
+### 7.4 The field directory `.tim` closes with
+
+```java
+final long dirStart = out.getFilePointer();
+final long indexDirStart = indexOut.getFilePointer();
+
+out.writeVInt(fields.size());
+
+for(FieldMetaData field : fields) {
+  out.writeVInt(field.fieldInfo.number);
+  out.writeVLong(field.numTerms);
+  out.writeVInt(field.rootCode.length);
+  out.writeBytes(field.rootCode.bytes, field.rootCode.offset, field.rootCode.length);
+  if (field.fieldInfo.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+    out.writeVLong(field.sumTotalTermFreq);
+  }
+  out.writeVLong(field.sumDocFreq);
+  out.writeVInt(field.docCount);
+  if (TERMS_VERSION_CURRENT >= TERMS_VERSION_META_ARRAY) {
+    out.writeVInt(field.longsSize);
+  }
+  indexOut.writeVLong(field.indexStartFP);
+}
+writeTrailer(out, dirStart);
+writeIndexTrailer(indexOut, indexDirStart);
+```
+
+Per field: number, `numTerms`, the root code as a length and its bytes,
+`sumTotalTermFreq` — **omitted entirely for a `DOCS_ONLY` field**, not
+written as zero — `sumDocFreq`, `docCount`, and `longsSize`.
+
+The same loop writes `.tip`'s `IndexStartFP` values, one `VLong` per field,
+so the two files' field orders are the same by construction.
+
+Both files then close with an **eight-byte `Long`** giving their directory's
+start:
+
+```java
+protected void writeTrailer(IndexOutput out, long dirStart) throws IOException {
+  out.writeLong(dirStart);
+}
+```
+
+**The reader finds both directories by seeking to length minus eight.** That
+is the only way in: nothing earlier in either file points at them.
+
+### 7.5 `.tip` — the index
+
+After the header, one transducer per field, then the `IndexStartFP` values
+and the trailer above.
+
+A transducer's output is a **`VLong`** carrying the block's file pointer with
+the two flags beneath it: `(fp << 2) | hasTerms | isFloor`, using
+`OUTPUT_FLAG_HAS_TERMS = 0x2` and `OUTPUT_FLAG_IS_FLOOR = 0x1`.
+
+When `isFloor` is set the output continues with a **`VInt` count of following
+blocks**, then per block a **lead byte** and
+`((subFp - fp) << 1) | subHasTerms` as a **`VLong`** — the sub-block's
+pointer as a delta from the floor head, with its own has-terms bit beneath.
+
+This is where §7.2's constraint bites: the lead byte is the key, so one lead
+byte must name exactly one following block.
+
+### 7.6 The serialized transducer
+
+`util/fst/FST.java`. The parts a writer emits, in order: the format version,
+the **packed flag**, the empty output, the input type, the start node, the
+node and arc counts, the **reversed byte store**, and then the arcs
+themselves with their flag bytes (`BIT_FINAL_ARC` and the rest) and
+byte-string outputs.
+
+Two choices froe makes, both recorded in §9 and both honoured by the reader:
+
+* **Unpacked.** Lucene's own terms writer builds unpacked transducers, so
+  unpacked is Lucene's own choice here and not a concession.
+* **Linear arcs only.** Lucene emits the fixed-array form —
+  an `ARCS_AS_FIXED_ARRAY` flags byte, a `VInt` arc count and a `VInt`
+  bytes-per-arc — for a node with at least five arcs at depth three or less,
+  or ten deeper. The reader dispatches on that flag **per node**, so a writer
+  that only ever emits linear arcs produces a transducer Lucene reads
+  correctly and seeks through more slowly.
+
+---
+
+## 8. Doc values and norms
+
+Two formats, deliberately similar and **not sharing their constants**. Using
+one's numeric-format codes in the other is the mistake this section exists to
+prevent.
+
+### 8.1 Doc values — `.dvm` and `.dvd`
+
+`codecs/lucene45/Lucene45DocValuesFormat.java` and its consumer.
+
+```java
+static final String DATA_CODEC = "Lucene45DocValuesData";
+static final String DATA_EXTENSION = "dvd";
+static final String META_CODEC = "Lucene45ValuesMetadata";
+static final String META_EXTENSION = "dvm";
+static final int VERSION_START = 0;
+static final int VERSION_SORTED_SET_SINGLE_VALUE_OPTIMIZED = 1;
+static final int VERSION_CURRENT = VERSION_SORTED_SET_SINGLE_VALUE_OPTIMIZED;
+static final byte NUMERIC = 0;
+static final byte BINARY = 1;
+static final byte SORTED = 2;
+static final byte SORTED_SET = 3;
+```
+
+and from the consumer:
+
+```java
+static final int BLOCK_SIZE = 16384;
+static final int ADDRESS_INTERVAL = 16;
+
+public static final int DELTA_COMPRESSED = 0;
+public static final int GCD_COMPRESSED = 1;
+public static final int TABLE_COMPRESSED = 2;
+
+public static final int BINARY_FIXED_UNCOMPRESSED = 0;
+public static final int BINARY_VARIABLE_UNCOMPRESSED = 1;
+public static final int BINARY_PREFIX_COMPRESSED = 2;
+
+public static final int SORTED_SET_WITH_ADDRESSES = 0;
+public static final int SORTED_SET_SINGLE_VALUED_SORTED = 1;
+```
+
+**`.dvm` is the metadata and `.dvd` the payload.** Each `.dvm` field entry
+opens with the field number and the type byte above, then a format-specific
+body. Both `.dvm` and `.nvm` **close with a `VInt` `-1`**, which the
+producers read as the loop terminator — a `-1` `VInt` is the five-byte form
+of §1.1, and a writer that omits it leaves the reader consuming whatever
+follows as another field number.
+
+**`missingOffset`** is written after the format for numeric and binary
+fields: the `.dvd` position of a one-bit-per-document missing bitset when any
+document lacks the field, and **`-1`** otherwise.
+
+**A terms dictionary** — used for `SORTED`, for a sorted-set's dictionary,
+and for binary fields — takes `BINARY_FIXED_UNCOMPRESSED` when every value
+has one length and `BINARY_PREFIX_COMPRESSED` otherwise, the latter with
+`ADDRESS_INTERVAL = 16`.
+
+**The sorted-set shapes.** Under
+`VERSION_SORTED_SET_SINGLE_VALUE_OPTIMIZED` the consumer writes a format
+`VInt`:
+
+* `SORTED_SET_SINGLE_VALUED_SORTED` (1) when **no document carries more than
+  one ordinal** — encoded exactly as `SORTED`, with `MISSING_ORD = -1` for a
+  document that carries none.
+* `SORTED_SET_WITH_ADDRESSES` (0) otherwise, which writes three further
+  entries: the dictionary as a terms dictionary; the flat `ords` stream
+  through the numeric path **with storage optimization off**; and a
+  doc-to-ordinal index.
+
+**That last entry's metadata is hard-coded and its declared format is
+inert.** It writes `NUMERIC`, `DELTA_COMPRESSED`, `-1`, the packed-integer
+version, the data pointer, `maxDoc` and the block size — but its *payload* is
+a **monotonic** block-packed cumulative sum of the per-document ordinal
+counts (§2.3), not a delta-compressed block-packed stream. The declared
+format is never consulted for it. A writer that honours the declared format
+here produces a file that parses and yields wrong ordinals.
+
+### 8.2 Norms — `.nvm` and `.nvd`
+
+`codecs/lucene42/Lucene42NormsConsumer.java`. **The `Lucene42` format, not
+`Lucene45`**, with its own version and its own numeric-format codes:
+
+```java
+static final int VERSION_START = 0;
+static final int VERSION_GCD_COMPRESSION = 1;
+static final int VERSION_CURRENT = VERSION_GCD_COMPRESSION;
+
+static final byte NUMBER = 0;
+
+static final int BLOCK_SIZE = 4096;
+
+static final byte DELTA_COMPRESSED = 0;
+static final byte TABLE_COMPRESSED = 1;
+static final byte UNCOMPRESSED = 2;
+static final byte GCD_COMPRESSED = 3;
+```
+
+Note the codes **differ from §8.1's**: here `TABLE_COMPRESSED` is 1 and
+`GCD_COMPRESSED` is 3, where the doc-values format has them 2 and 1. The
+block size is 4,096, not 16,384. Two formats, four names in common, none of
+the values shared.
+
+**A norms field always takes `UNCOMPRESSED`.** The norms format asks packed
+integers for the fastest decode, and a norm byte needs all eight bits, so the
+selection lands on the uncompressed form every time — one byte per document,
+straight through.
+
+The codec names the `Lucene42` norms format writes are
+**`Lucene41NormsData`** and **`Lucene41NormsMetadata`** — *41*, not 42. The
+format was renamed and the header strings were not. §9 records it; a writer
+that "corrects" them produces files the reader refuses with
+`CorruptIndexException`.
+
+---
+
+## 9. Compound files — `.cfs` and `.cfe`
+
+`store/CompoundFileWriter.java`.
+
+```java
+static final String DATA_CODEC = "CompoundFileWriterData";
+static final int VERSION_CURRENT = VERSION_START;   // 0
+static final String ENTRY_CODEC = "CompoundFileWriterEntries";
+```
+
+`.cfs` is its codec header followed by the concatenated file contents. `.cfe`
+is the directory:
+
+```java
+protected void writeEntryTable(Collection<FileEntry> entries,
+    IndexOutput entryOut) throws IOException {
+  CodecUtil.writeHeader(entryOut, ENTRY_CODEC, VERSION_CURRENT);
+  entryOut.writeVInt(entries.size());
+  for (FileEntry fe : entries) {
+    entryOut.writeString(IndexFileNames.stripSegmentName(fe.file));
+    entryOut.writeLong(fe.offset);
+    entryOut.writeLong(fe.length);
+  }
+}
+```
+
+A `VInt` entry count, then per entry the **segment-stripped name** — `.fdt`,
+never `_0.fdt` — and two **eight-byte `Long`s**, offset then length. That
+namespace is the one
+[`index-lucene-storage.md`](index-lucene-storage.md) §8.5 reads back, and
+froe's `strip_segment_name` already implements the stripping.
+
+**What stays outside the compound file**: `.si` and `segments_N`. Everything
+else a segment owns goes in.
+
+---
+
+## 10. The quirks register
+
+Every constant copied unchanged across versions, every field written but
+unread, and every place a valid alternative encoding exists with the one froe
+chooses. A reader of this document who needs to know "why is it like that"
+should find the answer here rather than in a commit message.
+
+### 10.1 Constants that survived a rename
+
+| Where | What |
+| --- | --- |
+| `Lucene42` norms | writes the codec names **`Lucene41NormsData`** and **`Lucene41NormsMetadata`**. The format was renamed; the header strings were not. Correcting them makes the reader refuse the file. |
+| `Lucene40` stored fields | `oakCodec` keeps the *40* stored-fields format inside an otherwise *46* composition, and its versions restart at 0. |
+| `.si` compound flag | `SegmentInfo.NO` is **`-1`**, not 0. |
+| `OMIT_POSITIONS` | is `-128`, the sign bit of a signed Java byte, where every other field-info bit is a small positive mask. |
+
+### 10.2 Written, and read by whom
+
+Nothing in this composition is written and *never* read. Two fields look
+unread and are not, and the register classifies them as **consumer-read**:
+
+| Field | Read by |
+| --- | --- |
+| `segments_N`'s `version` | a directory reader, comparing it against its own to decide whether an open reader is still current |
+| `segments_N`'s `counter` | an index writer reopening the index, to derive its next segment name |
+
+A writer that emits arbitrary values for either produces an index that reads
+correctly today and misbehaves the first time Oak reopens it to add a
+segment. Neither belongs in an "unread, so anything goes" list.
+
+### 10.3 Valid alternatives, and froe's choice
+
+| Decision | Lucene | froe | Why both are valid |
+| --- | --- | --- | --- |
+| packed format per bit width | `fastestFormatAndBits` selects `PACKED_SINGLE_BLOCK` for 1, 2 and 4 bits | `PACKED` everywhere | the reader honours the id the `.doc` format table records, per width |
+| all-equal block | emits the `ALL_VALUES_EQUAL` escape — bits-per-value 0, then one `VInt` | the same | not an alternative; the block writers' `bitsRequired == 0` path is this escape |
+| transducer arcs | the fixed-array form (`ARCS_AS_FIXED_ARRAY`, a `VInt` arc count, a `VInt` bytes-per-arc) for a node with ≥5 arcs at depth ≤3 or ≥10 deeper | linear arcs only | the reader dispatches on the flags byte **per node**; linear is slower to seek and correct everywhere |
+| transducer packing | unpacked, from its own terms writer | unpacked | Lucene's own choice here, not a concession |
+
+### 10.4 The raw-bits rule
+
+**A stored float is `Float.floatToIntBits` as a four-byte big-endian `Int`,
+and a stored double is `Double.doubleToLongBits` as an eight-byte
+big-endian `Long`.** No other section of this document pins it and no other
+task in plan 0009 owns it, so it is stated here as its own rule: a writer
+that formats either as text, or that uses a float-specific encoding,
+produces a `.fdt` that parses cleanly and yields nonsense.
+
+A stored `byte` or `short` is **widened to four bytes** and read back as an
+int; the format has no narrower numeric form, and codes 5 and 6 exist only as
+comments in the source.
+
+---
+
+## 11. Feasibility verdict
+
+Per module, against the thousand-line limit `scripts/oversized-files.sh`
+enforces, with the sources read to make the estimate.
+
+| Module | Sources read | Estimate | Notes |
+| --- | --- | --- | --- |
+| primitives (`VInt`/`VLong`/string/map/set, codec header, small float, norm) | `store/DataOutput.java`, `codecs/CodecUtil.java`, `util/SmallFloat.java`, `search/similarities/DefaultSimilarity.java` | ~250 | froe already has the *read* side of the header from plan 0008; this is its mirror |
+| packed integers (header-less, block-packed, monotonic) | `util/packed/PackedInts.java`, `AbstractBlockPackedWriter.java`, `BlockPackedWriter.java`, `MonotonicBlockPackedWriter.java` | ~450 | the bit-packing encoder is the bulk; one file |
+| transducer builder and serializer | `util/fst/FST.java`, `util/fst/Builder.java` | ~900 | **the tightest fit.** Linear arcs only (§10.3) is what keeps it under the limit; the fixed-array form would add ~200 |
+| postings (`.doc`/`.pos`/`.pay`, skip list) | `codecs/lucene41/Lucene41PostingsWriter.java`, `ForUtil.java`, `Lucene41SkipWriter.java`, `codecs/MultiLevelSkipListWriter.java` | ~800 | splits naturally at the skip writer if it grows |
+| block-tree terms (`.tim`/`.tip`) | `codecs/BlockTreeTermsWriter.java` | ~700 | the floor-block partition (§7.2) is the subtle part, not the bulk |
+| stored fields (`.fdx`/`.fdt`) | `codecs/lucene40/Lucene40StoredFieldsWriter.java` | ~200 | |
+| doc values (`.dvm`/`.dvd`) | `codecs/lucene45/Lucene45DocValuesConsumer.java`, its format | ~600 | the sorted-set shapes (§8.1) dominate |
+| norms (`.nvm`/`.nvd`) | `codecs/lucene42/Lucene42NormsConsumer.java` | ~150 | one format, always `UNCOMPRESSED` |
+| field infos (`.fnm`) | `codecs/lucene46/Lucene46FieldInfosWriter.java`, its format | ~200 | |
+| segment descriptor and commit file | `codecs/lucene46/Lucene46SegmentInfoWriter.java`, `index/SegmentInfos.java` | ~250 | the read side is plan 0008's |
+| compound file (`.cfs`/`.cfe`) | `store/CompoundFileWriter.java` | ~200 | froe already reads both |
+
+**No format feature the consumer needs is unwritable.** Everything Oak's
+`oakCodec` composition produces for a fresh single-segment index from
+pre-tokenized documents is specified above, and each format's reader accepts
+the subset froe chooses: `PACKED`-only packing, linear transducer arcs, and
+the `UNCOMPRESSED` norms form are all honoured by the reader's own dispatch.
+
+Two things are deliberately **out of scope** and neither is needed:
+**merging** — froe writes one segment and never merges — and **deletions**,
+which plan 0008's transport already handles as a file the commit references
+rather than a file froe writes.
+
+**Verdict: go.** The largest single module is the transducer serializer at
+roughly 900 lines, which fits under the limit only because froe emits linear
+arcs; if it does not fit in practice, the split is at the builder/serializer
+seam and is recorded here in advance so that the split is a planned one
+rather than a surprise during task 0903.

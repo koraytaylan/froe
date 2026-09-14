@@ -91,6 +91,7 @@ Index specifications:
 | [`index-definitions.md`](index-definitions.md) | `/oak:index` definitions, `/:async` lanes, the reindex and import protocols, the definition printer's JSON |
 | [`index-property-storage.md`](index-property-storage.md) | `property`, unique, node-type, `reference` and `counter` index storage, and the computation that produces it |
 | [`index-lucene-storage.md`](index-lucene-storage.md) | Lucene index data as repository content, and the filesystem layouts oak-run moves it through |
+| [`lucene-4-7-codec.md`](lucene-4-7-codec.md) | The Lucene 4.7.2 `oakCodec` composition from the write side: every file a fresh single-segment index carries, byte for byte |
 
 Write-path specifications:
 
