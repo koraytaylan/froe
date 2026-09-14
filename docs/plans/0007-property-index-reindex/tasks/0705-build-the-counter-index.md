@@ -10,8 +10,8 @@ touches:
   - crates/froe/tests/counter_index_builder_tests.rs
   - crates/froe/tests/fixtures/oak-counter-index-vectors.tsv
   - crates/froe-cli/tests/interop/judge/CounterVectors.java
-status: planned
-merged_as: ""
+status: done
+merged_as: "014ba466c75b13954e637055572e99c021d89caf"
 ---
 # Build The Counter Index From Oak's Hash Chain
 
