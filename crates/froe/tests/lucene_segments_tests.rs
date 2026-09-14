@@ -7,6 +7,11 @@
 //! naming the file and the offset — never a panic, and never an allocation
 //! driven by a number the file chose.
 
+#![allow(
+    dead_code,
+    reason = "the shared support module is larger than any one test binary uses"
+)]
+
 use std::io::Cursor;
 
 use froe::index::lucene::codec_header::{CODEC_MAGIC, read_codec_header};
@@ -492,5 +497,240 @@ fn an_implausible_entry_count_is_refused_before_it_is_reserved() {
     assert!(
         matches!(error, LuceneReadError::ImplausibleLength { .. }),
         "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The structural check, over a `:data` directory the independent encoder wrote
+// ---------------------------------------------------------------------------
+
+mod support;
+
+use froe::index::IndexDefinition;
+use froe::index::lucene::OakDirectory;
+use froe::index::lucene::check::check_structure;
+use froe::store::Repository;
+use support::property_index_layout::{Node, Property, write_repository_with_tree};
+
+struct StoreDirectory {
+    path: std::path::PathBuf,
+}
+
+impl StoreDirectory {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "froe-lucene-structure-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create the test directory");
+        Self { path }
+    }
+}
+
+impl Drop for StoreDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A `:data` child holding each named file as a streaming binary.
+fn data_directory(files: &[(&str, Vec<u8>)]) -> Node {
+    let mut data = Node::new().with(
+        "dirListing",
+        Property::Texts(files.iter().map(|(name, _)| (*name).to_owned()).collect()),
+    );
+    for (name, bytes) in files {
+        // The streaming form of §3.1: `jcr:data` sits directly on the file
+        // node as a single binary, with `blobSize` beside it. There is no
+        // `jcr:content` child — that is the JCR file shape, not Oak's
+        // directory shape.
+        data = data.with_child(
+            name,
+            Node::new()
+                .with("blobSize", Property::Long(1_047_552))
+                .with("jcr:data", Property::Binary(bytes.clone())),
+        );
+    }
+    data
+}
+
+/// A store whose `/oak:index/lucene` carries `files` under `:data`.
+fn store_with(directory: &StoreDirectory, files: &[(&str, Vec<u8>)]) -> Repository {
+    let definition = Node::new()
+        .with(
+            "jcr:primaryType",
+            Property::Name("oak:QueryIndexDefinition".to_owned()),
+        )
+        .with("type", Property::Text("lucene".to_owned()))
+        .with("async", Property::Text("async".to_owned()))
+        .with_child(":data", data_directory(files));
+    let root = Node::new().with_child("oak:index", Node::new().with_child("lucene", definition));
+    write_repository_with_tree(&directory.path, &root);
+    Repository::open(&directory.path).expect("open the repository")
+}
+
+/// Runs the structural check over that store's `:data`.
+fn structural_report(
+    repository: &Repository,
+) -> froe::index::lucene::check::LuceneStructuralReport {
+    let node = repository
+        .node_at_path("/oak:index/lucene")
+        .expect("resolve")
+        .expect("exists");
+    let definition = IndexDefinition::read(&node, "/oak:index/lucene").expect("model");
+    let directory = OakDirectory::open(repository, &node, &definition, ":data")
+        .expect("open :data")
+        .expect(":data exists");
+    check_structure(&directory).expect("check the structure")
+}
+
+/// A one-segment commit naming `files`, and the `.si` that goes with it.
+fn one_segment_commit(
+    document_count: i32,
+    deletions: i32,
+    files: &[&str],
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut commit = Writer::default();
+    commit
+        .header("segments", 1)
+        .long(1)
+        .int(1)
+        .int(1)
+        .string("_0")
+        .string("oakCodec")
+        .long(-1)
+        .int(deletions)
+        .long(-1)
+        .int(0)
+        .string_map(&[])
+        .long(0);
+    vec![
+        ("segments_1", commit.finish()),
+        ("_0.si", segment_info_bytes(document_count, files)),
+    ]
+}
+
+#[test]
+fn a_coherent_directory_reports_its_generation_codec_and_live_count() {
+    let directory = StoreDirectory::new("coherent");
+    let files = one_segment_commit(10, 3, &["_0.si", "segments_1"]);
+    let repository = store_with(&directory, &files);
+
+    let report = structural_report(&repository);
+    assert!(report.is_coherent(), "{report:?}");
+    assert_eq!(report.generation, Some(1));
+    assert_eq!(report.commit_file.as_deref(), Some("segments_1"));
+    assert_eq!(report.codec_name.as_deref(), Some("oakCodec"));
+    assert_eq!(report.segment_count, 1);
+    // Oak's own count: documents minus deletions.
+    assert_eq!(report.live_document_count, 7);
+    assert!(report.unregistered_codecs.is_empty(), "{report:?}");
+}
+
+#[test]
+fn a_file_the_segments_name_but_the_listing_lacks_is_reported_missing() {
+    let directory = StoreDirectory::new("missing");
+    // The `.si` claims a `_0.cfs` that the directory does not hold.
+    let files = one_segment_commit(4, 0, &["_0.si", "_0.cfs", "segments_1"]);
+    let repository = store_with(&directory, &files);
+
+    let report = structural_report(&repository);
+    assert!(!report.is_coherent());
+    assert_eq!(report.missing_files, vec!["_0.cfs".to_owned()]);
+}
+
+#[test]
+fn a_listed_file_no_segment_names_is_reported_unreferenced() {
+    let directory = StoreDirectory::new("unreferenced");
+    let mut files = one_segment_commit(4, 0, &["_0.si", "segments_1"]);
+    files.push(("_9.cfs", b"orphan".to_vec()));
+    let repository = store_with(&directory, &files);
+
+    let report = structural_report(&repository);
+    assert!(!report.is_coherent());
+    assert_eq!(report.unreferenced_files, vec!["_9.cfs".to_owned()]);
+}
+
+#[test]
+fn the_generation_hint_is_never_a_finding_by_its_presence() {
+    // §8.3: no commit's aggregate file set ever names `segments.gen`, so
+    // its presence must not be reported as an unreferenced file.
+    let directory = StoreDirectory::new("gen-hint");
+    let mut hint = Writer::default();
+    hint.int(-2).long(1).long(1);
+    let mut files = one_segment_commit(4, 0, &["_0.si", "segments_1"]);
+    files.push(("segments.gen", hint.finish()));
+    let repository = store_with(&directory, &files);
+
+    let report = structural_report(&repository);
+    assert!(report.is_coherent(), "{report:?}");
+    assert!(report.unreferenced_files.is_empty(), "{report:?}");
+}
+
+#[test]
+fn an_unregistered_codec_is_reported_rather_than_making_the_index_incoherent() {
+    // Oak would fail on it at open. Saying so is what the check is for, and
+    // the *files* are perfectly coherent.
+    let directory = StoreDirectory::new("unregistered-codec");
+    let mut commit = Writer::default();
+    commit
+        .header("segments", 1)
+        .long(1)
+        .int(1)
+        .int(1)
+        .string("_0")
+        .string("SomeOtherCodec")
+        .long(-1)
+        .int(0)
+        .long(-1)
+        .int(0)
+        .string_map(&[])
+        .long(0);
+    let files = vec![
+        ("segments_1", commit.finish()),
+        ("_0.si", segment_info_bytes(2, &["_0.si", "segments_1"])),
+    ];
+    let repository = store_with(&directory, &files);
+
+    let report = structural_report(&repository);
+    assert!(
+        report.is_coherent(),
+        "an unregistered codec is not a structural fault: {report:?}"
+    );
+    assert_eq!(
+        report.unregistered_codecs,
+        vec!["SomeOtherCodec".to_owned()]
+    );
+}
+
+#[test]
+fn a_directory_with_no_commit_file_reports_every_file_as_unreferenced() {
+    let directory = StoreDirectory::new("no-commit");
+    let repository = store_with(&directory, &[("_0.si", segment_info_bytes(1, &[]))]);
+
+    let report = structural_report(&repository);
+    assert!(!report.is_coherent());
+    assert_eq!(report.commit_file, None);
+    assert_eq!(report.unreferenced_files, vec!["_0.si".to_owned()]);
+}
+
+#[test]
+fn a_corrupt_commit_file_is_reported_as_unreadable_with_the_reason() {
+    let directory = StoreDirectory::new("corrupt-commit");
+    let files = vec![
+        ("segments_1", b"not a lucene file at all".to_vec()),
+        ("_0.si", segment_info_bytes(1, &[])),
+    ];
+    let repository = store_with(&directory, &files);
+
+    let report = structural_report(&repository);
+    assert!(!report.is_coherent());
+    assert_eq!(report.unreadable_files.len(), 1, "{report:?}");
+    assert_eq!(report.unreadable_files[0].0, "segments_1");
+    assert!(
+        report.unreadable_files[0].1.contains("Lucene 3.x"),
+        "the reason travels with the file: {report:?}"
     );
 }

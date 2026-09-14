@@ -549,6 +549,21 @@ fn read_lucene_facts(
     }
     if has_index_directory {
         info.size_in_bytes = Some(size);
+        // The document count plan 0006 left as `None`: it needs the commit
+        // file's table of contents, which froe could not read until plan
+        // 0008's readers landed. Oak's own count over a directory is the
+        // sum over segments of document count minus deletion count.
+        if let Some(directory) = OakDirectory::open(
+            provider,
+            node,
+            definition,
+            crate::index::lucene::INDEX_DATA_CHILD_NAME,
+        )? {
+            let structure = crate::index::lucene::check::check_structure(&directory)?;
+            if structure.commit_file.is_some() {
+                info.document_count = u64::try_from(structure.live_document_count).ok();
+            }
+        }
     }
     if node.child_node(SUGGEST_DATA_CHILD_NAME)?.is_some() {
         info.suggest_size_in_bytes = Some(suggest_size);
