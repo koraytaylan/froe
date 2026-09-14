@@ -10,8 +10,8 @@ touches:
   - crates/froe/src/index/lucene/codec/segment_info.rs
   - crates/froe/src/index/lucene/codec/compound.rs
   - crates/froe/tests/lucene_segment_assembly_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "d5e2b7f"
 ---
 # Assemble A Segment, Its Compound File And The Commit
 
