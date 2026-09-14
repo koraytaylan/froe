@@ -1,0 +1,157 @@
+# Known-answer vectors for Oak's SipHash-2-2 variant, the hash the counter
+# index chains down the content tree
+# (docs/analysis/index-property-storage.md section 9.2).
+#
+# Columns, tab-separated: the seed as a decimal signed 64-bit integer; the
+# path's elements joined with `|`, empty for the root; and the chained hash's
+# `hashCode()` as a decimal signed 32-bit integer.
+#
+# The elements are listed rather than a path spelled, because the chain is
+# over *elements* — `hash(root) = new SipHash(seed)` and
+# `hash(child) = new SipHash(hash(parent), name.hashCode())` — and a path
+# string cannot express an empty element. The `|a` row is exactly that case:
+# an element whose name is the empty string, whose `String.hashCode()` is
+# zero. Oak's editor never produces one, since it walks real child names, but
+# the constructor accepts it and the vector pins what it does.
+#
+# `name.hashCode()` is java.lang.String::hashCode, an int widened to long with
+# sign extension at the call.
+#
+# Note what the first row of each seed block shows: the root's hashCode is the
+# same for every seed. The four state words are `k0^C0, k1^C1, k0^C2, k1^C3`
+# and `hashCode` exclusive-ors all four, so both key halves cancel. The seed
+# only starts to matter one step down. A port that got the seeding wrong would
+# still pass a root-only test.
+#
+# The seed list includes -7610761686379641542, which is the value the real
+# Sling fixture's counter definition stores, and its own narrowing to 32 bits
+# sign-extended, which is what every run after the one that created it
+# actually uses.
+#
+# Generated against Oak's own class inside the digest-pinned Sling image the
+# interop suite runs against, oak-core-1.90.0.jar with Temurin 21.0.10, by
+# saving the jshell program below as vectors.jsh and running:
+#
+#   podman run --rm -e HOME=/tmp -v "$PWD/vectors.jsh:/tmp/vectors.jsh:ro,Z" \
+#     --entrypoint jshell \
+#     docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9 \
+#     -s -J-Djava.util.prefs.userRoot=/tmp \
+#     --class-path /opt/sling/artifacts/org/apache/jackrabbit/oak-core/1.90.0/oak-core-1.90.0.jar \
+#     /tmp/vectors.jsh
+#
+# then prepending this header to its standard output. The program:
+#
+#   import org.apache.jackrabbit.oak.plugins.index.counter.SipHash;
+#   import java.util.ArrayList;
+#   import java.util.List;
+#
+#   long[] seeds = {
+#     0L,
+#     1L,
+#     -1L,
+#     -7610761686379641542L,
+#     (long) (int) -7610761686379641542L,
+#     1234567890123456789L,
+#     Long.MIN_VALUE,
+#     Long.MAX_VALUE,
+#   };
+#
+#   // Each entry is a path spelled as its elements; the empty array is the root.
+#   List<String[]> paths = new ArrayList<>();
+#   paths.add(new String[] {});
+#   paths.add(new String[] {"a"});
+#   paths.add(new String[] {"a", "b"});
+#   paths.add(new String[] {"content"});
+#   paths.add(new String[] {"content", "interop", "files"});
+#   paths.add(new String[] {"jcr:content"});
+#   paths.add(new String[] {"äöü"});
+#   paths.add(new String[] {new String(new char[] {(char) 0xD83D, (char) 0xDE00})});
+#   paths.add(new String[] {"", "a"});
+#
+#   StringBuilder out = new StringBuilder();
+#   for (long seed : seeds) {
+#     for (String[] elements : paths) {
+#       SipHash hash = new SipHash(seed);
+#       for (String element : elements) {
+#         hash = new SipHash(hash, element.hashCode());
+#       }
+#       out.append(seed).append('\t')
+#          .append(String.join("|", elements)).append('\t')
+#          .append(hash.hashCode()).append('\n');
+#     }
+#   }
+#   System.out.print(out);
+#   /exit
+#
+0		352654348
+0	a	-374040916
+0	a|b	-252494488
+0	content	-788293117
+0	content|interop|files	-586128959
+0	jcr:content	-251207208
+0	äöü	-373825436
+0	😀	-374367307
+0	|a	-498877089
+1		352654348
+1	a	-144522105
+1	a|b	-404707127
+1	content	-808073176
+1	content|interop|files	1446203264
+1	jcr:content	-271535117
+1	äöü	-144592305
+1	😀	-143013474
+1	|a	-959368124
+-1		352654348
+-1	a	43167173
+-1	a|b	-321715572
+-1	content	975544682
+-1	content|interop|files	-585122863
+-1	jcr:content	438360753
+-1	äöü	43113229
+-1	😀	42574044
+-1	|a	-1161353202
+-7610761686379641542		352654348
+-7610761686379641542	a	2093615082
+-7610761686379641542	a|b	-636368523
+-7610761686379641542	content	1149045573
+-7610761686379641542	content|interop|files	-1047652600
+-7610761686379641542	jcr:content	1685614750
+-7610761686379641542	äöü	2093576482
+-7610761686379641542	😀	2094074611
+-7610761686379641542	|a	-1004449038
+-584039110		352654348
+-584039110	a	1605300436
+-584039110	a|b	145861074
+-584039110	content	1729756283
+-584039110	content|interop|files	-43229895
+-584039110	jcr:content	1193052064
+-584039110	äöü	1605207580
+-584039110	😀	1605762509
+-584039110	|a	1807899765
+1234567890123456789		352654348
+1234567890123456789	a	-567287486
+1234567890123456789	a|b	-828897364
+1234567890123456789	content	-426185235
+1234567890123456789	content|interop|files	-1562841180
+1234567890123456789	jcr:content	-962750922
+1234567890123456789	äöü	-567502966
+1234567890123456789	😀	-566956965
+1234567890123456789	|a	1768766133
+-9223372036854775808		352654348
+-9223372036854775808	a	777939868
+-9223372036854775808	a|b	-1682031692
+-9223372036854775808	content	384395059
+-9223372036854775808	content|interop|files	-2032715230
+-9223372036854775808	jcr:content	921443560
+-9223372036854775808	äöü	777854292
+-9223372036854775808	😀	776300165
+-9223372036854775808	|a	1870363958
+9223372036854775807		352654348
+9223372036854775807	a	21371643
+9223372036854775807	a|b	206002475
+9223372036854775807	content	972101204
+9223372036854775807	content|interop|files	-267588660
+9223372036854775807	jcr:content	435449231
+9223372036854775807	äöü	21326899
+9223372036854775807	😀	22878178
+9223372036854775807	|a	487641834
