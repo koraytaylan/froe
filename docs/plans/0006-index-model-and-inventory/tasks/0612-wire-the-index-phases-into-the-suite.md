@@ -11,8 +11,8 @@ touches:
   - scripts/interop-fixture.sh
   - .github/workflows/interop.yml
   - docs/interop.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "1f6e4c71f2d18e37d7742c8b8f12c5b6f5c7bc51"
 ---
 # Wire The Index Phases Into The Suite, Workflow And Run Record
 
