@@ -14,10 +14,15 @@ touches:
   - crates/froe/src/writer/mod.rs
   - crates/froe/src/lib.rs
   - crates/froe/src/index/definitions_json_reader.rs
+  - crates/froe/src/writer/index/lucene_import/drift.rs
+  - crates/froe/src/writer/index/lucene_import/materialize.rs
+  - crates/froe/src/writer/memory_segments.rs
+  - crates/froe/src/writer/record_writer/test_support.rs
+  - crates/froe/tests/lucene_import_drift_tests.rs
   - crates/froe/tests/lucene_import_tests.rs
   - docs/oak-segment-tar-feature-map.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "949c147, 33023ca, 4d565d5, da865d2, f00c259, 75ca2fd, 19431f0"
 ---
 # Import An Out-Of-Band Lucene Index
 
