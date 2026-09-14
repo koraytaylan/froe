@@ -117,6 +117,27 @@ fn draw_uuid_halves() -> (u64, u64) {
     )
 }
 
+/// Draws a fresh 32-bit value from the same entropy source.
+///
+/// The counter index's seed needs one. Oak draws 64 bits and then reads
+/// only 32 of them back on every run after the first, which makes the run
+/// that created the seed disagree with every later one about where hits
+/// fall; froe draws 32 to begin with, so both readings agree.
+///
+/// # Panics
+///
+/// As [`new_data_segment_identifier`]: the store verifies the source at
+/// open and refuses rather than proceeding without it.
+#[must_use]
+pub fn random_u32() -> u32 {
+    let mut bytes = [0u8; 4];
+    with_entropy_buffer(|buffer| buffer.try_fill(&mut bytes)).expect(
+        "the operating system entropy source failed; refusing to draw a counter seed \
+         from anything weaker",
+    );
+    u32::from_be_bytes(bytes)
+}
+
 /// Generates a fresh *data* segment identifier:
 /// `xxxxxxxx-xxxx-4xxx-Axxx-xxxxxxxxxxxx`.
 ///
