@@ -29,6 +29,7 @@ pub mod apply;
 pub mod counter_builder;
 pub mod definition_update;
 pub mod lucene_directory;
+pub mod lucene_import;
 pub mod plan;
 pub mod prepared;
 pub mod property_builder;
