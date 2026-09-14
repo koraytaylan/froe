@@ -8,8 +8,10 @@ gated: false
 touches:
   - docs/plans/0007-property-index-reindex/ARCHITECTURE.md
   - crates/froe/tests/index_reindex_guard_tests.rs
-status: planned
-merged_as: ""
+  - crates/froe/tests/support/property_index_layout.rs
+  - crates/froe/src/writer/index/selection.rs
+status: done
+merged_as: "82101d29cbb498834325a82220cfcee875e12732"
 ---
 # Record Guard Neutralization Evidence In The Safety Case
 
