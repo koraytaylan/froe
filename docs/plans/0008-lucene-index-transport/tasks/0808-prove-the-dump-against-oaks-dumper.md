@@ -9,8 +9,14 @@ touches:
   - crates/froe-cli/tests/interop/phase_lucene_transport.rs
   - crates/froe-cli/tests/interop/main.rs
   - crates/froe-cli/tests/interop/judge/Consistency.java
-status: planned
-merged_as: ""
+  - crates/froe-cli/tests/interop/phase_judge.rs
+  - crates/froe-cli/tests/interop/phase_recovery.rs
+  - crates/froe/src/index/lucene/segments.rs
+  - crates/froe/tests/lucene_segments_tests.rs
+  - docs/analysis/index-lucene-storage.md
+  - docs/interop.md
+status: done
+merged_as: "b80db37"
 ---
 # Prove The Dump Against Oak's Own Dumper
 

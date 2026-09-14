@@ -127,6 +127,16 @@ property_reindex
    │  produces, which is the whole claim of `froe index reindex`. Runs
    │  before commit for the same reason index_inventory does.
    ▼
+lucene_dump
+   │  Oak's own dumper reads :data out of the fixture; froe's `index dump`
+   │  reads the same :data; every file must be byte-identical, and Lucene's
+   │  own CheckIndex and Oak's own consistency checker at its full level
+   │  must both pass over froe's output
+   │  If this fails: froe reads Lucene index data out of the segment store
+   │  differently from Oak, so nothing it dumps can be imported anywhere.
+   │  Read-only, so its position is free; it runs here because the
+   │  fixture's Lucene index reflects the state Sling left.
+   ▼
 commit
    │  froe adds nodes with typed properties to the content tree via
    │  the library's commit API, then Sling reads them back
@@ -485,6 +495,63 @@ randomized `:count_*` counters, and index selection between competing mirror
 indexes can differ for the same reason, so only plans carrying no
 counter-derived number are compared. And it proves nothing about Lucene,
 which `froe index reindex` refuses by name until plan 0010.
+
+### lucene_dump
+
+The strongest question a read-only transport can be asked: **are the bytes
+froe reads out of `:data` the bytes Oak reads out of `:data`?** Not "the
+files froe wrote are a coherent Lucene index", which a self-consistent
+mistake satisfies — the same store, the same definition, two independent
+readers, byte for byte.
+
+* **The definitions are discovered, not listed.** Every direct child of
+  `/oak:index` whose modelled type is `lucene` and which carries a `:data`
+  child, so the comparison is per definition directory rather than one
+  against one; plan 0010 adds a second.
+
+* **Oak's own `LuceneIndexDumper`** writes the reference directory, out of
+  the very same store, into a directory of its own per definition.
+
+* **Every file is compared by name and by bytes.** A difference names the
+  file, both lengths and the first differing byte — never the contents,
+  which run to megabytes. `index-details.txt` is compared as a *parsed*
+  Java properties file rather than line by line, because both sides write
+  it through `java.util.Properties`, whose `saveConvert` escapes `:` in
+  values as well as keys: comparing the raw lines would compare an encoding
+  and would pass silently if one side stopped escaping.
+
+* **Lucene's own `CheckIndex`** runs over froe's output — the level-2
+  verdict froe cannot produce, and the only thing that can say a directory
+  is a real Lucene index.
+
+* **Oak's own `IndexConsistencyChecker` at its full level** runs over the
+  store, through the new `Consistency` judge class. The phase asserts that
+  the index-check status was **reached** and clean, not merely that some
+  verdict was printed: the checker runs Lucene's own checker only once the
+  directory's content came out consistent, so a blob failure would
+  otherwise read as a quiet pass at the level that matters.
+
+* **The document count is agreed twice.** Oak's `numdocs` over froe's dump
+  must equal the count froe computes from `segments_N` and each `.si`.
+  `:status/indexedNodes` is deliberately not used: it is a per-cycle
+  counter, not a document count.
+
+* **A negative control.** One byte is flipped in a copy of froe's dump and
+  the same comparison must refuse it, naming the file and the offset — a
+  comparison that passed over everything would pass over this phase too.
+
+* **The store snapshot is byte-identical afterwards.** The dump is
+  read-only and this is what holds it to that.
+
+**What it found on its first real run.** froe's dump was byte-identical
+and both Oak oracles were clean, and froe's *own* structural check called
+the same index incoherent: it reported `_0_1.del` as a file no segment
+names. A deletions file is derived from the segment's deletion generation
+and written down nowhere, so a reader collecting only the commit file's
+strings misses it. Since the import refuses an incoherent directory before
+copying a byte, `froe index import` would have refused every real Oak index
+whose segments carry deletions. Fixed in
+`docs/analysis/index-lucene-storage.md` §8.8 and `segments.rs`.
 
 ### commit
 
