@@ -8,8 +8,8 @@ gated: false
 touches:
   - docs/analysis/index-definitions.md
   - docs/analysis/README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "49243d64ae985f19773c10bc25eeb246e7755ba7"
 ---
 # Specify Index Definitions, Lanes And The Reindex Protocol
 

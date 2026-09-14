@@ -9,8 +9,8 @@ touches:
   - crates/froe/src/java/url_encoder.rs
   - crates/froe/src/java/mod.rs
   - crates/froe/tests/fixtures/java-url-encoder-vectors.tsv
-status: planned
-merged_as: ""
+status: done
+merged_as: "30f8c8813b041870e962f839ddd5bc6d72038cb2"
 ---
 # Port Java's URL Encoder For Property Index Keys
 

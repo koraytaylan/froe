@@ -7,8 +7,8 @@ depends_on: []
 gated: false
 touches:
   - docs/analysis/index-lucene-storage.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "fb2e7a2ca6fd302b803ca35064418242bea2ecd2"
 ---
 # Specify Lucene Index Storage In The Repository
 

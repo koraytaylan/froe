@@ -7,8 +7,8 @@ depends_on: []
 gated: false
 touches:
   - docs/analysis/index-property-storage.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "bc3d2c8a3b4afb4fec019ad633f901864a37605b"
 ---
 # Specify Property-Family Index Storage
 
