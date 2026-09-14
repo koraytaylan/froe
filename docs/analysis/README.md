@@ -40,6 +40,21 @@ When extending a specification, cite the Java file and method, and record the
 commit you read if it differs from the one above; a citation that names no
 revision cannot be re-checked once trunk moves.
 
+## When trunk and the consumer build disagree
+
+The commit above is a trunk snapshot. The build these documents are *verified
+against* is `oak-segment-tar` 1.90.0, inside the digest-pinned Apache Sling
+image the interoperability suite runs
+([`../interop.md`](../interop.md)). Where the two differ, **the consumer
+build's behaviour wins**, and the specification says so at the point of
+difference rather than describing trunk and leaving a reader to discover it.
+
+The reason is that froe is published for the build it is verified against: a
+trunk-only refinement froe reproduced would be a divergence from every
+repository froe is actually pointed at. The rule is recorded here so that the
+next such difference is resolved the same way rather than argued about; the
+index specifications below apply it explicitly.
+
 ## Stating the scope of a documented behaviour
 
 Where a behaviour is specific to one property type, format version, or code
@@ -68,6 +83,14 @@ Read-path specifications:
 | [`tooling-inventory.md`](tooling-inventory.md) | Complete feature inventory of `oak-segment-tar` |
 | [`read-tooling.md`](read-tooling.md) | Check, diff, revisions, history, search, debug tools |
 | [`official-documentation.md`](official-documentation.md) | Distillation of the official Oak format documentation, as an independent witness |
+
+Index specifications:
+
+| Document | Subsystem |
+| --- | --- |
+| [`index-definitions.md`](index-definitions.md) | `/oak:index` definitions, `/:async` lanes, the reindex and import protocols, the definition printer's JSON |
+| [`index-property-storage.md`](index-property-storage.md) | `property`, unique, node-type, `reference` and `counter` index storage, and the computation that produces it |
+| [`index-lucene-storage.md`](index-lucene-storage.md) | Lucene index data as repository content, and the filesystem layouts oak-run moves it through |
 
 Write-path specifications:
 
