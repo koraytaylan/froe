@@ -25,6 +25,7 @@
 //! records both as out of scope, and nothing in the consumer needs them.
 
 pub mod data_output;
+pub mod doc_values;
 pub mod fst;
 pub mod packed;
 pub mod postings;
@@ -35,9 +36,6 @@ pub mod terms;
 // module tree is the one the specification describes from the start, and so
 // a reader looking for a format finds where it will live rather than
 // wondering whether it exists.
-
-/// `.dvm` and `.dvd` (§8.1). Task 0907.
-pub mod doc_values {}
 
 /// `.nvm` and `.nvd` (§8.2). Task 0908.
 pub mod norms {}

@@ -101,6 +101,14 @@ pub use content::{
     PropertyValues, SegmentProvider, Template, read_binary_stream,
 };
 pub use error::{Error, Result};
+/// The sorted sequences plan 0009's writers consume.
+///
+/// The sort itself stays crate-internal — its budget, its spill directory
+/// and its run merge are froe's business — but a consumer that takes a
+/// sorted sequence has to be callable, and its vector tests live in
+/// separate integration-test crates. These three names are what such a
+/// caller needs and no more.
+pub use external_sort::{SortedPass, SortedPasses, SpillRecord};
 pub use gc_journal::GarbageCollectionJournalEntry;
 pub use journal::JournalEntry;
 pub use progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};

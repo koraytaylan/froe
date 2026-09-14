@@ -1764,6 +1764,228 @@ counts (§2.3), not a delta-compressed block-packed stream. The declared
 format is never consulted for it. A writer that honours the declared format
 here produces a file that parses and yields wrong ordinals.
 
+#### 8.1.1 The numeric entry
+
+`addNumericField`, which every numeric stream in this format goes through —
+a `NUMERIC` field, a `SORTED` field's ordinals, and a sorted set's flat
+`ords`.
+
+The statistics pass runs **only under `optimizeStorage`**, and decides the
+format:
+
+```java
+if (gcd != 1) {
+  if (v < Long.MIN_VALUE / 2 || v > Long.MAX_VALUE / 2) {
+    gcd = 1;                       // v - minValue might overflow
+  } else if (count != 0) {         // minValue needs to be set first
+    gcd = MathUtil.gcd(gcd, v - minValue);
+  }
+}
+minValue = Math.min(minValue, v);
+maxValue = Math.max(maxValue, v);
+if (uniqueValues != null && uniqueValues.add(v) && uniqueValues.size() > 256) {
+  uniqueValues = null;
+}
+```
+
+```java
+final long delta = maxValue - minValue;
+if (uniqueValues != null
+    && (delta < 0L || PackedInts.bitsRequired(uniqueValues.size() - 1) < PackedInts.bitsRequired(delta))
+    && count <= Integer.MAX_VALUE) {
+  format = TABLE_COMPRESSED;
+} else if (gcd != 0 && gcd != 1) {
+  format = GCD_COMPRESSED;
+} else {
+  format = DELTA_COMPRESSED;
+}
+```
+
+Three things about that decision are easy to get wrong:
+
+* **The table is not chosen just for having few distinct values.** It needs
+  at most 256 of them *and* either a delta that **overflowed into the
+  negative** — which one negative and one positive double's raw bits
+  produce — or an ordinal narrower than the delta. Ten values 0..9 have
+  four distinct-value bits against four delta bits, and land in
+  `DELTA_COMPRESSED`.
+* **The gcd is computed against `minValue` as it stands at the time**, which
+  is the running minimum and not the final one, and it is skipped for the
+  first value because there is no minimum yet.
+* **One extreme value disables the gcd for the whole field.** Anything
+  outside ±`Long.MAX_VALUE / 2` sets the divisor to 1 and never recovers, so
+  `GCD_COMPRESSED` is unreachable for a double field of magnitude two or
+  more, whose raw bits exceed that bound.
+
+Then the entry, in this order:
+
+```java
+meta.writeVInt(field.number);
+meta.writeByte(NUMERIC);
+meta.writeVInt(format);
+if (missing) { meta.writeLong(data.getFilePointer()); writeMissingBitset(values); }
+else         { meta.writeLong(-1L); }
+meta.writeVInt(PackedInts.VERSION_CURRENT);
+meta.writeLong(data.getFilePointer());
+meta.writeVLong(count);
+meta.writeVInt(BLOCK_SIZE);
+```
+
+**The missing bitset is written into `.dvd` between two `.dvm` positions**,
+so the data pointer that follows it is read after it has moved. One bit per
+document, least significant bit first, a byte at a time:
+
+```java
+byte bits = 0;
+int count = 0;
+for (Object v : values) {
+  if (count == 8) { data.writeByte(bits); count = 0; bits = 0; }
+  if (v != null) { bits |= 1 << (count & 7); }
+  count++;
+}
+if (count > 0) { data.writeByte(bits); }
+```
+
+A **set** bit means the document *has* the field, and the bitset exists only
+when at least one document lacks it. Oak's `:dv<name>` fields are sparse, so
+a writer that always wrote `-1` here would pass Lucene's own index checker
+and still misreport which documents have the field.
+
+The payload, per format:
+
+| format | `.dvm` tail | `.dvd` |
+| --- | --- | --- |
+| `DELTA_COMPRESSED` | — | block-packed values, `BLOCK_SIZE` 16,384 |
+| `GCD_COMPRESSED` | `Long` minimum, `Long` gcd | block-packed `(value - min) / gcd` |
+| `TABLE_COMPRESSED` | `VInt` table length, then that many `Long`s | header-less packed ordinals at `bitsRequired(size - 1)` |
+
+A missing value counts as **zero** in every branch, including the
+statistics.
+
+**The table's order is the iteration order of a `HashSet<Long>`**, which is
+neither sorted nor specified. The reader uses the table as a lookup by
+ordinal, so any order is valid; froe writes the values in ascending order
+because a writer whose output depends on hash iteration has no vectors.
+§10.3 records it.
+
+#### 8.1.2 The binary entry and the terms dictionary
+
+`addBinaryField` writes the values to `.dvd` as it measures them, so the
+`.dvm` entry is written afterwards and its `startFP` points back:
+
+```java
+meta.writeVInt(minLength == maxLength ? BINARY_FIXED_UNCOMPRESSED : BINARY_VARIABLE_UNCOMPRESSED);
+if (missing) { meta.writeLong(data.getFilePointer()); writeMissingBitset(values); }
+else         { meta.writeLong(-1L); }
+meta.writeVInt(minLength);
+meta.writeVInt(maxLength);
+meta.writeVLong(count);
+meta.writeLong(startFP);
+if (minLength != maxLength) {
+  meta.writeLong(data.getFilePointer());
+  meta.writeVInt(PackedInts.VERSION_CURRENT);
+  meta.writeVInt(BLOCK_SIZE);
+  // one monotonic address per value: the cumulative length
+}
+```
+
+A fixed-length field needs no addresses at all — the reader multiplies.
+
+`addTermsDict` is the dictionary a `SORTED` field and a sorted set share.
+**When every value has the same length it is an ordinary binary field**, and
+`addBinaryField` then writes its *own* field number and `BINARY` type byte —
+so a `SORTED` field's `.dvm` carries the field number three times, once for
+the `SORTED` entry, once for the dictionary and once for the ordinals.
+
+Otherwise it is prefix-compressed:
+
+```java
+meta.writeVInt(field.number);
+meta.writeByte(BINARY);
+meta.writeVInt(BINARY_PREFIX_COMPRESSED);
+meta.writeLong(-1L);
+…
+for (BytesRef v : values) {
+  if (count % ADDRESS_INTERVAL == 0) {
+    termAddresses.add(data.getFilePointer() - startFP);
+    lastTerm.length = 0;               // force the first term of a block absolute
+  }
+  int sharedPrefix = StringHelper.bytesDifference(lastTerm, v);
+  data.writeVInt(sharedPrefix);
+  data.writeVInt(v.length - sharedPrefix);
+  data.writeBytes(v.bytes, v.offset + sharedPrefix, v.length - sharedPrefix);
+  lastTerm.copyBytes(v);
+  count++;
+}
+final long indexStartFP = data.getFilePointer();
+termAddresses.finish();
+addressBuffer.writeTo(data);
+meta.writeVInt(minLength);
+meta.writeVInt(maxLength);
+meta.writeVLong(count);
+meta.writeLong(startFP);
+meta.writeVInt(ADDRESS_INTERVAL);
+meta.writeLong(indexStartFP);
+meta.writeVInt(PackedInts.VERSION_CURRENT);
+meta.writeVInt(BLOCK_SIZE);
+```
+
+Every sixteenth term is absolute — its shared prefix is forced to zero by
+emptying the running term — and its offset is recorded in a **monotonic**
+block-packed stream built in memory and appended after the terms. The
+missing offset is a hard `-1`: a dictionary has no missing values.
+
+#### 8.1.3 Sorted and sorted set
+
+```java
+public void addSortedField(FieldInfo field, Iterable<BytesRef> values, Iterable<Number> docToOrd) {
+  meta.writeVInt(field.number);
+  meta.writeByte(SORTED);
+  addTermsDict(field, values);
+  addNumericField(field, docToOrd, false);
+}
+```
+
+**`optimizeStorage` is false for the ordinal stream**, which is why a
+`SORTED` field's ordinals are always `DELTA_COMPRESSED`, carry no missing
+bitset — `missingOffset` is `-1` because the statistics pass that would set
+`missing` never runs — and use `-1` for a document with no value. The three
+entries share one field number.
+
+A sorted set opens with its own `SORTED_SET` entry and then a format `VInt`:
+
+```java
+if (isSingleValued(docToOrdCount)) {
+  meta.writeVInt(SORTED_SET_SINGLE_VALUED_SORTED);
+  addSortedField(field, values, /* ordCount == 0 ? MISSING_ORD : the ord */);
+  return;
+}
+meta.writeVInt(SORTED_SET_WITH_ADDRESSES);
+addTermsDict(field, values);
+addNumericField(field, ords, false);
+meta.writeVInt(field.number);
+meta.writeByte(NUMERIC);
+meta.writeVInt(DELTA_COMPRESSED);
+meta.writeLong(-1L);
+meta.writeVInt(PackedInts.VERSION_CURRENT);
+meta.writeLong(data.getFilePointer());
+meta.writeVLong(maxDoc);
+meta.writeVInt(BLOCK_SIZE);
+// a MONOTONIC block-packed cumulative sum of docToOrdCount
+```
+
+`isSingleValued` is "no document carries **more than one** ordinal", so a
+set where some documents carry none and the rest exactly one still takes the
+optimized form, with `MISSING_ORD = -1` for the empty ones.
+
+The addresses form's third entry is the one §8.1 flags: **its declared
+format is inert.** The metadata says `DELTA_COMPRESSED` and its count is
+`maxDoc` rather than the stream's own length, but the payload is a
+*monotonic* cumulative sum, and the reader decodes it monotonically without
+consulting the declaration. The `ords` entry before it is an ordinary
+numeric entry whose count is the **number of ordinals**, not the number of
+documents — the two counts in one field's metadata mean different things.
+
 ### 8.2 Norms — `.nvm` and `.nvd`
 
 `codecs/lucene42/Lucene42NormsConsumer.java`. **The `Lucene42` format, not
@@ -1877,6 +2099,7 @@ segment. Neither belongs in an "unread, so anything goes" list.
 | all-equal block | emits the `ALL_VALUES_EQUAL` escape — bits-per-value 0, then one `VInt` | the same | not an alternative; the block writers' `bitsRequired == 0` path is this escape |
 | transducer arcs | the fixed-array form (`ARCS_AS_FIXED_ARRAY`, a `VInt` arc count, a `VInt` bytes-per-arc) for a node with ≥5 arcs at depth ≤3 or ≥10 deeper | linear arcs only | the reader dispatches on the flags byte **per node**; linear is slower to seek and correct everywhere |
 | transducer packing | unpacked, from its own terms writer | unpacked | Lucene's own choice here, not a concession |
+| the `TABLE_COMPRESSED` value table (§8.1.1) | the iteration order of a `HashSet<Long>` | ascending | the reader uses the table as a lookup by ordinal; a writer whose output depends on hash iteration has no vectors |
 
 ### 10.4 The transducer pad, and what omitting it costs
 
