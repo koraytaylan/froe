@@ -1111,6 +1111,12 @@ The two phases together produce an observable asymmetry froe must reproduce:
 **a lone low surrogate stays raw in a string that trips nothing else, and is
 escaped as `\udcXX` in a string that also contains, say, a quote.**
 
+froe reproduces the rule but cannot reach it from a repository: its string
+records are decoded with a lossy UTF-8 decode, so a stored unpaired surrogate
+arrives as `U+FFFD`, which trips nothing. The escaper is still written over
+UTF-16 code units, because that is the rule's definition and because a caller
+constructing a value in memory can reach it.
+
 ### 8.6 The pretty-printed layout
 
 `JsopBuilder.prettyPrint(StringBuilder, JsopTokenizer, String ident)` with
@@ -1142,6 +1148,12 @@ default:
 * object members are separated by `",\n"` plus the current indent;
 * **every other token — the `:` between a key and its value — is followed by a
   single space**, which is the `default` branch.
+* **the output ends at the closing brace: there is no final newline.**
+  `prettyPrint` closes the outermost object with `'\n' + space + '}'` and
+  returns, `IndexDefinitionPrinter.print` hands that to `printWriter.print`,
+  and `PrinterDumper.dump` only flushes the writer. So `index-definitions.json`
+  ends with `}` and nothing after it, and a renderer that appends a newline
+  differs from Oak's on its very last byte.
 
 ## 9. Which paths the printer walks
 

@@ -33,7 +33,11 @@ use super::{
 };
 
 /// One property to encode on a synthetic node.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// `Eq` is deliberately not derived: `Double` holds an `f64`, and a fixture
+/// description is compared for equality nowhere — the trees are compared
+/// through what a reader makes of them, which is the point of the helper.
+#[derive(Clone, PartialEq, Debug)]
 pub enum Property {
     /// A single `BOOLEAN`, which is what `match` is.
     Boolean(bool),
@@ -48,6 +52,8 @@ pub enum Property {
     /// `async-LastIndexedTo` are. Stored as its ISO-8601 string, like every
     /// other non-binary value.
     Date(String),
+    /// A single `DOUBLE`, stored as the text `Double.toString` produces.
+    Double(f64),
     /// A multi-valued `STRING`, which is what `entry` is.
     Texts(Vec<String>),
     /// A multi-valued `NAME`, which is what `propertyNames` is.
@@ -71,6 +77,7 @@ impl Property {
             Property::Text(_) => 1,
             Property::Name(_) => 7,
             Property::Date(_) => 5,
+            Property::Double(_) => 4,
             Property::Texts(_) => -1,
             Property::Names(_) => -7,
             Property::Binary(_) => 2,
@@ -87,6 +94,7 @@ impl Property {
                 vec![value.clone()]
             }
             Property::Texts(values) | Property::Names(values) => values.clone(),
+            Property::Double(value) => vec![froe::content::property::double_to_text(*value)],
             Property::Binary(_) | Property::Binaries(_) => {
                 unreachable!("a binary property's values are bytes, not text")
             }
@@ -115,7 +123,7 @@ impl Property {
 }
 
 /// A node of a synthetic tree: its properties and its children, by name.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Node {
     properties: BTreeMap<String, Property>,
     children: BTreeMap<String, Node>,

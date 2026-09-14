@@ -58,6 +58,7 @@ pub mod status;
 pub mod value_pattern;
 
 pub use definition::{IndexDefinition, IndexType, IndexingMode, ReindexState, index_paths};
+pub use definitions_json::{ChildFilter, RenderOptions, render as render_definitions_json};
 pub use inventory::{IndexInfo, IndexInventory};
 pub use lanes::{AsyncLane, AsyncLanes};
 pub use path_filter::{PathFilter, PathVerdict};
