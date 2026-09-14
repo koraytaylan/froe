@@ -432,6 +432,20 @@ pub(crate) fn write_run_record() {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     let record = format!(
+        "{header}{phases}{closing}",
+        header = run_record_header(seconds_since_epoch, &oak_version, &store_version),
+        phases = run_record_phases(&canonical_index, &lucene_document_count()),
+        closing = RUN_RECORD_CLOSING,
+    );
+    let path = work_root().join("interop-run-record.txt");
+    std::fs::write(&path, &record).expect("write the interop run record");
+    eprintln!("  run record written to {}", path.display());
+    eprint!("{record}");
+}
+
+/// What the run was: when, against which image and build, with which binary.
+fn run_record_header(seconds_since_epoch: u64, oak_version: &str, store_version: &str) -> String {
+    format!(
         "froe Oak interoperability run record\n\
          \n\
          unix timestamp:      {seconds_since_epoch}\n\
@@ -440,8 +454,16 @@ pub(crate) fn write_run_record() {
          store.version:       {store_version}\n\
          froe binary:         {binary}\n\
          \n\
-         Phases passed, in dependency order:\n\
-         \x20 generate    Oak wrote the fixture store\n\
+         Phases passed, in dependency order:\n",
+        image = sling_image(),
+        binary = froe_bin().display(),
+    )
+}
+
+/// One entry per phase, saying what that phase proved.
+fn run_record_phases(canonical_index: &str, lucene_documents: &str) -> String {
+    format!(
+        "\x20 generate    Oak wrote the fixture store\n\
          \x20 read        froe read Oak's store (summary, tree, check, search, export)\n\
          \x20 judge_smoke the Oak-side judge compiled inside the pinned image and\n\
          \x20             each of its verdicts was shown reachable: Oak's own dumper\n\
@@ -469,6 +491,39 @@ pub(crate) fn write_run_record() {
          \x20             rebuild and the stop can leave a :cnt-less mirror node no\n\
          \x20             rebuild produces. Nothing outside /oak:index changed, and\n\
          \x20             froe check passed at the new head\n\
+         \x20 lucene_     froe's `index dump` of every lucene definition was\n\
+         \x20 dump        byte-identical to Oak's own LuceneIndexDumper reading the\n\
+         \x20             same :data — file set and contents both — with\n\
+         \x20             index-details.txt agreeing once each side's Java properties\n\
+         \x20             escaping was undone. Lucene's own CheckIndex called froe's\n\
+         \x20             output a valid index, Oak's own IndexConsistencyChecker was\n\
+         \x20             clean at its FULL level with the CheckIndex pass *reached*\n\
+         \x20             rather than skipped, and Oak's document count over froe's\n\
+         \x20             output equalled the count froe computes from segments_N and\n\
+         \x20             each .si. One flipped byte in a copy made the comparison\n\
+         \x20             name the file and the offset. The store was byte-identical\n\
+         \x20             afterwards\n\
+         \x20 lucene_     Both directions of `froe index import`. Round trip: froe\n\
+         \x20 import      dumped the index, the definition's hidden children were\n\
+         \x20             removed on a copy — the state a lost index leaves — and\n\
+         \x20             froe imported the dump back; every file read back out of\n\
+         \x20             the store byte-identical, and the definition rendered as the\n\
+         \x20             original did apart from what is fresh by design (uniqueKey,\n\
+         \x20             jcr:lastModified, the status uid, dirListing's order as a\n\
+         \x20             set, and jcr:data, whose stored blob carries the fresh\n\
+         \x20             uniqueKey). Out of band: the judge reproduced oak-run's\n\
+         \x20             IndexerSupport sequence from the classes the image ships —\n\
+         \x20             an in-memory copy of the lane checkpoint's state, the lane\n\
+         \x20             switch and reindex flag, Oak's own cycle under the\n\
+         \x20             visible-editor filter, the lanes switched back, Oak's own\n\
+         \x20             dumper and JsonSerializer for the artefact — and froe\n\
+         \x20             imported that, landing reindexCount two above the original\n\
+         \x20             as oak-run's own import leaves it, clearing the corrupt flag\n\
+         \x20             the copy carried, and releasing no checkpoint. A booted Oak\n\
+         \x20             answered a fulltext query through each imported index with\n\
+         \x20             the rows the pristine store answers and EXPLAIN naming\n\
+         \x20             lucene:lucene, logging no reindex and no index failure.\n\
+         \x20             Four refusals each left the store byte-identical\n\
          \x20 commit      Oak served content froe committed\n\
          \x20 checkpoint  froe created a checkpoint, listed by name\n\
          \x20 compact     Oak served the exact baseline tree after full compaction\n\
@@ -492,8 +547,12 @@ pub(crate) fn write_run_record() {
          \x20             compact rebuilt the index, and Oak then served\n\
          \x20             the exact baseline tree from the rebuilt archive\n\
          \x20 backup      Oak served the exact baseline tree after backup and restore\n\
-         \x20 recover     Oak served the exact baseline tree after journal recovery\n\
-         \n\
+         \x20 recover     Oak served the exact baseline tree after journal recovery\n",
+    )
+}
+
+/// What the run does *not* cover, and what the judge is.
+const RUN_RECORD_CLOSING: &str = "\n\
          The judge is Oak itself, compiled and run inside the same pinned image\n\
          from the bundles it ships; it is not a second implementation and not a\n\
          second image.\n\
@@ -502,15 +561,25 @@ pub(crate) fn write_run_record() {
          messages, so Oak consumed the store as froe wrote it rather than\n\
          reconstructing it.\n\
          \n\
+         The froe-side edits made to a copy *before* an operation under test,\n\
+         each through the public writer API and each visible in the digest\n\
+         delta the phase declares: index bookkeeping put back to what Oak\n\
+         started from (property_reindex); a definition's hidden children\n\
+         removed, the state a lost index leaves (lucene_import); `corrupt`\n\
+         forged as a DATE, the type Oak's own async lane writes\n\
+         (lucene_import); `async` removed, which is what makes a definition\n\
+         synchronous (lucene_import). Nothing in the fixture store itself is\n\
+         edited — every phase works on its own copy.\n\
+         \n\
+         The judge's Oak-side oracles on the pinned build: LuceneJudge's\n\
+         `dump` (Oak's own LuceneIndexDumper), `checkindex` (Lucene's own\n\
+         CheckIndex), `numdocs` and `sample-index`; Consistency's level 1 and\n\
+         2 (Oak's own IndexConsistencyChecker, the second running CheckIndex\n\
+         over a local copy); OutOfBandBuild's `build` (Oak's own Lucene\n\
+         editors, dumper and JsonSerializer, driving oak-run's own\n\
+         out-of-band sequence); and IndexJudge's definition and index\n\
+         printers.\n\
+         \n\
          Not covered: native macOS or Windows execution, store.version=1,\n\
          external blob stores, and Adobe AEM itself (this loop is Apache Sling\n\
-         with Oak).\n",
-        image = sling_image(),
-        binary = froe_bin().display(),
-        lucene_documents = lucene_document_count()
-    );
-    let path = work_root().join("interop-run-record.txt");
-    std::fs::write(&path, &record).expect("write the interop run record");
-    eprintln!("  run record written to {}", path.display());
-    eprint!("{record}");
-}
+         with Oak).\n";

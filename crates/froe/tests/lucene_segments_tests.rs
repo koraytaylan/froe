@@ -890,3 +890,30 @@ fn segment_entry_with_deletion_generation(
         },
     }
 }
+
+/// A Lucene definition's **estimated entry count** is its document count.
+///
+/// That is where Oak's own index printer puts the number, and the guide
+/// says the two are the same. `froe index list` reported nothing at all for
+/// a Lucene definition until this was wired, so the field the guide
+/// documents did not exist — which the `index_inventory` interop phase is
+/// what caught, comparing froe's listing against Oak's printer field by
+/// field.
+#[test]
+fn a_lucene_definitions_estimated_entry_count_is_its_document_count() {
+    let directory = StoreDirectory::new("entry-count");
+    let files = one_segment_commit(10, 3, &["_0.si", "segments_1"]);
+    let repository = store_with(&directory, &files);
+
+    let inventory =
+        froe::index::IndexInventory::collect(&repository, &repository.head()).expect("collect");
+    let lucene = inventory
+        .index_at("/oak:index/lucene")
+        .expect("the Lucene index");
+
+    assert_eq!(lucene.document_count, Some(7), "documents minus deletions");
+    assert_eq!(
+        lucene.estimated_entry_count, lucene.document_count,
+        "a Lucene definition's estimated entry count is its document count"
+    );
+}

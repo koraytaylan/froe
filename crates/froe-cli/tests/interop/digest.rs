@@ -19,30 +19,6 @@ pub(crate) fn digest_store_excluding(store: &Path, excluded: &[&str]) -> String 
     froe(&arguments)
 }
 
-/// Digests with content subtrees *and* property prefixes excluded.
-///
-/// The reindex oracle needs `--exclude-property-prefix :count_`: the
-/// approximate counters Oak's mirror strategy keeps are seeded from a
-/// random number, so two rebuilds of the same content disagree on them by
-/// construction. Everything else about the rebuilt index must match to the
-/// byte, and does.
-pub(crate) fn digest_store_excluding_properties(
-    store: &Path,
-    subtrees: &[&str],
-    prefixes: &[&str],
-) -> String {
-    let mut arguments = vec!["digest", store.to_str().unwrap()];
-    for prefix in subtrees {
-        arguments.push("--exclude-subtree");
-        arguments.push(prefix);
-    }
-    for prefix in prefixes {
-        arguments.push("--exclude-property-prefix");
-        arguments.push(prefix);
-    }
-    froe(&arguments)
-}
-
 /// The canonical content rendering of a store.
 ///
 /// This is what makes damage attributable rather than merely detectable.

@@ -485,7 +485,8 @@ pub(crate) fn sling_set_property(port: u16, path: &str, property: &SlingProperty
 /// finishes the rebuild, so both together are the completion signal: the
 /// flag alone would be satisfied by a definition that was never flagged.
 pub(crate) fn sling_wait_until_reindexed(port: u16, index_path: &str, count_before: i64) -> i64 {
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let within = Duration::from_secs(180);
+    let deadline = Instant::now() + within;
     let mut last = String::new();
     while Instant::now() < deadline {
         last = sling_get_json(port, index_path);
@@ -496,7 +497,7 @@ pub(crate) fn sling_wait_until_reindexed(port: u16, index_path: &str, count_befo
         }
         std::thread::sleep(Duration::from_secs(2));
     }
-    panic!("Oak did not finish rebuilding {index_path} within 180s; last rendering:\n{last}");
+    panic!("Oak did not finish rebuilding {index_path} within {within:?}; last rendering:\n{last}");
 }
 
 /// A JSON number field, read without a JSON parser.

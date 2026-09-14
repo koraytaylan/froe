@@ -82,6 +82,11 @@ pub struct DefinitionEdits {
     /// `facets` subtree is its first user, and task 0706's digest comparison
     /// is the regression that says so.
     pub visible_children: ChildEdits,
+    /// Whether to raise `reindex` so Oak rebuilds what this edit removed.
+    ///
+    /// Only a reset does. A rebuild writes the index itself and *clears*
+    /// the flag, which is what tells Oak there is nothing left to do.
+    pub reindex_flag_raised: bool,
     /// The hidden children this rebuild produced, by name. Every *other*
     /// hidden child is dropped unless its node carries a strict `BOOLEAN`
     /// `retainNodeInReindex = true`.
@@ -105,14 +110,28 @@ impl DefinitionEdits {
             property_removals: Vec::new(),
             visible_children: ChildEdits::new(),
             hidden_children,
+            reindex_flag_raised: false,
         }
     }
 
-    /// The edits a reset makes: hidden children removed, nothing else.
+    /// The edits a reset makes: hidden children removed, and `reindex`
+    /// flagged so Oak rebuilds what was removed.
     ///
-    /// A reset is not a reindex — it does not increment `reindexCount` and
-    /// does not clear `reindex`, because Oak's next cycle is what rebuilds
-    /// and what does that bookkeeping.
+    /// A reset is not a reindex — it does not increment `reindexCount`,
+    /// because Oak's own rebuild is what does that bookkeeping. But it
+    /// **must** raise the flag, and the first version of this did not.
+    ///
+    /// Removing the hidden children alone does not make Oak rebuild.
+    /// `IndexUpdate.shouldReindex` has exactly two triggers
+    /// (`index-definitions.md` §5.1): the `reindex` flag, and *a definition
+    /// absent from the before state's `oak:index`* with no hidden child.
+    /// A definition the store already holds is not absent, so the second
+    /// trigger never fires for it — and with the flag left where it was,
+    /// neither does the first. The interop scenario is what showed it:
+    /// after froe's reset Oak logged the lost checkpoint, restarted the
+    /// lane from scratch, and four minutes later the counter was still
+    /// empty and its own node estimate had not moved. The reset had
+    /// destroyed an index nothing was going to rebuild.
     #[must_use]
     pub fn reset() -> Self {
         Self {
@@ -122,6 +141,7 @@ impl DefinitionEdits {
             property_removals: Vec::new(),
             visible_children: ChildEdits::new(),
             hidden_children: Vec::new(),
+            reindex_flag_raised: true,
         }
     }
 }
@@ -187,6 +207,16 @@ fn definition_node_edits<Sink: SegmentSink>(
         // A definition Oak marked corrupt is no longer corrupt once it has
         // been rebuilt.
         node_edits.property_removals.push("corrupt".to_owned());
+    }
+
+    if edits.reindex_flag_raised {
+        // The trigger Oak honours for a definition it already holds.
+        let truth = writer.write_string("true")?;
+        node_edits.property_replacements.push(PropertyToWrite {
+            name: "reindex".to_owned(),
+            property_type: PropertyType::Boolean,
+            values: PropertyValuesToWrite::Single(truth),
+        });
     }
 
     if edits.disabler_verdict == DisablerVerdict::Flag {

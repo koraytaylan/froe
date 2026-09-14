@@ -96,9 +96,14 @@ pub struct IndexInfo {
     /// The estimated node count below the content root, for a counter
     /// definition.
     pub estimated_node_count: Option<NodeCountEstimate>,
-    /// The Lucene document count. Always `None` until froe can read
-    /// `segments_N`; the field exists so the shape does not change when it
-    /// can.
+    /// The Lucene document count: the sum over the index's segments of
+    /// documents minus deletions, as Oak's own count over a directory
+    /// computes it.
+    ///
+    /// Also reported as [`IndexInfo::estimated_entry_count`], which
+    /// is where Oak's own index printer puts it — a Lucene definition's
+    /// "estimated entry count" *is* this number. The typed field stays for
+    /// a caller that wants it without having to know that.
     pub document_count: Option<u64>,
     /// The Lucene files and their lengths.
     pub lucene_files: Vec<(String, u64)>,
@@ -562,6 +567,13 @@ fn read_lucene_facts(
             let structure = crate::index::lucene::check::check_structure(&directory)?;
             if structure.commit_file.is_some() {
                 info.document_count = u64::try_from(structure.live_document_count).ok();
+                // Oak's own index printer reports this as the definition's
+                // *estimated entry count*, because that is what a Lucene
+                // definition's own information provider computes. Reporting
+                // it only under a Lucene-specific name would leave
+                // `froe index list` silent on a field Oak prints, and the
+                // guide already says the two are the same number.
+                info.estimated_entry_count = info.document_count;
             }
         }
     }

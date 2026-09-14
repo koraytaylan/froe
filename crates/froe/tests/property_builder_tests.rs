@@ -149,11 +149,26 @@ fn write_through_the_builder(
     accounting
 }
 
-/// The digest lines of `/index` and everything below it.
+/// The digest lines of `/index` and everything below it, without the
+/// approximate counters.
+///
+/// `docs/analysis/index-property-storage.md` §11: the counter's name, its
+/// presence and its value are each drawn from a random generator, so two
+/// Oak reindexes of one tree disagree on them and no expectation can name
+/// one. Excluding the prefix is what that section says a comparison must
+/// do — and nothing else is excluded, so every other property is still
+/// held to the independent encoder's bytes. Their *shape* is asserted
+/// separately by `the_counters_have_the_shape_oaks_algorithm_produces`.
 fn index_lines(directory: &Path) -> Vec<String> {
     let repository = Repository::open(directory).expect("open the repository");
     let mut rendered = Vec::new();
-    digest_repository_excluding(&repository, &[], &[], &mut rendered).expect("digest");
+    digest_repository_excluding(
+        &repository,
+        &[],
+        &[froe::writer::index::approximate_counter::COUNT_PROPERTY_PREFIX.to_owned()],
+        &mut rendered,
+    )
+    .expect("digest");
     let digest = String::from_utf8(rendered).expect("the digest is UTF-8");
     digest
         .lines()
@@ -376,5 +391,106 @@ fn two_nodes_under_one_unique_key_are_refused_by_name() {
                 if key == "Alpha" && paths == &["/content/a".to_owned(), "/content/b".to_owned()]
         ),
         "the refusal is typed and names both paths: {error}"
+    );
+}
+
+/// The counters a rebuild writes have the shape Oak's algorithm produces.
+///
+/// The byte comparison cannot hold them — their name, presence and value
+/// are each random — so what is pinned here is every invariant the
+/// algorithm guarantees whatever the draws are
+/// (`docs/analysis/index-property-storage.md` §11):
+///
+/// * every value is a **positive multiple of 100**, `COUNT_RESOLUTION`;
+/// * no value reaches `COUNT_MAX`;
+/// * counters appear on the `:index` node and on key nodes, and **never on
+///   a path-element node** — the mirror strategy adjusts exactly two;
+/// * `getCountSync` over them is not `-1`, which is the whole point: an
+///   index Oak cannot price is an index Oak stops choosing.
+///
+/// The last is asserted over a build large enough that the 1-in-100 gate
+/// is overwhelmingly likely to have fired; a rebuild of a handful of
+/// entries legitimately writes none, exactly as a fresh Oak index has none.
+#[test]
+fn the_counters_have_the_shape_oaks_algorithm_produces() {
+    let directory = TestDirectory::new("counter-shape");
+    // Enough entries that both gates fire many times over.
+    let mut entries: Vec<(String, String)> = (0..4000)
+        .map(|serial| {
+            (
+                format!("key-{:04}", serial % 8),
+                format!("/content/node-{serial:04}"),
+            )
+        })
+        .collect();
+    // The builder relies on `(key, path)` order and does not check it, so
+    // the fixture has to establish it exactly as the sort does.
+    entries.sort();
+    let borrowed: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(key, path)| (key.as_str(), path.as_str()))
+        .collect();
+    write_through_the_builder(&directory.path, Strategy::Mirror, &borrowed);
+
+    let repository = Repository::open(&directory.path).expect("open the repository");
+    let mut rendered = Vec::new();
+    digest_repository_excluding(&repository, &[], &[], &mut rendered).expect("digest");
+    let digest = String::from_utf8(rendered).expect("the digest is UTF-8");
+
+    let mut total_on_index = 0i64;
+    let mut counted_nodes = 0usize;
+    for line in digest.lines() {
+        let Some((path, properties)) = line.split_once('\t') else {
+            continue;
+        };
+        let counters: Vec<i64> = properties
+            .split('\t')
+            .filter_map(|field| field.strip_prefix(":count_"))
+            .filter_map(|field| field.split_once('='))
+            .filter_map(|(_, value)| value.strip_prefix("Long:"))
+            .filter_map(|value| value.parse::<i64>().ok())
+            .collect();
+        if counters.is_empty() {
+            continue;
+        }
+        counted_nodes += 1;
+
+        // Two nodes and no more: the `:index` node, and a key node.
+        let depth_below_index = path
+            .strip_prefix("/index")
+            .expect("under /index")
+            .matches('/')
+            .count();
+        assert!(
+            depth_below_index <= 1,
+            "a counter landed on a path-element node at {path}: the mirror strategy \
+             adjusts the :index node and the key node only"
+        );
+
+        for value in &counters {
+            assert!(
+                *value > 0,
+                "{path}: a rebuild only adds, so {value} must be positive"
+            );
+            assert_eq!(
+                value % 100,
+                0,
+                "{path}: {value} is not a multiple of COUNT_RESOLUTION"
+            );
+            assert!(*value < 10_000_000, "{path}: {value} reaches COUNT_MAX");
+        }
+        if depth_below_index == 0 {
+            total_on_index = counters.iter().sum();
+        }
+    }
+
+    assert!(
+        counted_nodes > 0,
+        "4000 entries produced no counter at all, so Oak would price this index at -1 \
+         and stop choosing it"
+    );
+    assert!(
+        total_on_index > 0,
+        "the :index node itself carries no counter, which is the node Oak's cost model reads"
     );
 }

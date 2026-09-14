@@ -158,21 +158,31 @@ fn assert_oak_answers_queries_from_froes_index(froe_store: &Path) {
         .zip(from_oak.results.iter().zip(from_froe.results.iter()))
     {
         assert_eq!(
-            froe_rows, oak_rows,
+            without_instance_scoped_rows(froe_rows),
+            without_instance_scoped_rows(oak_rows),
             "{statement}: Oak answered differently from froe's index than from its own"
         );
     }
-    // Only the plans with no counter-derived number: a mirror-strategy
-    // plan prints an `estimatedCost:` the strategy derives from the
-    // randomized `:count_*` counters froe omits by recorded deviation, and
-    // index selection between competing mirror indexes can differ for the
-    // same reason.
+    // **Which index Oak chose**, and how it reads it — not what it costed
+    // that choice at. A mirror-strategy plan prints an `estimatedCost:`
+    // Oak derives from the `:count_*` approximate counters, and those are
+    // drawn from a random generator on every rebuild, Oak's own included
+    // (`index-property-storage.md` §11). Two Oak reindexes of one tree
+    // print different costs for the same plan, so comparing the number
+    // would be comparing the draws.
+    //
+    // The number is *replaced* rather than the statement dropped, because
+    // the plan is exactly where the counters matter: froe's first reindex
+    // wrote none, Oak could not price the index, and this comparison is
+    // what caught it — over froe's store Oak planned `traverse allNodes`
+    // where over its own it planned `property uuid`.
     for (statement, (oak_plan, froe_plan)) in DETERMINISTIC_PLAN_SAMPLES
         .iter()
         .zip(from_oak.plans.iter().zip(from_froe.plans.iter()))
     {
         assert_eq!(
-            froe_plan, oak_plan,
+            without_estimates(froe_plan),
+            without_estimates(oak_plan),
             "{statement}: Oak chose a different plan over froe's index than over its own"
         );
     }
@@ -265,10 +275,27 @@ fn assert_the_counter_reset_lets_oak_rebuild_from_scratch(work: &Path, oak_rebui
         hidden.is_empty(),
         "the reset left hidden children behind: {hidden:?}"
     );
+    // The reset raises `reindex` and changes nothing else. Raising it is
+    // the whole mechanism: `IndexUpdate.shouldReindex`'s other trigger
+    // needs the definition to be *absent* from the before state, which a
+    // definition the store already holds never is, so without the flag
+    // Oak rebuilds nothing and the reset is an index destroyed. This
+    // assertion used to forbid the flag, and the scenario had never run.
+    let without_the_flag = |line: &str| -> String {
+        line.split('\t')
+            .filter(|field| !field.starts_with("reindex="))
+            .collect::<Vec<_>>()
+            .join("\t")
+    };
+    let visible_after = visible_definition_properties(&store, COUNTER_DEFINITION);
+    assert!(
+        visible_after.contains("reindex=Boolean:true"),
+        "the reset must flag the definition, or Oak rebuilds nothing: {visible_after}"
+    );
     assert_eq!(
-        visible_definition_properties(&store, COUNTER_DEFINITION),
-        visible_before,
-        "the reset changed a visible property, which it must never do"
+        without_the_flag(&visible_after),
+        without_the_flag(&visible_before),
+        "the reset changed a visible property other than the flag, which it must never do"
     );
 
     eprintln!("  booting Sling so Oak's own lane rebuilds the counter");
@@ -281,28 +308,88 @@ fn assert_the_counter_reset_lets_oak_rebuild_from_scratch(work: &Path, oak_rebui
     let sling = PodmanContainer::run_detached("froe-reindex-reset", 8093, &volume.name);
     wait_for_sling(8093, "froe-reindex-reset");
 
-    let path = format!("/oak:index/{COUNTER_DEFINITION}");
-    let after = sling::sling_wait_until_reindexed(8093, &path, count_before - 1);
-    assert_eq!(
-        after,
-        count_before + 1,
-        "Oak's replay should advance reindexCount by exactly one"
+    wait_for_the_lost_checkpoint_notice("froe-reindex-reset");
+
+    // Then wait for Oak to say it is rebuilding *this* definition. That
+    // line is the evidence the reset's flag did its job — without it Oak
+    // rebuilds nothing, which is the defect this scenario exists to catch.
+    //
+    // **Not** the `reindex` flag clearing, and not `reindexCount`. This
+    // scenario removed the lane's checkpoint, so Oak cannot retrieve it
+    // and re-runs its initial index update on every cycle, reindexing the
+    // counter each time without ever settling. The flag is a completion
+    // signal for an ordinary reindex, not for a lane in this state — and
+    // waiting on it is what made an earlier version of this scenario
+    // report an empty counter after 180 seconds.
+    wait_for_the_log_line(
+        "froe-reindex-reset",
+        &format!(
+            "Reindexing will be performed for following indexes: [/oak:index/{COUNTER_DEFINITION}]"
+        ),
     );
-    let logs = container_logs("froe-reindex-reset");
-    assert!(
-        logs.contains("Failed to retrieve previously indexed checkpoint"),
-        "Oak should have logged the lost checkpoint that makes this a from-scratch \
-         rebuild rather than an incremental one"
-    );
+    let _ = count_before;
     drop(sling);
 
     let extracted = work.join("reset-extracted");
     store_from_volume(&volume.name, &extracted);
+
+    // Presence first. `non_canonical_counter_nodes` answers "nothing
+    // wrong" for a counter with no entries at all, so a canonicality
+    // assertion on its own would pass most loudly on the outcome this
+    // scenario exists to rule out.
+    let entries = counter_entry_count(&extracted);
+    assert!(
+        entries > 0,
+        "Oak's rebuild left the counter empty, so froe's reset removed an index nothing \
+         restored"
+    );
     let rebuilt = non_canonical_counter_nodes(&extracted);
     assert!(
         rebuilt.is_empty(),
         "Oak's from-scratch counter is not canonical: {rebuilt:?}"
     );
+    eprintln!("    Oak rebuilt the counter from scratch: {entries} entries, all canonical");
+}
+
+/// Waits for Oak to say the lane's checkpoint is gone.
+///
+/// That line is what makes this a from-scratch rebuild rather than an
+/// incremental catch-up.
+fn wait_for_the_lost_checkpoint_notice(container: &str) {
+    wait_for_the_log_line(
+        container,
+        "Failed to retrieve previously indexed checkpoint",
+    );
+}
+
+/// Waits for one line to appear in a container's log.
+fn wait_for_the_log_line(container: &str, line: &str) {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while Instant::now() < deadline {
+        if container_logs(container).contains(line) {
+            // The line precedes the commit that lands the rebuilt data;
+            // give the cycle a moment to finish writing it.
+            std::thread::sleep(Duration::from_secs(20));
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    panic!("Oak never logged {line:?} in {container}");
+}
+
+/// How many entries the extracted store's counter holds.
+fn counter_entry_count(store: &Path) -> usize {
+    let repository = froe::Repository::open(store).expect("open the extracted store");
+    let path = format!("/oak:index/{COUNTER_DEFINITION}");
+    let Some(node) = repository.node_at_path(&path).expect("resolve the counter") else {
+        return 0;
+    };
+    let definition =
+        froe::index::IndexDefinition::read(&node, &path).expect("model the counter definition");
+    froe::index::counter::CounterIndex::open(node, &definition)
+        .entries()
+        .expect("read the counter's entries")
+        .len()
 }
 
 /// The checkpoint the counter's lane names, if any.
@@ -319,7 +406,7 @@ fn counter_lane_checkpoint(store: &Path) -> Option<String> {
 
 /// The counter definition's visible properties, rendered.
 fn visible_definition_properties(store: &Path, name: &str) -> String {
-    let whole = digest_store_excluding_properties(store, &[], &[RANDOMIZED_PROPERTY_PREFIX]);
+    let whole = phase_digest(store);
     let path = format!("/oak:index/{name}");
     whole
         .lines()
@@ -564,7 +651,7 @@ fn assert_every_definition_renders_identically(
 
 /// One definition's subtree, with the randomized counters excluded.
 fn digest_of_subtree(store: &Path, subtree: &str) -> String {
-    let whole = digest_store_excluding_properties(store, &[], &[RANDOMIZED_PROPERTY_PREFIX]);
+    let whole = phase_digest(store);
     whole
         .lines()
         .filter(|line| {
@@ -636,7 +723,7 @@ fn assert_a_rerun_is_identical(store: &Path, work: &Path, definitions: &[String]
 
 /// Every rebuilt definition's hidden children, rendered.
 fn hidden_children_rendering(store: &Path, definitions: &[String]) -> String {
-    let whole = digest_store_excluding_properties(store, &[], &[RANDOMIZED_PROPERTY_PREFIX]);
+    let whole = phase_digest(store);
     whole
         .lines()
         .filter(|line| {
@@ -657,4 +744,60 @@ fn record_canonical_verdict(attempt: usize) {
         &path,
         format!("canonical on attempt {attempt} of {CANONICAL_ATTEMPTS}\n"),
     );
+}
+
+/// A plan with every counter-derived estimate replaced by a placeholder.
+///
+/// `estimatedCost` and `estimatedEntries` are the two numbers Oak derives
+/// from the randomized approximate counters. Everything else in the plan —
+/// which index, which access pattern, which warnings — is the claim.
+fn without_estimates(plan: &[String]) -> Vec<String> {
+    plan.iter()
+        .map(|line| {
+            let trimmed = line.trim();
+            for name in ["estimatedCost:", "estimatedEntries:"] {
+                if trimmed.starts_with(name) {
+                    return format!("{name} <counter-derived>");
+                }
+            }
+            line.clone()
+        })
+        .collect()
+}
+
+/// The rows a query answers, without the ones a booting Sling writes for
+/// itself.
+///
+/// This phase's whole premise is that both sides index the *same* store —
+/// and they do. The two sets of answers, though, come from two different
+/// Sling sessions: the oracle's from the session that rebuilt, froe's from
+/// a fresh boot on froe's copy. A booting Sling writes discovery, job and
+/// distribution nodes under `/var` keyed by *that instance's* fresh
+/// identifier, as this module's own header says, so the fresh boot answers
+/// with one announcement node the earlier session never had.
+///
+/// Excluding `/var` is therefore excluding the difference between two
+/// boots, not a difference between two indexes. Nothing the fixture owns
+/// lives there.
+fn without_instance_scoped_rows(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter(|path| !path.starts_with("/var/"))
+        .cloned()
+        .collect()
+}
+
+/// This phase's digest: the randomized counters excluded, and the
+/// dangling-lane exit tolerated.
+///
+/// The counter-reset scenario removes the counter's lane checkpoint on
+/// purpose — that is how it reaches `--from-head` — so every digest of
+/// that store afterwards carries the dangling-lane notice and exits 1.
+/// The exit is the command working, and it is the only failure accepted.
+fn phase_digest(store: &Path) -> String {
+    froe_tolerating_dangling_lane_checkpoints(&[
+        "digest",
+        store.to_str().expect("utf-8"),
+        "--exclude-property-prefix",
+        RANDOMIZED_PROPERTY_PREFIX,
+    ])
 }

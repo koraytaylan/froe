@@ -396,6 +396,58 @@ So **a reindex grows the store until the next compaction**. That is the
 honest cost, the plan says so, and the summary names the checkpoints that
 pin them.
 
+### 5.7 The approximate counters, and why froe writes them
+
+A property index carries hidden `:count_*` properties on its `:index` node
+and on each key node. They are Oak's **approximate counter**, and they are
+what Oak's query planner prices the index with: `getCountSync` answers `-1`
+when a node carries none, and an index Oak cannot price loses to a full
+traversal.
+
+froe's rebuild writes them, by running Oak's own algorithm
+(`ApproximateCounter.adjustCountSync`) with froe's own entropy. The *bytes*
+cannot match Oak's — the name is a fresh UUID, the presence is two random
+gates and the value depends on the draws, so two Oak reindexes of one tree
+disagree on them too — but the behaviour does, which is what the planner
+reads.
+
+> **This changed.** froe's first reindex wrote none, on the reasoning that
+> their absence is a state Oak reads without complaint. It is — and then Oak
+> stops choosing the index. The interop suite's query probe caught it: over
+> Oak's own rebuild of the fixture Oak planned
+> `property uuid … estimatedCost: 3102.0`, and over froe's rebuild of the
+> same entries it planned `traverse allNodes (warning: slow)`. An index that
+> is correct and no longer used is the worst outcome a maintenance command
+> can have, because nothing reports it.
+
+A consequence worth knowing when you compare two stores: **any** comparison
+of two rebuilds must exclude `:count_*`, froe's against froe's as much as
+froe's against Oak's. That is what `froe digest --exclude-property-prefix`
+is for.
+
+### 5.8 What `--from-head` does to a counter
+
+For a counter definition whose lane cannot be resolved, `--from-head` is the
+choice to **reset**: froe removes the definition's hidden children, builds
+nothing, and flags it `reindex = true` so Oak's own next cycle rebuilds it
+from scratch. froe does not rebuild a counter itself, because Oak's own
+replay would then double it.
+
+The flag is not optional. `IndexUpdate.shouldReindex` has two triggers: the
+`reindex` flag, and a definition *absent from the before state's*
+`/oak:index` with no hidden child. A definition your store already holds is
+never absent, so without the flag Oak rebuilds nothing — and a reset would
+be an index removed with nothing to restore it.
+
+> **This changed too.** The first version removed the hidden children and
+> left the flag alone. The interop suite's counter-reset scenario is what
+> found it: Oak restarted the lane, logged the lost checkpoint, and left the
+> counter empty.
+
+Oak's rebuild advances `reindexCount` by one and clears the flag. Until it
+finishes, `froe index list` shows the definition flagged with no counter
+data, which is the state it is meant to be in.
+
 ## 6. `froe index dump`
 
 Lucene index data out of the repository and onto the filesystem, in the

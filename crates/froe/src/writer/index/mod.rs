@@ -26,6 +26,8 @@
 use std::path::PathBuf;
 
 pub mod apply;
+/// Oak's approximate counter, as a rebuild writes it.
+pub mod approximate_counter;
 pub mod counter_builder;
 pub mod definition_update;
 pub mod lucene_directory;

@@ -286,9 +286,17 @@ fn the_disabler_flag_is_written_only_under_the_verdict() {
 }
 
 #[test]
-fn a_reset_changes_no_visible_property_at_all() {
-    // A reset is not a reindex: Oak's next cycle is what rebuilds and what
-    // does the bookkeeping, so `reindex` and `reindexCount` are untouched.
+fn a_reset_removes_the_hidden_children_and_flags_the_definition_for_reindex() {
+    // A reset is not a reindex — it builds nothing and does not touch
+    // `reindexCount`, because Oak's own rebuild does that bookkeeping —
+    // but it **must** raise `reindex`, and the first version did not.
+    //
+    // `IndexUpdate.shouldReindex` has two triggers: the flag, and a
+    // definition *absent from the before state's* `oak:index` with no
+    // hidden child. A definition the store already holds is never absent,
+    // so without the flag Oak rebuilds nothing, and a reset is an index
+    // removed with nothing to restore it. The interop counter-reset
+    // scenario is what caught it.
     let directory = TestDirectory::new("reset");
     let original = definition(vec![
         ("reindex", Property::Boolean(false)),
@@ -296,11 +304,31 @@ fn a_reset_changes_no_visible_property_at_all() {
     ])
     .with_child(":index", Node::new().with("junk", Property::Long(1)));
     let (before, after) = rewrite(&directory, original, &DefinitionEdits::reset());
-    assert_eq!(
-        fields(&before, ""),
-        fields(&after, ""),
-        "a reset touches no property of the definition node"
+
+    assert!(
+        fields(&after, "").contains(&"reindex=Boolean:true".to_owned()),
+        "a reset must flag the definition, or nothing rebuilds it: {:?}",
+        fields(&after, "")
     );
+    assert!(
+        fields(&after, "").contains(&"reindexCount=Long:3".to_owned()),
+        "a reset builds nothing, so it does not advance the count: {:?}",
+        fields(&after, "")
+    );
+    // Everything else the definition carried is untouched.
+    let ignoring_the_flag = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|field| !field.starts_with("reindex="))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        ignoring_the_flag(&fields(&before, "")),
+        ignoring_the_flag(&fields(&after, "")),
+        "a reset touches no property but the flag"
+    );
+
     assert!(before.iter().any(|line| line.starts_with("/:index")));
     assert!(
         !after.iter().any(|line| line.starts_with("/:index")),

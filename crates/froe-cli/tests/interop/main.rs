@@ -60,41 +60,46 @@
 //!     its position is free; it runs here because the fixture's Lucene index
 //!     reflects the state Sling left.
 //!
-//!  7. **`commit`** — froe adds nodes with typed properties through the
+//!  7. **`lucene_import`** — froe's import against Oak, both directions: a
+//!     round trip through froe's own dump, and an index Oak's own editors
+//!     built out of band, with a booted Oak answering a fulltext query
+//!     through each result.
+//!
+//!  8. **`commit`** — froe adds nodes with typed properties through the
 //!     library's commit API; Sling reads them back. The core interop claim.
 //!
-//!  8. **`checkpoint`** — froe writes a checkpoint: a metadata-only
+//!  9. **`checkpoint`** — froe writes a checkpoint: a metadata-only
 //!     write-path test the compaction phases' checkpoint handling rests on.
 //!
-//!  9. **`compact`** — froe compacts a copy and Sling boots the result.
+//! 10. **`compact`** — froe compacts a copy and Sling boots the result.
 //!
-//! 10. **`compact_tail`** — the same with `--tail`, which retains the shared
+//! 11. **`compact_tail`** — the same with `--tail`, which retains the shared
 //!     full generation and so reclaims strictly less.
 //!
-//! 11. **`checkpoint_removal`** — remove by name, remove-unreferenced and
+//! 12. **`checkpoint_removal`** — remove by name, remove-unreferenced and
 //!     remove-all; the checkpoint Oak's indexer resumes from survives the
 //!     middle one.
 //!
-//! 12. **`cleanup`** — a multi-generational store with an expired
+//! 13. **`cleanup`** — a multi-generational store with an expired
 //!     checkpoint, a stale archive, a truncated journal and corrupt journal
 //!     lines, all resolved in one run.
 //!
-//! 13. **`journal_retention`** — a plain compact retires every revision but
+//! 14. **`journal_retention`** — a plain compact retires every revision but
 //!     the head it wrote and sweeps the segments behind them.
 //!
-//! 14. **`compact_convergence`** — the run after a full compaction proves
+//! 15. **`compact_convergence`** — the run after a full compaction proves
 //!     the store fully compacted, mutates nothing, and says so.
 //!
-//! 15. **`version_history_purge`** — Oak versions two nodes and deletes one;
+//! 16. **`version_history_purge`** — Oak versions two nodes and deletes one;
 //!     froe purges the orphaned history under a digest with the purge as its
 //!     only exclusion.
 //!
-//! 16. **`repair`** — Oak's JVM is killed with SIGKILL holding an archive
+//! 17. **`repair`** — Oak's JVM is killed with SIGKILL holding an archive
 //!     open; an authorized compact rebuilds the index.
 //!
-//! 17. **`backup`** — froe backup and restore; Sling boots the result.
+//! 18. **`backup`** — froe backup and restore; Sling boots the result.
 //!
-//! 18. **`recover`** — froe recover-journal after deleting `journal.log`.
+//! 19. **`recover`** — froe recover-journal after deleting `journal.log`.
 //!     Last because it is the most destructive.
 //!
 //! All code in the loop is Apache-2.0 (Apache Sling + Apache Jackrabbit

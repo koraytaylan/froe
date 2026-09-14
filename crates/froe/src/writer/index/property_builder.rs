@@ -23,14 +23,12 @@
 //!
 //! # What is deliberately not written
 //!
-//! **No `:count_*` properties.** Every Oak insert adjusts the approximate
-//! counter, so an index Oak rebuilt carries some — but a *fresh* Oak index
-//! has none until the random generator happens to add one, and their absence
-//! is a state Oak reads without complaint: the approximate counter answers
-//! `-1` for a count that is not there. Writing a plausible-looking one would
-//! make froe's output differ from every Oak rebuild in a way no test could
-//! pin. This is invariant 1 of `index-property-storage.md` §13.
+//! Nothing, now. `:count_*` properties **are** written: see
+//! [`approximate_counter`](super::approximate_counter), which explains why
+//! the first version of this builder wrote none and what the interop query
+//! probe found when it did not.
 
+use super::approximate_counter::ApproximateCounter;
 use crate::PropertyType;
 use crate::error::{Error, Result};
 use crate::index::property::unique::ENTRY_PROPERTY_NAME;
@@ -65,6 +63,12 @@ struct OpenLevel {
     children: Vec<(String, RecordIdentifier)>,
     /// Whether an indexed path addresses this node itself.
     matched: bool,
+    /// The approximate counters this node accumulated.
+    ///
+    /// Only the key node — depth 0 — ever gets one: the mirror strategy
+    /// adjusts the counter on the `:index` node and the key node, never on
+    /// a path-element node.
+    counter: ApproximateCounter,
 }
 
 /// Builds a `ContentMirrorStoreStrategy` `:index` subtree from sorted
@@ -79,6 +83,8 @@ pub struct MirrorBuilder<'writer, Sink: SegmentSink> {
     /// The open path below `:index`: the key node, then one level per path
     /// element.
     levels: Vec<OpenLevel>,
+    /// The `:index` node's own approximate counters.
+    counter: ApproximateCounter,
     accounting: BuilderAccounting,
 }
 
@@ -89,6 +95,7 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
             writer,
             root_children: Vec::new(),
             levels: Vec::new(),
+            counter: ApproximateCounter::default(),
             accounting: BuilderAccounting::default(),
         }
     }
@@ -101,6 +108,11 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
     pub fn push(&mut self, key: &str, path: &str) -> Result<()> {
         let elements: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
 
+        // `ContentMirrorStoreStrategy.insert` adjusts the counter on the
+        // `:index` node and then on the key node, before descending. Both
+        // calls happen per insert, whatever the descent does.
+        self.counter.record_one_insert();
+
         // Level 0 is always the key node; a different key closes everything.
         if self.levels.first().map(|level| level.name.as_str()) != Some(key) {
             self.close_to_depth(0)?;
@@ -108,6 +120,7 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
                 name: key.to_owned(),
                 children: Vec::new(),
                 matched: false,
+                counter: ApproximateCounter::default(),
             });
         }
 
@@ -118,6 +131,7 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
                 name: (*element).to_owned(),
                 children: Vec::new(),
                 matched: false,
+                counter: ApproximateCounter::default(),
             });
         }
 
@@ -128,6 +142,9 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
         // and therefore addresses the key node itself.
         if let Some(addressed) = self.levels.last_mut() {
             addressed.matched = true;
+        }
+        if let Some(key_level) = self.levels.first_mut() {
+            key_level.counter.record_one_insert();
         }
         Ok(())
     }
@@ -142,9 +159,10 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
     pub fn finish(mut self) -> Result<(RecordIdentifier, BuilderAccounting)> {
         self.close_to_depth(0)?;
         let children = std::mem::take(&mut self.root_children);
+        let properties = self.counter.properties(self.writer)?;
         let record = self
             .writer
-            .write_node(None, &[], &child_nodes(&children), &[])?;
+            .write_node(None, &[], &child_nodes(&children), &properties)?;
         self.accounting.nodes_written += 1;
         Ok((record, self.accounting))
     }
@@ -188,7 +206,7 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
     }
 
     fn write_level(&mut self, level: &OpenLevel) -> Result<RecordIdentifier> {
-        let properties = if level.matched {
+        let mut properties = if level.matched {
             let value = self.writer.write_string("true")?;
             vec![PropertyToWrite {
                 name: MATCH_PROPERTY_NAME.to_owned(),
@@ -198,6 +216,7 @@ impl<'writer, Sink: SegmentSink> MirrorBuilder<'writer, Sink> {
         } else {
             Vec::new()
         };
+        properties.extend(level.counter.properties(self.writer)?);
         let record = self
             .writer
             // No primary type: Oak's own strategies set none.
@@ -227,6 +246,12 @@ pub struct UniqueBuilder<'writer, Sink: SegmentSink> {
     writer: &'writer mut RecordWriter<Sink>,
     children: Vec<(String, RecordIdentifier)>,
     open: Option<(String, Vec<String>)>,
+    /// The `:index` node's approximate counters.
+    ///
+    /// The `:index` node alone: `UniqueEntryStoreStrategy.insert` calls the
+    /// counter *before* `index.child(key)` and never again, so the key node
+    /// carries none.
+    counter: ApproximateCounter,
     accounting: BuilderAccounting,
 }
 
@@ -237,6 +262,7 @@ impl<'writer, Sink: SegmentSink> UniqueBuilder<'writer, Sink> {
             writer,
             children: Vec::new(),
             open: None,
+            counter: ApproximateCounter::default(),
             accounting: BuilderAccounting::default(),
         }
     }
@@ -244,6 +270,7 @@ impl<'writer, Sink: SegmentSink> UniqueBuilder<'writer, Sink> {
     /// Adds the entry for `path` under `key`, refusing a second distinct
     /// path.
     pub fn push(&mut self, key: &str, path: &str) -> Result<()> {
+        self.counter.record_one_insert();
         match &mut self.open {
             Some((open_key, paths)) if open_key == key => {
                 if paths.iter().all(|existing| existing != path) {
@@ -275,9 +302,10 @@ impl<'writer, Sink: SegmentSink> UniqueBuilder<'writer, Sink> {
     /// Finishes the subtree and returns the `:index` node's record.
     pub fn finish(mut self) -> Result<(RecordIdentifier, BuilderAccounting)> {
         self.close_open()?;
-        let record = self
-            .writer
-            .write_node(None, &[], &child_nodes(&self.children), &[])?;
+        let properties = self.counter.properties(self.writer)?;
+        let record =
+            self.writer
+                .write_node(None, &[], &child_nodes(&self.children), &properties)?;
         self.accounting.nodes_written += 1;
         Ok((record, self.accounting))
     }

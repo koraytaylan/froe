@@ -162,7 +162,18 @@ pub(crate) fn content_digest(store: &std::path::Path) -> String {
 pub(crate) fn digest_lines(store: &std::path::Path, path: &str) -> Vec<String> {
     let repository = Repository::open(store).expect("open the repository");
     let mut rendered = Vec::new();
-    digest_repository_excluding(&repository, &[], &[], &mut rendered).expect("digest");
+    // Without the approximate counters. `index-property-storage.md` §11:
+    // their name, presence and value are each drawn from a random
+    // generator, so *any* two rebuilds of one tree disagree on them —
+    // froe's two as much as Oak's two. A comparison of two runs that kept
+    // them would be comparing the random draws.
+    digest_repository_excluding(
+        &repository,
+        &[],
+        &[froe::writer::index::approximate_counter::COUNT_PROPERTY_PREFIX.to_owned()],
+        &mut rendered,
+    )
+    .expect("digest");
     let digest = String::from_utf8(rendered).expect("UTF-8");
     digest
         .lines()

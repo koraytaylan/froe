@@ -216,6 +216,38 @@ pub(crate) fn froe(args: &[&str]) -> String {
     stdout
 }
 
+/// The notice `froe digest` exits non-zero on when a lane's checkpoint is
+/// gone.
+const DANGLING_LANE_NOTICE: &str = "asynchronous index lanes reference checkpoints that no \
+     longer exist";
+
+/// Run froe, tolerating exactly one failure: the dangling-lane notice.
+///
+/// A scenario that *removes* a lane's checkpoint on purpose — which is how
+/// the counter-reset case reaches `--from-head` — then has a store every
+/// later `froe digest` reports on and exits 1 for. That exit is the
+/// command working, so this accepts it, and only it: any other non-zero
+/// status still fails, and a zero status with the notice absent is
+/// ordinary success.
+pub(crate) fn froe_tolerating_dangling_lane_checkpoints(args: &[&str]) -> String {
+    let output = Command::new(froe_bin())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to spawn froe {args:?}: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success() || stderr.contains(DANGLING_LANE_NOTICE),
+        "froe {args:?} exited with {status} for a reason other than a dangling lane \
+         checkpoint\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status = output.status
+    );
+    stdout
+}
+
 /// Run froe expecting it to refuse; assert failure and return stderr.
 ///
 /// A refusal is part of the contract for a destructive tool — that a run

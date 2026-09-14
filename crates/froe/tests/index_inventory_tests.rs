@@ -293,7 +293,11 @@ fn a_lucene_definitions_size_and_files_come_from_its_data_directory() {
     assert_eq!(lucene.lucene_files, [("_0.si".to_owned(), 225)]);
     assert_eq!(
         lucene.document_count, None,
-        "no document count until segments_N can be read"
+        "this fixture's :data holds a lone .si and no commit file, so there is no count"
+    );
+    assert_eq!(
+        lucene.estimated_entry_count, None,
+        "and no count means no estimated entry count either"
     );
     assert!(lucene.suggest_size_in_bytes.is_none());
 }
