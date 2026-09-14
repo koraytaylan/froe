@@ -10,8 +10,8 @@ touches:
   - crates/froe-cli/tests/interop/phase_recovery.rs
   - crates/froe-cli/tests/interop/main.rs
   - scripts/interop-fixture.sh
-status: planned
-merged_as: ""
+status: done
+merged_as: "8f5faf3d7c90e425dc1b746ab937c43ef4b7a0fc"
 ---
 # Wire The Property Reindex Phase Into The Suite
 
