@@ -118,6 +118,15 @@ pub enum SelectionRefusal {
         /// Why the filter could not be constructed.
         reason: String,
     },
+    /// A counter that is also maintained synchronously. Its lane's replay
+    /// adds to what is there, so a counter rebuilt from the head and then
+    /// replayed would be doubled.
+    HybridCounter {
+        /// The definition.
+        path: String,
+        /// The lane it also names.
+        lane: String,
+    },
     /// A definition carrying a composite-store mount's index data. A
     /// rebuild replaces the hidden children it produces, so rebuilding one
     /// of these would remove another mount's index — data froe did not
@@ -178,6 +187,7 @@ impl SelectionRefusal {
             | Self::Unmodellable { path, .. }
             | Self::ValuePatternNotSupported { path }
             | Self::MountFragmentPresent { path, .. }
+            | Self::HybridCounter { path, .. }
             | Self::PathFilterUnconstructable { path, .. }
             | Self::NestedDefinition { path }
             | Self::NotADefinition { path }
@@ -215,6 +225,12 @@ impl std::fmt::Display for SelectionRefusal {
                 formatter,
                 "{path} has a path filter Oak cannot construct ({reason}), so Oak's own \
                  cycle skips it and leaves its reindex flag set"
+            ),
+            Self::HybridCounter { path, lane } => write!(
+                formatter,
+                "{path} is a counter maintained both synchronously and on lane {lane}; \
+                 rebuilding it from either state and letting the other replay would \
+                 double every count"
             ),
             Self::MountFragmentPresent { path, child_name } => write!(
                 formatter,
@@ -527,6 +543,30 @@ fn resolve_state(
             Some(head_root.record_identifier()),
         )));
     };
+
+    // A *hybrid* definition lists `sync` beside its lane name, and Oak's
+    // synchronous cycle then maintains it on every commit as well as the
+    // lane doing so. Such an index is as current as the head, not as its
+    // lane — so rebuilding it from the lane's checkpoint would drop every
+    // entry committed since, which is a silently incomplete index. The
+    // lane's own later replay re-inserts what it already holds, leaving
+    // `match` and `entry` unchanged.
+    //
+    // A counter is the exception: its replay *adds*, so a counter rebuilt
+    // from the head and then replayed by its lane would be doubled. froe
+    // refuses rather than produce a number nobody can trust.
+    if definition.indexing_mode.synchronous_synonym {
+        if definition.index_type.as_ref() == Some(&IndexType::Counter) {
+            return Ok(Err(SelectionRefusal::HybridCounter {
+                path: definition.path.clone(),
+                lane: lane_name.to_owned(),
+            }));
+        }
+        return Ok(Ok((
+            IndexingState::Head,
+            Some(head_root.record_identifier()),
+        )));
+    }
 
     let lane = lanes.lane(lane_name);
     let checkpoint = lane.and_then(|lane| lane.checkpoint.as_deref());

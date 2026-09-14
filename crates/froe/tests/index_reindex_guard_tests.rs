@@ -886,3 +886,72 @@ fn a_replaced_lock_file_is_refused_before_the_store_is_opened() {
         "the refusal names the lock: {error}"
     );
 }
+
+#[test]
+fn a_hybrid_definition_is_indexed_from_the_head_not_its_lane_checkpoint() {
+    // `async = ["async", "sync"]` is Oak's hybrid shape: the lane maintains
+    // the index *and* the synchronous cycle does, on every commit. Such an
+    // index is therefore as current as the head, not as its lane — so
+    // rebuilding it from the lane's checkpoint would drop every entry
+    // committed since, which is a silently incomplete index rather than a
+    // missing one.
+    let directory = TestDirectory::new("guard-hybrid");
+    let store = directory.store();
+
+    let titled = |title: &str| {
+        Node::new()
+            .with(
+                "jcr:primaryType",
+                Property::Name("nt:unstructured".to_owned()),
+            )
+            .with("jcr:title", Property::Text(title.to_owned()))
+    };
+    let definitions = Node::new()
+        .with_child("nodetype", nodetype_definition())
+        .with_child(
+            "subject",
+            flagged(
+                "property",
+                vec![
+                    (
+                        "propertyNames",
+                        Property::Names(vec!["jcr:title".to_owned()]),
+                    ),
+                    (
+                        "async",
+                        Property::Texts(vec!["async".to_owned(), "sync".to_owned()]),
+                    ),
+                ],
+            ),
+        );
+    let head = Node::new()
+        .with_child(
+            "content",
+            Node::new()
+                .with_child("early", titled("Early"))
+                .with_child("late", titled("Late")),
+        )
+        .with_child(":async", async_lanes("async", Some("lane-checkpoint")))
+        .with_child("oak:index", definitions.clone());
+    let pinned = Node::new()
+        .with_child("content", Node::new().with_child("early", titled("Early")))
+        .with_child("oak:index", definitions);
+
+    support::property_index_layout::write_repository_with_checkpoints(
+        &store,
+        &head,
+        &[("lane-checkpoint", pinned)],
+    );
+
+    reindex(&store, options(&directory)).expect("reindex the hybrid definition");
+    let index = digest_lines(&store, "/oak:index/subject/:index");
+    assert!(
+        index.iter().any(|line| line.starts_with("/Early")),
+        "{index:?}"
+    );
+    assert!(
+        index.iter().any(|line| line.starts_with("/Late")),
+        "a hybrid index is maintained synchronously too, so the head's own content \
+         must be indexed: {index:?}"
+    );
+}
