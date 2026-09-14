@@ -411,7 +411,7 @@ mod tests {
             ("1970-01-01T01:00:00.000+01:00", 0),
             ("1969-12-31T23:00:00.000-01:00", 0),
             ("2012-03-01T12:30:45.678+01:00", 1_330_601_445),
-            ("2026-08-19T07:02:27Z", 1_787_122_947),
+            ("2026-08-19T07:02:27.000Z", 1_787_122_947),
             // A pre-epoch instant with a fraction floors toward the past,
             // which truncating division would get wrong by a second.
             ("1969-12-31T23:59:59.999Z", -1),
@@ -431,8 +431,12 @@ mod tests {
             "",
             "2012-03-01",
             "2012-03-01T12:30:45",
-            "2012-13-01T12:30:45Z",
-            "2012-03-01T12:30:45+0100",
+            "2012-13-01T12:30:45.000Z",
+            "2012-03-01T12:30:45.678+0100",
+            // Jackrabbit's own parser wants the milliseconds, and a date
+            // it refuses is one Oak would refuse too: the planner then
+            // keeps the history rather than aging it out.
+            "2026-08-19T07:02:27Z",
             "not a date at all",
         ] {
             assert_eq!(parse_iso8601_epoch_seconds(text), None, "for {text}");

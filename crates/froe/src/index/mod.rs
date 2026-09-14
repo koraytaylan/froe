@@ -143,6 +143,14 @@ pub enum IndexError {
         /// The stored pattern text, for the operator to read.
         pattern: String,
     },
+    /// A `DATE` value that Jackrabbit's own `ISO8601` refuses.
+    /// `FieldFactory.dateToLong` throws an unchecked exception there and
+    /// Oak's fulltext editor does not catch it, so the indexing commit
+    /// fails rather than the document being skipped.
+    UnparseableDate {
+        /// The value, as it is stored.
+        value: String,
+    },
     /// `/oak:index/nodetype` is absent, or its `type` does not read strictly
     /// as the `STRING` `property`. Oak's index path service refuses the whole
     /// enumeration here, before it chooses a branch.
@@ -214,6 +222,11 @@ impl fmt::Display for IndexError {
                 formatter,
                 "the index definition at {definition_path} restricts values with the regular \
                  expression {pattern:?}, which froe does not evaluate"
+            ),
+            IndexError::UnparseableDate { value } => write!(
+                formatter,
+                "the date {value:?} is not one Jackrabbit's own ISO8601 parses, so Oak's \
+                 indexing commit fails on it rather than skipping the document"
             ),
             IndexError::NodeTypeIndexUnusable { found } => write!(
                 formatter,
