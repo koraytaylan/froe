@@ -68,6 +68,9 @@ pub enum WorkUnit {
     Files,
     /// Bytes of content.
     Bytes,
+    /// Index entries: one `(key, path)` pair of a rebuilt property,
+    /// unique or reference index.
+    IndexEntries,
 }
 
 impl WorkUnit {
@@ -85,6 +88,7 @@ impl WorkUnit {
             Self::Checkpoints => "checkpoints",
             Self::Files => "files",
             Self::Bytes => "bytes",
+            Self::IndexEntries => "index entries",
         }
     }
 
@@ -100,6 +104,7 @@ impl WorkUnit {
             Self::Checkpoints => "checkpoint",
             Self::Files => "file",
             Self::Bytes => "byte",
+            Self::IndexEntries => "index entry",
         }
     }
 

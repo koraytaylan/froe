@@ -99,6 +99,21 @@ impl RunLocation {
         }
     }
 
+    /// The directory the runs go in.
+    ///
+    /// For a caller that derives a sibling location — the reference
+    /// collector puts its two sets under one directory and two prefixes.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// The prefix the run files are named under.
+    #[must_use]
+    pub fn name_prefix(&self) -> &str {
+        &self.name_prefix
+    }
+
     fn run_path(&self, number: usize) -> PathBuf {
         self.directory
             .join(format!("{}-{number:06}.run", self.name_prefix))
@@ -170,17 +185,6 @@ impl SortBudget {
 /// know how the sorting was done. Plan 0009's Lucene writer is in this crate
 /// and reaches it as a sibling.
 ///
-/// The dead-code expectation is scoped to the non-test build because the
-/// module's own tests construct it today; task 0704's collector is its first
-/// production caller, and the expectation becomes unfulfilled — and so an
-/// error — the moment that lands.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "task 0704's property collector is the first production caller"
-    )
-)]
 pub(crate) struct SortedRuns<Record: SpillRecord> {
     location: RunLocation,
     budget: SortBudget,
@@ -190,13 +194,6 @@ pub(crate) struct SortedRuns<Record: SpillRecord> {
     next_run_number: usize,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "task 0704's property collector is the first production caller"
-    )
-)]
 impl<Record: SpillRecord> SortedRuns<Record> {
     /// An empty sort writing its runs at `location`, charged against
     /// `budget`.
@@ -224,7 +221,14 @@ impl<Record: SpillRecord> SortedRuns<Record> {
     }
 
     /// How many runs have been spilled so far. For a caller that reports it.
+    ///
+    /// Read by this module's own tests today; task 0707's plan reports it in
+    /// the work-directory estimate.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "task 0707's plan is the first production caller")
+    )]
     pub(crate) fn spilled_run_count(&self) -> usize {
         self.spilled.len()
     }
@@ -260,7 +264,15 @@ impl<Record: SpillRecord> SortedRuns<Record> {
     /// Plan 0009's doc-value and norms writers make a statistics pass, a
     /// missing-bitset pass and a write pass over the same input, so the runs
     /// are kept until the [`SortedPasses`] is dropped rather than unlinked as
-    /// each cursor is exhausted.
+    /// each cursor is exhausted — which is also why nothing in this plan
+    /// calls it yet.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "plan 0009's doc-value and norms writers are the first callers"
+        )
+    )]
     pub(crate) fn into_sorted_passes(mut self) -> Result<SortedPasses<Record>> {
         self.spill()?;
         let spilled = std::mem::take(&mut self.spilled);

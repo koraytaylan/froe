@@ -54,6 +54,15 @@ pub enum Property {
     Date(String),
     /// A single `DOUBLE`, stored as the text `Double.toString` produces.
     Double(f64),
+    /// A single `REFERENCE`, the one type the reference index's strong set
+    /// indexes. Stored as its identifier string, like every other non-binary
+    /// value — the *type tag* is what distinguishes it.
+    Reference(String),
+    /// A single `WEAKREFERENCE`, which the reference index's weak set
+    /// indexes and which the version-store exclusion never applies to.
+    WeakReference(String),
+    /// A multi-valued `REFERENCE`.
+    References(Vec<String>),
     /// A multi-valued `STRING`, which is what `entry` is.
     Texts(Vec<String>),
     /// A multi-valued `NAME`, which is what `propertyNames` is.
@@ -78,6 +87,9 @@ impl Property {
             Property::Name(_) => 7,
             Property::Date(_) => 5,
             Property::Double(_) => 4,
+            Property::Reference(_) => 9,
+            Property::WeakReference(_) => 10,
+            Property::References(_) => -9,
             Property::Texts(_) => -1,
             Property::Names(_) => -7,
             Property::Binary(_) => 2,
@@ -93,7 +105,10 @@ impl Property {
             Property::Text(value) | Property::Name(value) | Property::Date(value) => {
                 vec![value.clone()]
             }
-            Property::Texts(values) | Property::Names(values) => values.clone(),
+            Property::Texts(values) | Property::Names(values) | Property::References(values) => {
+                values.clone()
+            }
+            Property::Reference(value) | Property::WeakReference(value) => vec![value.clone()],
             Property::Double(value) => vec![froe::content::property::double_to_text(*value)],
             Property::Binary(_) | Property::Binaries(_) => {
                 unreachable!("a binary property's values are bytes, not text")
@@ -117,7 +132,10 @@ impl Property {
     fn is_multiple(&self) -> bool {
         matches!(
             self,
-            Property::Texts(_) | Property::Names(_) | Property::Binaries(_)
+            Property::Texts(_)
+                | Property::Names(_)
+                | Property::Binaries(_)
+                | Property::References(_)
         )
     }
 }
