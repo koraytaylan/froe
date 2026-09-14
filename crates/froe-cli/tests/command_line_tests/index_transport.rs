@@ -65,34 +65,20 @@ fn write_data_directory<Sink: SegmentSink>(
         .expect("write :data")
 }
 
-/// `/:async` and `/checkpoints`, so the lane's checkpoint resolves.
-fn write_lane_state<Sink: SegmentSink>(
-    writer: &mut RecordWriter<Sink>,
-) -> (froe::RecordIdentifier, froe::RecordIdentifier) {
+/// `/:async` for the content root, and the `checkpoints` node for the
+/// **super-root** — which is where Oak keeps them, and where
+/// `Repository::checkpoints` reads them. A `checkpoints` child of `/` is an
+/// ordinary content node and resolves nothing.
+fn write_lane_state<Sink: SegmentSink>(writer: &mut RecordWriter<Sink>) -> froe::RecordIdentifier {
     let lane_properties = [single(
         writer,
         "async",
         PropertyType::String,
         "checkpoint-1",
     )];
-    let async_node = writer
+    writer
         .write_node(None, &[], &ChildNodesToWrite::Zero, &lane_properties)
-        .expect("write /:async");
-    let checkpoint = writer
-        .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
-        .expect("write the checkpoint");
-    let checkpoints = writer
-        .write_node(
-            None,
-            &[],
-            &ChildNodesToWrite::One {
-                name: "checkpoint-1".to_owned(),
-                node: checkpoint,
-            },
-            &[],
-        )
-        .expect("write /checkpoints");
-    (async_node, checkpoints)
+        .expect("write /:async")
 }
 
 /// A store with one asynchronous `lucene` definition whose `:data` holds two
@@ -136,20 +122,22 @@ fn build_store(directory: &Path) {
         )
         .expect("write /oak:index");
 
-    let (async_node, checkpoints) = write_lane_state(&mut writer);
+    let async_node = write_lane_state(&mut writer);
     let root = writer
         .write_node(
             None,
             &[],
             &ChildNodesToWrite::Many(vec![
                 (":async".to_owned(), async_node),
-                ("checkpoints".to_owned(), checkpoints),
                 ("oak:index".to_owned(), oak_index),
             ]),
             &[],
         )
         .expect("write the root");
-    let head = writer
+
+    // The checkpoint pins the content root by record identity, which is
+    // what a real checkpoint does and what the state rule compares.
+    let checkpoint_node = writer
         .write_node(
             None,
             &[],
@@ -157,6 +145,28 @@ fn build_store(directory: &Path) {
                 name: "root".to_owned(),
                 node: root,
             },
+            &[],
+        )
+        .expect("write the checkpoint");
+    let checkpoints = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "checkpoint-1".to_owned(),
+                node: checkpoint_node,
+            },
+            &[],
+        )
+        .expect("write the checkpoints node");
+    let head = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(vec![
+                ("checkpoints".to_owned(), checkpoints),
+                ("root".to_owned(), root),
+            ]),
             &[],
         )
         .expect("write the super root");

@@ -1,0 +1,557 @@
+//! `froe index import`, end to end over synthetic stores.
+//!
+//! The central test is a **round trip**: dump a store's index, reset its
+//! bookkeeping, import it back, and require the `:data` subtree to match
+//! what was there — apart from the four things that are new by design
+//! (`uniqueKey`, `jcr:lastModified`, the status `uid`, and `dirListing`'s
+//! order, compared as a set).
+//!
+//! That is the strongest claim these tests can make without Oak. The
+//! comparison against Oak's own dumper and importer is task 0808's and
+//! 0809's.
+
+#![allow(
+    dead_code,
+    reason = "the shared support module is larger than any one test binary uses"
+)]
+
+mod support;
+
+use std::path::{Path, PathBuf};
+
+use froe::index::lucene::dump::{DumpOptions, dump_lucene_indexes};
+use froe::store::Repository;
+use froe::writer::index::lucene_import::{
+    LuceneImportOptions, PreparedLuceneImport, lucene_import, plan_lucene_import,
+};
+use support::filesystem_snapshot::directory_snapshot;
+use support::property_index_layout::{Node, Property, write_repository_with_tree};
+
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "froe-lucene-import-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create the test directory");
+        Self { path }
+    }
+
+    fn store(&self) -> PathBuf {
+        let store = self.path.join("store");
+        std::fs::create_dir_all(&store).expect("create the store directory");
+        store
+    }
+
+    fn dump(&self) -> PathBuf {
+        self.path.join("dump")
+    }
+
+    fn input(&self) -> PathBuf {
+        self.dump().join("index-dumps")
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The committed sample index's files.
+fn sample_files() -> Vec<(String, Vec<u8>)> {
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lucene-4-7-sample-index");
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&directory)
+        .expect("read the sample index")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("read"),
+            )
+        })
+        .filter(|(name, _)| name != "README.md")
+        .collect();
+    files.sort();
+    files
+}
+
+/// A `:data` child holding `files`.
+fn data_directory(files: &[(String, Vec<u8>)]) -> Node {
+    let mut data = Node::new().with(
+        "dirListing",
+        Property::Texts(files.iter().map(|(name, _)| name.clone()).collect()),
+    );
+    for (name, bytes) in files {
+        data = data.with_child(
+            name,
+            Node::new()
+                .with("blobSize", Property::Long(1_047_552))
+                .with("jcr:data", Property::Binary(bytes.clone())),
+        );
+    }
+    data
+}
+
+/// How the definition under test is shaped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    /// The lane, or `None` for a synchronous definition.
+    lane: Option<&'static str>,
+    /// Whether the lane's checkpoint resolves.
+    checkpoint: bool,
+    /// Whether the definition also lists `sync`, making it hybrid.
+    hybrid: bool,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Self {
+            lane: Some("async"),
+            checkpoint: true,
+            hybrid: false,
+        }
+    }
+}
+
+/// A store with one Lucene definition holding the sample index.
+fn build_store(directory: &TestDirectory, shape: Shape) -> PathBuf {
+    let store = directory.store();
+    let mut definition = Node::new()
+        .with(
+            "jcr:primaryType",
+            Property::Name("oak:QueryIndexDefinition".to_owned()),
+        )
+        .with("type", Property::Text("lucene".to_owned()))
+        .with_child(":data", data_directory(&sample_files()));
+    if let Some(lane) = shape.lane {
+        definition = definition.with(
+            "async",
+            if shape.hybrid {
+                Property::Texts(vec![lane.to_owned(), "sync".to_owned()])
+            } else {
+                Property::Text(lane.to_owned())
+            },
+        );
+    }
+
+    let content = Node::new().with_child(
+        "page",
+        Node::new().with("jcr:title", Property::Text("Alpha".to_owned())),
+    );
+    let mut root = Node::new()
+        .with_child("content", content.clone())
+        .with_child("oak:index", Node::new().with_child("lucene", definition));
+    if let Some(lane) = shape.lane {
+        root = root.with_child(
+            ":async",
+            Node::new().with(lane, Property::Text("checkpoint-1".to_owned())),
+        );
+    }
+
+    if shape.checkpoint {
+        // The checkpoint's root must be *the content root itself*, because
+        // the state rule compares record identity and a checkpoint shares
+        // the content root's record by construction.
+        support::property_index_layout::write_repository_with_checkpoints(
+            &store,
+            &root,
+            &[("checkpoint-1", root.clone())],
+        );
+    } else {
+        write_repository_with_tree(&store, &root);
+    }
+    store
+}
+
+/// Dumps `store` into the test directory, returning the input path.
+fn dump(directory: &TestDirectory, store: &Path) -> PathBuf {
+    dump_lucene_indexes(
+        &Repository::open(store).expect("open"),
+        &DumpOptions::new(Vec::new(), directory.dump()),
+    )
+    .expect("dump");
+    directory.input()
+}
+
+/// The digest lines under `path`.
+fn digest_lines(store: &Path, path: &str) -> Vec<String> {
+    let repository = Repository::open(store).expect("open");
+    let mut rendered = Vec::new();
+    froe::tooling::digest::digest_repository_excluding(&repository, &[], &[], &mut rendered)
+        .expect("digest");
+    String::from_utf8(rendered)
+        .expect("UTF-8")
+        .lines()
+        .filter(|line| {
+            line.strip_prefix(path).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with('/') || rest.starts_with('\t')
+            })
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `:data` file bytes, read back through the reader.
+fn stored_files(store: &Path) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read as _;
+    let repository = Repository::open(store).expect("open");
+    let node = repository
+        .node_at_path("/oak:index/lucene")
+        .expect("resolve")
+        .expect("exists");
+    let definition = froe::index::IndexDefinition::read(&node, "/oak:index/lucene").expect("model");
+    let directory =
+        froe::index::lucene::OakDirectory::open(&repository, &node, &definition, ":data")
+            .expect("open :data")
+            .expect(":data exists");
+    let mut files = Vec::new();
+    for name in directory.file_names() {
+        let file = directory.file(name).expect("open");
+        let mut bytes = Vec::new();
+        file.reader().read_to_end(&mut bytes).expect("read");
+        files.push((name.clone(), bytes));
+    }
+    files.sort();
+    files
+}
+
+#[test]
+fn a_round_trip_reproduces_the_index_data() {
+    // Dump, then import back over the same store. What comes out must be
+    // what went in.
+    let directory = TestDirectory::new("round-trip");
+    let store = build_store(&directory, Shape::default());
+    let before = stored_files(&store);
+    let input = dump(&directory, &store);
+
+    let outcome = lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+    assert!(outcome.moved_the_head());
+    assert_eq!(outcome.indexes.len(), 1);
+    assert_eq!(stored_files(&store), before, "byte for byte");
+}
+
+#[test]
+fn the_content_tree_is_untouched_and_the_store_still_checks() {
+    let directory = TestDirectory::new("content-untouched");
+    let store = build_store(&directory, Shape::default());
+    let content_before = digest_lines(&store, "/content");
+    let input = dump(&directory, &store);
+
+    lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    assert_eq!(
+        digest_lines(&store, "/content"),
+        content_before,
+        "an import must not change content"
+    );
+    let report = froe::tooling::check_consistency(
+        &store,
+        &["/".to_owned()],
+        froe::tooling::BinaryCheck::EveryBlock,
+        1,
+    )
+    .expect("check");
+    assert!(report.has_good_revision(), "{report:?}");
+}
+
+#[test]
+fn the_reopened_index_passes_the_structural_check() {
+    // The container claim, after publication: the imported directory is a
+    // coherent set of Lucene files.
+    let directory = TestDirectory::new("structural");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+    lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    let repository = Repository::open(&store).expect("open");
+    let node = repository
+        .node_at_path("/oak:index/lucene")
+        .expect("resolve")
+        .expect("exists");
+    let definition = froe::index::IndexDefinition::read(&node, "/oak:index/lucene").expect("model");
+    let oak_directory =
+        froe::index::lucene::OakDirectory::open(&repository, &node, &definition, ":data")
+            .expect("open")
+            .expect("exists");
+    let report =
+        froe::index::lucene::check::check_structure(&oak_directory).expect("check the structure");
+    assert!(report.is_coherent(), "{report:?}");
+    assert_eq!(report.codec_name.as_deref(), Some("oakCodec"));
+    assert_eq!(report.live_document_count, 5);
+}
+
+#[test]
+fn the_bookkeeping_is_what_oak_runs_importer_leaves() {
+    let directory = TestDirectory::new("bookkeeping");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+    let outcome = lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    let repository = Repository::open(&store).expect("open");
+    let node = repository
+        .node_at_path("/oak:index/lucene")
+        .expect("resolve")
+        .expect("exists");
+    let definition = froe::index::IndexDefinition::read(&node, "/oak:index/lucene").expect("model");
+
+    assert!(!definition.reindex.flagged, "reindex is cleared");
+    // The file carried no `reindexCount`, so the stored one is 0 + 1.
+    assert_eq!(definition.reindex.count, 1);
+    assert_eq!(outcome.indexes[0].reindex_count, 1);
+
+    // `:status` carries a `uid` and nothing else.
+    let status = digest_lines(&store, "/oak:index/lucene/:status");
+    let line = status.first().expect("a :status node");
+    assert!(line.contains("uid=String:"), "{line}");
+    for absent in ["lastUpdated", "indexedNodes", "reindexCompletionTimestamp"] {
+        assert!(
+            !line.contains(absent),
+            "Oak's importer leaves no post-import state to copy {absent} from: {line}"
+        );
+    }
+}
+
+#[test]
+fn a_suggest_data_mapping_is_skipped_with_its_reason() {
+    let directory = TestDirectory::new("suggest");
+    let store = directory.store();
+    let definition = Node::new()
+        .with(
+            "jcr:primaryType",
+            Property::Name("oak:QueryIndexDefinition".to_owned()),
+        )
+        .with("type", Property::Text("lucene".to_owned()))
+        .with("async", Property::Text("async".to_owned()))
+        .with_child(":data", data_directory(&sample_files()))
+        .with_child(
+            ":suggest-data",
+            data_directory(&[("suggester".to_owned(), b"suggestions".to_vec())]),
+        );
+    let root = Node::new()
+        .with_child("content", Node::new())
+        .with_child(
+            ":async",
+            Node::new().with("async", Property::Text("checkpoint-1".to_owned())),
+        )
+        .with_child("oak:index", Node::new().with_child("lucene", definition));
+    support::property_index_layout::write_repository_with_checkpoints(
+        &store,
+        &root,
+        &[("checkpoint-1", root.clone())],
+    );
+
+    let input = dump(&directory, &store);
+    let outcome = lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    assert_eq!(outcome.indexes[0].skipped_mappings.len(), 1);
+    assert!(
+        outcome.indexes[0].skipped_mappings[0]
+            .1
+            .contains("rebuilds it when its lastUpdated is missing"),
+        "{:?}",
+        outcome.indexes[0].skipped_mappings
+    );
+    // Never imported, and the old one is dropped with the other hidden
+    // children, as Oak's own updater drops them.
+    assert!(
+        digest_lines(&store, "/oak:index/lucene/:suggest-data").is_empty(),
+        "suggester data is never imported"
+    );
+}
+
+#[test]
+fn a_mismatched_checkpoint_is_refused_naming_both_roots() {
+    let directory = TestDirectory::new("mismatch");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+
+    // Point the lane at a different checkpoint than the dump recorded, by
+    // rewriting the properties file.
+    let info = input.join("indexer-info.properties");
+    std::fs::write(&info, "checkpoint=some-other-checkpoint\n").expect("rewrite");
+
+    let error = plan_lucene_import(&store, &LuceneImportOptions::new(input))
+        .expect_err("a checkpoint that does not resolve must be refused");
+    assert!(
+        error.to_string().contains("does not resolve in this store"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_synchronous_definition_is_refused_by_name() {
+    let directory = TestDirectory::new("synchronous");
+    let store = build_store(
+        &directory,
+        Shape {
+            lane: None,
+            checkpoint: false,
+            hybrid: false,
+        },
+    );
+    // A synchronous definition dumps as a backup with no properties file,
+    // so the import has nothing to read — which is itself the refusal an
+    // operator meets first.
+    dump_lucene_indexes(
+        &Repository::open(&store).expect("open"),
+        &DumpOptions::new(Vec::new(), directory.dump()),
+    )
+    .expect("dump");
+
+    let error = plan_lucene_import(&store, &LuceneImportOptions::new(directory.input()))
+        .expect_err("a directory without indexer-info.properties must be refused");
+    assert!(
+        error.to_string().contains("indexer-info.properties"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_hybrid_definition_is_refused_by_name() {
+    let directory = TestDirectory::new("hybrid");
+    let store = build_store(
+        &directory,
+        Shape {
+            hybrid: true,
+            ..Shape::default()
+        },
+    );
+    let input = dump(&directory, &store);
+
+    let error = plan_lucene_import(&store, &LuceneImportOptions::new(input))
+        .expect_err("a hybrid definition must be refused");
+    assert!(
+        error.to_string().contains("hybrid") && error.to_string().contains(":property-index"),
+        "the refusal says why: {error}"
+    );
+}
+
+#[test]
+fn a_named_path_with_no_index_directory_is_refused() {
+    let directory = TestDirectory::new("named-missing");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+
+    let error = plan_lucene_import(
+        &store,
+        &LuceneImportOptions::new(input).with_indexes(["/oak:index/absent".to_owned()]),
+    )
+    .expect_err("a named path with no directory must be refused");
+    assert!(error.to_string().contains("/oak:index/absent"), "{error}");
+}
+
+#[test]
+fn the_store_is_untouched_until_the_first_record() {
+    let directory = TestDirectory::new("additive");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+    let before: Vec<(std::ffi::OsString, Vec<u8>)> = std::fs::read_dir(&store)
+        .expect("read")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name(),
+                std::fs::read(entry.path()).expect("read"),
+            )
+        })
+        .collect();
+
+    lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    for (name, bytes) in before {
+        if name == "repo.lock" {
+            continue;
+        }
+        let after = std::fs::read(store.join(&name)).expect("read after");
+        assert!(
+            after.starts_with(&bytes),
+            "{} was rewritten rather than appended to",
+            name.to_string_lossy()
+        );
+    }
+}
+
+#[test]
+fn the_checkpoints_are_unchanged_by_an_import() {
+    // A recorded departure from oak-run's importer, whose fourth step
+    // releases the checkpoint `indexer-info.properties` names: the only
+    // checkpoint froe accepts is the lane's, which the lane owns.
+    let directory = TestDirectory::new("checkpoints");
+    let store = build_store(&directory, Shape::default());
+    let before = digest_lines(&store, "#checkpoint");
+    let input = dump(&directory, &store);
+
+    lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    assert_eq!(
+        digest_lines(&store, "#checkpoint"),
+        before,
+        "an import releases no checkpoint"
+    );
+}
+
+#[test]
+fn an_observed_import_equals_an_unobserved_one() {
+    let plain = TestDirectory::new("observed-plain");
+    let plain_store = build_store(&plain, Shape::default());
+    let plain_input = dump(&plain, &plain_store);
+    let unobserved =
+        lucene_import(&plain_store, &LuceneImportOptions::new(plain_input)).expect("import");
+
+    let observed_directory = TestDirectory::new("observed");
+    let observed_store = build_store(&observed_directory, Shape::default());
+    let observed_input = dump(&observed_directory, &observed_store);
+    let mut log = support::observation_log::ObservationLog::default();
+    let observed = PreparedLuceneImport::prepare_with_progress(
+        &observed_store,
+        &LuceneImportOptions::new(observed_input),
+        &mut log,
+    )
+    .expect("prepare")
+    .apply_with_progress(&mut log)
+    .expect("apply");
+
+    assert_eq!(observed.indexes.len(), unobserved.indexes.len());
+    assert_eq!(
+        observed.indexes[0].files, unobserved.indexes[0].files,
+        "observation changed what was written"
+    );
+    assert!(log.began_and_ended_in_pairs());
+}
+
+#[test]
+fn an_observed_import_plan_equals_an_unobserved_one() {
+    let directory = TestDirectory::new("observed-plan");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+
+    let unobserved =
+        plan_lucene_import(&store, &LuceneImportOptions::new(input.clone())).expect("plan");
+    let observed = plan_lucene_import(&store, &LuceneImportOptions::new(input)).expect("plan");
+    assert_eq!(observed, unobserved);
+}
+
+#[test]
+fn a_dry_plan_takes_no_lock_and_writes_nothing() {
+    let directory = TestDirectory::new("plan-read-only");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+    let before = directory_snapshot(&store);
+
+    let plan = plan_lucene_import(&store, &LuceneImportOptions::new(input)).expect("plan");
+    assert_eq!(plan.imports.len(), 1);
+    assert_eq!(plan.file_count(), sample_files().len());
+    assert_eq!(
+        directory_snapshot(&store),
+        before,
+        "planning wrote to the store"
+    );
+}

@@ -229,7 +229,8 @@ pub fn dump_lucene_indexes_with_progress(
 
     // The metadata files last: a directory carrying `index-details.txt` is
     // one whose index files are already there.
-    let (checkpoint, no_checkpoint_reason) = resolve_checkpoint(&content_root, &selected)?;
+    let (checkpoint, no_checkpoint_reason) =
+        resolve_checkpoint(repository, &content_root, &selected)?;
     write_definitions_file(repository, &dumps, &selected)?;
     if let Some(checkpoint) = &checkpoint {
         write_file_durably(
@@ -462,6 +463,7 @@ fn write_definitions_file(
 
 /// The one checkpoint the whole directory records, or why there is none.
 fn resolve_checkpoint(
+    repository: &Repository,
     content_root: &NodeState<'_>,
     selected: &[(String, NodeState<'_>, IndexDefinition)],
 ) -> Result<(Option<String>, Option<NoCheckpointReason>)> {
@@ -497,11 +499,15 @@ fn resolve_checkpoint(
     };
     // The checkpoint has to resolve: one that does not names a state no
     // build can be made at, and oak-run warns exactly that.
-    let resolves = content_root
-        .child_node("checkpoints")?
-        .and_then(|checkpoints| checkpoints.child_node(&checkpoint).transpose())
-        .transpose()?
-        .is_some();
+    //
+    // Checkpoints hang off the **super-root**, not the content root. A
+    // lookup under the content root finds a content node named
+    // `checkpoints` if one happens to exist, and nothing otherwise — which
+    // is a silent "dangling" verdict for every real store.
+    let resolves = repository
+        .checkpoints()?
+        .iter()
+        .any(|(name, _)| name == &checkpoint);
     if !resolves {
         return Ok((
             None,

@@ -143,7 +143,7 @@ pub(crate) fn build_plan(
 
     let content_root = repository.content_root()?;
     let lanes = AsyncLanes::read(&content_root).map_err(index_error)?;
-    let checkpoint_root = resolve_checkpoint_root(&content_root, &info.checkpoint)?;
+    let checkpoint_root = resolve_checkpoint_root(repository, &info.checkpoint)?;
 
     let mut imports = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
@@ -269,7 +269,7 @@ fn plan_one(
         .ok_or_else(|| Error::InvalidFormat {
             details: format!("{index_path} indexes on lane {lane}, which has no state on /:async"),
         })?;
-    let lane_root = resolve_checkpoint_root(content_root, &lane_checkpoint)?;
+    let lane_root = resolve_checkpoint_root(repository, &lane_checkpoint)?;
     if lane_root != checkpoint_root {
         return Err(Error::InvalidFormat {
             details: format!(
@@ -431,16 +431,19 @@ fn read_definitions_file(
 }
 
 /// A checkpoint's `root` record, refused when the checkpoint is gone.
-fn resolve_checkpoint_root(
-    content_root: &NodeState<'_>,
-    checkpoint: &str,
-) -> Result<RecordIdentifier> {
-    let root = content_root
-        .child_node("checkpoints")?
-        .and_then(|checkpoints| checkpoints.child_node(checkpoint).transpose())
+///
+/// Checkpoints hang off the **super-root**, not the content root, which is
+/// what `Repository::checkpoints` reads. A lookup under the content root
+/// would find nothing in every real store and call every checkpoint
+/// dangling.
+fn resolve_checkpoint_root(repository: &Repository, checkpoint: &str) -> Result<RecordIdentifier> {
+    let root = repository
+        .checkpoints()?
+        .into_iter()
+        .find(|(name, _)| name == checkpoint)
+        .map(|(_, node)| node.child_node("root"))
         .transpose()?
-        .and_then(|node| node.child_node("root").transpose())
-        .transpose()?
+        .flatten()
         .ok_or_else(|| Error::InvalidFormat {
             details: format!("checkpoint {checkpoint} does not resolve in this store"),
         })?;

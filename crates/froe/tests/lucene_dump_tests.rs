@@ -135,14 +135,19 @@ fn store_with(
             ":async",
             Node::new().with(lane, Property::Text("checkpoint-1".to_owned())),
         );
-        if checkpoint {
-            root = root.with_child(
-                "checkpoints",
-                Node::new().with_child("checkpoint-1", Node::new()),
-            );
-        }
     }
-    write_repository_with_tree(&store, &root);
+    if lane.is_some() && checkpoint {
+        // Checkpoints hang off the **super-root**, not the content root.
+        // A `checkpoints` child of `/` is an ordinary content node and is
+        // not what Oak — or froe — resolves a lane checkpoint through.
+        support::property_index_layout::write_repository_with_checkpoints(
+            &store,
+            &root,
+            &[("checkpoint-1", root.clone())],
+        );
+    } else {
+        write_repository_with_tree(&store, &root);
+    }
     store
 }
 

@@ -38,5 +38,7 @@ pub mod drift;
 pub mod plan;
 pub mod prepared;
 
+pub use apply::{ImportedIndex, LuceneImportOutcome};
 pub use drift::{DriftVerdict, REWRITTEN_PROPERTY_NAMES};
 pub use plan::{LuceneImportOptions, LuceneImportPlan, PlannedImport, plan_lucene_import};
+pub use prepared::{PreparedLuceneImport, lucene_import, lucene_import_with_progress};
