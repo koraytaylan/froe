@@ -90,10 +90,10 @@ The plan follows compaction's open protocol exactly, canonicalizing the director
 
 | Boundary / cutpoint | Preconditions | Published or durable change | Returned-error state and named regression | Abrupt-exit state and named regression | Reconciliation |
 | --- | --- | --- | --- | --- | --- |
-| Spill files written in the run's subdirectory under `--work-directory`, which `apply` creates before the first spill (after `open_prepared`; a cancelled confirmation leaves nothing behind); `index-reindex.before-spill-cleanup` fires once the sort has returned its iterator and before the first index record is appended, with every spill file still on disk | plan replanned under the lock; residue policy evaluated in the plan (the plan refuses a froe-named subdirectory left by an earlier run in an operator-named directory and warns about one under the default) | files outside the store only | subdirectory removed on return (regression named by 0708) | leftover files in the run's subdirectory, never in the store (0708) | operator removes the subdirectory |
-| Index records appended (`index-reindex.before-head-publish`), then the definition rewritten — hidden children replaced or dropped unless flagged `retainNodeInReindex`, `reindex` set to `false`, `reindexCount` incremented, `corrupt` removed, a counter's `seed` created when absent, `:disableIndexesOnNextCycle` under the disabler's verdict, a parked `async = async-reindex` property removed, every other property and visible child preserved by identity (under a reset: only the rewritten definition node, its hidden children gone, and the spine) | fresh archive number above every physical name, at the head's generation | new archives only, unreachable from the head | store unchanged plus unreferenced archives at the head's generation (0708) | same (0708) | a later `froe compact` copies the live content into a fresh generation and retires every older archive, these included; they are never referenced by a checkpoint, having never been published (the superseded records of a *successful* run are the ones every lane checkpoint pins, which the Resources section states); they are not "interrupted-run residue" to the planner, which reserves that name for segments stamped *ahead* of the head |
-| Head publication (`compare_and_set_head`, then `flush`; `index-reindex.after-head-publish-before-flush`) | every new subtree verified through the open session; the store was opened with `open_prepared` | `compare_and_set_head` changes nothing on disk; `flush` seals and fsyncs the archive, syncs the directory, validates the finalized session, then appends one journal line naming the new head | old head before the journal append, new head after it, never partial (0708) | same (0708) | either head resolves; the loser's records are garbage |
-| Applied-state verification (`index-reindex.before-applied-verification`) | head published | none | reports the mismatch, store already final (0708) | not applicable | rerun the check |
+| Spill files written in the run's subdirectory under `--work-directory`, which `apply` creates before the first spill (after `open_prepared`; a cancelled confirmation leaves nothing behind); `index-reindex.before-spill-cleanup` fires once the sort has returned its iterator and before the first index record is appended, with every spill file still on disk | plan replanned under the lock; residue policy evaluated in the plan (the plan refuses a froe-named subdirectory left by an earlier run in an operator-named directory and warns about one under the default) | files outside the store only | subdirectory removed on return — `a_spill_failure_removes_the_run_subdirectory_and_leaves_the_store_unchanged` (0708) | leftover files in the run's subdirectory, never in the store — `a_death_before_spill_cleanup_leaves_no_file_in_the_store` (0708) | operator removes the subdirectory |
+| Index records appended (`index-reindex.before-head-publish`), then the definition rewritten — hidden children replaced or dropped unless flagged `retainNodeInReindex`, `reindex` set to `false`, `reindexCount` incremented, `corrupt` removed, a counter's `seed` created when absent, `:disableIndexesOnNextCycle` under the disabler's verdict, a parked `async = async-reindex` property removed, every other property and visible child preserved by identity (under a reset: only the rewritten definition node, its hidden children gone, and the spine) | fresh archive number above every physical name, at the head's generation | new archives only, unreachable from the head | store unchanged plus unreferenced archives at the head's generation — `an_error_before_head_publish_leaves_the_head_and_every_definition_as_they_were` (0708) | same — `a_death_before_head_publish_leaves_the_head_resolving_the_old_records` (0708) | a later `froe compact` copies the live content into a fresh generation and retires every older archive, these included; they are never referenced by a checkpoint, having never been published (the superseded records of a *successful* run are the ones every lane checkpoint pins, which the Resources section states); they are not "interrupted-run residue" to the planner, which reserves that name for segments stamped *ahead* of the head |
+| Head publication (`compare_and_set_head`, then `flush`; `index-reindex.after-head-publish-before-flush`) | every new subtree verified through the open session; the store was opened with `open_prepared` | `compare_and_set_head` changes nothing on disk; `flush` seals and fsyncs the archive, syncs the directory, validates the finalized session, then appends one journal line naming the new head | old head before the journal append, new head after it, never partial — `an_error_after_head_publish_before_flush_leaves_the_journal_naming_the_old_head` (0708) | same — `a_death_between_head_publish_and_flush_leaves_one_resolvable_head` (0708) | either head resolves; the loser's records are garbage |
+| Applied-state verification (`index-reindex.before-applied-verification`) | head published | none | reports the mismatch, store already final — `a_failed_applied_state_verification_reports_rather_than_repairs` (0708) | not applicable — the head is published and durable before this boundary | rerun the check |
 
 ### Task graph
 
@@ -119,4 +119,249 @@ Every file this plan puts under `crates/froe/src/writer/index/` is created as a 
 
 ### Safety case
 
-This plan is high-risk under `docs/high-risk-changes.md`, and its safety case lives here, as a section of this file, so that every plan in this directory keeps its frozen evidence in the same place as plans 0001, 0002 and 0004 keep theirs. Task 0701 writes the section before any code lands; task 0708 records every cutpoint it arms in the fault table; task 0709 fills the guards table; task 0714 freezes the range, records the interoperability run of task 0712, the verification report and the review, and lists the known gaps. Until 0701 lands, this paragraph is the placeholder.
+This plan is high-risk under [`high-risk-changes.md`](../../high-risk-changes.md),
+and its safety case lives here, as a section of this file, so that every plan
+in this directory keeps its frozen evidence where plans 0001, 0002 and 0004
+keep theirs. It succeeds
+[`0004-merged-maintenance-command/ARCHITECTURE.md`](../0004-merged-maintenance-command/ARCHITECTURE.md),
+which remains the case for the write session, the lock protocol, the caches
+and the walks, and which this plan extends rather than supersedes: nothing
+here changes what compaction does.
+
+In scope on three counts.
+
+* **It writes index records into a live store.** Every froe mutation until now
+  either copied content forward unchanged (compaction, backup, restore) or
+  removed something an operator confirmed. This one *computes* bytes that
+  Oak's own editors would have computed, and publishes them as the index Oak
+  will query. A wrong key, a wrong path element, a wrong strategy, and the
+  store still parses, still checks, still boots — and returns wrong query
+  results.
+* **It rewrites a definition node.** The bookkeeping Oak performs around a
+  reindex — `reindex`, `reindexCount`, `corrupt`, the hidden children, the
+  disabler flag, a parked `async` property — decides what Oak's *next* cycle
+  does. Getting it wrong does not corrupt the store; it makes Oak redo, skip,
+  or double the work, which is a fault that appears later and elsewhere.
+* **It is unbounded in the input it walks.** A reindex reads the whole state
+  a definition covers, which on a production store is every node. The memory
+  case of plan 0002 is what keeps that from being a second risk, and this plan
+  adds exactly one term to it, stated under Resources.
+
+Covers `crates/froe/src/external_sort.rs`,
+`crates/froe/src/writer/index/**`,
+`crates/froe/src/writer/fault_injection/index_reindex.rs`,
+`crates/froe/src/writer/commit.rs`,
+`crates/froe/src/writer/maintenance/**` (task 0715's refactor),
+`crates/froe/src/progress.rs` and `crates/froe-cli/src/index_reindex.rs`.
+
+#### Scope and retention
+
+**Default-safe work.** A run with no flag rebuilds the selected definitions
+and nothing else. It refuses, rather than guesses, every case where the state
+Oak's editor would have seen cannot be identified: a definition on a lane
+whose checkpoint is dangling or absent, a type this plan does not rebuild, a
+definition the model cannot read.
+
+**The one opt-in.** `--from-head` authorizes exactly two side effects on a
+definition whose lane checkpoint is dangling or absent, and nothing else:
+
+1. **A from-head rebuild of a mirror or unique definition.** Authorized
+   because Oak's replay from the missing state re-inserts entries that already
+   exist, and re-inserting leaves every `match` and `entry` exactly as it was.
+   Only the randomized `:count_*` approximate counters drift, because both
+   strategies adjust the counter on every insert — which is why
+   `froe digest --exclude-property-prefix :count_` exists.
+2. **A reset of a counter definition** — and, in plan 0010, of a Lucene
+   definition. Hidden children removed exactly as a reindex removes them,
+   retained ones kept, nothing rebuilt, no other byte touched. Oak's next
+   cycle then meets a definition with no hidden child and rebuilds it from
+   scratch. A *rebuild* here would be wrong: the replay would double the
+   counter whether or not froe ran.
+
+The plan output and the summary name every reset, so the authorization is
+visible before it is given and observable after it is taken.
+
+**What must survive unconditionally.** The content tree; every checkpoint;
+every definition not selected; of a selected definition, every property other
+than `reindex`, `reindexCount`, `corrupt`, a `seed` the counter run creates
+when absent, the `async` property of a definition parked at
+`async = async-reindex` (removed exactly as Oak's switch-back removes it), and
+the hidden `:disableIndexesOnNextCycle` (written only under Oak's own disabler
+predicate); every hidden child flagged `retainNodeInReindex`; every visible
+child of a selected definition, **including one froe does not model** — this
+plan writes no visible child through `DefinitionEdits`, and task 0706's digest
+comparison is the regression that says so; and `/:async` in full.
+
+**What is deliberately dropped.** The previous hidden children of a selected
+definition, exactly as Oak drops them.
+
+**What the run never touches.** Lane checkpoints, `journal.log` history,
+archives. A reindex adds archives; it retires none.
+
+#### Authoritative state
+
+The preview is advisory and lockless. It opens the store read-only, plans
+against what it reads, and every record identity in it is discarded.
+
+`PreparedReindex::prepare` is the lock boundary. It runs
+`validate_repository_shape` and the two pre-lock apply-identity gates
+(`validate_apply_environment`, `validate_apply_identity`), acquires
+`repo.lock`, runs `validate_path_identity`, **repeats both gates**, replans
+from disk, fingerprints the directory, certifies the archive number and runs
+the plan-independent `validate_metadata_source_apply_identity` — the gate that
+refuses a store whose newest active archive could not be re-owned under
+`open_prepared`'s `preserve_file_metadata`, which runs inside `flush` and
+would otherwise fail only after every record had been written.
+
+`apply` rechecks the fingerprint, then `validate_path_identity` again
+immediately before the destructive step — the fingerprint deliberately skips
+`repo.lock`, so only the identity check catches a replaced lock file — and
+only then opens through `WritableRepository::open_prepared`.
+
+Every fact rechecked under the lock, because each one can change between the
+preview and the run: the definition set; each definition's type and lane; the
+lane checkpoint's existence **and its root record**; the disabler verdict,
+which reads over the head's *other* definitions; the definition record; and
+the head. **No record identity from the lockless plan survives the replan**;
+that is the property that makes the preview safe to show and unsafe to use.
+
+Preview and apply share the selection and refusal predicates, so a preview
+that showed a rebuild and an apply that refuses it disagree only because the
+store changed.
+
+#### Mutation and publication order
+
+The [`### Mutation and publication order`](#mutation-and-publication-order)
+section above **is** this safety case's table. It is cited rather than copied,
+so a later edit cannot leave two versions to review. Each row names the
+regression test the task that arms its cutpoint will add; task 0708 fills
+those names in as it arms them.
+
+#### Interruption prefixes
+
+For a returned error and for abrupt death at each boundary, the store is
+either **unchanged plus unreferenced archives at the head's generation**, or
+**at the new head with every new subtree verified**. There is no third state.
+
+That follows from two facts about the publication step.
+`compare_and_set_head` is an **in-memory** move: it changes nothing on disk.
+`flush` seals and fsyncs the archive, syncs the directory, validates the
+finalized session, and only then appends the single journal line. So the two
+cutpoints around the publication observe the same on-disk prefix, and the
+journal append is the only byte that makes the new head resolvable.
+
+Before that append, the new records are present and unreachable — indistinguishable
+from an interrupted run's residue, and reclaimed by a later `froe compact`.
+After it, the new head resolves and every subtree under it was verified
+through the open session before publication.
+
+A returned error reports the operations observed to have completed and names
+any durability uncertainty. Abrupt death cannot report, so the next inspection
+is what must reconcile: `froe check` resolves whichever head the journal
+names, and `froe compact` retires the loser's records.
+
+#### Observed outcomes
+
+`ReindexOutcome` reports, per definition, a typed outcome built from observed
+operations:
+
+* **rebuilt**, with the entries written, the distinct keys, and the bytes;
+* **reset**, with the hidden children removed and the retained ones kept;
+* **`NothingToDo { reason }`** — a definition with no removable hidden child —
+  which **never moves the head**.
+
+It also reports the head before and after. Every figure comes from an observed
+operation; none is inferred from a plan, from the existence of a destination,
+or from diagnostic text. `ReindexAction` and the per-definition outcome are
+`#[non_exhaustive]`, and the command renders unknown variants through a
+wildcard arm, as `compaction_report.rs` does.
+
+#### Resources
+
+**Time.** Two walks of the state per confirmed run: the counting walk
+`prepare` performs under the lock, and the collecting walk of `apply`. A
+preceding `--dry-run` adds the lockless plan's. Then one pass over the
+rebuilt entries for the tail's entry-side verification, and two
+`verify_node_tree` passes over the new records — before publication and after
+the reopen. The sort adds n log n plus one merge pass over the spill bytes per
+fan-in level; the trie writer adds a single pass over the sorted sequence.
+Pinned by the visited-node counter of task 0704, the merge-pass counter of
+0702 and the write counter of 0703.
+
+**Memory.** This plan adds exactly one key-proportional term to the bounded
+memory case of plan 0002, and it is admitted deliberately:
+
+* *The trie writer's resident state.* For the mirror strategy it is the widest
+  fan-out on the current root-to-leaf path — **including the trie root
+  `:index`, which has one child per distinct key**. For a unique or reference
+  index it is the `:index` (or `:references`) node itself, one child per key.
+  In both cases the bound is *distinct keys × (one name + one record
+  identifier)*, because `ChildNodesToWrite::Many` holds every child of a wide
+  node while it is written. Reported per definition in the plan's estimate:
+  the entry count as the upper bound for a mirror definition, the exact
+  distinct-key count in the outcome.
+* *The counters' `credited_by_path` maps*, which outlive their builds: one
+  entry per credited node, so *hits × depth* per selected counter definition,
+  resident until the tail's verification compares them against the written
+  `:cnt`.
+* *The walk's depth-proportional state*, which the bounded-memory case of plan
+  0002 already documents.
+
+**Open files.** The merge's bound is the fan-in task 0702 declares, plus one —
+**never the run count**. One merge is live at a time, so a reference
+definition's two run sets do not double it.
+
+**Temporary disk.** One sort budget per definition, in bytes, configurable,
+with its default stated by task 0702; a reference definition's two run sets
+hold a shared `SortBudget` charge handle together rather than dividing it. The
+spill directory's worst case is the total entry bytes — about one path string
+per indexed value, which for `nodetype` is every node path once per type value
+— and transiently up to *fan-in × budget* more during a reduction pass, until
+the merged inputs are unlinked.
+
+**Which figures are only proxies.** The plan's entry count is an upper bound
+on mirror residency, not the residency. The reported free space is checked
+against the work-directory estimate, which is the *per-definition maximum
+including the reduction pass's transient*, not the selection's total.
+
+**How exhaustion leaves a safe prefix.** A spill that fails on `ENOSPC`
+returns a typed error **before the first index record is appended**, so the
+store is unchanged and the run subdirectory is removed.
+
+**The old index records** stay live through every retained checkpoint — each
+lane's checkpoint references them by construction, since a checkpoint's `root`
+is the content root's record — and are reclaimed only by a `froe compact` run
+after those checkpoints are released. A reindex therefore *grows* a store
+until the next compaction, which is the honest cost and is stated in the plan
+output.
+
+#### Guards
+
+| Guard and production callers | Named regression | Neutralization | Observed failing result |
+| --- | --- | --- | --- |
+| *To be filled by task 0709, one row per newly introduced or semantically changed refusal, preservation or publication guard, reaching every materially distinct production caller.* | | | |
+
+#### Fault and subprocess tests
+
+| Cutpoint | Fault model | Named test | Asserted prefix |
+| --- | --- | --- | --- |
+| *To be filled by task 0708 as it arms each cutpoint named in the mutation table above.* | | | |
+
+#### Interoperability
+
+*To be written by task 0714, recording the interop run of task 0712: the Oak
+build, the image digest, and what Oak's own reindex of the same store agreed
+with, compared with only the randomized approximate counters excused.*
+
+#### Verification report
+
+*To be written by task 0714: what was run, on what, with which results, and
+what the coverage of the fault tests is and is not.*
+
+#### Known gaps
+
+*To be written by task 0714.*
+
+#### Review
+
+*To be written by task 0714, which freezes the range.*
