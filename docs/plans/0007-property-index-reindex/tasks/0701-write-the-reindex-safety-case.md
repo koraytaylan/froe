@@ -7,8 +7,8 @@ depends_on: []
 gated: false
 touches:
   - docs/plans/0007-property-index-reindex/ARCHITECTURE.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "bb940da0971ca0e22c37899a6ce3bec4474428e5"
 ---
 # Write The Property Reindex Safety Case
 
