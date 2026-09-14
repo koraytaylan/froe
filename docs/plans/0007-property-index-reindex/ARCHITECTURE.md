@@ -430,19 +430,180 @@ the successful run's post-state and there is no distinct prefix to assert.
 
 #### Interoperability
 
-*To be written by task 0714, recording the interop run of task 0712: the Oak
-build, the image digest, and what Oak's own reindex of the same store agreed
-with, compared with only the randomized approximate counters excused.*
+**Direction:** Oak wrote the store, Oak rebuilt its own indexes, froe
+rebuilt the same extracted bytes, and the two were compared.
+
+**Image:** `docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8
+d9e443d105e1a4292a4cb7f810a8cc9`, the pinned digest, running the
+`oak-segment-tar` build `generate` records in `oak-build.txt`.
+
+**Operation under test:** `froe index reindex --yes`.
+
+**froe-side edits made to the copy before that operation:** each
+definition's `reindex` flag set and its `reindexCount` set to Oak's value
+minus one, through `definition_edits.rs` on the public writer API, so
+froe's single increment lands back on exactly Oak's value. Nothing else was
+changed; hidden children were re-attached by record identity.
+
+**Canonical-index check:** the counter's mirror was read through plan
+0006's reader and required to carry a `:cnt` on every node before any
+comparison, because a lane cycle between Oak's rebuild and the stop can
+leave a `:cnt`-less node no rebuild produces. Passed on attempt 1.
+
+**Verified post-state:** Oak rebuilt **23** definitions — every direct child
+of `/oak:index` whose type is `property`, `reference` or `counter`, the set
+discovered from the store rather than listed. froe's rebuild of the same
+bytes rendered **identically for every one** under
+`--exclude-property-prefix :count_`. The full content digest differed in 39
+lines over 52,252 nodes, every one inside the declared `/oak:index` scope.
+`froe check` passed at the new head. Reproduced across four runs.
+
+**Not run, and why.** The phase's query-level comparison and its
+counter-reset scenario need two further Sling boots. This host's memory
+watchdog killed the harness five times, at varying points including during
+the first bootstrap container, with 110+ GB of 122 GB available each time —
+a policy limit on the session's processes, not exhaustion. The phase code
+for both is written, compiled and linted; one boot cycle was removed while
+trying, which is kept because it is better design. **This gap is open: the
+maintainer's freeze should not treat the interoperability record as
+complete until those two halves have run.**
 
 #### Verification report
 
-*To be written by task 0714: what was run, on what, with which results, and
-what the coverage of the fault tests is and is not.*
+Every task in this range ran the stable host gate on `x86_64-unknown-linux-
+gnu` before its commit, each ending `=== END ===` with no failing section:
+`cargo +stable fmt --all -- --check`, `cargo +stable test --workspace
+--all-features --no-fail-fast`, the same `--release`, `cargo +stable clippy
+--workspace --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
+warnings" cargo +stable doc --workspace --all-features --no-deps`,
+`scripts/oversized-files.sh`, and `git diff --check HEAD`.
+
+**The five separations this report is held to.**
+
+*Execution from cross-compilation.* Everything above was executed, not
+cross-compiled. The i686 width sentinel and the MSRV gate were **not run in
+this range**; they are gaps below, not claims.
+
+*Synthetic credentials from execution as root.* The journal-owner and
+metadata-source gates are exercised through their `_for_credentials` twins,
+which model an identity the process does not have. No test depends on the
+runner's uid, and none ran as root. What that proves is the predicate, not
+the behaviour of a real foreign-owned file.
+
+*Process-exit or syscall injection from true power-loss ordering.* Task
+0708's four cutpoints inject a returned error or an abrupt `_exit` in a
+forked child. That proves the code's ordering around each boundary. It does
+**not** prove the platform's write ordering under power loss: no test here
+cuts power, and none can.
+
+*File existence from durability.* The probes assert a reopened store's head,
+journal lines and subtrees through a fresh read-only open. That a file
+exists after `flush` returned is asserted; that it survives a host crash at
+that instant is not.
+
+*froe-to-froe round trips from real Oak interoperability.* The reindex's
+own suites compare froe against froe and against an independent test-only
+encoder. Only the `property_reindex` phase compares against Oak, and its
+record above states exactly which halves ran.
+
+**Fault coverage, per claim.** Each row of the fault table names its
+cutpoint, its model (returned error or `_exit`), and the prefix it asserts;
+each was verified by deleting the cutpoint and watching the test fail on
+the child's exit code. What they do not cover: any boundary inside the
+external sort (deliberately — it takes no cutpoint, which is what keeps it
+independent of the segment-store write path), and abrupt death after the
+applied-state verification boundary, where the head is already durable and
+there is no distinct prefix to assert.
 
 #### Known gaps
 
-*To be written by task 0714.*
+**Guards with no synthetic regression.**
+
+* *The fsync-capability gate* (`validate_apply_environment`). It needs a
+  directory that refuses `fsync`; no fixture here provides one. Reachable
+  in production on a filesystem without directory-fsync support, which is
+  the condition `froe compact` already warns about.
+* *The head compare-and-set refusal.* Unreachable while the run holds
+  `repo.lock` exclusively from `prepare` through `flush`, so no second
+  writer can move the head inside the window. It is a belt on a guarded
+  window, and task 0707's seam perturbs a written subtree rather than the
+  head.
+* *The hybrid-counter refusal.* Carved out with its reason in the guards
+  table: constructing one means constructing a definition Oak itself has no
+  editor pairing for.
+
+**Recorded departures from Oak.**
+
+* *0703's omitted `:count_*` properties.* Oak's mirror strategy keeps
+  approximate counters seeded from a random number; froe omits them. Two
+  rebuilds of the same content disagree on them by construction, so they
+  are excluded from every comparison — and a mirror index's
+  `estimatedCost:` derives from them, which is why plan text is compared
+  only where it carries no counter-derived number.
+* *0705's 32-bit seed draw.* froe narrows the seed to 32 bits sign-extended
+  on every run after the creating one, matching what Oak's own editor
+  produces.
+* *The `--from-head` reset.* A counter on an unresolvable lane is reset
+  rather than rebuilt, because Oak's replay after a lost checkpoint doubles
+  a rebuilt counter whether or not froe ran.
+
+**Refusals, each stated rather than implemented.** `lucene` (until plan
+0010), `elasticsearch`, `disabled`, `ordered`, an unknown type, a
+`valuePattern` regular expression, a composite mount's index data, an
+unconstructable `PathFilter`, a nested definition, a node that is not an
+`oak:QueryIndexDefinition`, a lane mid-run at `/:async/async-reindex`, a
+dangling lane checkpoint or absent lane without `--from-head`, a
+multi-valued `reindexCount`, a duplicate unique key, and a hybrid counter.
+
+**Interoperability.** The `property_reindex` phase's query-level comparison
+and counter-reset scenario have not run; see the interoperability record
+above.
+
+**Verification axes not exercised in this range.** The MSRV host gate, the
+i686 width sentinel, and `scripts/interop-fixture.sh` as a whole chain.
+**Standing environment axes**, unchanged from earlier plans: no AEM build,
+no external blob store, no local macOS execution (CI's `macos-latest` job
+is the authority), and no native Windows execution.
 
 #### Review
 
-*To be written by task 0714, which freezes the range.*
+**This task is gated, and the gate has not been closed.** What follows is
+the review work, which is not gated. The freeze itself — declaring the
+range complete, and lifting the beta framing from `docs/index.md` §5 and
+the feature map's two rows — is the maintainer's decision, and it should
+not be taken while the interoperability record above has an open half.
+
+**Lenses run over the range, by passes that did not author it.**
+
+*The state-root decision: can any path index an async definition from the
+wrong state?* **Finding, confirmed and fixed.** Selection never read
+`indexing_mode`, so a hybrid definition — one listing `sync` beside its
+lane name, which Oak's synchronous cycle maintains on every commit as well
+as the lane — was rebuilt from the lane's checkpoint. Every entry committed
+since was silently dropped: a quietly incomplete index, where queries
+return fewer rows and nothing reports an error. Fixed by indexing a hybrid
+from the head and refusing a hybrid counter, with both rows added to the
+guards table and the head decision's neutralization recorded.
+
+*Reclaimability and identity preservation: can a rebuild drop a property or
+a visible child of a definition?* **No finding.** `rewrite_definition`
+names only hidden children in its child edits and only the bookkeeping
+properties in its property edits; every other slot is preserved by record
+identity through the one commit-path write. The empirical evidence is
+stronger than the reasoning: the interop comparison held over 23 real
+definitions, `reindexCount` and hidden-child presence included.
+
+*Interruption prefixes against the code.* **Finding, fixed during 0708.** A
+returned error left the session's archive without its trailers, so the next
+`froe compact` refused the whole store as damaged until an operator
+authorized an index repair — contradicting the mutation table's own
+reconciliation column. The session is now closed on every path, and a run
+that failed after `compare_and_set_head` puts the head back before closing.
+
+*Evidence wording.* **No finding that changes a claim.** Every "observed
+failing result" in the guards table quotes a failure produced while that
+guard was neutralized; six rows are defence in depth and say so; carved-out
+rows state their reason rather than implying coverage. The one wording risk
+checked specifically: the mount-fragment row quotes the missing refusal,
+which is what was observed, and describes the data loss as what the test's
+second half states rather than as something observed.
