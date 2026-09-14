@@ -236,6 +236,10 @@ pub(crate) fn cleanup_fault_child() {
         run_reindex_child(&directory, &cutpoint, &mode);
         return;
     }
+    if scenario == LUCENE_IMPORT_SCENARIO {
+        run_lucene_import_child(&directory, &cutpoint, &mode);
+        return;
+    }
     run_compaction_child(&directory, &scenario, &cutpoint, &mode);
 }
 
@@ -715,4 +719,256 @@ pub(crate) fn archive_file_names(directory: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+pub(crate) const LUCENE_IMPORT_SCENARIO: &str = "lucene-import";
+
+/// The blob size the import fixture's definition declares, and the one its
+/// `:data` is written with. They must agree: the reader takes the size from
+/// the definition, and a writer that chose its own would produce a
+/// directory the reader cuts into the wrong blocks.
+const IMPORT_FIXTURE_BLOB_SIZE: i64 = 32_768;
+
+/// The files the import fixture's index holds: the committed sample index,
+/// written by Oak itself.
+///
+/// They have to be a *coherent* Lucene index rather than plausible bytes,
+/// because the plan refuses an incoherent directory before it copies one —
+/// so a fixture of invented files would be refused before any cutpoint
+/// could fire. The largest of them is what `mid-file-copy` interrupts.
+fn import_fixture_files() -> Vec<(String, Vec<u8>)> {
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lucene-4-7-sample-index");
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&directory)
+        .expect("read the sample index")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("read a sample index file"),
+            )
+        })
+        .filter(|(name, _)| name != "README.md")
+        .collect();
+    files.sort();
+    files
+}
+
+/// A store holding one asynchronous `lucene` definition with a `:data`
+/// directory, a resolvable lane checkpoint, and a dump of it beside the
+/// store for the import to read.
+///
+/// Returns the store directory; the input directory is
+/// [`lucene_import_input`] of it, so the child finds it without being told.
+/// The `/oak:index` node of the import fixture: one asynchronous `lucene`
+/// definition whose `:data` holds the committed sample index.
+fn write_import_fixture_definitions<Sink: crate::writer::SegmentSink>(
+    writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
+) -> RecordIdentifier {
+    use crate::content::property::PropertyType;
+    use crate::writer::index::lucene_directory::{DirectoryListing, OakDirectoryWriter};
+    use crate::writer::record_writer::ChildNodesToWrite;
+
+    let data = {
+        let mut builder =
+            OakDirectoryWriter::new(writer, IMPORT_FIXTURE_BLOB_SIZE, DirectoryListing::Saved);
+        for (name, bytes) in import_fixture_files() {
+            builder
+                .add_file(&name, std::io::Cursor::new(bytes))
+                .expect("write an index file");
+        }
+        builder.finish().expect("finish :data")
+    };
+
+    let definition_properties = [
+        single_valued(
+            writer,
+            "jcr:primaryType",
+            PropertyType::Name,
+            "oak:QueryIndexDefinition",
+        ),
+        single_valued(writer, "type", PropertyType::String, "lucene"),
+        single_valued(writer, "async", PropertyType::String, "async"),
+        single_valued(
+            writer,
+            "blobSize",
+            PropertyType::Long,
+            &IMPORT_FIXTURE_BLOB_SIZE.to_string(),
+        ),
+    ];
+    let definition = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: ":data".to_owned(),
+                node: data,
+            },
+            &definition_properties,
+        )
+        .expect("write the definition");
+    writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "lucene".to_owned(),
+                node: definition,
+            },
+            &[],
+        )
+        .expect("write /oak:index")
+}
+
+/// The super-root of the import fixture: the content root, and a
+/// `checkpoint-1` pinning it by record identity.
+///
+/// Checkpoints hang off the **super-root**, which is where
+/// `Repository::checkpoints` reads them, and a real checkpoint shares the
+/// content root's record — which is what the state rule compares.
+fn write_import_fixture_super_root<Sink: crate::writer::SegmentSink>(
+    writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
+    content_root: RecordIdentifier,
+) -> RecordIdentifier {
+    use crate::writer::record_writer::ChildNodesToWrite;
+
+    let checkpoint = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "root".to_owned(),
+                node: content_root,
+            },
+            &[],
+        )
+        .expect("write the checkpoint");
+    let checkpoints = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "checkpoint-1".to_owned(),
+                node: checkpoint,
+            },
+            &[],
+        )
+        .expect("write the checkpoints node");
+    writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(vec![
+                ("checkpoints".to_owned(), checkpoints),
+                ("root".to_owned(), content_root),
+            ]),
+            &[],
+        )
+        .expect("write the super root")
+}
+
+pub(crate) fn write_lucene_import_fixture(root: &Path) -> PathBuf {
+    use crate::content::property::PropertyType;
+    use crate::writer::record_writer::ChildNodesToWrite;
+
+    let directory = root.join("store");
+    std::fs::create_dir_all(&directory).expect("create the import fixture store directory");
+
+    let store = WritableRepository::open(&directory).expect("bootstrap the import fixture");
+    let generation = store.writing_generation().expect("writing generation");
+    let mut writer = store.record_writer(generation);
+
+    let oak_index = write_import_fixture_definitions(&mut writer);
+    let lane_properties = [single_valued(
+        &mut writer,
+        "async",
+        PropertyType::String,
+        "checkpoint-1",
+    )];
+    let lane = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &lane_properties)
+        .expect("write /:async");
+    let content_root = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(vec![
+                (":async".to_owned(), lane),
+                (crate::index::INDEX_DEFINITIONS_NAME.to_owned(), oak_index),
+            ]),
+            &[],
+        )
+        .expect("write the content root");
+    let head = write_import_fixture_super_root(&mut writer, content_root);
+
+    writer.finish().expect("finish");
+    let previous = store.head();
+    assert!(store.compare_and_set_head(previous, head));
+    store.flush().expect("flush");
+    store.close().expect("close the import fixture");
+
+    // The input directory is the store's own dump, so the file bytes the
+    // import reads are exactly the bytes the store holds and a round trip
+    // is the expected post-state.
+    let repository = crate::store::Repository::open(&directory).expect("open the import fixture");
+    crate::index::lucene::dump::dump_lucene_indexes(
+        &repository,
+        &crate::index::lucene::dump::DumpOptions::new(Vec::new(), lucene_import_dump(&directory)),
+    )
+    .expect("dump the import fixture");
+    drop(repository);
+
+    directory
+}
+
+/// Where the import fixture's dump is written: a sibling of the store.
+fn lucene_import_dump(store: &Path) -> PathBuf {
+    store
+        .parent()
+        .expect("the fixture store always has a parent")
+        .join("dump")
+}
+
+/// The directory an import reads, which is what the dump wrote.
+pub(crate) fn lucene_import_input(store: &Path) -> PathBuf {
+    lucene_import_dump(store).join("index-dumps")
+}
+
+/// The import scenario: import the fixture's own dump back over it with the
+/// cutpoint armed.
+pub(crate) fn run_lucene_import_child(store: &Path, cutpoint: &str, mode: &str) {
+    use crate::writer::index::lucene_import::{LuceneImportOptions, lucene_import};
+
+    let outcome = lucene_import(store, &LuceneImportOptions::new(lucene_import_input(store)));
+    match mode {
+        ERROR_MODE => {
+            let error = outcome.expect_err("the import completed without the injected error");
+            let text = error.to_string();
+            assert!(
+                text.contains(cutpoint),
+                "the import failed before {cutpoint}: {error}"
+            );
+            if cutpoint == "lucene-import.mid-file-copy" {
+                // The one cutpoint that lands inside a file has to say
+                // which file and how far in, because that is what an
+                // operator whose filesystem filled up needs.
+                assert!(
+                    text.contains("the copy of ") && text.contains(" stopped at byte "),
+                    "a mid-copy failure names the file and the offset: {text}"
+                );
+            }
+        }
+        #[cfg(unix)]
+        CRASH_MODE => match outcome {
+            Ok(_) => panic!("the import completed without reaching {cutpoint}"),
+            Err(error) => panic!("the import failed before {cutpoint}: {error}"),
+        },
+        other => panic!("unsupported import fault mode {other}"),
+    }
+    // SAFETY: `_exit` has no memory-safety preconditions and this is an
+    // isolated child whose error path was checked above.
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(VERIFIED_EXIT_CODE)
+    }
 }

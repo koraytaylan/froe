@@ -20,6 +20,8 @@ mod index_reindex;
 #[cfg(unix)]
 mod journal;
 #[cfg(unix)]
+mod lucene_import;
+#[cfg(unix)]
 mod manifest;
 #[cfg(unix)]
 mod publication;

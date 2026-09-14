@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::content::node::NodeState;
 use crate::error::{Error, Result};
 use crate::index::lanes::AsyncLanes;
+use crate::index::lucene::check::LocalIndexDirectory;
 use crate::index::lucene::layout::{
     INDEX_DETAILS_FILE_NAME, INDEXER_INFO_FILE_NAME, IndexDetails, IndexerInfo,
 };
@@ -306,6 +307,15 @@ fn plan_one(
         byte_count,
     } = read_mappings(index_path, local_directory)?;
 
+    // The directory has to be a coherent Lucene index before a byte of it
+    // is copied. This is the only semantic claim froe can make about
+    // content it did not compute, and making it here — rather than after
+    // the copy — is what keeps a refused import byte-identical to the store
+    // it found.
+    for (jcr_name, source) in &mappings {
+        refuse_an_incoherent_directory(index_path, jcr_name, source)?;
+    }
+
     // The file's `reindexCount` plus one, which is what the importer's data
     // step produces after Oak's own updater installed the file's value.
     let file_count_property = definitions_file
@@ -324,6 +334,39 @@ fn plan_one(
         file_count,
         byte_count,
         reindex_count: file_count_property + 1,
+    })
+}
+
+/// Refuses a local directory that is not a coherent set of Lucene files.
+///
+/// An unregistered codec is deliberately **not** a refusal: the files are
+/// coherent and it is Oak that will refuse them at open, which
+/// [`LuceneStructuralReport::is_coherent`] already says. What is refused is
+/// a directory with no commit file, a file a segment names that is not
+/// there, a file no segment names, or a file whose header or table of
+/// contents does not read — every one of which would install an index Oak
+/// cannot open.
+fn refuse_an_incoherent_directory(index_path: &str, jcr_name: &str, source: &Path) -> Result<()> {
+    let report =
+        crate::index::lucene::check::check_structure(&LocalIndexDirectory::new(source.to_owned()))
+            .map_err(index_error)?;
+    if report.is_coherent() {
+        return Ok(());
+    }
+    let reason = if let Some((file, details)) = report.unreadable_files.first() {
+        format!("{file} does not read: {details}")
+    } else if let Some(missing) = report.missing_files.first() {
+        format!("the commit names {missing}, which the directory does not hold")
+    } else if let Some(extra) = report.unreferenced_files.first() {
+        format!("{extra} is in the directory and no segment names it")
+    } else {
+        "it holds no commit file".to_owned()
+    };
+    Err(Error::InvalidFormat {
+        details: format!(
+            "{index_path}'s {jcr_name} in {} is not a coherent Lucene index: {reason};              froe refuses it before copying a byte",
+            source.display()
+        ),
     })
 }
 

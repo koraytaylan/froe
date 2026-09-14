@@ -137,6 +137,25 @@ pub fn rewrite_definition<Sink: SegmentSink>(
     definition: &NodeState<'_>,
     edits: &DefinitionEdits,
 ) -> Result<RecordIdentifier> {
+    let node_edits = definition_node_edits(writer, definition, edits)?;
+    rewrite_node_with_edits(
+        provider,
+        writer,
+        Some(definition.record_identifier()),
+        &node_edits,
+    )
+}
+
+/// The commit-path edits one [`DefinitionEdits`] resolves to.
+///
+/// Separated from the rewrite because the stored-definition clone needs the
+/// *same* edits with the hidden children taken back out, and deriving them
+/// twice is how the clone and the definition come to disagree.
+fn definition_node_edits<Sink: SegmentSink>(
+    writer: &mut RecordWriter<Sink>,
+    definition: &NodeState<'_>,
+    edits: &DefinitionEdits,
+) -> Result<NodeEdits> {
     let mut node_edits = NodeEdits {
         property_replacements: edits.property_replacements.clone(),
         property_removals: edits.property_removals.clone(),
@@ -199,6 +218,56 @@ pub fn rewrite_definition<Sink: SegmentSink>(
         node_edits.child_edits.insert(name.clone(), Some(*record));
     }
 
+    Ok(node_edits)
+}
+
+/// The definition as `NodeStateCloner.cloneVisibleState` clones it from the
+/// **updated** state — which is the state an import stores under
+/// `:index-definition` (§6.2).
+///
+/// It cannot be produced by cloning the rewritten record, because that
+/// record is still in the writer's buffer and no provider can read it. So
+/// the same edits are applied to the original node with every hidden child
+/// taken back out, which is what the clone of the updated state *is*: the
+/// updated properties, the visible children, nothing hidden.
+///
+/// Visible children keep their own subtrees, cloned so that a hidden child
+/// nested under one is dropped too. A visible child the edits *replace*
+/// is pointed at as the edits give it — no import writes one today, and
+/// plan 0010's `facets` child is the first that would.
+pub fn clone_updated_definition_state<Sink: SegmentSink>(
+    provider: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    definition: &NodeState<'_>,
+    edits: &DefinitionEdits,
+) -> Result<RecordIdentifier> {
+    let mut node_edits = definition_node_edits(writer, definition, edits)?;
+    // Every hidden child goes, whether the rewrite produced it or the
+    // definition already carried it. The produced ones are the ones that
+    // matter: `:status` and `:data` are written by this very run, so they
+    // appear only in the edits and never in the node below.
+    for name in node_edits
+        .child_edits
+        .keys()
+        .filter(|name| name.starts_with(':'))
+        .cloned()
+        .collect::<Vec<String>>()
+    {
+        node_edits.child_edits.insert(name, None);
+    }
+    for (name, child) in definition.child_node_entries()? {
+        if name.starts_with(':') {
+            node_edits.child_edits.insert(name, None);
+            continue;
+        }
+        if node_edits.child_edits.contains_key(&name) {
+            continue;
+        }
+        let cloned = clone_visible_state(provider, writer, &child)?;
+        if cloned != child.record_identifier() {
+            node_edits.child_edits.insert(name, Some(cloned));
+        }
+    }
     rewrite_node_with_edits(
         provider,
         writer,
@@ -240,4 +309,161 @@ fn current_reindex_count(definition: &NodeState<'_>) -> Result<u64> {
 fn retains_across_reindex(child: &NodeState<'_>) -> Result<bool> {
     let property = child.property(RETAIN_PROPERTY)?;
     Ok(crate::index::strict_boolean(property.as_ref()))
+}
+
+/// How deep a `supersedes` path may be resolved.
+///
+/// The corrupt-input rule: a path from a store is file-supplied, so the walk
+/// that resolves it is bounded rather than trusted.
+const MAXIMUM_SUPERSEDES_DEPTH: usize = 64;
+
+/// Oak's `IndexDisabler.isAnyIndexToBeDisabled`, as a verdict.
+///
+/// `docs/analysis/index-definitions.md` §5.5 states the rule and quotes the
+/// Java (`oak-core`, `plugins/index/upgrade/IndexDisabler.java`). The flag is
+/// raised when, among the `supersedes` values — read **converting** to
+/// `STRINGS` — there is either
+///
+/// * a plain index path whose node exists and whose `type` does **not** read
+///   **strictly** as the `STRING` `disabled`, so a `NAME`-typed or
+///   array-typed `type` counts as active and raises the flag; or
+/// * a `/path/@type` entry whose named node type is still among that index's
+///   `declaringNodeTypes`, read **converting** to `NAMES`.
+///
+/// The asymmetry between the two reads is load-bearing and is reproduced
+/// rather than tidied: it is why a superseded index whose `type` was stored
+/// as a `NAME` is disabled over and over.
+///
+/// froe never *acts* on the flag — `disableOldIndexes` changes which index
+/// answers a query, which is a running Oak's decision and an operator's, not
+/// an offline tool's (§10, invariant 7). It only raises it where Oak raises
+/// it, so the cycle after froe's behaves as it would have.
+pub fn disabler_verdict(
+    content_root: &NodeState<'_>,
+    definition: &NodeState<'_>,
+) -> Result<DisablerVerdict> {
+    let superseded = crate::index::converting_strings(definition.property("supersedes")?.as_ref());
+    for entry in superseded {
+        let (path, node_type) = match entry.rsplit_once('/') {
+            Some((parent, last)) if last.starts_with('@') => (parent, Some(&last[1..])),
+            _ => (entry.as_str(), None),
+        };
+        let Some(node) = resolve_under(content_root, path)? else {
+            continue;
+        };
+        if let Some(node_type) = node_type {
+            let declared =
+                crate::index::converting_strings(node.property("declaringNodeTypes")?.as_ref());
+            if declared.iter().any(|declared| declared == node_type) {
+                return Ok(DisablerVerdict::Flag);
+            }
+        } else if crate::index::strict_string(node.property("type")?.as_ref()) != Some("disabled") {
+            return Ok(DisablerVerdict::Flag);
+        }
+    }
+    Ok(DisablerVerdict::Leave)
+}
+
+/// Resolves an absolute or relative path under `root`, bounded.
+fn resolve_under<'store>(
+    root: &NodeState<'store>,
+    path: &str,
+) -> Result<Option<NodeState<'store>>> {
+    let mut node = *root;
+    for (depth, element) in path.split('/').filter(|part| !part.is_empty()).enumerate() {
+        if depth >= MAXIMUM_SUPERSEDES_DEPTH {
+            return Ok(None);
+        }
+        let Some(child) = node.child_node(element)? else {
+            return Ok(None);
+        };
+        node = child;
+    }
+    Ok(Some(node))
+}
+
+/// The hidden property `IndexDefinition.INDEX_VERSION`.
+pub const INDEX_VERSION_PROPERTY: &str = ":version";
+
+/// The hidden child `IndexDefinition.INDEX_DEFINITION_NODE`.
+pub const STORED_DEFINITION_CHILD: &str = ":index-definition";
+
+/// `IndexDefinition.determineVersionForFreshIndex`, collapsed.
+///
+/// `docs/analysis/index-definitions.md` §6.2 quotes the Java and works the
+/// collapse: `IndexFormatVersion` has exactly `V1(1)` and `V2(2)`, the
+/// default is `V2`, and every branch but the `compatMode` one returns
+/// `max(V2, …)`. So a definition carrying `compatMode` gets that value, read
+/// **converting** to `LONG`, and every other definition gets 2 — neither
+/// `:version` nor `fullTextEnabled` can change the answer.
+///
+/// A `compatMode` outside `{1, 2}` is what Oak's `getVersion(int)` throws
+/// on; froe refuses it rather than writing a version Oak will not read.
+pub fn fresh_index_format_version(definition: &NodeState<'_>) -> Result<i64> {
+    let Some(property) = definition.property("compatMode")? else {
+        return Ok(2);
+    };
+    match crate::index::converting_long(Some(&property)) {
+        Some(version @ (1 | 2)) => Ok(version),
+        other => Err(Error::InvalidFormat {
+            details: format!(
+                "compatMode reads as {}, and Oak's IndexFormatVersion knows only 1 and 2",
+                other.map_or_else(|| "no number".to_owned(), |value| value.to_string())
+            ),
+        }),
+    }
+}
+
+/// How deep [`clone_visible_state`] walks.
+const MAXIMUM_CLONE_DEPTH: usize = 64;
+
+/// `NodeStateCloner.cloneVisibleState`.
+///
+/// `oak-search`, `plugins/index/search/util/NodeStateCloner.java`: its
+/// `ApplyVisibleDiff` overrides `childNodeAdded` alone, so the clone **drops
+/// hidden child nodes and keeps hidden properties**, at every depth.
+///
+/// Unchanged visible children are shared rather than copied: the clone is a
+/// node in the same store, and a record that already holds the right subtree
+/// is the right record to point at.
+pub fn clone_visible_state<Sink: SegmentSink>(
+    provider: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    node: &NodeState<'_>,
+) -> Result<RecordIdentifier> {
+    clone_visible_state_bounded(provider, writer, node, 0)
+}
+
+fn clone_visible_state_bounded<Sink: SegmentSink>(
+    provider: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    node: &NodeState<'_>,
+    depth: usize,
+) -> Result<RecordIdentifier> {
+    if depth >= MAXIMUM_CLONE_DEPTH {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "a definition nests more than {MAXIMUM_CLONE_DEPTH} levels deep, which no \
+                 index definition does and a corrupt record can claim"
+            ),
+        });
+    }
+
+    let mut edits = ChildEdits::new();
+    for (name, child) in node.child_node_entries()? {
+        if name.starts_with(':') {
+            edits.insert(name, None);
+            continue;
+        }
+        let cloned = clone_visible_state_bounded(provider, writer, &child, depth + 1)?;
+        if cloned != child.record_identifier() {
+            edits.insert(name, Some(cloned));
+        }
+    }
+    crate::writer::commit::rewrite_node_with_child_edits(
+        provider,
+        writer,
+        Some(node.record_identifier()),
+        &edits,
+    )
 }

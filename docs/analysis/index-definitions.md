@@ -656,6 +656,56 @@ idempotent.)
 * **`:version` is a hidden property on the definition node itself**, written on
   every path through `apply` — that is, on every Lucene reindex and on every
   import.
+
+  The value comes from `IndexDefinition.determineVersionForFreshIndex`
+  (`oak-search`, `plugins/index/search/IndexDefinition.java`), which the
+  `NodeBuilder` overload forwards to the three-property one:
+
+  ```java
+  private static IndexFormatVersion determineVersionForFreshIndex(PropertyState fulltext,
+                                                                  PropertyState compat,
+                                                                  PropertyState version) {
+      if (compat != null) {
+          return versionFrom(compat);
+      }
+
+      IndexFormatVersion defaultToUse = IndexFormatVersion.getDefault();
+      IndexFormatVersion existing = version != null ? versionFrom(version) : null;
+      IndexFormatVersion result = defaultToUse;
+
+      if (existing != null) {
+          result = IndexFormatVersion.max(result, existing);
+      }
+
+      if (fulltext != null && !fulltext.getValue(Type.BOOLEAN)) {
+          return IndexFormatVersion.max(result, IndexFormatVersion.V2);
+      }
+
+      return result;
+  }
+
+  private static IndexFormatVersion versionFrom(PropertyState ps) {
+      return IndexFormatVersion.getVersion(Math.toIntExact(ps.getValue(Type.LONG)));
+  }
+  ```
+
+  `IndexFormatVersion` (`oak-search`,
+  `plugins/index/search/IndexFormatVersion.java`) has exactly two constants,
+  `V1(1)` and `V2(2)`; `getDefault()` returns `V2`, `max` returns whichever
+  carries the higher number, and `getVersion(int)` throws
+  `IllegalArgumentException` for anything but 1 or 2.
+
+  So the rule collapses, and the collapse is what froe implements:
+
+  * `compatMode` present → its value read **converting to `LONG`**, which must
+    be 1 or 2; anything else is what Oak throws on, and froe refuses.
+  * otherwise → **2**, unconditionally. `max(V2, existing)` cannot exceed `V2`
+    because no third constant exists, and the `fullTextEnabled` branch returns
+    `max(result, V2)`, which is the same `V2`. Neither `:version` nor
+    `fullTextEnabled` can change the answer on a store Oak itself wrote.
+
+  The property is written with the `int` `getVersion()` returns, so it lands
+  as a `LONG`.
 * **The clone is of the builder's *base* state on a reindex**
   (`useStateFromBuilder = false`, which is what `enableReindexMode` passes
   unless the definition was rewritten in the same commit) **and of the updated

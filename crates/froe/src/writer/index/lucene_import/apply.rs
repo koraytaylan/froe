@@ -26,7 +26,11 @@ use crate::error::{Error, Result};
 use crate::index::IndexDefinition;
 use crate::progress::{ProgressObserver, Step, WorkUnit, count, observe};
 use crate::segment::record::RecordIdentifier;
-use crate::writer::index::definition_update::{DefinitionEdits, DisablerVerdict, ReindexCount};
+use crate::writer::index::definition_update::{
+    DefinitionEdits, INDEX_VERSION_PROPERTY, ReindexCount, STORED_DEFINITION_CHILD,
+    clone_updated_definition_state, disabler_verdict, fresh_index_format_version,
+    rewrite_definition,
+};
 use crate::writer::index::lucene_directory::{DirectoryListing, OakDirectoryWriter};
 use crate::writer::index::lucene_import::plan::PlannedImport;
 use crate::writer::index::lucene_import::prepared::PreparedLuceneImport;
@@ -40,6 +44,49 @@ const COPY_STEP: &str = "copying index files";
 
 /// The step opened while they are read back.
 const VERIFY_STEP: &str = "verifying the imported index";
+
+/// Fired while the largest file of a definition is being streamed in: the
+/// copy has appended records and the store's head still resolves the old
+/// `:data`.
+///
+/// Only a test build names it: the reader that fires it is the only caller,
+/// and that reader wraps a file only under `cfg(test)`.
+#[cfg(test)]
+const MID_FILE_COPY: &str = "lucene-import.mid-file-copy";
+
+/// Fired after every file is written, read back and the spine rewritten,
+/// and before the head moves: the store is unchanged plus unreferenced
+/// archives.
+const BEFORE_HEAD_PUBLISH: &str = "lucene-import.before-head-publish";
+
+/// Fired between `compare_and_set_head`, which changes nothing on disk, and
+/// `flush`, which seals, fsyncs and appends the journal line. The on-disk
+/// prefix here is the same one [`BEFORE_HEAD_PUBLISH`] observes.
+const AFTER_HEAD_PUBLISH_BEFORE_FLUSH: &str = "lucene-import.after-head-publish-before-flush";
+
+/// Fired after the store is final and before it is read back: a failure
+/// here is reported, never repaired.
+const BEFORE_APPLIED_VERIFICATION: &str = "lucene-import.before-applied-verification";
+
+/// One durability boundary of the mutation table, for the fault probes.
+#[cfg(test)]
+fn probe(cutpoint: &str) -> Result<()> {
+    crate::writer::fault_injection::fail_if_armed(cutpoint)?;
+    crate::writer::fault_injection::crash_if_armed(cutpoint);
+    Ok(())
+}
+
+/// Outside a test build there are no cutpoints and this compiles to nothing.
+#[cfg(not(test))]
+#[inline]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the sibling this stands in for can fail, and the caller is the same either way"
+)]
+fn probe(cutpoint: &str) -> Result<()> {
+    let _ = cutpoint;
+    Ok(())
+}
 
 /// What one definition's import produced.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -117,6 +164,7 @@ pub(crate) fn apply_prepared(
     let written = written?;
     closed?;
 
+    probe(BEFORE_APPLIED_VERIFICATION)?;
     verify_after_reopen(&prepared.directory, written.head_after, &written.indexes)?;
 
     Ok(LuceneImportOutcome {
@@ -174,6 +222,7 @@ fn write_every_index(
     })?;
 
     writer.finish()?;
+    probe(BEFORE_HEAD_PUBLISH)?;
     if !store.compare_and_set_head(head_before, head_after) {
         return Err(Error::InvalidFormat {
             details: "the head moved while the import held the lock, which cannot happen \
@@ -181,6 +230,7 @@ fn write_every_index(
                 .to_owned(),
         });
     }
+    probe(AFTER_HEAD_PUBLISH_BEFORE_FLUSH)?;
     store.flush()?;
 
     Ok(WrittenImport {
@@ -196,12 +246,15 @@ fn import_one<Sink: SegmentSink>(
     import: &PlannedImport,
     report: &mut dyn FnMut(usize),
 ) -> Result<(RecordIdentifier, ImportedIndex)> {
-    let definition_node = store
-        .head_node()
-        .child_node("root")?
-        .and_then(|root| descend(&root, &import.path).transpose())
-        .transpose()?
-        .ok_or_else(|| Error::InvalidFormat {
+    let content_root =
+        store
+            .head_node()
+            .child_node("root")?
+            .ok_or_else(|| Error::InvalidFormat {
+                details: "the super-root has no \"root\" child node".to_owned(),
+            })?;
+    let definition_node =
+        descend(&content_root, &import.path)?.ok_or_else(|| Error::InvalidFormat {
             details: format!("{} vanished between the plan and the apply", import.path),
         })?;
     let definition = IndexDefinition::read(&definition_node, &import.path).map_err(index_error)?;
@@ -230,19 +283,36 @@ fn import_one<Sink: SegmentSink>(
         })
         .collect();
 
-    let mut edits = DefinitionEdits::reindexed(DisablerVerdict::Leave, hidden_children);
+    // Oak's importer's data step raises the disabler's flag where Oak's own
+    // reindex path raises it, so the cycle after an import behaves as it
+    // would have. froe never acts on the flag.
+    let verdict = disabler_verdict(&content_root, &definition_node)?;
+    let mut edits = DefinitionEdits::reindexed(verdict, hidden_children);
     edits.reindex_count = ReindexCount::Set(import.reindex_count);
     // Oak's own cycle clears `corrupt`, and the importer's definition-refresh
     // step removes `indexImportState`.
     edits.property_removals.push("corrupt".to_owned());
     edits.property_removals.push("indexImportState".to_owned());
 
-    let record = crate::writer::index::definition_update::rewrite_definition(
-        store,
-        writer,
-        &definition_node,
-        &edits,
-    )?;
+    // `:version`, written on every path through Oak's `ReindexOperations`
+    // — every Lucene reindex and every import.
+    let version = fresh_index_format_version(&definition_node)?;
+    let version_value = writer.write_string(&version.to_string())?;
+    edits.property_replacements.push(PropertyToWrite {
+        name: INDEX_VERSION_PROPERTY.to_owned(),
+        property_type: crate::PropertyType::Long,
+        values: PropertyValuesToWrite::Single(version_value),
+    });
+
+    // `:index-definition` is a clone of the **updated** state on an import,
+    // where a reindex clones the base state. Oak computes that state before
+    // it sets the child, so the clone carries every property edit above and
+    // none of the hidden children.
+    let stored = clone_updated_definition_state(store, writer, &definition_node, &edits)?;
+    edits
+        .hidden_children
+        .push((STORED_DEFINITION_CHILD.to_owned(), stored));
+    let record = rewrite_definition(store, writer, &definition_node, &edits)?;
 
     Ok((
         record,
@@ -282,6 +352,14 @@ fn write_directory<Sink: SegmentSink>(
     };
     let mut builder = OakDirectoryWriter::new(writer, blob_size, listing);
 
+    // The largest file is where a copy spends its time and where an
+    // exhausted filesystem stops it, so that is where the cutpoint sits.
+    #[cfg(test)]
+    let largest = names
+        .iter()
+        .max_by_key(|path| std::fs::metadata(path).map_or(0, |data| data.len()))
+        .cloned();
+
     let mut written = Vec::new();
     for path in names {
         let name = path
@@ -295,11 +373,70 @@ fn write_directory<Sink: SegmentSink>(
         // One file at a time, streamed: the largest file bounds memory, not
         // the index.
         let handle = std::fs::File::open(&path)?;
-        builder.add_file(&name, handle)?;
+        #[cfg(test)]
+        {
+            if Some(&path) == largest.as_ref() {
+                builder.add_file(&name, ProbingReader::halfway_through(handle, &name, length))?;
+            } else {
+                builder.add_file(&name, handle)?;
+            }
+        }
+        #[cfg(not(test))]
+        {
+            builder.add_file(&name, handle)?;
+        }
         written.push((name, length));
         report(written.len());
     }
     Ok((builder.finish()?, written))
+}
+
+/// A reader that fires the mid-copy cutpoint partway through one file.
+///
+/// The cutpoint has to land *inside* a file rather than between two, because
+/// what it models is the filesystem filling up: the copy has already
+/// appended records for the bytes it read, and the error has to say which
+/// file and how far into it the run got. Only test builds wrap a file in
+/// one.
+#[cfg(test)]
+struct ProbingReader<Source> {
+    source: Source,
+    name: String,
+    read: u64,
+    fire_at: u64,
+    fired: bool,
+}
+
+#[cfg(test)]
+impl<Source: std::io::Read> ProbingReader<Source> {
+    /// Fires once half of `length` bytes have passed.
+    fn halfway_through(source: Source, name: &str, length: u64) -> Self {
+        Self {
+            source,
+            name: name.to_owned(),
+            read: 0,
+            fire_at: length / 2,
+            fired: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<Source: std::io::Read> std::io::Read for ProbingReader<Source> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.source.read(buffer)?;
+        self.read += count as u64;
+        if !self.fired && self.read >= self.fire_at {
+            self.fired = true;
+            probe(MID_FILE_COPY).map_err(|error| {
+                std::io::Error::other(format!(
+                    "the copy of {} stopped at byte {}: {error}",
+                    self.name, self.read
+                ))
+            })?;
+        }
+        Ok(count)
+    }
 }
 
 /// The `:status` node oak-run's importer leaves behind.

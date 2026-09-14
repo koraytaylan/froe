@@ -32,7 +32,7 @@ use crate::progress::{ProgressObserver, Step, WorkUnit, observe};
 use crate::segment::record::RecordIdentifier;
 use crate::writer::index::counter_builder::CounterBuilder;
 use crate::writer::index::definition_update::{
-    DefinitionEdits, DisablerVerdict, rewrite_definition,
+    DefinitionEdits, disabler_verdict, rewrite_definition,
 };
 use crate::writer::index::plan::{NoWorkReason, ReindexAction};
 use crate::writer::index::prepared::{PreparedReindex, RUN_DIRECTORY_PREFIX};
@@ -568,12 +568,18 @@ fn rebuild_one<Sink: SegmentSink>(
         }
     };
 
-    let mut edits = DefinitionEdits::reindexed(
-        // The verdict is selection's, computed over the head's other
-        // definitions; the rewrite never evaluates it.
-        DisablerVerdict::Leave,
-        hidden_children,
-    );
+    // Oak raises the disabler's flag on both branches of its reindex
+    // (`docs/analysis/index-definitions.md` §5.2, §5.5), over the *head's*
+    // definitions rather than the indexed state's: the question is which
+    // indexes are active now, not which were active at the checkpoint.
+    let head_root = store
+        .head_node()
+        .child_node("root")?
+        .ok_or_else(|| Error::InvalidFormat {
+            details: "the super-root has no \"root\" child node".to_owned(),
+        })?;
+    let verdict = disabler_verdict(&head_root, definition)?;
+    let mut edits = DefinitionEdits::reindexed(verdict, hidden_children);
     if let Some(seed) = created_seed {
         let value = writer.write_string(&seed.to_string())?;
         edits.property_replacements.push(PropertyToWrite {

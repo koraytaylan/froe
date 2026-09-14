@@ -276,12 +276,78 @@ fn is_never_referenced(name: &str) -> bool {
     name == crate::index::lucene::segments::SEGMENTS_GEN_FILE_NAME
 }
 
+/// A set of named Lucene files the structural check can read.
+///
+/// Two things implement it: a `:data` subtree in the store, and a local
+/// index directory on the filesystem — which is what an import validates
+/// **before it copies a byte**, so a directory that is not a coherent index
+/// is refused while the store is still byte-identical to the one the run
+/// found.
+pub trait LuceneFileSource {
+    /// Every file name the directory holds.
+    fn file_names(&self) -> Vec<String>;
+
+    /// One file's bytes, or why they could not be read.
+    ///
+    /// The structural check reads only `segments.gen`, the commit file and
+    /// each `.si`; none of them is more than a few kilobytes, so they are
+    /// read whole rather than streamed.
+    fn read_file(&self, name: &str) -> std::result::Result<Vec<u8>, String>;
+}
+
+impl LuceneFileSource for crate::index::lucene::OakDirectory<'_> {
+    fn file_names(&self) -> Vec<String> {
+        crate::index::lucene::OakDirectory::file_names(self).to_vec()
+    }
+
+    fn read_file(&self, name: &str) -> std::result::Result<Vec<u8>, String> {
+        let file = self.file(name).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::with_capacity(file.length() as usize);
+        std::io::Read::read_to_end(&mut file.reader(), &mut bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(bytes)
+    }
+}
+
+/// An index directory on the filesystem, as a dump writes one and an import
+/// reads one.
+pub struct LocalIndexDirectory {
+    path: std::path::PathBuf,
+}
+
+impl LocalIndexDirectory {
+    /// The directory at `path`.
+    #[must_use]
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl LuceneFileSource for LocalIndexDirectory {
+    fn file_names(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.path) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn read_file(&self, name: &str) -> std::result::Result<Vec<u8>, String> {
+        std::fs::read(self.path.join(name)).map_err(|error| error.to_string())
+    }
+}
+
 /// Reads a directory's table of contents and reports its coherence.
-pub fn check_structure(
-    directory: &crate::index::lucene::OakDirectory<'_>,
+pub fn check_structure<Source: LuceneFileSource + ?Sized>(
+    directory: &Source,
 ) -> IndexResult<LuceneStructuralReport> {
     let mut report = LuceneStructuralReport::default();
-    let listing: Vec<String> = directory.file_names().to_vec();
+    let listing: Vec<String> = LuceneFileSource::file_names(directory);
 
     // The hint first, because it can only raise the generation the listing
     // gives and never lowers it.
@@ -289,12 +355,12 @@ pub fn check_structure(
         .iter()
         .any(|name| name == crate::index::lucene::segments::SEGMENTS_GEN_FILE_NAME)
         .then(|| {
-            let file = directory
-                .file(crate::index::lucene::segments::SEGMENTS_GEN_FILE_NAME)
+            let bytes = directory
+                .read_file(crate::index::lucene::segments::SEGMENTS_GEN_FILE_NAME)
                 .ok()?;
-            let length = file.length();
+            let length = bytes.len() as u64;
             let mut reader = crate::index::lucene::read::Reader::new(
-                file.reader(),
+                std::io::Cursor::new(bytes),
                 crate::index::lucene::segments::SEGMENTS_GEN_FILE_NAME,
                 length,
             );
@@ -379,35 +445,25 @@ pub fn check_structure(
 }
 
 /// Reads one commit file and every `.si` it names, through the directory.
-fn read_commit(
-    directory: &crate::index::lucene::OakDirectory<'_>,
+fn read_commit<Source: LuceneFileSource + ?Sized>(
+    directory: &Source,
     commit_name: &str,
 ) -> std::result::Result<crate::index::lucene::segments::CommitFile, String> {
-    let file = directory
-        .file(commit_name)
-        .map_err(|error| error.to_string())?;
-    let length = file.length();
-    let mut reader = crate::index::lucene::read::Reader::new(file.reader(), commit_name, length);
+    let bytes = directory.read_file(commit_name)?;
+    let length = bytes.len() as u64;
+    let mut reader =
+        crate::index::lucene::read::Reader::new(std::io::Cursor::new(bytes), commit_name, length);
     crate::index::lucene::segments::read_commit_file(&mut reader, commit_name, |info_name| {
-        let info = directory.file(info_name).map_err(|error| {
+        // The `.si` is read whole rather than streamed: it is a few hundred
+        // bytes, and this keeps the borrow local rather than threading a
+        // lifetime through the whole commit read.
+        let bytes = directory.read_file(info_name).map_err(|details| {
             crate::index::lucene::read::LuceneReadError::Source {
                 file: info_name.to_owned(),
-                details: error.to_string(),
+                details,
             }
         })?;
-        let info_length = info.length();
-        // The file must outlive the reader, so its bytes are drained here
-        // and read from memory: a `.si` is a few hundred bytes, and this
-        // keeps the borrow local rather than threading a lifetime through
-        // the whole commit read.
-        let mut bytes = Vec::with_capacity(info_length as usize);
-        let mut chunk = info.reader();
-        std::io::Read::read_to_end(&mut chunk, &mut bytes).map_err(|error| {
-            crate::index::lucene::read::LuceneReadError::Source {
-                file: info_name.to_owned(),
-                details: error.to_string(),
-            }
-        })?;
+        let info_length = bytes.len() as u64;
         Ok(crate::index::lucene::read::Reader::new(
             std::io::Cursor::new(bytes),
             info_name,

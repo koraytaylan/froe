@@ -109,6 +109,12 @@ struct Shape {
     checkpoint: bool,
     /// Whether the definition also lists `sync`, making it hybrid.
     hybrid: bool,
+    /// The `type` of the index a `supersedes` entry names, or `None` for a
+    /// definition carrying no `supersedes` at all.
+    superseded: Option<&'static str>,
+    /// A `compatMode`, which is the one property that can change the
+    /// `:version` the import writes.
+    compatibility_mode: Option<i64>,
 }
 
 impl Default for Shape {
@@ -117,6 +123,8 @@ impl Default for Shape {
             lane: Some("async"),
             checkpoint: true,
             hybrid: false,
+            superseded: None,
+            compatibility_mode: None,
         }
     }
 }
@@ -142,13 +150,35 @@ fn build_store(directory: &TestDirectory, shape: Shape) -> PathBuf {
         );
     }
 
+    if shape.superseded.is_some() {
+        definition = definition.with(
+            "supersedes",
+            Property::Texts(vec!["/oak:index/old".to_owned()]),
+        );
+    }
+    if let Some(mode) = shape.compatibility_mode {
+        definition = definition.with("compatMode", Property::Long(mode));
+    }
+
     let content = Node::new().with_child(
         "page",
         Node::new().with("jcr:title", Property::Text("Alpha".to_owned())),
     );
+    let mut definitions = Node::new().with_child("lucene", definition);
+    if let Some(kind) = shape.superseded {
+        definitions = definitions.with_child(
+            "old",
+            Node::new()
+                .with(
+                    "jcr:primaryType",
+                    Property::Name("oak:QueryIndexDefinition".to_owned()),
+                )
+                .with("type", Property::Text(kind.to_owned())),
+        );
+    }
     let mut root = Node::new()
         .with_child("content", content.clone())
-        .with_child("oak:index", Node::new().with_child("lucene", definition));
+        .with_child("oak:index", definitions);
     if let Some(lane) = shape.lane {
         root = root.with_child(
             ":async",
@@ -394,7 +424,7 @@ fn a_synchronous_definition_is_refused_by_name() {
         Shape {
             lane: None,
             checkpoint: false,
-            hybrid: false,
+            ..Shape::default()
         },
     );
     // A synchronous definition dumps as a backup with no properties file,
@@ -610,4 +640,116 @@ fn a_refresh_the_lane_revert_set_is_accepted() {
     let plan = plan_lucene_import(&store, &LuceneImportOptions::new(input))
         .expect("a file-side refresh is what an honest out-of-band build leaves");
     assert_eq!(plan.imports.len(), 1);
+}
+
+/// The disabler's flag, raised where Oak's own importer raises it.
+///
+/// `docs/analysis/index-definitions.md` §5.5: the flag goes up when a
+/// `supersedes` entry names an index whose `type` does not read **strictly**
+/// as the `STRING` `disabled`. froe raises it and never acts on it.
+#[test]
+fn a_supersedes_naming_an_active_index_raises_the_disabler_flag() {
+    let directory = TestDirectory::new("disabler-active");
+    let store = build_store(
+        &directory,
+        Shape {
+            superseded: Some("property"),
+            ..Shape::default()
+        },
+    );
+    let input = dump(&directory, &store);
+    lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    let line = digest_lines(&store, "/oak:index/lucene")
+        .into_iter()
+        .next()
+        .expect("the definition");
+    assert!(
+        line.contains(":disableIndexesOnNextCycle=Boolean:true"),
+        "an active superseded index raises the flag: {line}"
+    );
+}
+
+/// And the other side of the same predicate: a superseded index already
+/// disabled raises nothing.
+#[test]
+fn a_supersedes_naming_a_disabled_index_raises_nothing() {
+    let directory = TestDirectory::new("disabler-disabled");
+    let store = build_store(
+        &directory,
+        Shape {
+            superseded: Some("disabled"),
+            ..Shape::default()
+        },
+    );
+    let input = dump(&directory, &store);
+    lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    let line = digest_lines(&store, "/oak:index/lucene")
+        .into_iter()
+        .next()
+        .expect("the definition");
+    assert!(
+        !line.contains(":disableIndexesOnNextCycle"),
+        "a disabled superseded index raises nothing: {line}"
+    );
+}
+
+/// `:version` is written on every import, and the fresh-index rule
+/// collapses to 2 unless the definition carries a `compatMode`.
+#[test]
+fn the_fresh_index_format_version_is_written() {
+    for (mode, expected) in [(None, 2), (Some(1), 1), (Some(2), 2)] {
+        let directory = TestDirectory::new(&format!("version-{mode:?}"));
+        let store = build_store(
+            &directory,
+            Shape {
+                compatibility_mode: mode,
+                ..Shape::default()
+            },
+        );
+        let input = dump(&directory, &store);
+        lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+        let line = digest_lines(&store, "/oak:index/lucene")
+            .into_iter()
+            .next()
+            .expect("the definition");
+        assert!(
+            line.contains(&format!(":version=Long:{expected}")),
+            "compatMode {mode:?} must give :version {expected}: {line}"
+        );
+    }
+}
+
+/// `:index-definition` is the visible clone of the **updated** state: every
+/// property the import wrote, and not one hidden child.
+#[test]
+fn the_stored_definition_clones_the_updated_visible_state() {
+    let directory = TestDirectory::new("stored-definition");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+    lucene_import(&store, &LuceneImportOptions::new(input)).expect("import");
+
+    let clone = digest_lines(&store, "/oak:index/lucene/:index-definition");
+    let line = clone.first().expect("a :index-definition node");
+
+    // Hidden *properties* are kept, which is what makes the clone useful
+    // for drift: `:version` is one, and so is the disabler's flag when it
+    // is raised.
+    assert!(line.contains(":version=Long:2"), "{line}");
+    // The properties the import rewrote are the updated ones, not the base
+    // state's: a clone carrying `reindex=true` would be a reindex's clone.
+    assert!(line.contains("reindex=Boolean:false"), "{line}");
+    assert!(line.contains("reindexCount=Long:1"), "{line}");
+
+    // Hidden *children* are dropped, at every depth.
+    for hidden in [":data", ":status", ":index-definition"] {
+        assert!(
+            !clone
+                .iter()
+                .any(|line| line.contains(&format!("/oak:index/lucene/:index-definition/{hidden}"))),
+            "the clone kept the hidden child {hidden}: {clone:?}"
+        );
+    }
 }
