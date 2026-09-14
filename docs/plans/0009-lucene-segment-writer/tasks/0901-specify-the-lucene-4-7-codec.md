@@ -8,8 +8,8 @@ gated: false
 touches:
   - docs/analysis/lucene-4-7-codec.md
   - docs/analysis/README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "e6f7b88, 02c62f1"
 ---
 # Specify The Lucene 4.7 Codec And Record The Feasibility Verdict
 
