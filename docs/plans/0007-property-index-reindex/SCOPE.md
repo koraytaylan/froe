@@ -1,0 +1,28 @@
+# Scope — Plan 0007
+
+> Rebuild the property-family indexes offline — `property`, unique, node-type, `reference` and `counter` — exactly as Oak's own editors would, in one head move, under the maintenance discipline `froe compact` already follows, and prove it against Oak's own reindex of the same store.
+
+## Why this plan
+
+A property index with `reindex=true` is rebuilt synchronously by the first commit after AEM starts, inside that commit's thread, blocking startup for as long as the traversal takes; on a large store the `nodetype` index — which mirrors every node — is the notorious multi-hour case. Oak has no offline path for it: oak-run's `--reindex` builds property indexes into a *separate* segment store that is never imported back, and Oak's own index importer carries a comment saying that property-index import is "later". froe already holds everything the rebuild needs — the content tree, the node-type registry, the writer, the lock and the verification discipline — so the rebuild can happen while the instance is stopped and cost nothing on startup.
+
+The plan is high-risk under `docs/high-risk-changes.md`: it publishes new bytes under `/oak:index`, moves the head, and makes the previous index records unreachable. It therefore starts with its safety case and ends with a frozen adversarial review, and the interop evidence is designed around the strongest oracle available: Oak rebuilds the same indexes on a copy of the same store, and froe's rebuild must render identically to Oak's modulo exactly the randomized approximate counters — nothing else is excused.
+
+## In scope
+
+- **The state to index.** A synchronous index is rebuilt from the head; an asynchronous-lane index (the `counter`) is rebuilt from the state at its lane's checkpoint, because the lane's next cycle replays the difference from that checkpoint and a delta-based index rebuilt from the head would double-count it. A dangling lane checkpoint is refused; `--from-head` is offered only where Oak's own replay after such a loss leaves the entries unchanged (the mirror and unique strategies; only the randomized counters drift), and, for the counter (and in plan 0010 a Lucene definition) on such a lane, it performs the one Oak-correct action instead — a *reset*: the hidden children removed exactly as a reindex removes them (retained ones kept), every visible property untouched, nothing built — because Oak's replay after a lost checkpoint doubles every counter and Lucene definition on that lane whether or not froe ran, while a definition it finds absent from the missing state with no hidden child it rebuilds from scratch — the rule `docs/analysis/index-definitions.md` records.
+- **The structures.** Mirror and unique storage with exact key derivation, type predicates and path filters; the reference index over `REFERENCE` and `WEAKREFERENCE` values; the counter with Oak's SipHash chain and the stored seed.
+- **The bookkeeping.** Exactly what Oak's own reindex performs: `reindex=false`, `reindexCount` incremented, hidden children replaced (respecting `retainNodeInReindex`), `corrupt` cleared, a counter's `seed` created when absent, a parked `async = async-reindex` property removed, the hidden `:disableIndexesOnNextCycle` flag written under the disabler predicate `docs/analysis/index-definitions.md` records, for a definition whose `supersedes` names an active index; every other record preserved by identity.
+- **The operation.** Plan read-only without the lock; prepare under the lock with a replanned, fingerprinted plan; build into fresh archives above every physical archive number; verify the new subtrees through the open session; publish with one compare-and-set and one flush; verify again from a fresh reopen. `--dry-run`, `--yes`, `--index` selection, `--work-directory` and `--sort-budget-mebibytes` for the external sort.
+- **Resource bounds.** An external sort with a declared byte budget, so the `nodetype` index of an 18-million-node store builds in bounded memory; a streaming trie writer whose state is bounded by fan-out along one path.
+- **Evidence.** Safety case, mutation table, guard neutralization, fault and process-death cutpoints, the `property_reindex` interop phase with Oak's rebuild as oracle, Oak booting the froe-built store without logging a reindex and answering the same queries, with identical plans where the plan text carries no counter-derived cost, and a frozen review.
+- **Compact awareness.** `froe compact`'s plan warns about definitions flagged `reindex=true`, naming the command that clears them.
+
+## Out of scope
+
+- Lucene indexes (plans 0008, 0009, 0010) and any index type outside the five above.
+- `valuePattern` regular expressions: a definition that carries one is refused with a typed error, never approximated.
+- Composite-store mounts: a definition whose storage names carry a mount fragment is refused.
+- Uniqueness enforcement as a commit-time constraint. The rebuild reports duplicate values for a unique index — Oak would fail the commit with a uniqueness constraint violation — and refuses to publish an index that would present them, because publishing would hand Oak a constraint violation it cannot recover from.
+- The old counter modes (`oak.countHashed=false` and `oak.index.useCounterOld=true`), whose defaults task 0602 records.
+- Six definition shapes selection refuses by name, each with its own error variant carrying the definition path: a `PathFilter` Oak cannot construct; a definition whose parent is not `/oak:index`; a lane caught mid-run, with a `/:async/async-reindex` checkpoint present; a lane absent from `/:async` altogether; a node that is not an `oak:QueryIndexDefinition`; and a multi-valued `reindexCount`.

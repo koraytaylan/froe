@@ -1,0 +1,27 @@
+---
+id: add-the-index-inventory-phase
+title: Add The Index Inventory Interop Phase
+workstream: "0006"
+kind: task
+depends_on: [add-read-only-index-commands, build-the-oak-side-judge, enrich-the-fixture-for-indexes]
+gated: false
+touches:
+  - crates/froe-cli/tests/interop/phase_index_inventory.rs
+  - crates/froe-cli/tests/interop/main.rs
+  - crates/froe-cli/tests/interop/phase_maintenance.rs
+status: planned
+merged_as: ""
+---
+# Add The Index Inventory Interop Phase
+
+The `index_inventory` phase is the first place froe's reading of index structures meets Oak's, over a store Oak wrote. Its oracle is the judge running Oak's own printers over the same bytes.
+
+**Steps:**
+
+1. `froe index definitions` over the fixture must be byte-identical to the judge's `definitions` output after both are normalized only for trailing whitespace — same keys in the same order, same type codes, same pretty-printing, hidden properties such as the `lucene` definition's `:version` included. A difference names the definition and the first differing line.
+2. `froe index list` must agree with the judge's `info` JSON on every field both compute, over the definitions both list: Oak's index-information service omits `disabled` and untyped definitions and any index whose provider throws — a Lucene definition whose lane has no `/:async` entry is the case that throws — so the comparison runs over the intersection of paths, and the phase asserts that the difference of the two sets is exactly the union of the definitions froe reports as ignored by Oak, the `disabled` definitions and the Lucene definitions whose lane is absent from `/:async`, after asserting that the fixture holds none of the latter two. Oak prints per type: for Lucene, lane, last-indexed-to, last-updated, creation time from `:index-definition/creationTimestamp`, which is absent right after a reindex or import until a later refresh writes it, reindex completion time from `:status/reindexCompletionTimestamp`, size in bytes, suggest size, the entry count Oak's own document count gives, the hidden-mount and property-index flags, the definition-changed verdict — the diff text is froe's own rendering, so only the verdict is compared — and, excluded from the comparison, `Is active`, which the printer emits for every type but which is constantly true over a store without non-default mounts — every index path the service yields is active there — so froe models no such field, this plan reporting mounts rather than modelling them; for property indexes, `Is active` and the estimated entry count the property-index provider computes, with no lane and no timestamps; for counter and reference, nothing but `Type` and the excluded `Is active`, so those two types are compared on `Type` alone — thin by design, not by accident, and the reason their agreement carries less weight than the other types'. `Type` precedes every per-type field set, since the printer emits it first. The phase compares exactly that per-type field set; the Lucene entry count is asserted absent on froe's side here and task 0802, the task that fills it, turns that assertion into equality in the same commit so the chain never goes red.
+3. `froe index check` must pass on the pristine store, and the phase must then forge one defect through the writer on a copy — remove one content node whose path a mirror index holds — and assert the check names exactly that entry.
+4. For every Lucene directory the judge dumps, `checkindex` must be clean and `numdocs` is recorded in the run record, pinning that froe's readers were pointed at real, valid index data; `numdocs` is not compared with `:status/indexedNodes`, which is a per-cycle counter Oak resets on every indexing cycle, not a document count.
+5. Register the phase module `phase_index_inventory.rs` in `main.rs`, assert the phase runs before `commit` (froe's direct commits run none of Oak's index editors, so a later position would leave the fixture's synchronous `jcr:title` index legitimately short an entry; one file per plan's phases keeps each under the thousand-line gate) and assert that the operations were read-only: widen `store_file_snapshot` in `phase_maintenance.rs` to `pub(crate)` in place (a move would be a refactor of its own) and assert the store's file snapshot is byte-identical after the phase — the first read-only phase to do so; `read` only compares digests today.
+
+- **Done when:** the phase passes against the pinned image with the definitions comparison byte-identical and every listed field equal over the intersection, the snapshot assertion holds, and a deliberately broken definitions renderer (one type code wrong) makes it fail on that line, and the stable host gate passes (`--all-features`, so the interop suite is compiled and linted).
