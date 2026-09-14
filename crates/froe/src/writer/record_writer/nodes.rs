@@ -9,6 +9,7 @@ use super::{
 pub(crate) const TEMPLATE_DEDUP_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// A property of a node to be written.
+#[derive(Clone)]
 pub struct PropertyToWrite {
     /// The property name.
     pub name: String,
@@ -20,6 +21,12 @@ pub struct PropertyToWrite {
 }
 
 /// The written shape of a property's values.
+///
+/// `Clone` because a rewrite that replaces some of a node's properties
+/// carries the replacements alongside the preserved slots and writes them
+/// together; every variant is a record identifier or a list of them, so a
+/// clone copies identifiers rather than content.
+#[derive(Clone)]
 pub enum PropertyValuesToWrite {
     /// A single value record.
     Single(RecordIdentifier),

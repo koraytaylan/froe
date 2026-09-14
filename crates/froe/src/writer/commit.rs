@@ -124,53 +124,143 @@ pub fn rewrite_node_with_child_edits<Sink: SegmentSink>(
         },
     };
 
-    // Materialize the resulting child set. Unchanged many-child maps are
-    // preserved wholesale; any edit rebuilds the map from its entries
-    // (which themselves preserve the child records by identifier).
-    let children = if edits.is_empty() {
-        match parts.children {
-            ExistingChildren::Zero => ChildNodesToWrite::Zero,
-            ExistingChildren::One { name, node } => ChildNodesToWrite::One { name, node },
-            ExistingChildren::Many { map } => ChildNodesToWrite::ManyExistingMap(map),
-        }
-    } else {
-        let mut entries: BTreeMap<String, RecordIdentifier> = match parts.children {
-            ExistingChildren::Zero => BTreeMap::new(),
-            ExistingChildren::One { name, node } => {
-                let mut entries = BTreeMap::new();
-                entries.insert(name, node);
-                entries
-            }
-            ExistingChildren::Many { map } => crate::content::map::map_entries(provider, map)?
-                .into_iter()
-                .map(|entry| (entry.name, entry.value))
-                .collect(),
-        };
-        for (name, edit) in edits {
-            match edit {
-                Some(node) => {
-                    entries.insert(name.clone(), *node);
-                }
-                None => {
-                    entries.remove(name);
-                }
-            }
-        }
-        match entries.len() {
-            0 => ChildNodesToWrite::Zero,
-            1 => {
-                let (name, node) = entries.into_iter().next().expect("one entry");
-                ChildNodesToWrite::One { name, node }
-            }
-            _ => ChildNodesToWrite::Many(entries.into_iter().collect()),
-        }
-    };
-
+    let children = resulting_children(provider, parts.children, edits)?;
     writer.write_node(
         parts.primary_type.as_deref(),
         &parts.mixin_types,
         &children,
         &parts.properties,
+    )
+}
+
+/// The child set an edit produces.
+///
+/// An unchanged many-child map is preserved wholesale, by identifier; any
+/// edit rebuilds the map from its entries, which themselves preserve the
+/// child records by identifier.
+#[allow(
+    clippy::missing_panics_doc,
+    reason = "the single-entry expect is guarded by the match arm's length"
+)]
+fn resulting_children(
+    provider: &dyn SegmentProvider,
+    existing: ExistingChildren,
+    edits: &ChildEdits,
+) -> Result<ChildNodesToWrite> {
+    if edits.is_empty() {
+        return Ok(match existing {
+            ExistingChildren::Zero => ChildNodesToWrite::Zero,
+            ExistingChildren::One { name, node } => ChildNodesToWrite::One { name, node },
+            ExistingChildren::Many { map } => ChildNodesToWrite::ManyExistingMap(map),
+        });
+    }
+    let mut entries: BTreeMap<String, RecordIdentifier> = match existing {
+        ExistingChildren::Zero => BTreeMap::new(),
+        ExistingChildren::One { name, node } => {
+            let mut entries = BTreeMap::new();
+            entries.insert(name, node);
+            entries
+        }
+        ExistingChildren::Many { map } => crate::content::map::map_entries(provider, map)?
+            .into_iter()
+            .map(|entry| (entry.name, entry.value))
+            .collect(),
+    };
+    for (name, edit) in edits {
+        match edit {
+            Some(node) => {
+                entries.insert(name.clone(), *node);
+            }
+            None => {
+                entries.remove(name);
+            }
+        }
+    }
+    Ok(match entries.len() {
+        0 => ChildNodesToWrite::Zero,
+        1 => {
+            let (name, node) = entries.into_iter().next().expect("one entry");
+            ChildNodesToWrite::One { name, node }
+        }
+        _ => ChildNodesToWrite::Many(entries.into_iter().collect()),
+    })
+}
+
+/// What a rewrite changes about a node: its properties as well as its
+/// children.
+///
+/// [`rewrite_node_with_child_edits`] preserves every property *slot*, which
+/// is what makes it safe for a spine rewrite — the values are carried by
+/// identifier, never decoded and re-encoded. A definition rewrite has to
+/// change some of those properties, so it needs a way to say which, while
+/// keeping the identity discipline for everything it does not name.
+#[derive(Default)]
+pub(crate) struct NodeEdits {
+    /// Properties to write in place of whatever the node carries. A name
+    /// listed here replaces the existing slot; a name not listed keeps it.
+    pub(crate) property_replacements: Vec<PropertyToWrite>,
+    /// Properties to remove outright.
+    pub(crate) property_removals: Vec<String>,
+    /// Children to add, replace or remove.
+    pub(crate) child_edits: ChildEdits,
+}
+
+/// Rewrites a node with edits to its properties *and* its children,
+/// preserving its primary type, its mixin types, and every property slot it
+/// does not name.
+///
+/// The sibling of [`rewrite_node_with_child_edits`], sharing its reader and
+/// its slot-preserving write, so a definition rewrite reuses the commit
+/// path's identity discipline rather than imitating it.
+#[allow(
+    clippy::missing_panics_doc,
+    reason = "the single-entry expect is guarded by the match arm's length"
+)]
+pub(crate) fn rewrite_node_with_edits<Sink: SegmentSink>(
+    provider: &dyn SegmentProvider,
+    writer: &mut RecordWriter<Sink>,
+    base: Option<RecordIdentifier>,
+    edits: &NodeEdits,
+) -> Result<RecordIdentifier> {
+    let parts = match base {
+        Some(node) => read_node_parts(provider, node)?,
+        None => NodeParts {
+            primary_type: None,
+            mixin_types: Vec::new(),
+            properties: Vec::new(),
+            children: ExistingChildren::Zero,
+        },
+    };
+
+    let mut properties: Vec<PropertyToWrite> = parts
+        .properties
+        .into_iter()
+        .filter(|property| {
+            !edits.property_removals.contains(&property.name)
+                && !edits
+                    .property_replacements
+                    .iter()
+                    .any(|replacement| replacement.name == property.name)
+        })
+        .collect();
+    for replacement in &edits.property_replacements {
+        properties.push(PropertyToWrite {
+            name: replacement.name.clone(),
+            property_type: replacement.property_type,
+            values: replacement.values.clone(),
+        });
+    }
+    // Sorted, so a rewrite that replaces a property leaves the node's slots
+    // in the order the writer's template deduplication expects rather than
+    // in the order the edits happened to arrive.
+    properties.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+
+    let children = resulting_children(provider, parts.children, &edits.child_edits)?;
+    writer.write_node(
+        parts.primary_type.as_deref(),
+        &parts.mixin_types,
+        &children,
+        &properties,
     )
 }
 
