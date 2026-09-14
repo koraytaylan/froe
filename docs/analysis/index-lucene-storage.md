@@ -122,7 +122,7 @@ Four consequences:
    would be as correct as Oak's own output, and a comparison that demanded
    the same order would fail against Oak for no reason.
 
-The fixture's `:data` shows the disorder plainly (§8).
+The fixture's `:data` shows the disorder plainly (§9).
 
 ### 1.2 `unsafeForActiveDeletion`
 
@@ -175,7 +175,7 @@ file.setProperty(PROP_BLOB_SIZE, definition.getBlobSize());
   (`oak-search`, `search/IndexDefinition.java`) with
   `DEFAULT_BLOB_SIZE = 1024 * 1024 - 1024` — **1,047,552**. So the definition's
   value is clamped up to 1024 and the default is 1,047,552, which is the value
-  the real fixture carries (§8).
+  the real fixture carries (§9).
 
   **But it is read back from the file node, not from the definition**, and the
   fallback when the file node has no `blobSize` is the *reader's own*
@@ -344,7 +344,7 @@ froe refuses with a typed error rather than reproducing Oak's
 
 So **the shape a store holds says which tool last wrote it**, and a store that
 Oak wrote and oak-run then imported into holds both shapes side by side. The
-real 1.90.0 fixture holds streaming files (§8). froe reads both and, for plan
+real 1.90.0 fixture holds streaming files (§9). froe reads both and, for plan
 0008's importer, writes the buffered form Oak's own importer writes.
 
 ## 4. What the blobs are, in a segment store
@@ -662,7 +662,203 @@ if (suggesterLastUpdatedValue != null) {
 may legitimately be absent from a store: Oak will rebuild the suggestions on
 the next cycle that needs them. froe never reports its absence as a defect.
 
-## 8. Worked example, checked against the real Sling fixture
+## 8. Table of contents formats
+
+The bytes *inside* a file, at last — but only the five structures that make an
+index's file set enumerable. Everything below is Lucene 4.7.2, which
+`oak-lucene` embeds and re-exports as `4.7.2-oak2`; the sources cited are
+`lucene-core` 4.7.2 under `org/apache/lucene/`, and where a path below starts
+with `codecs/` or `store/` or `index/` it is relative to that.
+
+This section stops where the postings begin. It specifies the codec header,
+`segments.gen`, `segments_N`, `.si` and the compound file's table of contents
+— enough to say *which files an index is made of* and to reach any one of
+them. It says nothing about a term dictionary or a postings list, which plan
+0009 specifies for the write side.
+
+### 8.1 Primitive encodings
+
+Three primitives recur, all from `store/DataInput.java` and its writing twin:
+
+| Primitive | Encoding | Source |
+| --- | --- | --- |
+| `Int` | 4 bytes, big-endian | `DataOutput.writeInt` |
+| `Long` | 8 bytes, big-endian | `DataOutput.writeLong` |
+| `VInt` | 7 bits per byte, low group first, high bit set while more follow | `DataOutput.writeVInt` |
+| `String` | a `VInt` **byte** length, then that many UTF-8 bytes | `DataOutput.writeString` (`writeVInt(utf8Result.length)` then the bytes) |
+| `StringSet` | an `Int` count, then that many `String` | `DataOutput.writeStringSet` |
+| `StringStringMap` | an `Int` count, then that many key/value `String` pairs | `DataOutput.writeStringStringMap` |
+
+The `String` length is in **bytes, not characters**, and a reader that
+allocates it before checking it against the remaining file length is a denial
+of service on a hostile file. froe validates every length against the bytes
+that remain before allocating.
+
+### 8.2 The codec header
+
+Every file below opens with one (`codecs/CodecUtil.java`):
+
+| Offset | Field | Encoding |
+| --- | --- | --- |
+| 0 | magic | `Int` = `0x3fd76c17` (`CodecUtil.CODEC_MAGIC`) |
+| 4 | codec name | `String` |
+| … | version | `Int` |
+
+`CodecUtil.writeHeader` refuses a codec name that is not simple ASCII or is
+128 bytes or longer, so `headerLength` is exactly `9 + name.length()`.
+`checkHeader` reads the magic and then delegates to `checkHeaderNoMagic`,
+which compares the name and then range-checks the version, raising
+`IndexFormatTooOldException` below the minimum and `IndexFormatTooNewException`
+above the maximum. froe reports all three as distinct typed errors naming the
+file and the offset, because an operator's next move differs: a wrong magic is
+not a Lucene file at all, a wrong name is the wrong *kind* of Lucene file, and
+a version outside the range is one this froe does not read.
+
+### 8.3 `segments.gen`
+
+Its own format, with no codec header (`index/SegmentInfos.java`, the
+`writeSegmentsGen`/`readSegmentsGen` pair around line 270 and line 770):
+
+| Field | Encoding |
+| --- | --- |
+| format | `Int` = `-2` (`SegmentInfos.FORMAT_SEGMENTS_GEN_CURRENT`) |
+| generation | `Long` |
+| generation, again | `Long` |
+
+**The reading rule, and why the file is never a finding.** The commit
+generation is the **maximum** of two candidates: the one derived from the
+directory listing — the highest `_N` suffix among the `segments_N` names, with
+`segments.gen` itself skipped — and the one in this file, which counts **only
+when its two copies agree**. Oak writes it best-effort and deletes it on any
+failure, so its absence, its truncation and a disagreement between its two
+copies are all ordinary. froe therefore treats the file as a hint: present and
+self-consistent, it can only raise the generation; anything else about it is
+ignored, and **its absence is never reported as a fault**.
+
+### 8.4 `segments_N`
+
+The commit file (`index/SegmentInfos.java`, `read(Directory, String)` at line
+314). After the codec header — name `segments`, versions `VERSION_40` = 0
+through `VERSION_46` = 1 — the body is:
+
+| Field | Encoding | Notes |
+| --- | --- | --- |
+| version | `Long` | the commit's own version counter |
+| counter | `Int` | the next segment name to allocate |
+| segment count | `Int` | **refused when negative**, as `read` does |
+| *per segment* | | |
+| name | `String` | e.g. `_0` |
+| codec name | `String` | resolved through `Codec.forName` |
+| deletion generation | `Long` | |
+| deletion count | `Int` | **refused when negative or above the segment's document count** |
+| field-infos generation | `Long` | **only from `VERSION_46`** |
+| generation update files | `Int` count, then that many (`Long`, `StringSet`) pairs | **only from `VERSION_46`** |
+| user data | `StringStringMap` | |
+| checksum | `Long` | the running checksum of everything before it |
+
+Two facts a reader must not miss. The per-segment record does **not** contain
+the segment's own metadata — `read` calls into
+`codec.segmentInfoFormat().getSegmentInfoReader().read(...)` mid-loop, so the
+`.si` file is opened *between* the codec name and the deletion generation, and
+a reader that treats the record as self-contained will misparse the rest of
+the file. And the first `Int` is read raw and compared to `CODEC_MAGIC`
+before any header check: a file whose first `Int` is something else is a
+Lucene 3.x commit file, which this froe does not read and reports as such.
+
+**The codec name is not fixed.** It is whatever the definition selected:
+`oakCodec` for a fulltext-enabled definition or an explicit `codec = oakCodec`,
+`Lucene46` for every other definition, `compressingCodec` under the
+`oak.lucene.compressing-codec` system property, or any other name the
+`META-INF/services` codec registration carries when `codec` names it. froe's
+reader **accepts every registered name and reports it**; only the writers of
+plans 0009 and 0010 restrict themselves to `oakCodec`. A name outside the
+registered set is *reported, not refused* — Oak would fail on it at open, and
+saying so is precisely what the check exists for.
+
+### 8.5 `.si`, the per-segment descriptor
+
+`codecs/lucene46/Lucene46SegmentInfoReader.java`. The file is
+`<segment>.si`, and it **always sits beside the `.cfs`, never inside it**.
+After the codec header — name `Lucene46SegmentInfo`
+(`Lucene46SegmentInfoFormat.CODEC_NAME`), versions `VERSION_START` = 0 through
+`VERSION_CURRENT` = 0:
+
+| Field | Encoding | Notes |
+| --- | --- | --- |
+| Lucene version | `String` | the version that wrote the segment |
+| document count | `Int` | **refused when negative** |
+| compound flag | 1 byte | `SegmentInfo.YES` means the segment's files live in a `.cfs` |
+| diagnostics | `StringStringMap` | |
+| file set | `StringSet` | the segment's own files, by full name |
+
+The reader then requires `getFilePointer() == length()` — **the file must be
+consumed exactly**, with no trailing bytes. froe enforces the same, because a
+`.si` with trailing bytes is one Lucene itself refuses.
+
+### 8.6 The compound file
+
+`store/CompoundFileDirectory.java`, `readEntries` at line 128. The pair is
+`<segment>.cfs` (data) and `<segment>.cfe` (entries).
+
+The `.cfs` opens with a codec header naming `CompoundFileWriterData`
+(`CompoundFileWriter.DATA_CODEC`), version 0 only. The table of contents is in
+the `.cfe`, which opens with a codec header naming
+`CompoundFileWriterEntries` (`CompoundFileWriter.ENTRY_CODEC`), version 0
+only, and then:
+
+| Field | Encoding |
+| --- | --- |
+| entry count | `VInt` |
+| *per entry* | |
+| name | `String` |
+| offset | `Long` |
+| length | `Long` |
+
+Three rules that a careless reader gets wrong.
+
+**The name is segment-stripped.** The entries carry `.fdt`, `.tim`, `.fnm` —
+**never** `_0.fdt`. `CompoundFileDirectory` looks up by
+`IndexFileNames.stripSegmentName(name)` (`index/IndexFileNames.java` line
+168), which cuts everything up to and including the segment prefix. So a
+lookup must strip first, and this namespace must **never** be mixed with the
+full names that `segments_N` and `.si` carry. froe's reader refuses a `.cfe`
+whose entry name still carries a segment prefix: that file was not written by
+Lucene's own writer, and accepting it would let a crafted directory address a
+file by two names.
+
+**The entries are in no specified order.** `readEntries` builds a map; the
+offsets need not ascend. A reader that assumes order will read the wrong
+bytes for an index that is perfectly valid.
+
+**A duplicate name is corruption.** `readEntries` refuses on
+`Duplicate cfs entry id=…`, and so does froe.
+
+Every entry's `offset + length` is validated against the `.cfs` length before
+any read, so an entry pointing past the end is a typed error naming the entry
+and the two numbers rather than a panic or an out-of-bounds read.
+
+### 8.7 What the structural check asserts
+
+Between oak-run's level 1 (the blobs resolve, §5) and its level 2 (Lucene's
+own `CheckIndex`), froe's structural check answers: *is this directory a
+coherent set of Lucene files?*
+
+* every file the segments name exists in the directory listing, and every
+  listed file is named by the segments — allowing by name the `.del` and
+  generation files the commit file itself lists, and `segments.gen`, which no
+  commit's aggregate file set ever names and which may legitimately be absent;
+* every codec header validates;
+* the deletion count of each segment is within its document count (the same
+  bound `SegmentInfos.read` enforces);
+* the **live document count** is the sum over segments of document count minus
+  deletion count, which is how Oak's own document count over a directory
+  computes it;
+* the codec name is reported, and reported as unregistered when it is outside
+  the set the image's `META-INF/services` registration carries.
+
+---
+
+## 9. Worked example, checked against the real Sling fixture
 
 The fixture is the store `generate` produces: Apache Sling 14 with
 `oak-segment-tar` 1.90.0, stopped cleanly, its segment store extracted.
@@ -731,7 +927,7 @@ definition is asynchronous (§7.2), and both `:status` and `:index-definition`
 present. There is no `:suggest-data`: the definition does not enable
 suggestions, and §7.4 says its absence is legal in any case.
 
-## 9. AEM safety invariants
+## 10. AEM safety invariants
 
 1. **A wrong file length makes Oak throw on open.** The length is derived, not
    stored (§3), so it is wrong exactly when the blob bytes, the `blobSize` or
