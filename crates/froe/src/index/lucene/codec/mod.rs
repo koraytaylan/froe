@@ -28,15 +28,13 @@ pub mod data_output;
 pub mod fst;
 pub mod packed;
 pub mod postings;
+pub mod stored_fields;
 pub mod terms;
 
 // The later tasks of plan 0009 own these. Each is declared here so the
 // module tree is the one the specification describes from the start, and so
 // a reader looking for a format finds where it will live rather than
 // wondering whether it exists.
-
-/// `.fdx` and `.fdt` (§5). Task 0906.
-pub mod stored_fields {}
 
 /// `.dvm` and `.dvd` (§8.1). Task 0907.
 pub mod doc_values {}
