@@ -80,6 +80,7 @@ pub(crate) mod cache;
 pub mod checksum;
 pub mod content;
 pub mod error;
+pub(crate) mod external_sort;
 pub mod gc_journal;
 pub mod hashing;
 pub mod index;
