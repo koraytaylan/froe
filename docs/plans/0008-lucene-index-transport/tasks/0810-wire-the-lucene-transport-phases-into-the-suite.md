@@ -10,8 +10,8 @@ touches:
   - crates/froe-cli/tests/interop/phase_recovery.rs
   - crates/froe-cli/tests/interop/main.rs
   - scripts/interop-fixture.sh
-status: planned
-merged_as: ""
+status: done
+merged_as: "b80db37, 44d6a61, 3de6338"
 ---
 # Wire The Lucene Transport Phases Into The Suite
 
