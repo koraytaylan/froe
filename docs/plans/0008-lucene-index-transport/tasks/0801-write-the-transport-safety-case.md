@@ -7,8 +7,8 @@ depends_on: []
 gated: false
 touches:
   - docs/plans/0008-lucene-index-transport/ARCHITECTURE.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "b82594080f44a285a959847961c3f7ee6a2ea508"
 ---
 # Write The Lucene Import Safety Case
 
