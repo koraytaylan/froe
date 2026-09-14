@@ -20,8 +20,8 @@ touches:
   - docs/oak-segment-tar-feature-map.md
   - docs/cli-output.md
   - README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "3a7125cf549da1a4d7ec32bbf49fadd51b07d868 ddf4e4b48bce2e44eb81e47736948cd2c88a751e"
 ---
 # Add The Read-Only Index Commands
 
