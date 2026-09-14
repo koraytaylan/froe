@@ -199,7 +199,10 @@ The summary restates the purge —
 `purged: 31,473 orphaned version histories (524,086 nodes omitted from the copy)` —
 and `froe digest --exclude-subtree <path>` renders a digest with named
 exclusions, so a before-digest can be compared against an after-digest with
-the purge and nothing else excused.
+the purge and nothing else excused. `--exclude-property-prefix <prefix>`
+excuses properties rather than subtrees, at every node rather than at the
+head only, for values a rebuild legitimately redraws — Oak's `:count_*`
+approximate counters.
 
 One figure needs its explanation, and gets it in the plan, the summary,
 and here. When retained checkpoints keep their snapshots of the purged

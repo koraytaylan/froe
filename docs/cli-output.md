@@ -214,7 +214,8 @@ Known granularity limits, stated rather than hidden:
   than a count. The ticker still announces them and prints their
   completion, in both rendering styles.
 * `digest` writes the digest to standard output and its summary — counts,
-  lookup failures, dangling `/:async` checkpoint references, and any
+  the number of properties excused by `--exclude-property-prefix` when any
+  were, lookup failures, dangling `/:async` checkpoint references, and any
   difference from `--baseline` — to standard error, **including** when
   `--output` sends the digest to a file. The summary never moves to standard
   output, because a command whose stream layout depends on its flags is

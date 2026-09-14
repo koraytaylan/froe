@@ -304,6 +304,7 @@ pub(crate) fn print_digest(
     output_path: Option<&Path>,
     baseline_path: Option<&Path>,
     exclude_subtrees: &[String],
+    exclude_property_prefixes: &[String],
 ) -> froe::Result<bool> {
     let repository = Repository::open(repository_path)?;
 
@@ -313,7 +314,13 @@ pub(crate) fn print_digest(
     // — and the common case, taking a digest before a maintenance run, has
     // no baseline to compare against yet.
     let Some(baseline_path) = baseline_path else {
-        let Some(summary) = stream_digest(&repository, output_path, exclude_subtrees)? else {
+        let Some(summary) = stream_digest(
+            &repository,
+            output_path,
+            exclude_subtrees,
+            exclude_property_prefixes,
+        )?
+        else {
             // The consumer closed the pipe partway through, so there is no
             // complete digest and no verdict to give.
             return Ok(true);
@@ -323,7 +330,12 @@ pub(crate) fn print_digest(
     };
 
     let mut rendered = Vec::new();
-    let summary = digest_repository_excluding(&repository, exclude_subtrees, &mut rendered)?;
+    let summary = digest_repository_excluding(
+        &repository,
+        exclude_subtrees,
+        exclude_property_prefixes,
+        &mut rendered,
+    )?;
     let digest = String::from_utf8(rendered).map_err(|error| froe::Error::InvalidFormat {
         details: format!("the digest is not valid UTF-8: {error}"),
     })?;
@@ -385,10 +397,16 @@ fn stream_digest(
     repository: &Repository,
     output_path: Option<&Path>,
     exclude_subtrees: &[String],
+    exclude_property_prefixes: &[String],
 ) -> froe::Result<Option<DigestSummary>> {
     if let Some(path) = output_path {
         let mut file = io::BufWriter::new(std::fs::File::create(path)?);
-        let summary = digest_repository_excluding(repository, exclude_subtrees, &mut file)?;
+        let summary = digest_repository_excluding(
+            repository,
+            exclude_subtrees,
+            exclude_property_prefixes,
+            &mut file,
+        )?;
         file.flush()?;
         return Ok(Some(summary));
     }
@@ -399,6 +417,7 @@ fn stream_digest(
         summary = Some(digest_repository_excluding(
             repository,
             exclude_subtrees,
+            exclude_property_prefixes,
             output,
         )?);
         Ok(())
@@ -419,6 +438,13 @@ fn format_digest_summary(summary: &DigestSummary) -> String {
         summary.binary_bytes,
         summary.checkpoints
     );
+    if summary.excluded_properties > 0 {
+        let _ = writeln!(
+            report,
+            "{} properties were excluded by name and are not part of the digest",
+            summary.excluded_properties
+        );
+    }
     if summary.lookup_failures > 0 {
         let _ = writeln!(
             report,

@@ -84,12 +84,21 @@ const CHECKPOINT_PATH_PREFIX: &str = "#checkpoint";
 const SUPER_ROOT_PATH: &str = "#super-root";
 
 /// What a digest run observed, beside the digest itself.
+///
+/// `#[non_exhaustive]`: this grew a field in 0.11 and will grow more, and a
+/// downstream match or literal should not break each time. Construct one
+/// with [`DigestSummary::default`] and read the fields you need.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DigestSummary {
     /// Nodes rendered, across the content tree and every checkpoint.
     pub nodes: u64,
     /// Properties rendered.
     pub properties: u64,
+    /// Properties omitted because their names matched an excluded prefix.
+    /// They are counted rather than silently dropped, so the summary line
+    /// says how much a run excused.
+    pub excluded_properties: u64,
     /// Binary values whose content was read and checksummed.
     pub binaries: u64,
     /// Bytes of binary content read.
@@ -146,23 +155,36 @@ pub fn digest_repository<Output: Write + ?Sized>(
     repository: &Repository,
     output: &mut Output,
 ) -> Result<DigestSummary> {
-    digest_repository_excluding(repository, &[], output)
+    digest_repository_excluding(repository, &[], &[], output)
 }
 
 /// Digests exactly like [`digest_repository`], omitting the content
-/// subtrees under the given path prefixes — the mechanism that lets a
-/// digest taken before a confirmed version-history purge be compared
-/// against one taken after it, with the purge and nothing else excused.
+/// subtrees under the given path prefixes and the properties whose names
+/// start with one of the given property prefixes.
 ///
-/// The exclusions apply to the head's content tree only, never to
-/// checkpoint snapshots: a purge preserves those, so their sections must
-/// stay byte-identical. A digest with exclusions opens by naming them —
-/// `#excluded`, a tab, and each prefix — so two digests are never compared blind; the
-/// comparison helpers treat that header as a line like any other, which
+/// The subtree exclusion is the mechanism that lets a digest taken before a
+/// confirmed version-history purge be compared against one taken after it,
+/// with the purge and nothing else excused. It applies to the head's
+/// content tree only, never to checkpoint snapshots: a purge preserves
+/// those, so their sections must stay byte-identical.
+///
+/// The property exclusion is the mechanism plan 0007's reindex oracle
+/// needs. Oak's approximate counters write `:count_<random uuid>`
+/// properties whose names, presence and values are all drawn from a random
+/// generator, so two indexes built from identical content differ on them by
+/// design. Unlike the subtree exclusion it applies to **every node in the
+/// rendering** — content, super-root and every checkpoint — because a
+/// counter property appears wherever the index node it annotates does.
+///
+/// A digest with exclusions opens by naming them: `#excluded`, a tab and
+/// each subtree prefix, then `#excluded-properties`, a tab and each
+/// property prefix. Two digests are therefore never compared blind — the
+/// comparison helpers treat those headers as lines like any other, which
 /// makes a full digest and an excluding one deliberately incomparable.
 pub fn digest_repository_excluding<Output: Write + ?Sized>(
     repository: &Repository,
     excluded_content_prefixes: &[String],
+    excluded_property_prefixes: &[String],
     output: &mut Output,
 ) -> Result<DigestSummary> {
     let mut summary = DigestSummary::default();
@@ -170,11 +192,18 @@ pub fn digest_repository_excluding<Output: Write + ?Sized>(
         repository,
         buffer: vec![0u8; BINARY_BUFFER_BYTES],
         binary_checksums: BoundedCache::new(BINARY_CHECKSUM_CACHE_BUDGET_BYTES),
+        excluded_property_prefixes,
     };
-    if !excluded_content_prefixes.is_empty() {
-        let mut sorted: Vec<&String> = excluded_content_prefixes.iter().collect();
+    for (label, prefixes) in [
+        ("#excluded", excluded_content_prefixes),
+        ("#excluded-properties", excluded_property_prefixes),
+    ] {
+        if prefixes.is_empty() {
+            continue;
+        }
+        let mut sorted: Vec<&String> = prefixes.iter().collect();
         sorted.sort();
-        let mut header = String::from("#excluded");
+        let mut header = String::from(label);
         for prefix in sorted {
             header.push('\t');
             header.push_str(&escape(prefix));
@@ -222,6 +251,11 @@ struct Renderer<'repository> {
     repository: &'repository Repository,
     buffer: Vec<u8>,
     binary_checksums: BoundedCache<RecordIdentifier, CachedBinaryChecksum>,
+    /// Applied at every node rather than at a subtree root, because the
+    /// properties this excuses — Oak's `:count_*` approximate counters —
+    /// are scattered through the index storage rather than gathered under
+    /// one path.
+    excluded_property_prefixes: &'repository [String],
 }
 
 /// What folding one inline binary produced, so a later property that names
@@ -341,6 +375,19 @@ impl Renderer<'_> {
         summary.nodes += 1;
 
         let mut properties = node.properties()?;
+        if !self.excluded_property_prefixes.is_empty() {
+            // Counted rather than dropped silently: the summary line says
+            // how much the run excused, so an exclusion that matched more
+            // than it was meant to is visible without a second digest.
+            let before = properties.len();
+            properties.retain(|property| {
+                !self
+                    .excluded_property_prefixes
+                    .iter()
+                    .any(|prefix| property.name.starts_with(prefix.as_str()))
+            });
+            summary.excluded_properties += (before - properties.len()) as u64;
+        }
         properties.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
 
         let mut line = String::with_capacity(64);

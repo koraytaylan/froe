@@ -189,6 +189,15 @@ pub(crate) enum Command {
         /// one taken after it, with the purge and nothing else excused.
         #[arg(long = "exclude-subtree")]
         exclude_subtrees: Vec<String>,
+        /// Omit every property whose name starts with PREFIX, at every
+        /// node; repeatable. The digest then opens with a header naming
+        /// every exclusion, so it can never be compared blind against a
+        /// digest taken without one. This is how two indexes built from
+        /// identical content are compared despite Oak's approximate
+        /// counters, whose `:count_<uuid>` property names are drawn from a
+        /// random generator and differ by design.
+        #[arg(long = "exclude-property-prefix", value_name = "PREFIX")]
+        exclude_property_prefixes: Vec<String>,
     },
     /// Show the differences between two revisions (read-only).
     Difference {

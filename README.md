@@ -109,7 +109,11 @@ segment identifiers that compaction legitimately changes.
 `--exclude-subtree` names content subtrees to leave out — and stamps the
 exclusion into the digest itself — so a digest taken before a confirmed
 purge compares against one taken after it with the purge and nothing else
-excused. Take one before a maintenance run and compare after:
+excused. `--exclude-property-prefix` does the same for properties by name,
+at every node, for content that differs by design: Oak's approximate
+counters write `:count_<uuid>` properties whose names and values are both
+drawn from a random generator, so two indexes built from identical content
+never match until those are excused. Take one before a maintenance run and compare after:
 
 ```console
 $ froe digest /path/to/segmentstore --output before.digest

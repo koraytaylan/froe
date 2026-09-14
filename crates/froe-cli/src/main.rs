@@ -190,12 +190,14 @@ pub(crate) fn run_diagnostic_command(
             output,
             baseline,
             exclude_subtrees,
+            exclude_property_prefixes,
         } => {
             if !tooling_display::print_digest(
                 &repository,
                 output.as_deref(),
                 baseline.as_deref(),
                 &exclude_subtrees,
+                &exclude_property_prefixes,
             )? {
                 return Ok(ExitCode::FAILURE);
             }

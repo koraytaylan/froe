@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use froe::content::property::PropertyType;
 use froe::store::Repository;
-use froe::tooling::digest::{compare_digests, digest_repository};
+use froe::tooling::digest::{
+    DigestSummary, compare_digests, digest_repository, digest_repository_excluding, parse_digest,
+};
 use froe::writer::record_writer::{ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite};
 use froe::writer::store_writer::WritableRepository;
 
@@ -438,4 +440,229 @@ fn a_checkpoint_that_async_still_references_but_no_longer_exists_is_reported() {
         "a reference to a checkpoint that is gone is reported"
     );
     assert!(!summary.is_clean(), "and the run is not clean");
+}
+
+/// Writes a store shaped like a property index: `/oak:index/uuid/:index`
+/// carrying a stable property beside the approximate counters Oak's
+/// `ApproximateCounter` writes, whose names and values are both drawn from
+/// a random generator.
+///
+/// `counters` is what those random draws produced on this run, so two
+/// stores can be built that differ in exactly that and nothing else.
+fn build_index_repository(directory: &Path, counters: &[(&str, &str)]) {
+    let store = WritableRepository::open(directory).expect("open the store directory");
+    let generation = store.writing_generation().expect("the writing generation");
+    let mut writer = store.record_writer(generation);
+
+    let mut properties = Vec::with_capacity(counters.len() + 1);
+    let stable = writer.write_string("true").expect("stable value");
+    properties.push(PropertyToWrite {
+        name: "match".to_owned(),
+        property_type: PropertyType::Boolean,
+        values: PropertyValuesToWrite::Single(stable),
+    });
+    for (name, value) in counters {
+        let written = writer.write_string(value).expect("counter value");
+        properties.push(PropertyToWrite {
+            name: (*name).to_owned(),
+            property_type: PropertyType::Long,
+            values: PropertyValuesToWrite::Single(written),
+        });
+    }
+    let index_storage = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &properties)
+        .expect("write the :index node");
+    let definition = writer
+        .write_node(
+            Some("oak:QueryIndexDefinition"),
+            &[],
+            &ChildNodesToWrite::One {
+                name: ":index".to_owned(),
+                node: index_storage,
+            },
+            &[],
+        )
+        .expect("write the definition");
+    let oak_index = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "uuid".to_owned(),
+                node: definition,
+            },
+            &[],
+        )
+        .expect("write /oak:index");
+    let root = writer
+        .write_node(
+            Some("rep:root"),
+            &[],
+            &ChildNodesToWrite::One {
+                name: "oak:index".to_owned(),
+                node: oak_index,
+            },
+            &[],
+        )
+        .expect("write the content root");
+    let checkpoints = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &[])
+        .expect("write the checkpoints container");
+    let super_root = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(vec![
+                ("root".to_owned(), root),
+                ("checkpoints".to_owned(), checkpoints),
+            ]),
+            &[],
+        )
+        .expect("write the super-root");
+
+    writer.finish().expect("finish the writer");
+    let previous = store.head();
+    assert!(
+        store.compare_and_set_head(previous, super_root),
+        "advance the head"
+    );
+    store.close().expect("close the store");
+}
+
+fn digest_excluding_properties(directory: &Path, prefixes: &[String]) -> (String, DigestSummary) {
+    let repository = Repository::open(directory).expect("open the repository");
+    let mut rendered = Vec::new();
+    let summary = digest_repository_excluding(&repository, &[], prefixes, &mut rendered)
+        .expect("digest the repository");
+    (
+        String::from_utf8(rendered).expect("the digest is valid UTF-8"),
+        summary,
+    )
+}
+
+#[test]
+fn an_excluded_property_prefix_excuses_the_counters_and_nothing_else() {
+    // The two stores hold the same index with the same `match` property and
+    // different approximate counters — different names, different values,
+    // a different number of them — which is exactly what two Oak rebuilds
+    // of identical content produce.
+    let first = TestDirectory::new("counters-first");
+    build_index_repository(
+        &first.path,
+        &[
+            (":count_0d7c1e53-4f2a-4d9b-8a11-6c2f0b3e5a47", "120"),
+            (":count_9b4e2a10-7c3d-4e51-9f28-1a6b4c7d8e90", "40"),
+        ],
+    );
+    let second = TestDirectory::new("counters-second");
+    build_index_repository(
+        &second.path,
+        &[(":count_31f8c6a2-5d0e-4b73-8c19-2e7a9f4d6b05", "85")],
+    );
+
+    let prefixes = vec![":count_".to_owned()];
+    let (excused_first, first_summary) = digest_excluding_properties(&first.path, &prefixes);
+    let (excused_second, second_summary) = digest_excluding_properties(&second.path, &prefixes);
+    assert_eq!(
+        excused_first, excused_second,
+        "with the counters excused the two stores render identically"
+    );
+    assert_eq!(first_summary.excluded_properties, 2);
+    assert_eq!(second_summary.excluded_properties, 1);
+    assert_eq!(
+        first_summary.properties, second_summary.properties,
+        "an excluded property is not counted as rendered"
+    );
+
+    let (full_first, full_summary) = digest_excluding_properties(&first.path, &[]);
+    let (full_second, _) = digest_excluding_properties(&second.path, &[]);
+    assert_ne!(
+        full_first, full_second,
+        "without the exclusion the counters are a difference, which is the point of the flag"
+    );
+    assert_eq!(full_summary.excluded_properties, 0);
+    assert_eq!(
+        full_summary.properties,
+        first_summary.properties + 2,
+        "the counters are rendered when they are not excused"
+    );
+
+    // The exclusion is by prefix and by nothing else: the stable property
+    // of the same node survives it.
+    assert!(
+        line_for(&excused_first, "/oak:index/uuid/:index").contains("match=Boolean:true"),
+        "{excused_first}"
+    );
+    assert!(
+        excused_first
+            .lines()
+            .filter(|line| !line.starts_with("#excluded-properties"))
+            .all(|line| !line.contains(":count_")),
+        "the prefix survives only in the header that announces it — {excused_first}"
+    );
+}
+
+#[test]
+fn the_property_exclusion_header_names_the_prefixes_and_parses_as_a_line() {
+    let directory = TestDirectory::new("counter-header");
+    build_index_repository(&directory.path, &[(":count_abc", "1")]);
+    let prefixes = vec![":count_".to_owned(), ":stat_".to_owned()];
+    let (digest, _) = digest_excluding_properties(&directory.path, &prefixes);
+    assert!(
+        digest.starts_with("#excluded-properties\t:count_\t:stat_\n"),
+        "sorted, tab-separated, first line — {digest}"
+    );
+    let parsed = parse_digest(&digest);
+    assert_eq!(
+        parsed.get("#excluded-properties"),
+        Some(&":count_\t:stat_"),
+        "the header is a record like any other, so a comparison sees it"
+    );
+}
+
+#[test]
+fn a_store_with_nothing_to_excuse_still_differs_by_its_header() {
+    // This is the guard against comparing blind: an operator who digests
+    // one store with the exclusion and another without must be told they
+    // are not comparable, even when the exclusion happened to match
+    // nothing.
+    let directory = TestDirectory::new("counter-absent");
+    build_index_repository(&directory.path, &[]);
+    let (full, full_summary) = digest_excluding_properties(&directory.path, &[]);
+    let (excused, excused_summary) =
+        digest_excluding_properties(&directory.path, &[":count_".to_owned()]);
+    assert_eq!(excused_summary.excluded_properties, 0);
+    assert_eq!(full_summary.properties, excused_summary.properties);
+
+    let difference = compare_digests(&full, &excused);
+    assert_eq!(difference.added, ["#excluded-properties"]);
+    assert!(difference.removed.is_empty(), "{difference:?}");
+    assert!(difference.changed.is_empty(), "{difference:?}");
+}
+
+#[test]
+fn the_property_exclusion_reaches_checkpoint_snapshots_as_well() {
+    // Unlike the subtree exclusion, which deliberately stops at the head:
+    // a counter property appears wherever the index node it annotates
+    // does, and a checkpoint holds that node too.
+    let directory = TestDirectory::new("counters-checkpoint");
+    build_repository(&directory.path, None);
+    let (full, _) = digest_excluding_properties(&directory.path, &[]);
+    let (excused, summary) = digest_excluding_properties(&directory.path, &["jcr:".to_owned()]);
+    assert!(
+        full.contains("jcr:title") && full.contains("jcr:data"),
+        "the store under test has to hold the properties being excused"
+    );
+    assert!(!excused.contains("jcr:title"), "{excused}");
+    assert!(
+        excused
+            .lines()
+            .filter(|line| line.starts_with("#checkpoint/"))
+            .all(|line| !line.contains("jcr:title")),
+        "the checkpoint's copy is excused too — {excused}"
+    );
+    assert!(
+        summary.excluded_properties >= 4,
+        "two nodes in the head and the same two through the checkpoint — {summary:?}"
+    );
 }

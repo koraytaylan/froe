@@ -182,3 +182,71 @@ pub(crate) fn digest_excludes_exactly_the_named_subtree() {
         "outside the exclusion, the digests are byte-identical"
     );
 }
+
+/// `digest --exclude-property-prefix` excuses properties by name at every
+/// node, declares the exclusion in a header of its own, and says on
+/// standard error how much it excused — the flag plan 0007's reindex
+/// oracle uses to excuse Oak's randomly named approximate counters.
+#[test]
+pub(crate) fn digest_excludes_properties_by_prefix_and_says_how_many() {
+    let directory = TestDirectory::new("digest-property-exclusion");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate_with_orphaned_history(&store);
+
+    let excluded_prefix = "jcr:versionable";
+    let full = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["digest", store.to_str().expect("path")])
+        .output()
+        .expect("run the full digest");
+    assert!(full.status.success(), "the full digest must succeed");
+    let full_digest = String::from_utf8_lossy(&full.stdout).into_owned();
+    assert!(
+        full_digest.contains(excluded_prefix),
+        "the fixture has to carry the property being excused:\n{full_digest}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&full.stderr).contains("excluded by name"),
+        "a digest with no exclusion says nothing about one"
+    );
+
+    let excluded = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args([
+            "digest",
+            store.to_str().expect("path"),
+            "--exclude-property-prefix",
+            excluded_prefix,
+        ])
+        .output()
+        .expect("run the excluding digest");
+    assert!(
+        excluded.status.success(),
+        "the excluding digest must succeed"
+    );
+    let excluded_digest = String::from_utf8_lossy(&excluded.stdout).into_owned();
+    let report = String::from_utf8_lossy(&excluded.stderr).into_owned();
+
+    assert!(
+        excluded_digest.starts_with(&format!("#excluded-properties\t{excluded_prefix}\n")),
+        "the exclusion is declared in the output itself:\n{excluded_digest}"
+    );
+    assert!(
+        excluded_digest
+            .lines()
+            .skip(1)
+            .all(|line| !line.contains(excluded_prefix)),
+        "no property under the exclusion survives:\n{excluded_digest}"
+    );
+    assert!(
+        report.contains("1 properties were excluded by name"),
+        "the summary says how much was excused:\n{report}"
+    );
+
+    // Everything the exclusion does not name is untouched, and the node
+    // itself still has a line — an excused property is not an excused node.
+    assert_eq!(
+        full_digest.lines().count(),
+        excluded_digest.lines().count() - 1,
+        "the header is the only line the exclusion adds or removes"
+    );
+}
