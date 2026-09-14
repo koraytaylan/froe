@@ -11,6 +11,7 @@ pub mod check;
 pub mod codec_header;
 pub mod compound;
 pub mod directory;
+pub mod dump;
 pub mod layout;
 pub mod read;
 pub mod segments;
@@ -19,6 +20,10 @@ pub use check::{BlobFault, LuceneBlobReport, check_blobs};
 pub use codec_header::{CODEC_MAGIC, CodecHeader, header_length, read_codec_header};
 pub use compound::{CompoundEntry, CompoundTableOfContents, read_table_of_contents};
 pub use directory::{FileEncoding, OakDirectory, OakIndexFile, OakIndexFileReader};
+pub use dump::{
+    DumpOptions, DumpOutcome, DumpedIndex, NoCheckpointReason, dump_lucene_indexes,
+    dump_lucene_indexes_with_progress,
+};
 pub use layout::{IndexDetails, IndexerInfo, filesystem_directory_name, index_folder_base_name};
 pub use read::{LuceneReadError, LuceneResult, Reader};
 pub use segments::{
