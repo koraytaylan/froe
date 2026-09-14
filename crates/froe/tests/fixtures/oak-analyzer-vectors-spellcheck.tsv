@@ -1,0 +1,635 @@
+# Token tuples Oak's own analyzers produced, for froe to replay.
+#
+# Generated inside the pinned Sling image against its own oak-lucene and
+# lucene-analyzers-common jars:
+#
+#   podman run --rm --user 0 --entrypoint /bin/sh \
+#     -v <work>:/work:z \
+#     docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9 \
+#     -c 'CP=$(find /opt/sling/artifacts -name "*.jar" | tr "\n" ":"); \
+#         cd /work && javac -cp "$CP" -d . Analyze.java StoreSupport.java && \
+#         java -cp ".:$CP" Analyze analyze spellcheck corpus.txt out-spellcheck.tsv'
+#
+# The corpus is `oak-analyzer-corpus.txt`; a `line` row carries the index of
+# the corpus line it came from, counting only the lines the judge analyzes.
+#
+# The chain is applied to the corpus line **as written**. Where the document
+# maker feeds a chain something derived — `:ancestors` gets the node's
+# parent path, not its own — that derivation is the document model's, and
+# `docs/analysis/lucene-oak-documents.md` §3.8 owns it.
+#
+# A stream of more than 300 tuples is recorded as its first 150, an
+# `elided` count, and its last 150: the cap and the boundaries are proved
+# by the ends and the total, and froe's replay elides by the same rule.
+#
+# Columns: `line`\t<index>
+#          `count`\t<how many tuples the stream produced>
+#          `token`\t<term as UTF-8 hex>\t<position increment>\t<start>\t<end>\t<type>
+#          `elided`\t<how many tuples are not listed>
+#          `end`\t<final position increment>\t<final offset>
+line	0
+count	9
+token	746865	1	0	3	<ALPHANUM>
+token	74686520717569636b	0	0	9	shingle
+token	74686520717569636b2062726f776e	0	0	15	shingle
+token	717569636b	1	4	9	<ALPHANUM>
+token	717569636b2062726f776e	0	4	15	shingle
+token	717569636b2062726f776e20666f78	0	4	19	shingle
+token	62726f776e	1	10	15	<ALPHANUM>
+token	62726f776e20666f78	0	10	19	shingle
+token	666f78	1	16	19	<ALPHANUM>
+end	0	19
+line	1
+count	6
+token	706f77657273686f74	1	0	9	<ALPHANUM>
+token	706f77657273686f74206970686f6e65	0	0	16	shingle
+token	706f77657273686f74206970686f6e6520786d6c6874747072657175657374	0	0	31	shingle
+token	6970686f6e65	1	10	16	<ALPHANUM>
+token	6970686f6e6520786d6c6874747072657175657374	0	10	31	shingle
+token	786d6c6874747072657175657374	1	17	31	<ALPHANUM>
+end	0	31
+line	2
+count	15
+token	666f6f	1	0	3	<ALPHANUM>
+token	666f6f20626172	0	0	7	shingle
+token	666f6f206261722077656c6c	0	0	12	shingle
+token	626172	1	4	7	<ALPHANUM>
+token	6261722077656c6c	0	4	12	shingle
+token	6261722077656c6c206b6e6f776e	0	4	18	shingle
+token	77656c6c	1	8	12	<ALPHANUM>
+token	77656c6c206b6e6f776e	0	8	18	shingle
+token	77656c6c206b6e6f776e2065	0	8	20	shingle
+token	6b6e6f776e	1	13	18	<ALPHANUM>
+token	6b6e6f776e2065	0	13	20	shingle
+token	6b6e6f776e2065206d61696c	0	13	25	shingle
+token	65	1	19	20	<ALPHANUM>
+token	65206d61696c	0	19	25	shingle
+token	6d61696c	1	21	25	<ALPHANUM>
+end	0	25
+line	3
+count	9
+token	666f6f	1	0	3	<ALPHANUM>
+token	666f6f20626172	0	0	7	shingle
+token	666f6f20626172206c656164696e67	0	0	16	shingle
+token	626172	1	4	7	<ALPHANUM>
+token	626172206c656164696e67	0	4	16	shingle
+token	626172206c656164696e6720747261696c696e67	0	4	25	shingle
+token	6c656164696e67	1	9	16	<ALPHANUM>
+token	6c656164696e6720747261696c696e67	0	9	25	shingle
+token	747261696c696e67	1	17	25	<ALPHANUM>
+end	0	26
+line	4
+count	12
+token	6f	1	0	1	<ALPHANUM>
+token	6f206e65696c	0	0	6	shingle
+token	6f206e65696c20626172	0	0	12	shingle
+token	6e65696c	1	2	6	<ALPHANUM>
+token	6e65696c20626172	0	2	12	shingle
+token	6e65696c2062617220646f6e	0	2	18	shingle
+token	626172	1	9	12	<ALPHANUM>
+token	62617220646f6e	0	9	18	shingle
+token	62617220646f6e2074	0	9	20	shingle
+token	646f6e	1	15	18	<ALPHANUM>
+token	646f6e2074	0	15	20	shingle
+token	74	1	19	20	<ALPHANUM>
+end	0	20
+line	5
+count	6
+token	6f	1	0	1	<ALPHANUM>
+token	6f206e65696c	0	0	6	shingle
+token	6f206e65696c2073	0	0	8	shingle
+token	6e65696c	1	2	6	<ALPHANUM>
+token	6e65696c2073	0	2	8	shingle
+token	73	1	7	8	<ALPHANUM>
+end	0	8
+line	6
+count	12
+token	6a327365	1	0	4	<ALPHANUM>
+token	6a3273652075746638	0	0	9	shingle
+token	6a327365207574663820783836	0	0	13	shingle
+token	75746638	1	5	9	<ALPHANUM>
+token	7574663820783836	0	5	13	shingle
+token	7574663820783836203634	0	5	16	shingle
+token	783836	1	10	13	<ALPHANUM>
+token	783836203634	0	10	16	shingle
+token	78383620363420337264	0	10	20	shingle
+token	3634	1	14	16	<ALPHANUM>
+token	363420337264	0	14	20	shingle
+token	337264	1	17	20	<ALPHANUM>
+end	0	20
+line	7
+count	18
+token	3432	1	0	2	<NUM>
+token	34322033	0	0	4	shingle
+token	34322033203134	0	0	7	shingle
+token	33	1	3	4	<NUM>
+token	33203134	0	3	7	shingle
+token	332031342031	0	3	9	shingle
+token	3134	1	5	7	<NUM>
+token	31342031	0	5	9	shingle
+token	3134203120303030	0	5	13	shingle
+token	31	1	8	9	<NUM>
+token	3120303030	0	8	13	shingle
+token	31203030302031	0	8	15	shingle
+token	303030	1	10	13	<NUM>
+token	3030302031	0	10	15	shingle
+token	303030203120303030	0	10	19	shingle
+token	31	1	14	15	<NUM>
+token	3120303030	0	14	19	shingle
+token	303030	1	16	19	<NUM>
+end	0	19
+line	8
+count	12
+token	666f6f	1	0	3	<ALPHANUM>
+token	666f6f20626172	0	0	7	shingle
+token	666f6f2062617220337264	0	0	13	shingle
+token	626172	1	4	7	<ALPHANUM>
+token	62617220337264	0	4	13	shingle
+token	62617220337264206a327365	0	4	18	shingle
+token	337264	1	10	13	<ALPHANUM>
+token	337264206a327365	0	10	18	shingle
+token	337264206a32736520706f77657273686f74	0	10	28	shingle
+token	6a327365	1	14	18	<ALPHANUM>
+token	6a32736520706f77657273686f74	0	14	28	shingle
+token	706f77657273686f74	1	19	28	<ALPHANUM>
+end	0	28
+line	9
+count	9
+token	e4b8ad	1	0	1	<IDEOGRAPHIC>
+token	e4b8ad20e69687	0	0	2	shingle
+token	e4b8ad20e6968720e6b58b	0	0	3	shingle
+token	e69687	1	1	2	<IDEOGRAPHIC>
+token	e6968720e6b58b	0	1	3	shingle
+token	e6968720e6b58b20e8af95	0	1	4	shingle
+token	e6b58b	1	2	3	<IDEOGRAPHIC>
+token	e6b58b20e8af95	0	2	4	shingle
+token	e8af95	1	3	4	<IDEOGRAPHIC>
+end	0	4
+line	10
+count	12
+token	e381b2	1	0	1	<HIRAGANA>
+token	e381b220e38289	0	0	2	shingle
+token	e381b220e3828920e3818c	0	0	3	shingle
+token	e38289	1	1	2	<HIRAGANA>
+token	e3828920e3818c	0	1	3	shingle
+token	e3828920e3818c20e381aa	0	1	4	shingle
+token	e3818c	1	2	3	<HIRAGANA>
+token	e3818c20e381aa	0	2	4	shingle
+token	e3818c20e381aa20e382abe382bfe382abe3838a	0	2	9	shingle
+token	e381aa	1	3	4	<HIRAGANA>
+token	e381aa20e382abe382bfe382abe3838a	0	3	9	shingle
+token	e382abe382bfe382abe3838a	1	5	9	<KATAKANA>
+end	0	9
+line	11
+count	1
+token	ed959ceab5adec96b4	1	0	3	<HANGUL>
+end	0	3
+line	12
+count	1
+token	e0b984e0b897e0b8a2	1	0	3	<SOUTHEAST_ASIAN>
+end	0	3
+line	13
+count	3
+token	63616665cc81	1	0	5	<ALPHANUM>
+token	63616665cc812061cc8062	0	0	9	shingle
+token	61cc8062	1	6	9	<ALPHANUM>
+end	0	9
+line	14
+count	3
+token	68656c6c6f	1	0	5	<ALPHANUM>
+token	68656c6c6f20776f726c64	0	0	14	shingle
+token	776f726c64	1	9	14	<ALPHANUM>
+end	0	14
+line	15
+count	1
+token	666c6167	1	5	9	<ALPHANUM>
+end	0	9
+line	16
+count	3
+token	f09090a8f09090a9	1	0	4	<ALPHANUM>
+token	f09090a8f09090a92064657365726574	0	0	12	shingle
+token	64657365726574	1	5	12	<ALPHANUM>
+end	0	12
+line	17
+count	9
+token	61	1	0	1	<ALPHANUM>
+token	612062	0	0	3	shingle
+token	6120622063	0	0	5	shingle
+token	62	1	2	3	<ALPHANUM>
+token	622063	0	2	5	shingle
+token	6220632064	0	2	7	shingle
+token	63	1	4	5	<ALPHANUM>
+token	632064	0	4	7	shingle
+token	64	1	6	7	<ALPHANUM>
+end	0	7
+line	18
+count	6
+token	6669727374	1	0	5	<ALPHANUM>
+token	6669727374207365636f6e64	0	0	12	shingle
+token	6669727374207365636f6e64207468697264	0	0	18	shingle
+token	7365636f6e64	1	6	12	<ALPHANUM>
+token	7365636f6e64207468697264	0	6	18	shingle
+token	7468697264	1	13	18	<ALPHANUM>
+end	0	18
+line	19
+count	6
+token	636f6e74656e74	1	1	8	<ALPHANUM>
+token	636f6e74656e7420696e7465726f70	0	1	16	shingle
+token	636f6e74656e7420696e7465726f702070616765	0	1	21	shingle
+token	696e7465726f70	1	9	16	<ALPHANUM>
+token	696e7465726f702070616765	0	9	21	shingle
+token	70616765	1	17	21	<ALPHANUM>
+end	0	21
+line	20
+count	15
+token	636f6e74656e74	1	1	8	<ALPHANUM>
+token	636f6e74656e742064616d	0	1	12	shingle
+token	636f6e74656e742064616d20636f6c6c656374696f6e73	0	1	24	shingle
+token	64616d	1	9	12	<ALPHANUM>
+token	64616d20636f6c6c656374696f6e73	0	9	24	shingle
+token	64616d20636f6c6c656374696f6e732061	0	9	26	shingle
+token	636f6c6c656374696f6e73	1	13	24	<ALPHANUM>
+token	636f6c6c656374696f6e732061	0	13	26	shingle
+token	636f6c6c656374696f6e7320612062	0	13	28	shingle
+token	61	1	25	26	<ALPHANUM>
+token	612062	0	25	28	shingle
+token	6120622063	0	25	30	shingle
+token	62	1	27	28	<ALPHANUM>
+token	622063	0	27	30	shingle
+token	63	1	29	30	<ALPHANUM>
+end	0	30
+line	21
+count	1
+token	636f6e74656e74	1	1	8	<ALPHANUM>
+end	0	8
+line	22
+count	0
+end	0	1
+line	23
+count	1
+token	616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161	1	0	255	<ALPHANUM>
+end	0	255
+line	24
+count	0
+end	1	256
+line	25
+count	0
+end	1	256
+line	26
+count	1
+token	646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464	1	0	255	<ALPHANUM>
+end	0	255
+line	27
+count	0
+end	1	300
+line	28
+count	30147
+token	66	1	0	1	<ALPHANUM>
+token	662066	0	0	3	shingle
+token	6620662066	0	0	5	shingle
+token	66	1	2	3	<ALPHANUM>
+token	662066	0	2	5	shingle
+token	6620662066	0	2	7	shingle
+token	66	1	4	5	<ALPHANUM>
+token	662066	0	4	7	shingle
+token	6620662066	0	4	9	shingle
+token	66	1	6	7	<ALPHANUM>
+token	662066	0	6	9	shingle
+token	6620662066	0	6	11	shingle
+token	66	1	8	9	<ALPHANUM>
+token	662066	0	8	11	shingle
+token	6620662066	0	8	13	shingle
+token	66	1	10	11	<ALPHANUM>
+token	662066	0	10	13	shingle
+token	6620662066	0	10	15	shingle
+token	66	1	12	13	<ALPHANUM>
+token	662066	0	12	15	shingle
+token	6620662066	0	12	17	shingle
+token	66	1	14	15	<ALPHANUM>
+token	662066	0	14	17	shingle
+token	6620662066	0	14	19	shingle
+token	66	1	16	17	<ALPHANUM>
+token	662066	0	16	19	shingle
+token	6620662066	0	16	21	shingle
+token	66	1	18	19	<ALPHANUM>
+token	662066	0	18	21	shingle
+token	6620662066	0	18	23	shingle
+token	66	1	20	21	<ALPHANUM>
+token	662066	0	20	23	shingle
+token	6620662066	0	20	25	shingle
+token	66	1	22	23	<ALPHANUM>
+token	662066	0	22	25	shingle
+token	6620662066	0	22	27	shingle
+token	66	1	24	25	<ALPHANUM>
+token	662066	0	24	27	shingle
+token	6620662066	0	24	29	shingle
+token	66	1	26	27	<ALPHANUM>
+token	662066	0	26	29	shingle
+token	6620662066	0	26	31	shingle
+token	66	1	28	29	<ALPHANUM>
+token	662066	0	28	31	shingle
+token	6620662066	0	28	33	shingle
+token	66	1	30	31	<ALPHANUM>
+token	662066	0	30	33	shingle
+token	6620662066	0	30	35	shingle
+token	66	1	32	33	<ALPHANUM>
+token	662066	0	32	35	shingle
+token	6620662066	0	32	37	shingle
+token	66	1	34	35	<ALPHANUM>
+token	662066	0	34	37	shingle
+token	6620662066	0	34	39	shingle
+token	66	1	36	37	<ALPHANUM>
+token	662066	0	36	39	shingle
+token	6620662066	0	36	41	shingle
+token	66	1	38	39	<ALPHANUM>
+token	662066	0	38	41	shingle
+token	6620662066	0	38	43	shingle
+token	66	1	40	41	<ALPHANUM>
+token	662066	0	40	43	shingle
+token	6620662066	0	40	45	shingle
+token	66	1	42	43	<ALPHANUM>
+token	662066	0	42	45	shingle
+token	6620662066	0	42	47	shingle
+token	66	1	44	45	<ALPHANUM>
+token	662066	0	44	47	shingle
+token	6620662066	0	44	49	shingle
+token	66	1	46	47	<ALPHANUM>
+token	662066	0	46	49	shingle
+token	6620662066	0	46	51	shingle
+token	66	1	48	49	<ALPHANUM>
+token	662066	0	48	51	shingle
+token	6620662066	0	48	53	shingle
+token	66	1	50	51	<ALPHANUM>
+token	662066	0	50	53	shingle
+token	6620662066	0	50	55	shingle
+token	66	1	52	53	<ALPHANUM>
+token	662066	0	52	55	shingle
+token	6620662066	0	52	57	shingle
+token	66	1	54	55	<ALPHANUM>
+token	662066	0	54	57	shingle
+token	6620662066	0	54	59	shingle
+token	66	1	56	57	<ALPHANUM>
+token	662066	0	56	59	shingle
+token	6620662066	0	56	61	shingle
+token	66	1	58	59	<ALPHANUM>
+token	662066	0	58	61	shingle
+token	6620662066	0	58	63	shingle
+token	66	1	60	61	<ALPHANUM>
+token	662066	0	60	63	shingle
+token	6620662066	0	60	65	shingle
+token	66	1	62	63	<ALPHANUM>
+token	662066	0	62	65	shingle
+token	6620662066	0	62	67	shingle
+token	66	1	64	65	<ALPHANUM>
+token	662066	0	64	67	shingle
+token	6620662066	0	64	69	shingle
+token	66	1	66	67	<ALPHANUM>
+token	662066	0	66	69	shingle
+token	6620662066	0	66	71	shingle
+token	66	1	68	69	<ALPHANUM>
+token	662066	0	68	71	shingle
+token	6620662066	0	68	73	shingle
+token	66	1	70	71	<ALPHANUM>
+token	662066	0	70	73	shingle
+token	6620662066	0	70	75	shingle
+token	66	1	72	73	<ALPHANUM>
+token	662066	0	72	75	shingle
+token	6620662066	0	72	77	shingle
+token	66	1	74	75	<ALPHANUM>
+token	662066	0	74	77	shingle
+token	6620662066	0	74	79	shingle
+token	66	1	76	77	<ALPHANUM>
+token	662066	0	76	79	shingle
+token	6620662066	0	76	81	shingle
+token	66	1	78	79	<ALPHANUM>
+token	662066	0	78	81	shingle
+token	6620662066	0	78	83	shingle
+token	66	1	80	81	<ALPHANUM>
+token	662066	0	80	83	shingle
+token	6620662066	0	80	85	shingle
+token	66	1	82	83	<ALPHANUM>
+token	662066	0	82	85	shingle
+token	6620662066	0	82	87	shingle
+token	66	1	84	85	<ALPHANUM>
+token	662066	0	84	87	shingle
+token	6620662066	0	84	89	shingle
+token	66	1	86	87	<ALPHANUM>
+token	662066	0	86	89	shingle
+token	6620662066	0	86	91	shingle
+token	66	1	88	89	<ALPHANUM>
+token	662066	0	88	91	shingle
+token	6620662066	0	88	93	shingle
+token	66	1	90	91	<ALPHANUM>
+token	662066	0	90	93	shingle
+token	6620662066	0	90	95	shingle
+token	66	1	92	93	<ALPHANUM>
+token	662066	0	92	95	shingle
+token	6620662066	0	92	97	shingle
+token	66	1	94	95	<ALPHANUM>
+token	662066	0	94	97	shingle
+token	6620662066	0	94	99	shingle
+token	66	1	96	97	<ALPHANUM>
+token	662066	0	96	99	shingle
+token	6620662066	0	96	101	shingle
+token	66	1	98	99	<ALPHANUM>
+token	662066	0	98	101	shingle
+token	6620662066	0	98	103	shingle
+elided	29847
+token	66	1	19998	19999	<ALPHANUM>
+token	662066	0	19998	20001	shingle
+token	6620662066	0	19998	20003	shingle
+token	66	1	20000	20001	<ALPHANUM>
+token	662066	0	20000	20003	shingle
+token	6620662066	0	20000	20005	shingle
+token	66	1	20002	20003	<ALPHANUM>
+token	662066	0	20002	20005	shingle
+token	6620662066	0	20002	20007	shingle
+token	66	1	20004	20005	<ALPHANUM>
+token	662066	0	20004	20007	shingle
+token	6620662066	0	20004	20009	shingle
+token	66	1	20006	20007	<ALPHANUM>
+token	662066	0	20006	20009	shingle
+token	6620662066	0	20006	20011	shingle
+token	66	1	20008	20009	<ALPHANUM>
+token	662066	0	20008	20011	shingle
+token	6620662066	0	20008	20013	shingle
+token	66	1	20010	20011	<ALPHANUM>
+token	662066	0	20010	20013	shingle
+token	6620662066	0	20010	20015	shingle
+token	66	1	20012	20013	<ALPHANUM>
+token	662066	0	20012	20015	shingle
+token	6620662066	0	20012	20017	shingle
+token	66	1	20014	20015	<ALPHANUM>
+token	662066	0	20014	20017	shingle
+token	6620662066	0	20014	20019	shingle
+token	66	1	20016	20017	<ALPHANUM>
+token	662066	0	20016	20019	shingle
+token	6620662066	0	20016	20021	shingle
+token	66	1	20018	20019	<ALPHANUM>
+token	662066	0	20018	20021	shingle
+token	6620662066	0	20018	20023	shingle
+token	66	1	20020	20021	<ALPHANUM>
+token	662066	0	20020	20023	shingle
+token	6620662066	0	20020	20025	shingle
+token	66	1	20022	20023	<ALPHANUM>
+token	662066	0	20022	20025	shingle
+token	6620662066	0	20022	20027	shingle
+token	66	1	20024	20025	<ALPHANUM>
+token	662066	0	20024	20027	shingle
+token	6620662066	0	20024	20029	shingle
+token	66	1	20026	20027	<ALPHANUM>
+token	662066	0	20026	20029	shingle
+token	6620662066	0	20026	20031	shingle
+token	66	1	20028	20029	<ALPHANUM>
+token	662066	0	20028	20031	shingle
+token	6620662066	0	20028	20033	shingle
+token	66	1	20030	20031	<ALPHANUM>
+token	662066	0	20030	20033	shingle
+token	6620662066	0	20030	20035	shingle
+token	66	1	20032	20033	<ALPHANUM>
+token	662066	0	20032	20035	shingle
+token	6620662066	0	20032	20037	shingle
+token	66	1	20034	20035	<ALPHANUM>
+token	662066	0	20034	20037	shingle
+token	6620662066	0	20034	20039	shingle
+token	66	1	20036	20037	<ALPHANUM>
+token	662066	0	20036	20039	shingle
+token	6620662066	0	20036	20041	shingle
+token	66	1	20038	20039	<ALPHANUM>
+token	662066	0	20038	20041	shingle
+token	6620662066	0	20038	20043	shingle
+token	66	1	20040	20041	<ALPHANUM>
+token	662066	0	20040	20043	shingle
+token	6620662066	0	20040	20045	shingle
+token	66	1	20042	20043	<ALPHANUM>
+token	662066	0	20042	20045	shingle
+token	6620662066	0	20042	20047	shingle
+token	66	1	20044	20045	<ALPHANUM>
+token	662066	0	20044	20047	shingle
+token	6620662066	0	20044	20049	shingle
+token	66	1	20046	20047	<ALPHANUM>
+token	662066	0	20046	20049	shingle
+token	6620662066	0	20046	20051	shingle
+token	66	1	20048	20049	<ALPHANUM>
+token	662066	0	20048	20051	shingle
+token	6620662066	0	20048	20053	shingle
+token	66	1	20050	20051	<ALPHANUM>
+token	662066	0	20050	20053	shingle
+token	6620662066	0	20050	20055	shingle
+token	66	1	20052	20053	<ALPHANUM>
+token	662066	0	20052	20055	shingle
+token	6620662066	0	20052	20057	shingle
+token	66	1	20054	20055	<ALPHANUM>
+token	662066	0	20054	20057	shingle
+token	6620662066	0	20054	20059	shingle
+token	66	1	20056	20057	<ALPHANUM>
+token	662066	0	20056	20059	shingle
+token	6620662066	0	20056	20061	shingle
+token	66	1	20058	20059	<ALPHANUM>
+token	662066	0	20058	20061	shingle
+token	6620662066	0	20058	20063	shingle
+token	66	1	20060	20061	<ALPHANUM>
+token	662066	0	20060	20063	shingle
+token	6620662066	0	20060	20065	shingle
+token	66	1	20062	20063	<ALPHANUM>
+token	662066	0	20062	20065	shingle
+token	6620662066	0	20062	20067	shingle
+token	66	1	20064	20065	<ALPHANUM>
+token	662066	0	20064	20067	shingle
+token	6620662066	0	20064	20069	shingle
+token	66	1	20066	20067	<ALPHANUM>
+token	662066	0	20066	20069	shingle
+token	6620662066	0	20066	20071	shingle
+token	66	1	20068	20069	<ALPHANUM>
+token	662066	0	20068	20071	shingle
+token	6620662066	0	20068	20073	shingle
+token	66	1	20070	20071	<ALPHANUM>
+token	662066	0	20070	20073	shingle
+token	6620662066	0	20070	20075	shingle
+token	66	1	20072	20073	<ALPHANUM>
+token	662066	0	20072	20075	shingle
+token	6620662066	0	20072	20077	shingle
+token	66	1	20074	20075	<ALPHANUM>
+token	662066	0	20074	20077	shingle
+token	6620662066	0	20074	20079	shingle
+token	66	1	20076	20077	<ALPHANUM>
+token	662066	0	20076	20079	shingle
+token	6620662066	0	20076	20081	shingle
+token	66	1	20078	20079	<ALPHANUM>
+token	662066	0	20078	20081	shingle
+token	6620662066	0	20078	20083	shingle
+token	66	1	20080	20081	<ALPHANUM>
+token	662066	0	20080	20083	shingle
+token	6620662066	0	20080	20085	shingle
+token	66	1	20082	20083	<ALPHANUM>
+token	662066	0	20082	20085	shingle
+token	6620662066	0	20082	20087	shingle
+token	66	1	20084	20085	<ALPHANUM>
+token	662066	0	20084	20087	shingle
+token	6620662066	0	20084	20089	shingle
+token	66	1	20086	20087	<ALPHANUM>
+token	662066	0	20086	20089	shingle
+token	6620662066	0	20086	20091	shingle
+token	66	1	20088	20089	<ALPHANUM>
+token	662066	0	20088	20091	shingle
+token	6620662066	0	20088	20093	shingle
+token	66	1	20090	20091	<ALPHANUM>
+token	662066	0	20090	20093	shingle
+token	6620662066	0	20090	20095	shingle
+token	66	1	20092	20093	<ALPHANUM>
+token	662066	0	20092	20095	shingle
+token	6620662066	0	20092	20097	shingle
+token	66	1	20094	20095	<ALPHANUM>
+token	662066	0	20094	20097	shingle
+token	6620662066	0	20094	20099	shingle
+token	66	1	20096	20097	<ALPHANUM>
+token	662066	0	20096	20099	shingle
+token	66	1	20098	20099	<ALPHANUM>
+end	0	20100
+line	29
+count	0
+end	0	11
+line	30
+count	1
+token	d790d791	1	0	2	<ALPHANUM>
+end	0	3
+line	31
+count	3
+token	d790	1	0	1	<ALPHANUM>
+token	d79020d791	0	0	3	shingle
+token	d791	1	2	3	<ALPHANUM>
+end	0	3
+line	32
+count	9
+token	33	1	0	1	<ALPHANUM>
+token	3320356b67	0	0	5	shingle
+token	3320356b672031	0	0	7	shingle
+token	356b67	1	2	5	<ALPHANUM>
+token	356b672031	0	2	7	shingle
+token	356b67203120356d	0	2	10	shingle
+token	31	1	6	7	<ALPHANUM>
+token	3120356d	0	6	10	shingle
+token	356d	1	8	10	<ALPHANUM>
+end	0	10
+line	33
+count	3
+token	6162	1	0	2	<ALPHANUM>
+token	6162206364	0	0	5	shingle
+token	6364	1	3	5	<ALPHANUM>
+end	0	5
+line	34
+count	2
+token	5f207461696c	1	257	261	shingle
+token	7461696c	1	257	261	<ALPHANUM>
+end	0	261
+line	35
+count	8
+token	616c706861	1	0	5	<ALPHANUM>
+token	616c706861205f	0	0	307	shingle
+token	616c706861205f2062657461	0	0	311	shingle
+token	5f2062657461	1	307	311	shingle
+token	5f20626574612067616d6d61	0	307	317	shingle
+token	62657461	1	307	311	<ALPHANUM>
+token	626574612067616d6d61	0	307	317	shingle
+token	67616d6d61	1	312	317	<ALPHANUM>
+end	0	317

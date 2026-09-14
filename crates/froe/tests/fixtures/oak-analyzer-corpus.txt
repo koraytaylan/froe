@@ -1,0 +1,87 @@
+# The corpus Oak's own analyzers are run over, for froe to replay.
+#
+# One input per line. A `#` line is a comment and an empty line is
+# skipped, so every escape below exists to keep a control character,
+# an astral character or a ten-thousand-token text out of the file:
+#
+#   \n \t \r \\   the obvious four
+#   \uNNNN         one UTF-16 code unit
+#   \xNNNNNN       one code point, so an astral character is one escape
+#   \*N*TEXT*      TEXT repeated N times
+#
+# The judge unescapes, analyzes, and prints the tuples; froe replays
+# them. What each line is for is in the comment above it.
+# plain ASCII words
+the quick brown fox
+# case transitions, which Oak does not split on
+PowerShot iPhone XMLHttpRequest
+# a hyphen, which the tokenizer breaks at
+Foo-Bar well-known e-mail
+# underscores, which are ExtendNumLet and join
+foo_bar _leading trailing_
+# an apostrophe and a possessive
+O'Neil's Bar's don't
+# a right single quotation mark as the apostrophe
+O\u2019Neil\u2019s
+# digits inside words, which Oak does not split on
+j2se utf8 x86_64 3rd
+# bare numbers and number groupings
+42 3.14 1,000 1_000
+# a mixed string the specification works through
+Foo-Bar's 3rd j2se PowerShot
+# CJK ideographs, one token each
+\u4e2d\u6587\u6d4b\u8bd5
+# hiragana, one token each, and katakana, run together
+\u3072\u3089\u304c\u306a \u30ab\u30bf\u30ab\u30ca
+# hangul, run together
+\ud55c\uad6d\uc5b4
+# Thai, a complex-context run
+\u0e44\u0e17\u0e22
+# a combining mark, which Extend attaches to its base
+cafe\u0301 a\u0300b
+# an emoji, which is not a word character
+hello \x01f600 world
+# two regional indicators, consumed and not emitted
+\x01f1e6\x01f1e7 flag
+# an astral letter, which the supplementary macros cover
+\x010400\x010401 deseret
+# whitespace variants
+a\tb\u00a0c\u2003d
+# a newline, which only the suggest chain splits on
+first\nsecond\nthird
+# a repository path, which the ancestors chain walks
+/content/interop/page
+# a deeper path
+/content/dam/collections/a/b/c
+# a path with a trailing element only
+/content
+# the root, whose parent path is itself
+/
+# a token of exactly 255 code units, which survives
+\*255*a*
+# a token of 256 code units, which the standard tokenizer drops
+\*256*b*
+# 254 units then an astral character, so the token reaches 256
+\*254*c*\x010400
+# a suggest line of 255 units, at the character tokenizer bound
+\*255*d*
+# a suggest line of 300 units, which that tokenizer cuts
+\*300*e*
+# a text above the ten-thousand-token cap
+\*10050*f *
+# an empty-ish input of separators alone
+--- ... !!!
+# a Hebrew letter with a single quote, UAX#29 WB7a
+\u05d0\u05d1\u0027
+# a Hebrew letter with a double quote between letters, WB7b
+\u05d0\u0022\u05d1
+# a number joined to a letter run by a mid-num-let
+3.5kg 1,5m
+# a format character inside a word, which WB4 absorbs
+ab\u200dcd
+# an over-long token followed by a short one: the dropped token still
+# takes a position, so the next token's increment is 2
+\*256*b* tail
+# an over-long token between two short ones, which the shingle chain
+# fills with its filler token
+alpha \*300*z* beta gamma

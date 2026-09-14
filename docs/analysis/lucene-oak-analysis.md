@@ -180,7 +180,47 @@ tie, the earliest rule:
 The last rule is what discards everything else: punctuation, whitespace and
 a lone regional indicator produce no token at all.
 
-### 2.4 Length, offsets and skipped positions
+The word rule, verbatim, because its shape is what §2.4 turns on:
+
+```
+{ExtendNumLetEx}*  ( {KatakanaEx}          ( {ExtendNumLetEx}*   {KatakanaEx}                           )*
+                   | ( {HebrewLetterEx}    ( {SingleQuoteEx}     | {DoubleQuoteEx}  {HebrewLetterEx}    )
+                     | {NumericEx}         ( ( {ExtendNumLetEx}* | {MidNumericEx} ) {NumericEx}         )*
+                     | {HebrewOrALetterEx} ( ( {ExtendNumLetEx}* | {MidLetterEx}  ) {HebrewOrALetterEx} )*
+                     )+
+                   )
+({ExtendNumLetEx}+ ( … the same group … )
+)*
+{ExtendNumLetEx}*
+```
+
+### 2.4 Longest match is not greedy match
+
+JFlex matches the **longest** string the rule accepts, and for this rule
+that is not what taking each alternative as far as it goes produces. The
+`( … )+` has three alternatives, two of which begin on a Hebrew letter,
+and a *shorter* first alternative can let a later one reach further.
+
+`אב'` is the case, and it is in the corpus:
+
+* the letter-run alternative, taken greedily, consumes both Hebrew letters
+  and stops at 2 — the apostrophe is no letter, and no alternative
+  starts on one;
+* the accepting split is the letter run over `א` alone, then WB7a's
+  `{HebrewLetterEx} {SingleQuoteEx}` over `ב'`, which reaches 3.
+
+Oak's own analyzers produce the three-character token, and froe's tokenizer
+therefore simulates every alternative at once — one left-to-right pass
+over the atoms, keeping the last position at which an accepting state was
+live — rather than committing to an alternative and running it out. The
+`<NUM>` rule is simulated the same way for the same reason.
+
+An "atom" there is one `X (Format | Extend)*` of the grammar, and consuming
+that tail greedily is safe: the `Word_Break` classes are disjoint, so no
+element of any rule begins with a `Format` or an `Extend` and a shorter
+tail can never let a longer match through.
+
+### 2.5 Length, offsets and skipped positions
 
 ```java
 private int maxTokenLength = StandardAnalyzer.DEFAULT_MAX_TOKEN_LENGTH;   // 255
@@ -338,7 +378,7 @@ private int position(boolean inject) {
     return 0;
   }
   accumPosInc = 0;
-  return posInc;
+  return Math.max(1, posInc);
 }
 ```
 
@@ -564,14 +604,35 @@ end state part of this specification, and it differs by chain:
 | Chain | Final position increment | Final offset |
 | --- | --- | --- |
 | Oak's analyzer (standard tokenizer at the source) | the number of over-long tokens dropped since the last emitted one | how far the scanner read — the whole value |
-| the same under the token-count cap | the same, from the tokenizer below the cap | the same |
+| the same under the token-count cap, **when the cap bites** | what was dropped immediately *before* the last token the cap kept | the end of that token |
 | path hierarchy (`:ancestors`) | 0 | the length of the input |
-| the suggest tokenizer (`:suggest`) | 0 | the end of the last token |
+| the suggest tokenizer (`:suggest`) | 0 | the length of the input |
 | the shingle chain (`:spellcheck`) | the wrapped chain's, which is Oak's analyzer's | the wrapped chain's |
 
-The cap is a filter above the tokenizer, so it changes neither: `end()`
-passes through it untouched. What it changes is how many tokens the field
-holds — and, through the inverter's own counting, the field's norm length.
+**The cap changes the end state**, and that is worth stating plainly
+because it is the opposite of what a filter usually does.
+`LimitTokenCountAnalyzer`'s two-argument constructor passes
+`consumeAllTokens = false`, so on reaching its limit the filter returns
+`false` **without pulling the stream below it**. Nothing has drained the
+tokenizer, and `end()` therefore reports where the scanner happens to
+stand: `scanner.yychar() + scanner.yylength()` is the end of the last
+token it matched, not the end of the value, and `skippedPositions` still
+holds what `incrementToken` zeroed on entry and counted before that
+token. A stream the cap does *not* bite is unaffected, since the filter
+then drains its input as usual.
+
+Corpus line 28 of task 1003's fixture is the case: 10,050 values of `f`
+separated by spaces, capped at 10,000, and Oak's own judge records the end
+state as increment 0, offset 19,999 — the end of the ten-thousandth
+token — against an input 20,100 characters long.
+
+The `:suggest` row is the second place where reading the code beats
+reading the shape. `CharTokenizer.incrementToken` sets `finalOffset`
+twice: to each token's end as it is emitted, and to everything the reader
+consumed on the call that returns `false`. Lucene always calls
+`incrementToken` until it is false before `end()`, so the second
+assignment is the one that survives, and a value ending in a newline
+reports past its last token.
 
 ---
 

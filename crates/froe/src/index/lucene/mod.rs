@@ -7,11 +7,13 @@
 //! file is stored in and nothing about the bytes inside one, which are the
 //! Lucene 4.7.2 format.
 
+pub mod analysis;
 pub mod check;
 pub mod codec;
 pub mod codec_header;
 pub mod compound;
 pub mod directory;
+pub mod documents;
 pub mod dump;
 pub mod layout;
 pub mod read;
