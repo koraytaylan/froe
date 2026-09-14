@@ -7,8 +7,8 @@ depends_on: []
 gated: false
 touches:
   - docs/analysis/lucene-oak-analysis.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "b0dbdd4"
 ---
 # Specify Oak's Analysis Chain And Numeric Encodings
 
