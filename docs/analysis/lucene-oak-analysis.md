@@ -62,6 +62,26 @@ tables were baked in when Lucene 4.7.2 was released; a JVM that knows a
 later Unicode does not change a single token. The *case* tables are the
 opposite — §3 — and the two must not be conflated.
 
+### 0.4 Jackrabbit's `ISO8601`, which Oak converts a DATE with
+
+`FieldFactory.dateToLong` — §8.4 — parses through
+`org.apache.jackrabbit.util.ISO8601`, which Oak does not vendor either:
+
+```
+org.apache.jackrabbit:jackrabbit-jcr-commons:2.22.3:sources
+https://repo1.maven.org/maven2/org/apache/jackrabbit/jackrabbit-jcr-commons/2.22.3/jackrabbit-jcr-commons-2.22.3-sources.jar
+sha256  3f10d27183ccca8a2b837344e875dfccc80ac943c815e7a769405f3ee6114b7a
+```
+
+**Four jars in the pinned image carry a copy of that class** —
+`jackrabbit-jcr-commons`, `org.apache.sling.jcr.resource`,
+`org.apache.sling.event` and `org.apache.sling.repoinit.parser`, the last
+three embedding it privately. The version above is the one the
+`jackrabbit-jcr-commons` bundle *exports*, which is what Oak's own bundle
+imports at runtime; a flat class path would let any of the four answer
+instead, so the judge refuses to run unless the copy it loaded came from
+that jar.
+
 ---
 
 ## 1. Oak's own analyzer
@@ -699,6 +719,79 @@ value's.** A `DOUBLE` doc value is the raw bits of the double
 negative double, for `-0.0` and for `NaN`. The two live in one field name
 and mean different things; §8.1 of `lucene-oak-documents.md` states it from
 the document maker's side.
+
+### 8.4 The DATE conversion
+
+`plugins/index/lucene/FieldFactory.java`:
+
+```java
+public static Long dateToLong(String date){
+    if( date == null){
+        return null;
+    }
+    Calendar c = ISO8601.parse(date);
+    if (c != null) {
+        return c.getTimeInMillis();
+    } else {
+        throw new RuntimeException("Unable to parse the provided date field : " + date
+                + " to convert to millis. Supported format is ±YYYY-MM-DDThh:mm:ss.SSSTZD");
+    }
+}
+```
+
+**A date that does not parse throws**, and the fulltext editor does not
+catch it, so the indexing commit fails rather than the document being
+skipped. A *missing* value is the `null` branch and contributes no field.
+froe returns a typed refusal for the first and absence for the second.
+
+The parser is §0.4's `ISO8601.parse`, and it is not the ISO-8601 a
+reasonable reader would write. Its rules, from the pinned source:
+
+1. An optional leading `+` or `-`, then `YYYY-MM-DDThh:mm:ss.SSS` with
+   **every field of exactly that width** and every delimiter literal. The
+   fraction is **mandatory** and exactly three digits: `…T12:30:45Z` is
+   refused, `…T12:30:45.67Z` is refused, and `…T12:30:45.6780Z` is
+   refused.
+2. Each field goes through `Integer.parseInt`, which takes **every BMP
+   decimal digit**, not only ASCII: `٢٠١٢-03-01T12:30:45.678Z` parses, and to the same
+   millisecond as `2012-…`. It also takes a sign inside the field, which
+   the width rules make unreachable for the year and merely refused by
+   the range checks below for the rest.
+3. The time-zone designator is **the whole of the rest of the string**,
+   resolved in this order: a small map holding `Z`, `+00:00`, `-00:00`
+   and the thirty-nine listed offsets; otherwise `TimeZone.getTimeZone`
+   over `"GMT" + designator`, accepted only if the zone's own identifier
+   comes back **equal to what was asked for**. So:
+   * `Z` and an **empty** designator are both UTC — the empty one because
+     `getTimeZone("GMT")` answers to `GMT`;
+   * `0` is UTC too, `GMT0` being a zone identifier of its own in the
+     database;
+   * `+hh:mm` and `-hh:mm` are accepted for `hh` up to 23 and `mm` up to
+     59, and refused above either;
+   * every other spelling is refused, `+0`, `-0`, `+00`, `+1:00`,
+     `+0100`, `Z0` and `UTC` included, because `getTimeZone` normalizes
+     them to something else or to `GMT`.
+4. The fields go into a `GregorianCalendar` with **`setLenient(false)`**,
+   which rejects a field out of range and any date that does not read
+   back as it was written: month 13, day 30 of February, hour 24, minute
+   60 and second 60 are all refused, and 2012-02-29 is accepted while
+   2013-02-29 is not.
+5. **The calendar is the historical one, with its Julian cutover at
+   1582-10-15.** A date before that instant is read in the *Julian*
+   calendar, and the ten days the cutover swallowed do not exist:
+   1582-10-04 is accepted and is the day before 1582-10-15, while
+   1582-10-05 through 1582-10-14 are refused. `1000-01-01T00:00:00.000Z`
+   is therefore -30,609,792,000,000 and not the proleptic Gregorian
+   value.
+6. The era comes from the leading sign, and from a year of `0000`:
+   either sets `ERA` to `BC` with `YEAR = year + 1`, so `-0001` is the
+   astronomical year -1 and `0000` is the astronomical year 0. The
+   astronomical year must then fit four digits: `getYear` refuses
+   anything outside -9999 to 9999, which the four-digit field mostly
+   enforces already.
+
+froe reproduces all six in `java/iso8601.rs`, and task 1004's vectors
+pin them against this class running in the image.
 
 ---
 
