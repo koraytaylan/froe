@@ -9,8 +9,8 @@ touches:
   - crates/froe/src/writer/index/property_builder.rs
   - crates/froe/tests/property_index_builder_tests.rs
   - crates/froe/tests/support/property_index_layout.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "3c7cc2f1a422fa052a2f4f875d5afa1f2401e076"
 ---
 # Write Mirror And Unique Index Records From Sorted Entries
 
