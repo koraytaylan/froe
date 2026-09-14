@@ -1,0 +1,83 @@
+# What Oak's own name pattern answers for a pattern and a property path,
+# with Java's regular-expression engine behind it, for froe to replay.
+#
+# Generated inside the pinned Sling image against its own oak-search jar:
+#
+#   podman run --rm --user 0 --entrypoint /bin/sh \
+#     -v <work>:/work:z \
+#     docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9 \
+#     -c 'CP=$(find /opt/sling/artifacts -name "*.jar" | tr "\n" ":"); \
+#         cd /work && javac -cp "$CP" -d . RegularExpressionVectors.java StoreSupport.java && \
+#         java -cp ".:$CP" RegularExpressionVectors regular-expression-vectors table.tsv' \
+#     > java-regular-expression-vectors.tsv
+#
+# The judge reproduces `IndexDefinition.NamePattern` — Oak's own
+# parent-and-name split through `PathUtils`, then `Pattern.matcher(name)
+# .matches()` — because that, and not a bare regular-expression match, is
+# what decides whether a property definition applies.
+#
+# Columns: <pattern>\t<property path>\t<verdict>
+#
+# The verdict is `match`, `nomatch`, or `invalid` when Java's own parser
+# refuses the pattern. `\e` is the empty string; nothing else is escaped,
+# and no pattern here contains a tab.
+^[^\/]*$	jcr:title	match
+^[^\/]*$	:nodeName	match
+^[^\/]*$	jcr:content/jcr:title	nomatch
+^[^\/]*$	\e	match
+^[^\/]*$	a/b/c	nomatch
+jcr:content/.*	jcr:content/jcr:title	match
+jcr:content/.*	jcr:content/	match
+jcr:content/.*	jcr:title	nomatch
+jcr:content/.*	other/jcr:title	nomatch
+jcr:content/.*	jcr:content/a/b	nomatch
+.*Tags	cq:Tags	match
+.*Tags	Tags	match
+.*Tags	tags	nomatch
+.*Tags	cq:TagsExtra	nomatch
+.*	jcr:title	match
+.*	\e	match
+.*	a/b	nomatch
+/.*	jcr:title	nomatch
+/.*	/jcr:title	match
+foo/	foo/	match
+foo/	foo	nomatch
+[a-z]+	abc	match
+[a-z]+	abC	nomatch
+[^a-z]+	ABC	match
+[^a-z]+	abc	nomatch
+[a-z0-9_:]+	sling:resourceType	nomatch
+a|b	a	match
+a|b	b	match
+a|b	c	nomatch
+(ab)+c	ababc	match
+(ab)+c	abac	nomatch
+a?b*c+	ac	match
+a?b*c+	bbbccc	match
+a?b*c+	ab	nomatch
+x.y	xay	match
+x.y	xy	nomatch
+x\.y	x.y	match
+x\.y	xay	nomatch
+\[abc\]	[abc]	match
+[.]	.	match
+[.]	a	nomatch
+[\-a]	-	match
+^abc$	abc	match
+^abc$	xabc	nomatch
+cq:.*	cq:tags	match
+cq:.*	cqtags	nomatch
+[a-z]*Tags	cqTags	match
+[a-z]*Tags	Tags	match
+(jcr|cq):.*	jcr:title	match
+(jcr|cq):.*	sling:title	nomatch
+\d+	123	match
+\w+	abc	match
+a{2,3}	aaa	match
+(?i)abc	ABC	match
+(?:ab)c	abc	match
+(a)\1	aa	match
+(?=a)b	ab	nomatch
+[[:alpha:]]	a	match
+a**	a	invalid
+[z-a]	a	invalid

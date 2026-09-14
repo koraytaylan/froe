@@ -84,8 +84,20 @@ means: fulltext-enabled, with no `codec` property naming something else.
 this.fulltextEnabled = aggregate.hasNodeAggregates() || hasAnyFullTextEnabledProperty();
 ```
 
+with
+
+```java
+public boolean fulltextEnabled() {
+    return index && (analyzed || nodeScopeIndex);
+}
+```
+
 — a rule with node aggregates, or one with a property definition that is
-`analyzed`, `nodeScopeIndex` or `useInSuggest`/`useInSpellcheck`.
+indexed and either `analyzed` or `nodeScopeIndex`. **`useInSuggest` and
+`useInSpellcheck` are not in it**, and a definition whose only fulltext
+intent is one of those two therefore gets `Lucene46` and is refused here.
+The patterns count as well as the exact names: `hasAnyFullTextEnabledProperty`
+walks `propDefinitions` and then `namePatterns`.
 
 ### 1.2 The old-format definition
 
@@ -172,9 +184,17 @@ Three facts, each load-bearing:
   `new TreeMap<>(String.CASE_INSENSITIVE_ORDER)`, so a definition naming
   `sling:resourceType` matches a property `sling:resourcetype`. The
   fixture's lower-cased names depend on it.
-* **The first of two case-insensitive duplicates wins**, because the loop
-  guards with `!propDefns.containsKey(propName)` before creating the
-  definition.
+* **A duplicate leaves one definition, and which one turns on where the
+  duplication is.** The loop guards with `!propDefns.containsKey(propName)`
+  — the **child's** name — against a map keyed by each definition's
+  **`name`**, and then `put`s under that `name`. So two children whose own
+  names collide leave the first, because the second is never created; two
+  children naming one property through `name` leave the second, because
+  its `put` replaces the first; and a child whose name a previous
+  definition's `name` already claimed is skipped whole, refusals included.
+  The map's values are what `propDefinitions` holds, so an overwritten
+  definition is gone from the rule — though it may already have joined one
+  of the side lists the constructor fills.
 * **A hidden name is tried against the patterns too.** The commented-out
   `return null` is Oak's own note that this is bug compatibility — and it
   is why the synthetic `:nodeName` reaches a catch-all pattern (§3.7).
@@ -216,6 +236,21 @@ only for it, the parent is `""` and the whole text is the name expression.
 
 The match is then a **parent-path equality** followed by a **whole-string**
 regular-expression match — `Matcher.matches`, not `find`.
+
+froe carries no regular-expression engine and will not approximate Java's,
+so `documents/name_pattern.rs` implements a **bounded subset** — literals,
+`.`, `*`, `+`, `?`, `|`, grouping, character classes with negation, ranges
+and escapes, and `^` and `$` at the ends, where `Matcher.matches` makes
+them redundant — and refuses everything else by name. That covers the
+catch-all above and the patterns AEM's shipped definitions use,
+`jcr:content/.*` and `.*Tags` among them; `\d`, `\w`, `{2,3}`, `(?i)`,
+`(?:`, a back-reference, a look-around and a nested class are each a named
+refusal, as is a quantifier over a quantified group, which is where a
+backtracking matcher goes exponential. Task 1005's vectors evaluate a
+table of patterns and property paths through this same `NamePattern`
+logic inside the image, so every accepted pattern is proved against
+Java's own engine and every refused one is proved to be refused rather
+than misread.
 
 Precedence, stated once: rule order and property-definition order are the
 `:childOrder` of `indexRules` and `properties`, raw child order when that

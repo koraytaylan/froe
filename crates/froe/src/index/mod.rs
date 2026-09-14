@@ -143,6 +143,28 @@ pub enum IndexError {
         /// The stored pattern text, for the operator to read.
         pattern: String,
     },
+    /// A Lucene definition declares something this plan does not
+    /// reproduce. Each such construct writes a field froe would not, and
+    /// a silently missing field is a query that stops matching, so the
+    /// reindex refuses the definition rather than building part of it.
+    UnsupportedDefinition {
+        /// The definition that cannot be rebuilt.
+        definition_path: String,
+        /// What it declares, named for the operator.
+        feature: String,
+    },
+    /// An `isRegexp` property name froe's bounded subset does not carry.
+    /// froe has no regular-expression engine and will not approximate
+    /// Java's: a pattern read approximately is a field that silently
+    /// stops being written.
+    UnsupportedNamePattern {
+        /// The definition carrying the pattern.
+        definition_path: String,
+        /// The pattern text, as stored.
+        pattern: String,
+        /// What in it was not carried, for the operator to read.
+        reason: String,
+    },
     /// A `DATE` value that Jackrabbit's own `ISO8601` refuses.
     /// `FieldFactory.dateToLong` throws an unchecked exception there and
     /// Oak's fulltext editor does not catch it, so the indexing commit
@@ -222,6 +244,22 @@ impl fmt::Display for IndexError {
                 formatter,
                 "the index definition at {definition_path} restricts values with the regular \
                  expression {pattern:?}, which froe does not evaluate"
+            ),
+            IndexError::UnsupportedDefinition {
+                definition_path,
+                feature,
+            } => write!(
+                formatter,
+                "the index definition at {definition_path} cannot be rebuilt natively: {feature}"
+            ),
+            IndexError::UnsupportedNamePattern {
+                definition_path,
+                pattern,
+                reason,
+            } => write!(
+                formatter,
+                "the index definition at {definition_path} names properties with the regular \
+                 expression {pattern:?}, which froe does not evaluate: it holds {reason}"
             ),
             IndexError::UnparseableDate { value } => write!(
                 formatter,
