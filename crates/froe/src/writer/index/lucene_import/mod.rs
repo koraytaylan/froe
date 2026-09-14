@@ -34,5 +34,7 @@
 //!   definition by cloning it, which is what the refresh means.
 
 pub mod drift;
+pub mod plan;
 
 pub use drift::{DriftVerdict, REWRITTEN_PROPERTY_NAMES};
+pub use plan::{LuceneImportOptions, LuceneImportPlan, PlannedImport, plan_lucene_import};
