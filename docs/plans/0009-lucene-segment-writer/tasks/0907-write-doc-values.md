@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe/src/index/lucene/codec/doc_values.rs
   - crates/froe/tests/lucene_doc_values_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "15488dd"
 ---
 # Write Lucene45 Doc Values
 
