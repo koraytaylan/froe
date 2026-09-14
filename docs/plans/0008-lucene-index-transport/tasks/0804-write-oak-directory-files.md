@@ -10,8 +10,9 @@ touches:
   - crates/froe/src/writer/record_writer/values.rs
   - crates/froe/tests/oak_directory_writer_tests.rs
   - crates/froe/src/writer/index/mod.rs
-status: planned
-merged_as: ""
+  - crates/froe/src/writer/identifier_generator.rs
+status: done
+merged_as: "0a52bb988e86d971c895f3c4c11f988d4e7bf9cc"
 ---
 # Write Lucene Index Files Into The Repository
 
