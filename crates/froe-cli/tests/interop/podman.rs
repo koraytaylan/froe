@@ -203,3 +203,91 @@ pub(crate) fn extract_bundle_count(json: &str, index: usize) -> Option<i64> {
         .collect::<Option<Vec<i64>>>()?;
     numbers.get(index).copied()
 }
+
+// ---------------------------------------------------------------------------
+// One-off containers
+// ---------------------------------------------------------------------------
+
+/// One bind mount of a one-off container.
+pub(crate) struct Mount {
+    /// The host path, which must exist: podman would otherwise create a
+    /// directory owned by the container's user and the failure would look
+    /// like a missing file rather than a wrong path.
+    pub(crate) host: PathBuf,
+    /// Where it appears inside the container.
+    pub(crate) container: &'static str,
+    /// Whether the container may write to it. Read-only is the default for
+    /// a reason: the fixture every later phase reads is mounted here, and a
+    /// judge that could write to it would make its own run a mutation.
+    pub(crate) writable: bool,
+}
+
+impl Mount {
+    pub(crate) fn read_only(host: impl Into<PathBuf>, container: &'static str) -> Self {
+        Self {
+            host: host.into(),
+            container,
+            writable: false,
+        }
+    }
+
+    pub(crate) fn writable(host: impl Into<PathBuf>, container: &'static str) -> Self {
+        Self {
+            host: host.into(),
+            container,
+            writable: true,
+        }
+    }
+
+    fn argument(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.host.display(),
+            self.container,
+            if self.writable { "rw" } else { "ro" }
+        )
+    }
+}
+
+/// A container that runs one command and is removed when it exits.
+pub(crate) struct OneOffContainer {
+    pub(crate) image: String,
+    pub(crate) mounts: Vec<Mount>,
+    pub(crate) entrypoint: &'static str,
+}
+
+/// Runs `container` with `arguments` and returns its output, without
+/// asserting anything about the status — the caller decides what a failure
+/// means, because half this suite's judge classes report their verdict
+/// *through* a non-zero status.
+///
+/// The container runs as uid 0. Under rootless podman that is the invoking
+/// user on the host, which is what lets the command write to a bind-mounted
+/// host directory at all; as the image's own user it cannot, and the failure
+/// arrives as an unreadable `error while writing X.class` rather than as a
+/// permission problem.
+pub(crate) fn run_one_off(container: &OneOffContainer, arguments: &[&str]) -> std::process::Output {
+    // Podman's own ceiling, so a wedged JVM is reaped by podman rather than
+    // leaving this process blocked on a pipe that never closes.
+    let deadline = froe_timeout().as_secs().to_string();
+    let mut command = Command::new("podman");
+    command.args(["run", "--rm", "--user", "0", "--timeout", &deadline]);
+    command.args(["--entrypoint", container.entrypoint]);
+    for mount in &container.mounts {
+        assert!(
+            mount.host.exists(),
+            "the mount source {} does not exist; podman would create a \
+             directory there and the failure would look like a missing file",
+            mount.host.display()
+        );
+        command.args(["-v", &mount.argument()]);
+    }
+    command.arg(&container.image);
+    command.args(arguments);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to spawn podman run {arguments:?}: {error}"))
+}
