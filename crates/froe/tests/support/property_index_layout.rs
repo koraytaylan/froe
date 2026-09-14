@@ -48,6 +48,13 @@ pub enum Property {
     Texts(Vec<String>),
     /// A multi-valued `NAME`, which is what `propertyNames` is.
     Names(Vec<String>),
+    /// A single `BINARY`, which is what a streaming Lucene index file's
+    /// `jcr:data` is. The bytes are the **stored** blob, so a caller that is
+    /// modelling a file appends the unique key itself.
+    Binary(Vec<u8>),
+    /// A multi-valued `BINARY`, which is what a buffered Lucene index file's
+    /// `jcr:data` is: one entry per chunk, each already carrying its key.
+    Binaries(Vec<Vec<u8>>),
 }
 
 impl Property {
@@ -61,6 +68,8 @@ impl Property {
             Property::Name(_) => 7,
             Property::Texts(_) => -1,
             Property::Names(_) => -7,
+            Property::Binary(_) => 2,
+            Property::Binaries(_) => -2,
         }
     }
 
@@ -71,11 +80,30 @@ impl Property {
             Property::Long(value) => vec![value.to_string()],
             Property::Text(value) | Property::Name(value) => vec![value.clone()],
             Property::Texts(values) | Property::Names(values) => values.clone(),
+            Property::Binary(_) | Property::Binaries(_) => {
+                unreachable!("a binary property's values are bytes, not text")
+            }
         }
     }
 
+    /// The stored blobs of a binary property, in order.
+    fn value_blobs(&self) -> Vec<Vec<u8>> {
+        match self {
+            Property::Binary(bytes) => vec![bytes.clone()],
+            Property::Binaries(chunks) => chunks.clone(),
+            _ => unreachable!("a non-binary property has no blobs"),
+        }
+    }
+
+    fn is_binary(&self) -> bool {
+        matches!(self, Property::Binary(_) | Property::Binaries(_))
+    }
+
     fn is_multiple(&self) -> bool {
-        matches!(self, Property::Texts(_) | Property::Names(_))
+        matches!(
+            self,
+            Property::Texts(_) | Property::Names(_) | Property::Binaries(_)
+        )
     }
 }
 
@@ -301,13 +329,21 @@ fn encode_property_values(
     let entries: Vec<u32> = node
         .properties
         .values()
-        .map(|property| {
-            if property.is_multiple() {
-                encode_counted_list(segment, &property.value_texts(), allocate)
-            } else {
-                encode_string(segment, &property.value_texts()[0], allocate)
-            }
-        })
+        .map(
+            |property| match (property.is_binary(), property.is_multiple()) {
+                (true, true) => {
+                    let blobs = property.value_blobs();
+                    let records: Vec<u32> = blobs
+                        .iter()
+                        .map(|blob| encode_binary(segment, blob, allocate))
+                        .collect();
+                    encode_counted_list_of(segment, &records, blobs.len(), allocate)
+                }
+                (true, false) => encode_binary(segment, &property.value_blobs()[0], allocate),
+                (false, true) => encode_counted_list(segment, &property.value_texts(), allocate),
+                (false, false) => encode_string(segment, &property.value_texts()[0], allocate),
+            },
+        )
         .collect();
     Some(encode_uncounted_list(segment, &entries, allocate))
 }
@@ -389,12 +425,69 @@ fn encode_counted_list(
         .iter()
         .map(|value| encode_string(segment, value, allocate))
         .collect();
-    let mut bytes = (values.len() as u32).to_be_bytes().to_vec();
+    encode_counted_list_of(segment, &value_records, values.len(), allocate)
+}
+
+/// A counted list over already-encoded value records: the size, then the
+/// body pointer, which an empty list omits entirely.
+fn encode_counted_list_of(
+    segment: &mut SegmentBuilder,
+    value_records: &[u32],
+    size: usize,
+    allocate: &mut impl FnMut() -> u32,
+) -> u32 {
+    let mut bytes = (size as u32).to_be_bytes().to_vec();
     if !value_records.is_empty() {
-        let body = encode_uncounted_list(segment, &value_records, allocate);
+        let body = encode_uncounted_list(segment, value_records, allocate);
         bytes.extend(record_identifier_bytes(0, body));
     }
     let record = allocate();
     segment.add_record(record, super::TYPE_LIST, bytes);
+    record
+}
+
+/// An inline binary value record, in whichever of the three length forms the
+/// content needs.
+///
+/// The three heads are the format's own: a one-byte head below 128 bytes, a
+/// two-byte head with the top bit set below 16,512, and an eight-byte head
+/// with the top two bits set above that, followed by a block list over
+/// 4096-byte block records.
+fn encode_binary(
+    segment: &mut SegmentBuilder,
+    content: &[u8],
+    allocate: &mut impl FnMut() -> u32,
+) -> u32 {
+    const SMALL_LIMIT: usize = 128;
+    const MEDIUM_LIMIT: usize = 16_512;
+    const BLOCK_SIZE: usize = 4096;
+
+    let record = allocate();
+    if content.len() < SMALL_LIMIT {
+        let mut bytes = vec![content.len() as u8];
+        bytes.extend_from_slice(content);
+        segment.add_record(record, TYPE_VALUE, bytes);
+        return record;
+    }
+    if content.len() < MEDIUM_LIMIT {
+        let stored = ((content.len() - SMALL_LIMIT) as u16) | 0x8000;
+        let mut bytes = stored.to_be_bytes().to_vec();
+        bytes.extend_from_slice(content);
+        segment.add_record(record, TYPE_VALUE, bytes);
+        return record;
+    }
+    let block_records: Vec<u32> = content
+        .chunks(BLOCK_SIZE)
+        .map(|block| {
+            let block_record = allocate();
+            segment.add_record(block_record, super::TYPE_VALUE, block.to_vec());
+            block_record
+        })
+        .collect();
+    let list = encode_uncounted_list(segment, &block_records, allocate);
+    let stored = ((content.len() - MEDIUM_LIMIT) as u64) | 0xC000_0000_0000_0000;
+    let mut bytes = stored.to_be_bytes().to_vec();
+    bytes.extend(record_identifier_bytes(0, list));
+    segment.add_record(record, TYPE_VALUE, bytes);
     record
 }

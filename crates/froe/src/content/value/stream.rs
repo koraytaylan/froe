@@ -26,7 +26,8 @@ pub(crate) enum BinaryStreamSource {
 /// only the list entry for the current 4 KiB block; the complete block list
 /// and binary are never materialized by the stream itself.
 ///
-/// This type implements [`io::Read`]. Call [`Self::read_chunk`] instead when
+/// This type implements [`io::Read`] and [`io::Seek`]. Call
+/// [`Self::read_chunk`] instead when
 /// the caller needs `froe`'s precise [`Error`] variants: `io::Read` preserves
 /// non-I/O errors as the inner value of an [`io::Error`], where they remain
 /// available through [`io::Error::get_ref`] and downcasting. The stream is
@@ -187,6 +188,64 @@ impl<Provider: SegmentProvider + ?Sized> BinaryStream<'_, Provider> {
         })?;
         self.position += read_length_u64;
         Ok(read_length)
+    }
+}
+
+/// Positioning within one binary value's blocks.
+///
+/// The stream already tracks its position and its declared length, and a
+/// block is resolved from the position on every read, so a seek is a
+/// position change and nothing else: no block is fetched until the next read
+/// asks for one.
+///
+/// The bounds are the ones a reader of a *stored* value can honour. A seek
+/// before the start is [`io::ErrorKind::InvalidInput`], as it is for every
+/// `Seek` implementation. A seek **past the end is also refused**, which
+/// `io::Seek` permits but does not require: a file's blocks exist only up to
+/// its length, so a position beyond it could not be read from and letting one
+/// be set would only move the failure to a later call with less context.
+///
+/// Non-I/O failures — a malformed record reached while resolving a
+/// length — cannot occur here, because seeking resolves nothing. A caller
+/// that needs froe's typed errors gets them from the next
+/// [`BinaryStream::read_chunk`].
+impl<Provider: SegmentProvider + ?Sized> io::Seek for BinaryStream<'_, Provider> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        let (origin, offset) = match position {
+            io::SeekFrom::Start(offset) => {
+                self.position = self.refuse_past_end(offset)?;
+                return Ok(self.position);
+            }
+            io::SeekFrom::End(offset) => (self.length, offset),
+            io::SeekFrom::Current(offset) => (self.position, offset),
+        };
+        let absolute = origin.checked_add_signed(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seeking to a negative position in a binary value",
+            )
+        })?;
+        self.position = self.refuse_past_end(absolute)?;
+        Ok(self.position)
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.position)
+    }
+}
+
+impl<Provider: SegmentProvider + ?Sized> BinaryStream<'_, Provider> {
+    fn refuse_past_end(&self, position: u64) -> io::Result<u64> {
+        if position > self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "seeking to {position} in a binary value of {} bytes",
+                    self.length
+                ),
+            ));
+        }
+        Ok(position)
     }
 }
 
