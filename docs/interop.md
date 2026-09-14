@@ -9,7 +9,7 @@ no Adobe/AEM license is involved. Sling boots Oak with TarMK by default,
 so the store is byte-for-byte what a production Oak repository produces.
 
 The image is **pinned by manifest digest** in
-`crates/froe-cli/tests/interop.rs`, because the claim in the README names an
+`crates/froe-cli/tests/interop/environment.rs`, because the claim in the README names an
 Oak build and a mutable tag could be re-pushed with a different one. The
 suite also asserts the `oak-segment-tar` version inside the image, so a
 substitution fails loudly rather than silently redefining what was verified.
@@ -104,6 +104,22 @@ read
    │  If this fails: froe cannot read Oak's format. No write-path
    │  verification is meaningful without a working reader.
    ▼
+judge_smoke
+   │  the Oak-side judge is compiled inside the pinned image and each of
+   │  its verdicts shown reachable: Oak's dumper produces a Lucene
+   │  directory froe did not write, Lucene's own CheckIndex calls it
+   │  clean, and one flipped byte makes it refuse
+   │  If this fails: every later comparison against Oak would be
+   │  meaningless while passing, which is the failure a smoke phase exists
+   │  to catch.
+   ▼
+index_inventory
+   │  froe's index readers against Oak's own printers over the same bytes
+   │  If this fails: froe reads Oak's index structures differently from
+   │  Oak. Runs before commit, because froe's direct commits run none of
+   │  Oak's index editors and a fixture froe has written to is
+   │  legitimately short an index entry.
+   ▼
 commit
    │  froe adds nodes with typed properties to the content tree via
    │  the library's commit API, then Sling reads them back
@@ -124,6 +140,18 @@ compact
    │  expired checkpoints and corrupt journal lines all go in the same
    │  run. Sling boots against the result.
    │  If this fails: the write path's plan-and-apply machinery is broken.
+   ▼
+compact_tail
+   │  the same, with --tail: the shared full generation is retained, so
+   │  the run reclaims less and must still leave a store Oak boots
+   ▼
+checkpoint_removal
+   │  remove by name, remove-unreferenced and remove-all; the checkpoint
+   │  Oak's async indexer references survives remove-unreferenced
+   ▼
+cleanup
+   │  a multi-generational store with an expired checkpoint, a stale
+   │  archive, a truncated journal and corrupt journal lines
    ▼
 journal_retention
    │  a plain froe compact retires every revision but the head it
@@ -251,6 +279,28 @@ at all. Without that control, a mistyped container name or a `podman logs`
 that failed for any reason would report "Oak consumed the store as froe
 wrote it" while having read nothing.
 
+The store also carries three shapes the index phases and the later plans
+need, added through Sling and never through froe: a `mix:referenceable`
+target with a sibling holding a `REFERENCE` and a `WEAKREFERENCE` to it, so
+`/oak:index/reference` has entries under both hidden children; a group with
+two members, so `repMembers` indexes a multi-valued `rep:members` under a
+declared `rep:MemberReferences` type; and a property index over `jcr:title`
+posted *after* the content exists, which Oak rebuilds in the same commit.
+
+`generate` asserts all three are in the extracted store before it records the
+digest baseline, through `froe node` and `froe tree` rather than through the
+index readers under test — a check written against the reader it is checking
+cannot fail when that reader is wrong.
+
+The rebuilt index cannot be left flagged, and that is Oak's doing rather than
+a choice: under the default `oak.indexUpdate.ignoreReindexFlags=false`,
+collecting the editors clears `reindex`, increments `reindexCount` and
+registers the editor, and the cycle then runs that editor from the missing
+state to the head before the commit completes. So `generate` asserts the
+opposite — `reindex = false`, `reindexCount = 1`, a non-empty `:index` — and
+a still-flagged definition, which the reindex plans need, comes from a
+synthetic store instead.
+
 ### read
 
 froe reads the Oak-written store: `summary`, `tree`, `check`,
@@ -269,6 +319,95 @@ The phase also re-derives the content digest `generate` recorded and requires
 it to match, which proves the rendering is reproducible across processes.
 Without that, every later comparison would report differences that mean
 nothing.
+
+### judge_smoke
+
+The suite can make Oak *consume* froe's output through every other phase.
+This is the one that lets it *ask Oak questions*.
+
+The judge is a handful of Java classes compiled and run **inside the pinned
+Sling image**, against the Oak bundles that image ships. It is not a second
+implementation and not a second image: `oak-core`, `oak-store-spi`,
+`oak-segment-tar` and `oak-lucene-1.90.0.jar` are all there, the last
+inlining Lucene 4.7.2 whole — `CheckIndex` and the `META-INF/services`
+registration of `oakCodec` included — and the image carries a full Temurin 21
+JDK. What it does **not** ship is `oak-run` or `oak-run-commons`, so where a
+phase relies on one of their helpers the judge re-implements it from the
+shipped classes. `javac` succeeding is itself the assertion that every class
+the judge needs is in the image.
+
+The classes are compiled rather than committed. A committed `.class` file
+would have been built against whatever JDK and Oak were on the machine that
+produced it and would keep working against an image it no longer matches;
+compiling in the image makes a mismatch a compile error rather than a silent
+`NoSuchMethodError` three phases later. The class directory is cached under a
+hash of the sources **and** the resolved image reference, so neither a
+changed judge nor a different image — the canary's floating tag included —
+can run against stale classes.
+
+What the judge can stand in for: Oak's own verdicts about a store or a
+directory — its definition printer, its index printer, its Lucene dumper,
+Lucene's `CheckIndex`, a document count, and a commit through Oak's own index
+update. What it cannot: anything `oak-run` alone does, and anything that
+needs a booted Sling, which is what the container phases are for.
+
+One convention runs through it. A class that opens a segment store writes its
+data to a file the caller names, never to standard output, because opening a
+store initializes Oak's logging and that logging goes to standard output — a
+printer's bytes on that stream would arrive interleaved with `TarMK ReadOnly
+opened`. A class that renders only a verdict writes nothing to standard
+output and exits non-zero with the offending item on standard error.
+
+`judge_smoke` proves each verdict is reachable before any phase trusts one:
+Oak's dumper produces a Lucene directory froe did not write, `CheckIndex`
+calls it clean — which is also the proof that the class path resolves
+`oakCodec`, since without the registration the reader cannot open a segment
+at all — a sample `oakCodec` index is written and checked, and one flipped
+byte of `segments_1` makes the checker refuse. Without that last one the
+clean verdicts would prove nothing, because a checker that always passes also
+passes.
+
+### index_inventory
+
+froe's reading of index structures against Oak's own, over a store Oak wrote.
+
+* **`froe index definitions` is byte-identical to Oak's
+  `IndexDefinitionPrinter`**, normalized only for trailing whitespace. Same
+  key order, same type codes, same pretty-printing, hidden properties such as
+  the `lucene` definition's `:version` included. This file is what Oak's own
+  definition updater consumes, and applying it replaces the whole definition
+  node, so the fidelity is the requirement rather than a nicety. A difference
+  names the first differing line with both sides.
+* **`froe index list` agrees with Oak's `IndexPrinter` field by field**, over
+  the intersection of the paths both list — and the phase asserts the two
+  sets are equal, so a fixture holding a `disabled`, untyped or throwing
+  definition fails rather than quietly shrinking the comparison. `Is active`
+  is excluded because it is constantly true over a store without non-default
+  mounts. Two renderings are reconciled rather than papered over: Oak formats
+  timestamps to whole seconds where froe renders the stored millisecond form,
+  and Oak computes a suggester size of zero where froe omits a size it has no
+  child for.
+* **`froe index check` passes the pristine store and names a forged defect.**
+  Removing the reference target through froe's own writer — the node several
+  indexes name — makes the check exit 3 and name the path that no longer
+  resolves.
+* **Every Lucene directory Oak dumps is a valid Lucene index**, by Lucene's
+  own `CheckIndex`. The document count is recorded in the run record rather
+  than compared with `:status/indexedNodes`, which is a per-cycle counter Oak
+  resets on every indexing cycle and not a document count.
+* **Oak is asked whether its editor covers the subtrees whose nodes the
+  fixture's node-type index does not name.** A pristine store has eighteen of
+  them, and the phase creates a node under each of `/content/interop` (the
+  control), `/oak:index/lucene/indexRules` and
+  `/jcr:system/rep:permissionStore` on a copy, commits through Oak's own
+  index update, and asserts all three entries appear. They do — so the
+  absences are about which commit wrote those nodes, not about coverage, and
+  `froe index check` is right to report a missing entry as an observation
+  rather than a verdict. `docs/analysis/index-property-storage.md` §13
+  invariant 7 carries the reasoning; this phase is what keeps it honest.
+
+The phase asserts it runs before `commit`, and that the store's file snapshot
+is byte-identical afterwards — the first read-only phase to assert the latter.
 
 ### commit
 
@@ -325,6 +464,34 @@ Two assertions carry the "content preserved" claim, and both are byte-level:
 
 Depends on `read` (to verify the compacted store) and `commit` (to trust
 the writer).
+
+### compact_tail
+
+The same run with `--tail`. Tail compaction retains the shared full
+generation, so it reclaims strictly less than a full run — and that is the
+point: a store Oak must still boot against, produced by the mode an operator
+reaches for when a full run is too expensive. The same digest and binary
+assertions as `compact` carry the content claim.
+
+Because the retained generation is exactly what a tail run may not reclaim,
+`froe compact --tail` never purges orphaned version histories and its report
+says so.
+
+### checkpoint_removal
+
+`remove` by name, `remove-unreferenced` and `remove-all`, in that order, each
+followed by a boot. The load-bearing assertion is the middle one: the
+checkpoint Oak's own asynchronous indexer resumes from **survives**
+`remove-unreferenced`. Removing it would not fail anything immediately — Oak
+logs a warning and reindexes from the missing state — which is exactly why it
+has to be asserted here rather than left to a later phase to notice.
+
+### cleanup
+
+A multi-generational store built by two compactions, carrying an expired
+checkpoint, a stale archive left by an interrupted run, a truncated journal
+and corrupt journal lines. One `froe compact` run resolves all of them, and
+Oak boots the result and serves the baseline tree.
 
 ### compact — reclamation
 
@@ -524,8 +691,12 @@ leaves behind.
 `.github/workflows/interop.yml` runs the suite on three occasions, because
 they answer different questions:
 
-- **Push, path-filtered** on the write path, the suite, and the workflow —
-  the froe-side axis, where a regression is possible. Pinned digest.
+- **Push, path-filtered** on the library, the command-line crate, the script
+  and the workflow — the froe-side axis, where a regression is possible.
+  Pinned digest. The filter was the write path alone until the index phases
+  arrived; every phase now exercises a reader as well as a writer, and the
+  index phases compare froe's readers against Oak's own printers, so a change
+  anywhere in either crate can regress the claim.
 - **Monthly schedule** against the floating tag — the environment axis, which
   can break with no froe commit at all: a new Oak build in the image, a new
   runner image, a new stable compiler. This is what a timer is actually for;
@@ -543,7 +714,7 @@ on a run from some earlier day.
 
 ## Implementation
 
-The tests live in `crates/froe-cli/tests/interop.rs`, behind the
+The tests live in `crates/froe-cli/tests/interop/`, behind the
 `interop` feature flag. The shell script
 `scripts/interop-fixture.sh` is a thin wrapper around `cargo test`.
 

@@ -363,6 +363,13 @@ pub(crate) fn recover() {
 pub(crate) fn interop_full() {
     generate();
     read();
+    // Before `commit`, and load-bearing: froe's direct commits run none of
+    // Oak's index editors, so after `commit` the fixture's synchronous
+    // `jcr:title` index legitimately lacks an entry and the comparison
+    // against Oak would report a difference that says nothing about either
+    // side's reading. `index_inventory` asserts its own position too.
+    judge_smoke();
+    index_inventory();
     commit();
     checkpoint();
     compact();
@@ -377,6 +384,17 @@ pub(crate) fn interop_full() {
     recover();
     write_run_record();
     eprintln!("  all interop phases passed");
+}
+
+/// The Lucene document count `index_inventory` recorded, or `unknown` when
+/// that phase did not run in this process.
+///
+/// The count is Oak's own, over a directory Oak dumped: the run record names
+/// it because it is what says froe's readers were pointed at real index data
+/// rather than at something that merely parsed.
+fn lucene_document_count() -> String {
+    std::fs::read_to_string(work_root().join("index-lucene-numdocs.txt"))
+        .map_or_else(|_| "unknown".to_owned(), |count| count.trim().to_owned())
 }
 
 /// Write the run record: what was verified, against which Oak build, when.
@@ -410,6 +428,18 @@ pub(crate) fn write_run_record() {
          Phases passed, in dependency order:\n\
          \x20 generate    Oak wrote the fixture store\n\
          \x20 read        froe read Oak's store (summary, tree, check, search, export)\n\
+         \x20 judge_smoke the Oak-side judge compiled inside the pinned image and\n\
+         \x20             each of its verdicts was shown reachable: Oak's own dumper\n\
+         \x20             produced a Lucene directory froe did not write, Lucene's own\n\
+         \x20             CheckIndex called it clean, and one flipped byte made it refuse\n\
+         \x20 index_      froe's index definitions were byte-identical to Oak's own\n\
+         \x20 inventory   IndexDefinitionPrinter, froe index list agreed with Oak's\n\
+         \x20             IndexPrinter field by field over every definition both list,\n\
+         \x20             froe index check passed the pristine store and named a forged\n\
+         \x20             stale entry with exit 3, every Lucene directory Oak dumped was\n\
+         \x20             a valid Lucene index ({lucene_documents} documents), and Oak's own index\n\
+         \x20             update was asked whether its editor covers the subtrees whose\n\
+         \x20             nodes the fixture's node-type index does not name — it does\n\
          \x20 commit      Oak served content froe committed\n\
          \x20 checkpoint  froe created a checkpoint, listed by name\n\
          \x20 compact     Oak served the exact baseline tree after full compaction\n\
@@ -435,6 +465,10 @@ pub(crate) fn write_run_record() {
          \x20 backup      Oak served the exact baseline tree after backup and restore\n\
          \x20 recover     Oak served the exact baseline tree after journal recovery\n\
          \n\
+         The judge is Oak itself, compiled and run inside the same pinned image\n\
+         from the bundles it ships; it is not a second implementation and not a\n\
+         second image.\n\
+         \n\
          Every boot additionally asserted that Oak logged none of its repair\n\
          messages, so Oak consumed the store as froe wrote it rather than\n\
          reconstructing it.\n\
@@ -443,7 +477,8 @@ pub(crate) fn write_run_record() {
          external blob stores, and Adobe AEM itself (this loop is Apache Sling\n\
          with Oak).\n",
         image = sling_image(),
-        binary = froe_bin().display()
+        binary = froe_bin().display(),
+        lucene_documents = lucene_document_count()
     );
     let path = work_root().join("interop-run-record.txt");
     std::fs::write(&path, &record).expect("write the interop run record");

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Thin wrapper around the Rust interop test suite.
 #
-# The tests live in crates/froe-cli/tests/interop.rs and run under
+# The tests live in crates/froe-cli/tests/interop/ and run under
 # `cargo test` behind the `interop` feature flag. This script is a
 # convenience entrypoint so the CI workflow and developers don't need
 # to remember the cargo invocation.
@@ -9,11 +9,17 @@
 # Usage:
 #   scripts/interop-fixture.sh             # run all phases in order
 #   scripts/interop-fixture.sh read        # run a single phase
-#   scripts/interop-fixture.sh compact     # (phases: generate, read,
-#   scripts/interop-fixture.sh compact     #  commit, checkpoint, compact,
-#   scripts/interop-fixture.sh backup      #  compact_tail,
-#   scripts/interop-fixture.sh recover     #  checkpoint_removal, cleanup,
-#                                          #  backup, recover)
+#
+# The phases, in the order interop_full runs them. This list, the accept
+# pattern below and the error text below it are the same list three times
+# over; all three are kept in step with `interop_full` deliberately, because
+# a phase the script will not accept is a phase nobody can re-run on its own,
+# and a failure that cannot be reproduced in isolation cannot be attributed
+# to anything.
+#
+#   generate, read, judge_smoke, index_inventory, commit, checkpoint,
+#   compact, compact_tail, checkpoint_removal, cleanup, journal_retention,
+#   compact_convergence, version_history_purge, repair, backup, recover
 #
 # Prerequisites:
 #   - podman installed and runnable by the current user
@@ -56,7 +62,7 @@ else
     # Run a single phase.
     phase="$1"
     case "$phase" in
-        generate|read|checkpoint|commit|compact|compact_tail|checkpoint_removal|cleanup|journal_retention|repair|backup|recover)
+        generate|read|judge_smoke|index_inventory|commit|checkpoint|compact|compact_tail|checkpoint_removal|cleanup|journal_retention|compact_convergence|version_history_purge|repair|backup|recover)
             # generate must run first for all other phases.
             if [[ "$phase" != "generate" ]]; then
                 echo "Running 'generate' first (required by all phases)..."
@@ -66,9 +72,10 @@ else
             ;;
         *)
             echo "Unknown phase: $phase" >&2
-            echo "Phases: generate, read, commit, checkpoint, compact, compact_tail," >&2
-            echo "        checkpoint_removal, cleanup, journal_retention, repair," >&2
-            echo "        backup, recover" >&2
+            echo "Phases: generate, read, judge_smoke, index_inventory, commit," >&2
+            echo "        checkpoint, compact, compact_tail, checkpoint_removal," >&2
+            echo "        cleanup, journal_retention, compact_convergence," >&2
+            echo "        version_history_purge, repair, backup, recover" >&2
             exit 1
             ;;
     esac

@@ -26,50 +26,64 @@
 //!
 //! # Dependency chain
 //!
-//! The tests run in a strict dependency chain. Each phase depends on the
-//! previous one and aborts the chain on failure:
+//! The tests run in a strict dependency chain, in the order `interop_full`
+//! runs them. Each phase depends on the previous one and aborts the chain on
+//! failure. `docs/interop.md` carries the same list with a section per phase.
 //!
-//! 1. **`generate`** — Boot Sling, populate content, churn subtrees, stop.
-//!    Produces the shared Oak store fixture. If this fails, nothing else
-//!    can run because every later phase reads this store.
+//!  1. **`generate`** — Boot Sling, populate content, add the index shapes
+//!     the later plans rebuild, churn subtrees, stop. Produces the shared
+//!     Oak store fixture every later phase reads.
 //!
-//! 2. **`read`** — froe reads the Oak store: summary, tree, check, search,
-//!    export. If this fails, froe cannot read Oak's format and no write-path
-//!    verification is meaningful — there is no way to confirm that froe's
-//!    output is correct without a working reader.
+//!  2. **`read`** — froe reads the Oak store: summary, tree, check, search,
+//!     export. Without a working reader no write-path verification means
+//!     anything, because there is no way to confirm froe's output is correct.
 //!
-//! 3. **`commit`** — froe adds nodes with typed properties to the content
-//!    tree via the library's commit API, then Sling reads them back. If
-//!    this fails, froe cannot write content that Oak reads — the core
-//!    interop claim. There is no point testing checkpoint, compact,
-//!    backup, or recover if the writer cannot produce content
-//!    Oak reads.
+//!  3. **`judge_smoke`** — the Oak-side judge is compiled inside the pinned
+//!     image and each of its verdicts shown reachable. A judge that silently
+//!     ran against the wrong class path would make every later comparison
+//!     meaningless *while passing*.
 //!
-//! 4. **`checkpoint`** — froe writes a checkpoint against the Oak store.
-//!    A metadata-only write-path test (logical head update). If this
-//!    fails, the writer's checkpoint machinery is broken, which affects
-//!    compact's expired-checkpoint handling and its checkpoint
-//!    preservation.
+//!  4. **`index_inventory`** — froe's index readers against Oak's own
+//!     printers. Before `commit`, and load-bearing: froe's direct commits run
+//!     none of Oak's index editors, so afterwards the fixture is legitimately
+//!     short an index entry.
 //!
-//! 5. **`compact`** — froe compacts a copy of the store and Sling boots
-//!    against the result. Depends on `read` (to verify the result) and
-//!    `commit` (to trust the writer). If this fails, the reclamation
-//!    multi-generational fixture cannot be built (it uses two compactions).
+//!  5. **`commit`** — froe adds nodes with typed properties through the
+//!     library's commit API; Sling reads them back. The core interop claim.
 //!
-//! 6. **`cleanup`** — froe compact against a multi-generational store built
-//!    by two compactions, with an expired checkpoint, a stale archive, a
-//!    truncated journal, and corrupt journal lines. Depends on `compact`
-//!    (to build the gen 0→1→2 fixture) and `checkpoint` (for the expired
-//!    checkpoint). If this fails, the write path's plan-and-apply
-//!    machinery is broken.
+//!  6. **`checkpoint`** — froe writes a checkpoint: a metadata-only
+//!     write-path test the compaction phases' checkpoint handling rests on.
 //!
-//! 7. **`backup`** — froe backup + restore, Sling boots against the
-//!    restored store. Depends on `read` and `commit`. Independent of
-//!    compact but later in the chain because it is lower-risk.
+//!  7. **`compact`** — froe compacts a copy and Sling boots the result.
 //!
-//! 8. **`recover`** — froe recover-journal after deleting journal.log,
-//!    Sling boots against the recovered store. Depends on `read`. Last
-//!    because it is the most destructive (deletes the journal).
+//!  8. **`compact_tail`** — the same with `--tail`, which retains the shared
+//!     full generation and so reclaims strictly less.
+//!
+//!  9. **`checkpoint_removal`** — remove by name, remove-unreferenced and
+//!     remove-all; the checkpoint Oak's indexer resumes from survives the
+//!     middle one.
+//!
+//! 10. **`cleanup`** — a multi-generational store with an expired
+//!     checkpoint, a stale archive, a truncated journal and corrupt journal
+//!     lines, all resolved in one run.
+//!
+//! 11. **`journal_retention`** — a plain compact retires every revision but
+//!     the head it wrote and sweeps the segments behind them.
+//!
+//! 12. **`compact_convergence`** — the run after a full compaction proves
+//!     the store fully compacted, mutates nothing, and says so.
+//!
+//! 13. **`version_history_purge`** — Oak versions two nodes and deletes one;
+//!     froe purges the orphaned history under a digest with the purge as its
+//!     only exclusion.
+//!
+//! 14. **`repair`** — Oak's JVM is killed with SIGKILL holding an archive
+//!     open; an authorized compact rebuilds the index.
+//!
+//! 15. **`backup`** — froe backup and restore; Sling boots the result.
+//!
+//! 16. **`recover`** — froe recover-journal after deleting `journal.log`.
+//!     Last because it is the most destructive.
 //!
 //! All code in the loop is Apache-2.0 (Apache Sling + Apache Jackrabbit
 //! Oak); no Adobe license is involved at any point.
@@ -114,6 +128,8 @@ use fixtures::*;
 use judge::*;
 use oak::*;
 use phase_baseline::*;
+use phase_index_inventory::*;
+use phase_judge::*;
 use phase_maintenance::*;
 use phase_writing::*;
 use podman::*;

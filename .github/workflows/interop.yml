@@ -3,15 +3,15 @@
 # against froe's output to confirm the result is consumable by a real Oak.
 #
 # See docs/interop.md for the dependency chain and phase descriptions. The
-# tests live in crates/froe-cli/tests/interop.rs behind the `interop` feature.
+# tests live in crates/froe-cli/tests/interop/ behind the `interop` feature.
 #
 # This workflow is the standing regression guard for the interoperability claim
 # in README.md. It runs on three distinct occasions, because they answer
 # different questions:
 #
-#   push (filtered)  A change touched the write path, the suite, or this
-#                    workflow, so a froe-side regression is possible. Runs
-#                    against the pinned digest.
+#   push (filtered)  A change touched the library, the command-line crate,
+#                    the script or this workflow, so a froe-side regression
+#                    is possible. Runs against the pinned digest.
 #   schedule         Monthly canary against the *floating* tag, which asks
 #                    whether the ecosystem moved underneath the claim — a new
 #                    Oak build in the image, a new runner image, a new stable
@@ -26,10 +26,15 @@ name: interop
 on:
   push:
     paths:
-      - "crates/froe/src/writer/**"
-      - "crates/froe/src/store.rs"
-      - "crates/froe-cli/src/mutation.rs"
-      - "crates/froe-cli/tests/interop.rs"
+      # Broadened deliberately. The old list named the write path alone —
+      # plus two paths that stopped existing when the suite and the store
+      # module became directories, so a change to the interop suite itself
+      # stopped triggering this run at all. Every phase now exercises a
+      # reader as well as a writer, and the index phases compare froe's
+      # readers against Oak's own printers, so a change anywhere in the
+      # library or the command-line crate can regress the claim.
+      - "crates/froe/src/**"
+      - "crates/froe-cli/**"
       - "scripts/interop-fixture.sh"
       - ".github/workflows/interop.yml"
   schedule:
