@@ -12,8 +12,8 @@ touches:
   - crates/froe-cli/tests/interop/sling.rs
   - crates/froe-cli/tests/interop/digest.rs
   - crates/froe-cli/tests/interop/oak.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "abc485211a7f3fc1aa8d67c11dbca2247329546d"
 ---
 # Prove The Property Reindex Against Oak's Own Reindex
 
