@@ -44,6 +44,10 @@ pub enum Property {
     /// A single `NAME`, which is what `jcr:primaryType` is when it is a
     /// stored property rather than a template slot.
     Name(String),
+    /// A single `DATE`, which is what `lastUpdated` and
+    /// `async-LastIndexedTo` are. Stored as its ISO-8601 string, like every
+    /// other non-binary value.
+    Date(String),
     /// A multi-valued `STRING`, which is what `entry` is.
     Texts(Vec<String>),
     /// A multi-valued `NAME`, which is what `propertyNames` is.
@@ -66,6 +70,7 @@ impl Property {
             Property::Long(_) => 3,
             Property::Text(_) => 1,
             Property::Name(_) => 7,
+            Property::Date(_) => 5,
             Property::Texts(_) => -1,
             Property::Names(_) => -7,
             Property::Binary(_) => 2,
@@ -78,7 +83,9 @@ impl Property {
         match self {
             Property::Boolean(value) => vec![value.to_string()],
             Property::Long(value) => vec![value.to_string()],
-            Property::Text(value) | Property::Name(value) => vec![value.clone()],
+            Property::Text(value) | Property::Name(value) | Property::Date(value) => {
+                vec![value.clone()]
+            }
             Property::Texts(values) | Property::Names(values) => values.clone(),
             Property::Binary(_) | Property::Binaries(_) => {
                 unreachable!("a binary property's values are bytes, not text")
