@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe-cli/tests/interop/sling.rs
   - crates/froe-cli/tests/interop/phase_baseline.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "204ec5903bcde3f66c434070e70eb86e552393b2"
 ---
 # Enrich The Generated Fixture For Index Coverage
 
