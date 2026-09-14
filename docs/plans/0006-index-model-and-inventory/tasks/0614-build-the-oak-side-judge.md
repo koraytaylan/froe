@@ -12,8 +12,8 @@ touches:
   - crates/froe-cli/tests/interop/judge/LuceneJudge.java
   - crates/froe-cli/tests/interop/podman.rs
   - crates/froe-cli/tests/interop/main.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "c46af00cf263164850c5c1b52b4f3184058ba312"
 ---
 # Build The Oak-Side Judge Inside The Pinned Image
 
