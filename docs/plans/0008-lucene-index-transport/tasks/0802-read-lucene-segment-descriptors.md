@@ -23,8 +23,8 @@ touches:
   - crates/froe-cli/tests/interop/phase_index_inventory.rs
   - docs/index.md
   - docs/oak-segment-tar-feature-map.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "ee6a426b7dc6359dcf65d8232422b673a7bff027"
 ---
 # Read Lucene Segment Descriptors And Compound Files
 
