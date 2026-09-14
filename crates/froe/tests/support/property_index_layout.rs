@@ -257,6 +257,100 @@ pub fn write_repository_with_tree(directory: &std::path::Path, root: &Node) {
     );
 }
 
+/// A repository whose super-root carries `checkpoints` beside `root`.
+///
+/// Oak's checkpoints hang off the *super-root*, not off the content root, so
+/// a fixture that puts them under `/` models nothing: an index on a lane
+/// would find its checkpoint dangling. Each entry is one checkpoint name and
+/// the content root that checkpoint pins.
+pub fn write_repository_with_checkpoints(
+    directory: &std::path::Path,
+    root: &Node,
+    checkpoints: &[(&str, Node)],
+) {
+    let uuid = data_segment_uuid(0x51);
+    let mut segment = SegmentBuilder::new(uuid);
+    let mut next_record = 1u32;
+    let mut allocate = move || {
+        let record = next_record;
+        next_record += 1;
+        record
+    };
+    let root_record = encode_node(&mut segment, root, &mut allocate);
+
+    // Each checkpoint node holds its own `root` child, which is the state
+    // that checkpoint pins.
+    let mut checkpoint_children = Vec::new();
+    for (name, pinned) in checkpoints {
+        let pinned_record = encode_node(&mut segment, pinned, &mut allocate);
+        let node = encode_named_children(&mut segment, &[("root", pinned_record)], &mut allocate);
+        checkpoint_children.push(((*name).to_owned(), node));
+    }
+    let checkpoint_children: Vec<(&str, u32)> = checkpoint_children
+        .iter()
+        .map(|(name, record)| (name.as_str(), *record))
+        .collect();
+    let checkpoints_record =
+        encode_named_children(&mut segment, &checkpoint_children, &mut allocate);
+
+    let super_root_record = encode_named_children(
+        &mut segment,
+        &[("checkpoints", checkpoints_record), ("root", root_record)],
+        &mut allocate,
+    );
+
+    let bytes = segment.build();
+    let mut archive = ArchiveBuilder::new();
+    archive.add_segment(uuid, bytes);
+    write_repository(
+        directory,
+        &[("data00000a.tar".to_owned(), archive.build("data00000a.tar"))],
+        &[format!(
+            "{}:{super_root_record} root 1700000000000",
+            format_uuid(uuid)
+        )],
+    );
+}
+
+/// A property-less node whose children are already-encoded records.
+///
+/// The children must arrive in the order the format stores them, which is
+/// by name as a byte string.
+fn encode_named_children(
+    segment: &mut SegmentBuilder,
+    children: &[(&str, u32)],
+    allocate: &mut impl FnMut() -> u32,
+) -> u32 {
+    let mut head = 0u32;
+    match children.len() {
+        0 => head |= 1 << 29,
+        1 => {}
+        _ => head |= 1 << 28,
+    }
+    let mut template = head.to_be_bytes().to_vec();
+    if children.len() == 1 {
+        let name_record = encode_string(segment, children[0].0, allocate);
+        template.extend(record_identifier_bytes(0, name_record));
+    }
+    let template_record = allocate();
+    segment.add_record(template_record, TYPE_TEMPLATE, template);
+
+    let owned: Vec<(String, u32)> = children
+        .iter()
+        .map(|(name, record)| ((*name).to_owned(), *record))
+        .collect();
+    let child_slot = encode_child_slot(segment, &owned, allocate);
+
+    let record = allocate();
+    let mut bytes = record_identifier_bytes(0, record);
+    bytes.extend(record_identifier_bytes(0, template_record));
+    if let Some(slot) = child_slot {
+        bytes.extend(record_identifier_bytes(0, slot));
+    }
+    segment.add_record(record, TYPE_NODE, bytes);
+    record
+}
+
 /// The super-root: one child named `root`, pointing at the already-encoded
 /// content root rather than at a second copy of it, which is what a real
 /// store does and what makes the head and the content root share a tree.

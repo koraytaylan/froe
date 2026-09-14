@@ -118,6 +118,16 @@ pub enum SelectionRefusal {
         /// Why the filter could not be constructed.
         reason: String,
     },
+    /// A definition carrying a composite-store mount's index data. A
+    /// rebuild replaces the hidden children it produces, so rebuilding one
+    /// of these would remove another mount's index — data froe did not
+    /// write and cannot rebuild.
+    MountFragmentPresent {
+        /// The definition.
+        path: String,
+        /// The mount-decorated hidden child that was found.
+        child_name: String,
+    },
     /// A nested definition — one whose parent is not `/oak:index`. Oak
     /// scopes it to the node holding its `oak:index` and runs a child cycle
     /// whose paths are relative to that node. Refused, never approximated.
@@ -167,6 +177,7 @@ impl SelectionRefusal {
             | Self::NoEditor { path, .. }
             | Self::Unmodellable { path, .. }
             | Self::ValuePatternNotSupported { path }
+            | Self::MountFragmentPresent { path, .. }
             | Self::PathFilterUnconstructable { path, .. }
             | Self::NestedDefinition { path }
             | Self::NotADefinition { path }
@@ -204,6 +215,11 @@ impl std::fmt::Display for SelectionRefusal {
                 formatter,
                 "{path} has a path filter Oak cannot construct ({reason}), so Oak's own \
                  cycle skips it and leaves its reindex flag set"
+            ),
+            Self::MountFragmentPresent { path, child_name } => write!(
+                formatter,
+                "{path} carries {child_name}, a composite-store mount's index data that \
+                 a rebuild would remove and cannot reproduce"
             ),
             Self::NestedDefinition { path } => write!(
                 formatter,
@@ -290,14 +306,9 @@ pub fn select(
         }
 
         let Some(definition) = info.definition.clone() else {
-            let refusal = SelectionRefusal::Unmodellable {
-                path: info.path.clone(),
-                reason: info
-                    .model_error
-                    .clone()
-                    .unwrap_or_else(|| "the definition could not be read".to_owned()),
-            };
-            selection.refused.push(refusal);
+            selection
+                .refused
+                .push(refuse_unmodellable(&head_root, info)?);
             continue;
         };
         if !named && !definition.reindex.flagged {
@@ -335,7 +346,92 @@ pub fn select(
             Err(refusal) => selection.refused.push(refusal),
         }
     }
+    answer_every_named_path(&head_root, inventory, options, &mut selection)?;
     Ok(selection)
+}
+
+/// Answers a requested path the inventory never listed.
+///
+/// The inventory enumerates nodes whose `jcr:primaryType` is
+/// `oak:QueryIndexDefinition`, so a path naming anything else — a content
+/// node, a typo, a definition someone removed — falls out of the loop above
+/// without producing either a selection or a refusal. An operator who names
+/// a definition is always answered, so the omission is filled here rather
+/// than reported as nothing to do.
+fn answer_every_named_path(
+    head_root: &NodeState<'_>,
+    inventory: &IndexInventory,
+    options: &SelectionOptions,
+    selection: &mut Selection,
+) -> crate::Result<()> {
+    for requested in &options.requested_paths {
+        if inventory.indexes.iter().any(|info| &info.path == requested) {
+            continue;
+        }
+        let Some(node) = descend(head_root, requested)? else {
+            selection.refused.push(SelectionRefusal::Unmodellable {
+                path: requested.clone(),
+                reason: "there is no node at this path".to_owned(),
+            });
+            continue;
+        };
+        // The node is there but the enumeration passed over it. Why decides
+        // the answer, and the shape rules already know: a nested definition
+        // is nested, a `lucene` one is Lucene, and a node that is not a
+        // definition at all is that.
+        let refusal = match IndexDefinition::read(&node, requested) {
+            Ok(definition) => {
+                refuse_by_shape(&definition).unwrap_or(SelectionRefusal::Unmodellable {
+                    path: requested.clone(),
+                    reason: "the node type index did not enumerate this definition".to_owned(),
+                })
+            }
+            Err(_) => SelectionRefusal::NotADefinition {
+                path: requested.clone(),
+            },
+        };
+        selection.refused.push(refusal);
+    }
+    Ok(())
+}
+
+/// The refusal for a definition the inventory could not model.
+///
+/// The inventory carries the failure as text, which is right for a listing
+/// and not enough here: an operator who is told a path filter cannot be
+/// constructed learns that Oak's own cycle skips this definition too and
+/// leaves its `reindex` flag set, where "could not be read" only says froe
+/// gave up. So the read is repeated on this one node, on the refusal path
+/// only, to recover the variant.
+fn refuse_unmodellable(
+    head_root: &NodeState<'_>,
+    info: &crate::index::inventory::IndexInfo,
+) -> crate::Result<SelectionRefusal> {
+    let path = info.path.clone();
+    let unmodellable = |reason: String| SelectionRefusal::Unmodellable {
+        path: path.clone(),
+        reason,
+    };
+    let Some(node) = descend(head_root, &info.path)? else {
+        return Ok(unmodellable(
+            info.model_error
+                .clone()
+                .unwrap_or_else(|| "the definition node is absent".to_owned()),
+        ));
+    };
+    match IndexDefinition::read(&node, &info.path) {
+        Ok(_) => Ok(unmodellable(
+            "the definition could not be read when the inventory was collected".to_owned(),
+        )),
+        Err(
+            error @ (crate::index::IndexError::RelativeFilterPath { .. }
+            | crate::index::IndexError::EmptyIncludeSet { .. }),
+        ) => Ok(SelectionRefusal::PathFilterUnconstructable {
+            path,
+            reason: error.to_string(),
+        }),
+        Err(other) => Ok(unmodellable(other.to_string())),
+    }
 }
 
 /// The refusals that follow from the definition alone.
@@ -347,6 +443,28 @@ fn refuse_by_shape(definition: &IndexDefinition) -> Option<SelectionRefusal> {
     // relative to it. Refused rather than approximated.
     if !path.starts_with("/oak:index/") || path.matches('/').count() != 2 {
         return Some(SelectionRefusal::NestedDefinition { path });
+    }
+
+    // Oak's own editor filters values through the pattern before indexing
+    // them. froe evaluates the prefix halves and not the regular expression,
+    // so a rebuild would write entries Oak would have left out — a wrong
+    // index rather than a missing one.
+    if definition
+        .property
+        .value_pattern
+        .regular_expression()
+        .is_some()
+    {
+        return Some(SelectionRefusal::ValuePatternNotSupported { path });
+    }
+
+    // A rebuild replaces the definition's hidden children, and a mount
+    // fragment's data belongs to a composite store's other mount.
+    if let Some(child_name) = definition.mount_children().first() {
+        return Some(SelectionRefusal::MountFragmentPresent {
+            path,
+            child_name: (*child_name).to_owned(),
+        });
     }
 
     match definition.index_type.as_ref() {
