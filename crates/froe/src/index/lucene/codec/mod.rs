@@ -27,14 +27,12 @@
 pub mod data_output;
 pub mod fst;
 pub mod packed;
+pub mod postings;
 
 // The later tasks of plan 0009 own these. Each is declared here so the
 // module tree is the one the specification describes from the start, and so
 // a reader looking for a format finds where it will live rather than
 // wondering whether it exists.
-
-/// `.doc`, `.pos` and `.pay` (§6). Task 0904.
-pub mod postings {}
 
 /// The block-tree terms dictionary, `.tim` and `.tip` (§7). Task 0905.
 pub mod terms {}

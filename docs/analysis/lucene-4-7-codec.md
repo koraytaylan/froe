@@ -966,6 +966,297 @@ framing to recover from getting it wrong.
 offset of the last, partial position block, so a reader can jump to it
 without walking the full ones.
 
+### 6.5 Positions, offsets and payloads — `.pos` and `.pay`
+
+`Lucene41PostingsWriter.addPosition` and the second half of `finishTerm`.
+
+Three buffers of 128 fill in step with the document buffer, and **all three
+hold deltas**:
+
+```java
+posDeltaBuffer[posBufferUpto] = position - lastPosition;
+…
+offsetStartDeltaBuffer[posBufferUpto] = startOffset - lastStartOffset;
+offsetLengthBuffer[posBufferUpto] = endOffset - startOffset;
+lastStartOffset = startOffset;
+…
+posBufferUpto++;
+lastPosition = position;
+```
+
+`lastPosition` and `lastStartOffset` are reset to zero by `startDoc`, so a
+position delta is measured **within its document** while the buffer itself
+runs across document boundaries — the 128 positions in one block routinely
+belong to several documents, and the first position of each is its absolute
+value. An offset *length* is `end - start` and is not a delta against
+anything; only the start is.
+
+When the buffer fills, three or four packed blocks go out, in this order and
+no other:
+
+```java
+if (posBufferUpto == BLOCK_SIZE) {
+  forUtil.writeBlock(posDeltaBuffer, encoded, posOut);
+  if (fieldHasPayloads) {
+    forUtil.writeBlock(payloadLengthBuffer, encoded, payOut);
+    payOut.writeVInt(payloadByteUpto);
+    payOut.writeBytes(payloadBytes, 0, payloadByteUpto);
+    payloadByteUpto = 0;
+  }
+  if (fieldHasOffsets) {
+    forUtil.writeBlock(offsetStartDeltaBuffer, encoded, payOut);
+    forUtil.writeBlock(offsetLengthBuffer, encoded, payOut);
+  }
+  posBufferUpto = 0;
+}
+```
+
+The position deltas go to `.pos`; everything else goes to `.pay`, payload
+lengths before offsets. **The position buffer is cleared here**, unlike the
+document buffer, which `finishDoc` clears (§6.2) — nothing downstream needs
+to see that the position block was just filled.
+
+#### The `VInt` tail
+
+Whatever is left in the buffers at `finishTerm` goes to `.pos` **alone** —
+payload lengths and offsets that would have gone to `.pay` in a full block
+are interleaved into `.pos` instead, so the tail's shape is not the block's
+shape with fewer entries:
+
+```java
+int lastPayloadLength = -1;  // force first payload length to be written
+int lastOffsetLength = -1;   // force first offset length to be written
+for(int i=0;i<posBufferUpto;i++) {
+  final int posDelta = posDeltaBuffer[i];
+  if (fieldHasPayloads) {
+    final int payloadLength = payloadLengthBuffer[i];
+    if (payloadLength != lastPayloadLength) {
+      lastPayloadLength = payloadLength;
+      posOut.writeVInt((posDelta<<1)|1);
+      posOut.writeVInt(payloadLength);
+    } else {
+      posOut.writeVInt(posDelta<<1);
+    }
+    if (payloadLength != 0) {
+      posOut.writeBytes(payloadBytes, payloadBytesReadUpto, payloadLength);
+      payloadBytesReadUpto += payloadLength;
+    }
+  } else {
+    posOut.writeVInt(posDelta);
+  }
+
+  if (fieldHasOffsets) {
+    int delta = offsetStartDeltaBuffer[i];
+    int length = offsetLengthBuffer[i];
+    if (length == lastOffsetLength) {
+      posOut.writeVInt(delta << 1);
+    } else {
+      posOut.writeVInt(delta << 1 | 1);
+      posOut.writeVInt(length);
+      lastOffsetLength = length;
+    }
+  }
+}
+```
+
+Two independent low-bit flags, each meaning "a length follows", each against
+its own running value, and **the position delta is shifted only when the
+field has payloads**. A field with offsets and no payloads writes the
+position delta bare and then a shifted offset delta — the same `VInt` stream
+carrying two different conventions one after the other, distinguishable only
+by a reader that knows the field's options.
+
+Both running lengths start at `-1` and are local to this loop, so the first
+entry of every tail carries its length explicitly. They are *not* carried
+over from the preceding full blocks, where every length was written
+unconditionally.
+
+`lastPosBlockOffset` (§6.4) is read **before** the tail is written:
+
+```java
+if (state.totalTermFreq > BLOCK_SIZE) {
+  lastPosBlockOffset = posOut.getFilePointer() - posStartFP;
+} else {
+  lastPosBlockOffset = -1;
+}
+```
+
+so it points at the tail's first byte, and it is `-1` for a term whose total
+term frequency is exactly 128 — the boundary is strict, and a term with 128
+positions has no tail at all.
+
+**A pulsed term still writes its positions.** §6.3 suppresses the `.doc`
+entry for a single-document term and nothing else; the tail, the blocks and
+`posStartFP` are all as they would be for any other term.
+
+### 6.6 The skip list
+
+`codecs/lucene41/Lucene41SkipWriter.java` over
+`codecs/MultiLevelSkipListWriter.java`. The skip list lives **inside `.doc`**,
+appended after the term's postings, and `skipOffset` (§6.4) locates it
+relative to the term's start.
+
+Configuration, from the postings writer's constructor:
+
+```java
+skipWriter = new Lucene41SkipWriter(maxSkipLevels,   // 10
+                                    BLOCK_SIZE,      // 128
+                                    state.segmentInfo.getDocCount(),
+                                    docOut, posOut, payOut);
+// → super(skipInterval = 128, skipMultiplier = 8, maxSkipLevels = 10, df)
+```
+
+```java
+if (df <= skipInterval) {
+  numberOfSkipLevels = 1;
+} else {
+  numberOfSkipLevels = 1+MathUtil.log(df/skipInterval, skipMultiplier);
+}
+if (numberOfSkipLevels > maxSkipLevels) {
+  numberOfSkipLevels = maxSkipLevels;
+}
+```
+
+The `df` here is the **segment's document count**, not any term's, because
+the writer is built once per segment. It fixes how many buffers exist and
+how deep `bufferSkip` may climb; it does **not** decide how many levels a
+given term emits.
+
+#### Buffering a point
+
+`startDoc` buffers one, and the condition is the subtle part:
+
+```java
+if (lastBlockDocID != -1 && docBufferUpto == 0) {
+  skipWriter.bufferSkip(lastBlockDocID, docCount, lastBlockPosFP, lastBlockPayFP,
+                        lastBlockPosBufferUpto, lastBlockPayloadByteUpto);
+}
+```
+
+A point is buffered on the *first document after* a filled block, never on
+the document that filled it, and it describes the state at the block's end:
+the last document id in the closed block, the document count at that moment
+(always a multiple of 128), and the `.pos`/`.pay` file pointers and buffer
+offsets `finishDoc` latched. So **a term whose document count is exactly a
+multiple of 128 buffers no point for its final block** — there is no
+following document to trigger one.
+
+How high a point climbs:
+
+```java
+assert df % skipInterval == 0;
+int numLevels = 1;
+df /= skipInterval;
+while ((df % skipMultiplier) == 0 && numLevels < numberOfSkipLevels) {
+  numLevels++;
+  df /= skipMultiplier;
+}
+
+long childPointer = 0;
+for (int level = 0; level < numLevels; level++) {
+  writeSkipData(level, skipBuffer[level]);
+  long newChildPointer = skipBuffer[level].getFilePointer();
+  if (level != 0) {
+    skipBuffer[level].writeVLong(childPointer);
+  }
+  childPointer = newChildPointer;
+}
+```
+
+The point at document count 128 reaches level 0 only; the point at 1,024
+reaches level 1; the point at 8,192 reaches level 2 — one more level per
+factor of eight, capped at ten.
+
+The child pointer written after a level-*n* entry is the offset **just past**
+the level-(*n*−1) entry buffered in the same call, measured within that
+level's own buffer. The reader rebases it onto where that level's region
+landed in the file (`childPointer[level] = readVLong() + skipPointer[level-1]`),
+which is why it is a buffer-relative offset and not a file pointer.
+
+#### The payload of one point
+
+```java
+skipBuffer.writeVInt(curDoc - lastSkipDoc[level]);          lastSkipDoc[level] = curDoc;
+skipBuffer.writeVInt((int)(curDocPointer - lastSkipDocPointer[level]));
+                                                            lastSkipDocPointer[level] = curDocPointer;
+if (fieldHasPositions) {
+  skipBuffer.writeVInt((int)(curPosPointer - lastSkipPosPointer[level]));
+                                                            lastSkipPosPointer[level] = curPosPointer;
+  skipBuffer.writeVInt(curPosBufferUpto);
+  if (fieldHasPayloads) {
+    skipBuffer.writeVInt(curPayloadByteUpto);
+  }
+  if (fieldHasOffsets || fieldHasPayloads) {
+    skipBuffer.writeVInt((int)(curPayPointer - lastSkipPayPointer[level]));
+                                                            lastSkipPayPointer[level] = curPayPointer;
+  }
+}
+```
+
+Every delta is **per level**: each level keeps its own previous document and
+its own previous pointers, so a level-1 entry's deltas span the eight
+level-0 entries beneath it. `curPosBufferUpto` is an absolute offset into the
+position block, not a delta.
+
+`resetSkip`, called by `startTerm`, sets each level's previous document to
+zero and each level's previous pointers to the **current** file pointers —
+which are the term's start pointers — so the first point of every term is
+measured from the term's own beginning.
+
+#### Emitting the list
+
+```java
+long skipPointer = output.getFilePointer();
+for (int level = numberOfSkipLevels - 1; level > 0; level--) {
+  long length = skipBuffer[level].getFilePointer();
+  if (length > 0) {
+    output.writeVLong(length);
+    skipBuffer[level].writeTo(output);
+  }
+}
+skipBuffer[0].writeTo(output);
+return skipPointer;
+```
+
+Highest level first, each above level 0 prefixed by its own `VLong` byte
+length, level 0 last and unprefixed — its length is implied by the end of the
+skip packet. An empty level is omitted entirely, **length prefix and all**.
+
+And the list is written at all only for a term above the block size:
+
+```java
+if (docCount > BLOCK_SIZE) {
+  skipOffset = skipWriter.writeSkip(docOut) - docStartFP;
+} else {
+  skipOffset = -1;
+}
+```
+
+Strictly greater, so a term of exactly 128 documents records no skip offset —
+consistent with its having buffered no point.
+
+#### Why the missing final point is safe
+
+The reader derives how many levels to expect from the term's own document
+frequency, and would read one `VLong` length too many for a term whose
+document count is a multiple of 1,024 — the writer buffers no point for a
+final full block, so such a term never reaches the level the count implies.
+`Lucene41SkipReader` closes the gap before the arithmetic happens:
+
+```java
+protected int trim(int df) {
+  return df % blockSize == 0? df - 1: df;
+}
+
+public void init(long skipPointer, long docBasePointer, long posBasePointer, long payBasePointer, int df) {
+  super.init(skipPointer, trim(df));
+```
+
+so `1+MathUtil.log(trim(df)/skipInterval, skipMultiplier)` is exactly the
+highest level the writer reached. Confirmed against the pinned image:
+terms of 129, 1,023, 1,024, 1,025, 8,191, 8,192 and 8,193 documents all
+advance correctly through Lucene's own reader.
+
 ---
 
 ## 7. Terms — `.tim` and `.tip`
