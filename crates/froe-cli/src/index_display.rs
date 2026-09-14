@@ -223,91 +223,135 @@ pub(crate) fn print_index_list(
 /// One index's line. Deliberately one line per index rather than a wide
 /// table: a definition path is long, and a table that wraps is worse to read
 /// than a list.
+///
+/// Every field is written through [`field`], so the name column is one width
+/// and a value is always separated from its name by at least two spaces.
+/// That is not only for the eye: the interop phase parses this output to
+/// compare it against Oak's own index printer, and a field whose value ran
+/// into its name would be parsed as a name.
 fn render_index_row(index: &IndexInfo) -> String {
-    let mut row = format!(
-        "{}\n  type              {}\n",
-        sanitize_terminal_text(&index.path),
-        index.index_type().map_or_else(
+    let mut row = format!("{}\n", sanitize_terminal_text(&index.path));
+    field(
+        &mut row,
+        "type",
+        &index.index_type().map_or_else(
             || "unreadable".to_owned(),
-            |kind| kind.stored_name().to_owned()
-        )
+            |kind| kind.stored_name().to_owned(),
+        ),
     );
     let definition = index.definition.as_ref();
     if let Some(lane) = definition.and_then(|definition| definition.lane.as_deref()) {
-        let _ = writeln!(row, "  lane              {}", sanitize_terminal_text(lane));
+        field(&mut row, "lane", &sanitize_terminal_text(lane));
     }
     if let Some(checkpoint) = &index.lane_checkpoint {
-        let _ = writeln!(
-            row,
-            "  lane checkpoint   {}{}",
-            sanitize_terminal_text(checkpoint),
-            if index.lane_checkpoint_dangling {
-                "  (dangling)"
-            } else {
-                ""
-            }
+        field(
+            &mut row,
+            "lane checkpoint",
+            &format!(
+                "{}{}",
+                sanitize_terminal_text(checkpoint),
+                if index.lane_checkpoint_dangling {
+                    "  (dangling)"
+                } else {
+                    ""
+                }
+            ),
         );
     }
     if let Some(indexed_up_to) = &index.indexed_up_to {
-        let _ = writeln!(
-            row,
-            "  indexed up to     {}",
-            sanitize_terminal_text(indexed_up_to)
+        field(
+            &mut row,
+            "indexed up to",
+            &sanitize_terminal_text(indexed_up_to),
         );
     }
     if let Some(definition) = definition {
-        let _ = writeln!(
-            row,
-            "  reindex           {} (count {})",
-            definition.reindex.flagged, definition.reindex.count
+        field(
+            &mut row,
+            "reindex",
+            &format!(
+                "{} (count {})",
+                definition.reindex.flagged, definition.reindex.count
+            ),
         );
     }
-    if let Some(size) = index.size_in_bytes {
-        let _ = writeln!(
-            row,
-            "  size              {} ({size})",
-            froe::format_byte_size(size)
-        );
-    }
-    if let Some(size) = index.suggest_size_in_bytes {
-        let _ = writeln!(
-            row,
-            "  suggest size      {} ({size})",
-            froe::format_byte_size(size)
-        );
-    }
-    if let Some(entries) = index.estimated_entry_count {
-        let _ = writeln!(row, "  estimated entries {}", format_count(entries));
-    }
-    if let Some(estimate) = index.estimated_node_count {
-        let _ = writeln!(
-            row,
-            "  estimated nodes   {}",
-            render_node_estimate(estimate)
-        );
-    }
-    if index.approximate_counters > 0 {
-        let _ = writeln!(
-            row,
-            "  counters          {}",
-            format_count(index.approximate_counters as u64)
-        );
-    }
-    if !index.lucene_files.is_empty() {
-        let _ = writeln!(
-            row,
-            "  lucene files      {}",
-            format_count(index.lucene_files.len() as u64)
-        );
-    }
+    render_sizes_and_estimates(&mut row, index);
+    field(
+        &mut row,
+        "hidden mount",
+        &index.hidden_children.has_mount.to_string(),
+    );
+    field(
+        &mut row,
+        "property index",
+        &index.hidden_children.has_property_index.to_string(),
+    );
+    field(
+        &mut row,
+        "definition drift",
+        &index.definition_changed.to_string(),
+    );
     if index.definition_changed {
         let _ = writeln!(
             row,
-            "  definition        changed since the stored clone ({} paths)",
+            "  {:<FIELD_NAME_WIDTH$}{} paths differ from the stored clone",
+            "",
             format_count(index.definition_diff.len() as u64)
         );
     }
     row
+}
+
+/// The measured half of a row: what the storage weighs and what the type's
+/// own information provider estimates about it.
+///
+/// Each is printed only when there is one, because an absent value is not a
+/// zero — no `:suggest-data` child is not a suggester of size zero, and a
+/// type with no information provider has no estimate rather than an estimate
+/// of nothing.
+fn render_sizes_and_estimates(row: &mut String, index: &IndexInfo) {
+    if let Some(size) = index.size_in_bytes {
+        field(
+            row,
+            "size",
+            &format!("{} ({size})", froe::format_byte_size(size)),
+        );
+    }
+    if let Some(size) = index.suggest_size_in_bytes {
+        field(
+            row,
+            "suggest size",
+            &format!("{} ({size})", froe::format_byte_size(size)),
+        );
+    }
+    if let Some(entries) = index.estimated_entry_count {
+        field(row, "estimated entries", &format_count(entries));
+    }
+    if let Some(estimate) = index.estimated_node_count {
+        field(row, "estimated nodes", &render_node_estimate(estimate));
+    }
+    if index.approximate_counters > 0 {
+        field(
+            row,
+            "counters",
+            &format_count(index.approximate_counters as u64),
+        );
+    }
+    if !index.lucene_files.is_empty() {
+        field(
+            row,
+            "lucene files",
+            &format_count(index.lucene_files.len() as u64),
+        );
+    }
+}
+
+/// The width the field-name column is padded to, chosen so the longest name
+/// still leaves two spaces before its value.
+const FIELD_NAME_WIDTH: usize = 19;
+
+fn field(row: &mut String, name: &str, value: &str) {
+    let _ = writeln!(row, "  {name:<FIELD_NAME_WIDTH$}{value}");
 }
 
 fn render_node_estimate(estimate: NodeCountEstimate) -> String {

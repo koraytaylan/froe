@@ -594,7 +594,9 @@ pub(crate) fn compact_convergence() {
 }
 
 /// Every file of the store with its bytes, `repo.lock` aside.
-fn store_file_snapshot(store: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+pub(crate) fn store_file_snapshot(
+    store: &Path,
+) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
     std::fs::read_dir(store)
         .expect("read the store directory")
         .map(|entry| {

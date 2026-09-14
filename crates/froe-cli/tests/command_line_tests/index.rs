@@ -415,8 +415,13 @@ pub(crate) fn list_prints_every_definition_and_check_exits_zero() {
     assert_eq!(exit_code(&run), 0, "{}", run.stderr);
     assert!(run.stdout.contains("/oak:index/title"), "{}", run.stdout);
     assert!(run.stdout.contains("/oak:index/counter"), "{}", run.stdout);
+    // Padding-independent: the interop phase parses this column and may
+    // widen it, and a test that pinned the spaces would fail on a change
+    // that is not about what the command reports.
     assert!(
-        run.stdout.contains("type              property"),
+        run.stdout
+            .lines()
+            .any(|line| line.starts_with("  type") && line.ends_with("property")),
         "{}",
         run.stdout
     );

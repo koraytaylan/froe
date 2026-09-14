@@ -14,16 +14,17 @@
 import java.io.File;
 
 import org.apache.jackrabbit.oak.segment.SegmentNodeStoreBuilders;
+import org.apache.jackrabbit.oak.segment.file.FileStore;
 import org.apache.jackrabbit.oak.segment.file.FileStoreBuilder;
 import org.apache.jackrabbit.oak.segment.file.ReadOnlyFileStore;
 import org.apache.jackrabbit.oak.spi.state.NodeStore;
 
 final class StoreSupport implements AutoCloseable {
 
-    private final ReadOnlyFileStore fileStore;
+    private final AutoCloseable fileStore;
     private final NodeStore nodeStore;
 
-    private StoreSupport(ReadOnlyFileStore fileStore, NodeStore nodeStore) {
+    private StoreSupport(AutoCloseable fileStore, NodeStore nodeStore) {
         this.fileStore = fileStore;
         this.nodeStore = nodeStore;
     }
@@ -47,8 +48,22 @@ final class StoreSupport implements AutoCloseable {
         return nodeStore;
     }
 
+    /**
+     * Opens the segment store at {@code directory} for **writing**.
+     *
+     * Only ever used against a copy. A writable open takes the repository
+     * lock and writes a manifest, so pointing it at the shared fixture would
+     * make the judge's own run a mutation of what every later phase reads.
+     */
+    static StoreSupport openWritable(String directory) throws Exception {
+        FileStore fileStore = FileStoreBuilder
+                .fileStoreBuilder(new File(directory))
+                .build();
+        return new StoreSupport(fileStore, SegmentNodeStoreBuilders.builder(fileStore).build());
+    }
+
     @Override
-    public void close() {
+    public void close() throws Exception {
         fileStore.close();
     }
 

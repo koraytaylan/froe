@@ -98,6 +98,7 @@ mod fixtures;
 mod judge;
 mod oak;
 mod phase_baseline;
+mod phase_index_inventory;
 mod phase_judge;
 mod phase_maintenance;
 mod phase_recovery;

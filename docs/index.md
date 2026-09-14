@@ -182,9 +182,18 @@ Two halves:
   **never** part of the verdict. A covered node no entry names may be an
   entry the index lost — or a node Oak never indexed, and froe cannot tell
   which. This is not hypothetical: a pristine Oak 1.90.0 store written by
-  Sling has eighteen of them under `/oak:index/nodetype`.
-  `docs/analysis/index-property-storage.md` §13 invariant 7 records the
-  evidence and the open question.
+  Sling has eighteen of them under `/oak:index/nodetype` — the `lucene`
+  definition's `indexRules` subtree and the `rep:permissionStore` nodes.
+
+  Oak itself says why. Its editor *does* cover those nodes: the interop
+  suite creates a node under each through Oak's own index update and the
+  entry appears every time. What those eighteen record is the commit that
+  wrote them — one that ran before Oak's index hook was in the chain — and
+  nothing will add their entries later, because nothing will change
+  `jcr:primaryType` on a node that already has it. A healthy store keeps
+  them forever, which is why they are an observation.
+  `docs/analysis/index-property-storage.md` §13 invariant 7 has the
+  evidence.
 
 **Lucene** gets Oak's **level 1** (`IndexConsistencyChecker.BLOBS_ONLY`): every
 binary property under the definition subtree, hidden children included, is

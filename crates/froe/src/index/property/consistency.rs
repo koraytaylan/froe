@@ -153,17 +153,26 @@ impl PropertyIndexReport {
     ///
     /// A **missing** entry is not in that class. A node the definition
     /// covers that no entry names may be an entry the index lost — or a node
-    /// Oak never indexed in the first place. The generated Oak 1.90.0
-    /// fixture, freshly written by Sling and never touched by froe, has
-    /// eighteen of them under `/oak:index/nodetype`: the `indexRules`
-    /// subtree of the `lucene` definition, and the `rep:permissionStore`
-    /// nodes under `/jcr:system`. Oak's own tooling makes no claim here
-    /// either — `oak-run`'s `--index-consistency-check` ignores every
-    /// definition whose type is not `lucene`. So froe reports missing
-    /// entries as an observation and never as a verdict, which is invariant
-    /// 6 of `docs/analysis/index-property-storage.md` §13 applied to the
-    /// covered-node half: a check that cries wolf is a check an operator
-    /// stops running.
+    /// Oak never indexed in the first place, and froe cannot tell which. The
+    /// generated Oak 1.90.0 fixture, freshly written by Sling and never
+    /// touched by froe, has eighteen of them under `/oak:index/nodetype`:
+    /// the `indexRules` subtree of the `lucene` definition, and the
+    /// `rep:permissionStore` nodes under `/jcr:system`.
+    ///
+    /// Oak itself settles why, and the answer makes the rule permanent: its
+    /// editor *does* cover those nodes — the interop suite proves it by
+    /// creating a node under each of them through Oak's own index update and
+    /// watching the entry appear — so what those eighteen record is the
+    /// commit that wrote them, one that ran before Oak's index hook was in
+    /// the chain. Nothing will ever add their entries, because nothing will
+    /// change `jcr:primaryType` on a node that already has it.
+    ///
+    /// Oak's own tooling makes no competing claim: `oak-run`'s
+    /// `--index-consistency-check` ignores every definition whose type is
+    /// not `lucene`. So froe reports missing entries as an observation and
+    /// never as a verdict, which is invariant 7 of
+    /// `docs/analysis/index-property-storage.md` §13: a check that cries
+    /// wolf is a check an operator stops running.
     #[must_use]
     pub fn has_definite_faults(&self) -> bool {
         !self.stale_entries.is_empty()

@@ -1034,22 +1034,44 @@ froe's rebuild — must use `(int) -7610761686379641542` sign-extended back to
    `oak:QueryIndexDefinition`), and the `rep:permissionStore` nodes under
    `/jcr:system` (nine, `rep:PermissionStore` and `rep:Permissions`). The
    definition carries no `declaringNodeTypes`, no `valuePattern` and no path
-   filter, so nothing in the definition excuses them, and nothing in
-   `IndexUpdate`, `VisibleEditor` or `PropertyIndexEditor` excludes an index
-   definition's own visible subtree or the permission store — each of those
-   was read at the pinned commit and none of them filters here. **The
-   mechanism is therefore not established; the observation is.** Oak's own
-   tooling makes no claim either way: `IndexConsistencyCheckPrinter` adds
+   filter, so nothing in the definition excuses them.
+
+   **Oak was asked directly, and the answer is that the editor covers them.**
+   The `index_inventory` phase creates a child node carrying
+   `jcr:primaryType = nt:unstructured` under each of `/content/interop`,
+   `/oak:index/lucene/indexRules` and `/jcr:system/rep:permissionStore` on a
+   *copy* of the fixture and commits it through
+   `EditorHook(new IndexUpdateProvider(new PropertyIndexEditorProvider()))`,
+   which is the hook that maintains this index. All three entries appear —
+   the content path being the control that says the harness itself works. So
+   `IndexUpdate`, `VisibleEditor` and `PropertyIndexEditor` exclude nothing
+   here, exactly as reading them said.
+
+   A *new node* is what settles it and an existing node touched on an
+   unrelated property does not: `PropertyIndexEditor` writes an entry when an
+   **indexed** property is added, changed or removed, so a commit that leaves
+   `jcr:primaryType` alone is correctly a no-op for this index whatever the
+   coverage rule is. The first attempt at this experiment set an unrelated
+   property, got `after=false` for every path, and would have concluded the
+   opposite.
+
+   **The conclusion is therefore about *which commit* wrote those nodes, not
+   about coverage.** They were written by commits that did not run this
+   index's editor — `Oak.createNewContentRepository` adds the index hook
+   *after* `initialContent`, with the comment "add index hooks later to
+   prevent the OakInitializer to do excessive indexing" — and Oak will never
+   add their entries afterwards, because nothing will change
+   `jcr:primaryType` on a node that already has it. A store Oak itself wrote
+   legitimately and permanently contains them.
+
+   That makes the rule permanent rather than provisional:
+   `PropertyIndexReport::has_definite_faults` decides `froe index check`'s
+   exit code, and `is_consistent` — which also requires the missing set to be
+   empty — is the strict all-clear a healthy store can fail. Oak's own
+   tooling makes no competing claim: `IndexConsistencyCheckPrinter` adds
    every definition whose `type` is not `lucene` to `ignoredIndexes` and
    checks nothing about it, so the property family's consistency check is
-   froe's own and has no Oak verdict to match.
-
-   `PropertyIndexReport::has_definite_faults` is therefore what decides
-   `froe index check`'s exit code, and `is_consistent` — which includes the
-   missing set — is the strict all-clear a store Oak wrote can fail. Task
-   0615 asks Oak itself, through the judge, which of the two explanations is
-   right; until it answers, froe reports the count and says plainly that it
-   cannot tell.
+   froe's own.
 7. **A property index's `:index` is never absent** (§2.3). That asymmetry with
    invariant 6 is real and is the one case where absence *is* reportable.
 8. **Never write a value froe cannot prove Oak would have written.** The
