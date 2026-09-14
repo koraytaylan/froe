@@ -12,19 +12,29 @@
 //! for a Lucene index means its writer *appends* every document again to the
 //! retained `:data`, doubling the index with no error anywhere. See §3.1.
 //!
-//! # A deliberate, temporary duplication
+//! # The one rule, and its two callers
 //!
-//! [`AsyncLanes::dangling_checkpoints`] reimplements the rule
-//! `crate::tooling::digest`'s private `dangling_async_checkpoints` already
-//! applies, including its deliberately conservative shape test: *every*
-//! string value of *every* non-`-temp` property on `/:async` is treated as a
-//! checkpoint reference, whatever the property is called, because Oak stores
-//! each lane's resume point as an ordinary string property whose name varies
-//! by lane. The duplication is temporary: `tooling/digest.rs` belongs to
-//! another task's footprint, and the task that depends on both makes the
-//! digest delegate here and deletes this note. Narrowing the rule in the
-//! meantime would make the two disagree, which is the one outcome worse than
-//! duplicating them.
+//! [`AsyncLanes::dangling_checkpoints`] is where that verdict is decided,
+//! and `crate::tooling::digest` is its other caller — the digest reports a
+//! dangling reference among the invariants it judges on its own. The rule
+//! is deliberately **conservative**: *every* string value of *every*
+//! non-`-temp` property on `/:async` is treated as a checkpoint reference,
+//! whatever the property is called, because Oak stores each lane's resume
+//! point as an ordinary string property whose name varies by lane. Only the
+//! UUID shape narrows it, and only so an unrelated string property cannot
+//! be reported as gone.
+//!
+//! The `-temp` exclusion is not an optimization. `AsyncIndexUpdate` keeps
+//! `<lane>-temp` as the list of checkpoints the indexer *intends to
+//! release*; entries in it are routinely already gone, because releasing
+//! them is what it is for. Treating that list like a resume point reports a
+//! dangling reference on a pristine, untouched Oak store — verified against
+//! the interop fixture, where Oak's own `async-temp` names one live
+//! checkpoint and one already released.
+//!
+//! `commit.rs`'s `remove_unreferenced_checkpoints` keeps a twin of the rule
+//! deliberately: it decides what maintenance may *delete*, so it must stay
+//! at least as conservative as this one and is free to be more so.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -128,6 +138,10 @@ impl AsyncLanes {
 
     /// The checkpoints `/:async` names that `/checkpoints` no longer holds,
     /// sorted.
+    ///
+    /// `crate::tooling::digest` calls this for the invariant it reports
+    /// beside the digest itself, so a change here changes what `froe digest`
+    /// says about a store.
     ///
     /// Dangling means *resolved and absent*: a checkpoint whose node cannot
     /// be read is an error, never a dangling reference, because reporting an
@@ -249,8 +263,19 @@ mod tests {
         assert!(is_checkpoint_reference(
             "8b3d5f2a-1c4e-4a7b-9f01-2d3e4f5a6b7c"
         ));
+        // An ordinary string property on /:async must not be reported as a
+        // dangling checkpoint just because the checkpoint set lacks it.
+        assert!(!is_checkpoint_reference("async"));
         assert!(!is_checkpoint_reference("not-a-checkpoint"));
+        assert!(!is_checkpoint_reference("2026-08-17T10:00:00.000Z"));
+        assert!(!is_checkpoint_reference(""));
+        // Right characters, no groups.
         assert!(!is_checkpoint_reference("8b3d5f2a1c4e4a7b9f012d3e4f5a6b7c"));
+        // Right group count, wrong widths.
+        assert!(!is_checkpoint_reference(
+            "8b3d5f2-1c4e-4a7b-9f01-2d3e4f5a6b7c"
+        ));
+        // Right shape, non-hexadecimal.
         assert!(!is_checkpoint_reference(
             "8b3d5f2a-1c4e-4a7b-9f01-2d3e4f5a6b7z"
         ));

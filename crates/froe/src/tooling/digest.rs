@@ -55,6 +55,8 @@ use crate::content::node::{NodeState, PropertyValues};
 use crate::content::property::PropertyValue;
 use crate::content::value::{BinaryValue, read_binary_stream};
 use crate::error::{Error, Result};
+use crate::index::IndexError;
+use crate::index::lanes::AsyncLanes;
 use crate::segment::record::RecordIdentifier;
 use crate::store::Repository;
 
@@ -241,7 +243,23 @@ pub fn digest_repository_excluding<Output: Write + ?Sized>(
         renderer.walk_excluding(node, &path, &[], output, &mut summary)?;
     }
 
-    summary.dangling_async_checkpoints = dangling_async_checkpoints(repository, &checkpoint_names)?;
+    // The rule lives with the lane model it belongs to; the digest is one
+    // of its two callers. It resolves `/checkpoints` itself rather than
+    // taking the set this walk gathered — the same answer from the same
+    // store, and one fewer thing for the two to disagree about.
+    summary.dangling_async_checkpoints =
+        AsyncLanes::dangling_checkpoints(&repository.content_root()?, &repository.head()).map_err(
+            |error| match error {
+                // Reading `/:async` and `/checkpoints` is all it does, so
+                // this is the only variant it can reach. The other arm
+                // carries the message rather than discarding it, because a
+                // variant that becomes reachable later must not go silent.
+                IndexError::Record(source) => source,
+                other => Error::InvalidFormat {
+                    details: other.to_string(),
+                },
+            },
+        )?;
 
     output.flush().map_err(Error::InputOutput)?;
     Ok(summary)
@@ -496,68 +514,6 @@ impl Renderer<'_> {
     }
 }
 
-/// The `/:async` property suffix holding checkpoints *scheduled for
-/// release* rather than resumed from.
-///
-/// `AsyncIndexUpdate` keeps three properties per lane: `<lane>` is the
-/// checkpoint the next run resumes from, `<lane>-LastIndexedTo` is a
-/// timestamp, and `<lane>-temp` is a list of checkpoints the indexer
-/// intends to release. Entries in that list are routinely already gone —
-/// releasing them is precisely what it is for — so treating it like a
-/// resume point reports a dangling reference on a pristine, untouched Oak
-/// store. Verified against the interop fixture, where Oak's own
-/// `async-temp` names one live checkpoint and one already released.
-const ASYNC_PENDING_RELEASE_SUFFIX: &str = "-temp";
-
-/// Checkpoint names `/:async` still needs that no longer exist.
-///
-/// Conservative in the same way the maintenance path is: every string
-/// value of every *resume-point* property on the `:async` node is treated
-/// as a checkpoint reference, because Oak stores each lane's resume point
-/// as an ordinary string property whose name varies by lane.
-fn dangling_async_checkpoints(
-    repository: &Repository,
-    checkpoint_names: &HashSet<String>,
-) -> Result<Vec<String>> {
-    let Some(async_state) = repository.content_root()?.child_node(":async")? else {
-        return Ok(Vec::new());
-    };
-    let mut dangling = Vec::new();
-    for property in async_state.properties()? {
-        if property.name.ends_with(ASYNC_PENDING_RELEASE_SUFFIX) {
-            continue;
-        }
-        let values = match &property.values {
-            PropertyValues::Single(value) => std::slice::from_ref(value),
-            PropertyValues::Multiple(values) => values.as_slice(),
-        };
-        for value in values {
-            if let PropertyValue::String(text) = value
-                && is_checkpoint_reference(text)
-                && !checkpoint_names.contains(text)
-                && !dangling.contains(text)
-            {
-                dangling.push(text.clone());
-            }
-        }
-    }
-    dangling.sort();
-    Ok(dangling)
-}
-
-/// Whether a string looks like a checkpoint name rather than an ordinary
-/// value. Oak names checkpoints with a UUID, so requiring that shape keeps
-/// an unrelated string property on `:async` from being reported as a
-/// dangling reference.
-fn is_checkpoint_reference(text: &str) -> bool {
-    let groups: Vec<&str> = text.split('-').collect();
-    groups.len() == 5
-        && [8, 4, 4, 4, 12] == groups.iter().map(|group| group.len()).collect::<Vec<_>>()[..]
-        && text
-            .chars()
-            .all(|character| character == '-' || character.is_ascii_hexdigit())
-}
-
 /// The rendered form of a path. The content root is `/`; everything else
 /// already carries its leading separator or its synthetic prefix.
 fn display_path(path: &str) -> String {
@@ -657,7 +613,7 @@ pub fn compare_digests(baseline: &str, current: &str) -> DigestDifference {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_digests, escape, is_checkpoint_reference, parse_digest};
+    use super::{compare_digests, escape, parse_digest};
 
     #[test]
     fn escaping_is_unambiguous_for_every_reserved_byte() {
@@ -676,26 +632,6 @@ mod tests {
         // The forging case: a literal backslash-t must not decode as a tab,
         // which is exactly what escaping the backslash first prevents.
         assert_ne!(escape("a\\tb"), escape("a\tb"));
-    }
-
-    #[test]
-    fn a_checkpoint_reference_is_recognized_only_in_oaks_shape() {
-        assert!(is_checkpoint_reference(
-            "8b3d5f2a-1c4e-4a7b-9f01-2d3e4f5a6b7c"
-        ));
-        // An ordinary string property on :async must not be reported as a
-        // dangling checkpoint just because the checkpoint set lacks it.
-        assert!(!is_checkpoint_reference("async"));
-        assert!(!is_checkpoint_reference("2026-08-17T10:00:00.000Z"));
-        assert!(!is_checkpoint_reference(""));
-        // Right group count, wrong widths.
-        assert!(!is_checkpoint_reference(
-            "8b3d5f2-1c4e-4a7b-9f01-2d3e4f5a6b7c"
-        ));
-        // Right shape, non-hexadecimal.
-        assert!(!is_checkpoint_reference(
-            "8b3d5f2z-1c4e-4a7b-9f01-2d3e4f5a6b7c"
-        ));
     }
 
     #[test]
