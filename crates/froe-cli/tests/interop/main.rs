@@ -134,6 +134,7 @@ mod phase_index_inventory;
 mod phase_judge;
 mod phase_lucene_import;
 mod phase_lucene_transport;
+mod phase_lucene_writer;
 mod phase_maintenance;
 mod phase_property_reindex;
 mod phase_recovery;

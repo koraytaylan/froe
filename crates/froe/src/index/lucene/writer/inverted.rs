@@ -271,6 +271,21 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
         )
     }
 
+    /// The field's index, which the document-order pass already assigned.
+    fn index_of(&self, name: &str) -> Result<usize> {
+        self.by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| Error::InvalidFormat {
+                details: format!("the field {name} has no number yet"),
+            })
+    }
+
+    /// The field's number.
+    fn number_of(&self, name: &str) -> Result<i32> {
+        self.index_of(name).map(|index| self.fields[index].number)
+    }
+
     /// Finds or creates the field, reconciling it with what earlier
     /// documents said (§4.4).
     fn field_state(&mut self, field: &Field) -> Result<usize> {
@@ -334,6 +349,13 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
     /// the spilling runs.
     pub fn add_document(&mut self, document: &Document) -> Result<()> {
         let this_document = self.document_count;
+        // Field numbers are assigned in **document order**, as Lucene's own
+        // field infos assign them, and every field of a group reconciles —
+        // not only the first, since it is a later value of a name that can
+        // omit norms or narrow the options.
+        for field in &document.fields {
+            self.field_state(field)?;
+        }
         self.write_stored_fields(document)?;
 
         // Fields of one name compose, and the groups keep the order their
@@ -351,7 +373,7 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
         let mut values: BTreeMap<usize, DocValue> = BTreeMap::new();
         for name in &order {
             let group = &groups[name.as_str()];
-            let index = self.field_state(group[0])?;
+            let index = self.index_of(name)?;
             if let Some(norm) = self.invert_group(index, group, this_document)? {
                 norms.insert(index, norm);
             }
@@ -389,10 +411,7 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
         // it is counted first.
         let numbers: Vec<i32> = stored
             .iter()
-            .map(|field| {
-                self.field_state(field)
-                    .map(|index| self.fields[index].number)
-            })
+            .map(|field| self.number_of(&field.name))
             .collect::<Result<_>>()?;
         let writer = self.stored.as_mut().expect("opened above");
         writer.start_document(stored.len())?;

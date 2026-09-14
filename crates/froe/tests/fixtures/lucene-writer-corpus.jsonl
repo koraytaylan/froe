@@ -1,0 +1,34 @@
+# Documents for the Lucene writer conformance phase, in the writer's own
+# model: already tokenized, already typed. froe writes them with its own
+# writer and the judge writes them with Lucene's, and the two indexes are
+# enumerated and compared.
+#
+# One JSON object per line. A line with a `count` stands for that many
+# documents, with `{n}` in a token, a stored string or a doc value replaced
+# by the document's number — which is how the corpus reaches the document
+# and term-frequency counts the skip list needs without a file of 8,300
+# lines.
+#
+# Field defaults: options "positions", indexed true, omit_norms false,
+# boost 1.0, no tokens, final_increment 0, final_offset the last token's
+# end. A token defaults to increment 1 and offsets that follow the previous
+# token with one space between; `repeat` multiplies its text.
+#
+# What each document exercises is in its own `note`.
+#
+# The bulk line carries the skip list's boundaries: 8,300 documents put the
+# term `common` three skip levels deep under the multiplier of 8 and the
+# interval of 128 (a point at 8,192 climbs to level 2), and its 8,300
+# distinct `w{n}` terms floor the block-tree dictionary many times over.
+{"note":"every stored type and doc-value type in one document","fields":[{"name":":path","options":"docs","omit_norms":true,"tokens":[{"t":"/content/first"}],"stored":{"text":"/content/first"},"doc_value":{"sorted_text":"/content/first"}},{"name":"blob","indexed":false,"omit_norms":true,"stored":{"binary":"00ff10deadbeef"}},{"name":"count","indexed":false,"omit_norms":true,"stored":{"integer":-7},"doc_value":{"numeric":-7}},{"name":"stamp","indexed":false,"omit_norms":true,"stored":{"long":-9007199254740993}},{"name":"facets","indexed":false,"omit_norms":true,"doc_value":{"sorted_set":["alpha","gamma","alpha"]}}]}
+{"note":"every index option side by side, with and without norms","fields":[{"name":"only_docs","options":"docs","omit_norms":true,"tokens":[{"t":"a"},{"t":"b"},{"t":"a"}]},{"name":"with_freqs","options":"freqs","omit_norms":true,"tokens":[{"t":"a"},{"t":"b"},{"t":"a"}]},{"name":"with_positions","options":"positions","tokens":[{"t":"a"},{"t":"b"},{"t":"a"}]},{"name":"with_offsets","options":"offsets","tokens":[{"t":"a"},{"t":"b"},{"t":"a"}]}]}
+{"note":"several analyzed fields of one name, which is what Oak writes for a multi-valued property","fields":[{"name":"tags","tokens":[{"t":"red"},{"t":"blue"}],"final_increment":0,"final_offset":8},{"name":"tags","tokens":[{"t":"green"}],"final_increment":0,"final_offset":5},{"name":"tags","tokens":[{"t":"red"}],"final_increment":0,"final_offset":3}]}
+{"note":"several boosted norms-bearing fields of one name: the boosts multiply into one norm and the lengths sum","fields":[{"name":"boosted","boost":2.0,"tokens":[{"t":"one"},{"t":"two"}]},{"name":"boosted","boost":0.5,"tokens":[{"t":"three"}]}]}
+{"note":"a trailing increment and offset the next value starts past, which is what a stop filter at the end of a value reports","fields":[{"name":"gapped","tokens":[{"t":"head"}],"final_increment":3,"final_offset":9},{"name":"gapped","tokens":[{"t":"tail"}],"final_increment":0,"final_offset":4}]}
+{"note":"overlapping tokens: increment 0 never on the first, discounted from the norm's length","fields":[{"name":"overlap","tokens":[{"t":"quick"},{"t":"fast","i":0,"s":0,"e":5},{"t":"fox"}]}]}
+{"note":"a term above the maximum term length: skipped, the document kept, the position still counted","fields":[{"name":"huge","tokens":[{"t":"short"},{"t":"x","repeat":32767,"s":6,"e":32773},{"t":"after"}]}]}
+{"note":"a norms-bearing analyzed field whose value yields no token: no term, no directory entry, and a norm all the same","fields":[{"name":"silent","tokens":[],"final_offset":0}]}
+{"note":"the field-infos downgrade, first half: positions here","fields":[{"name":"downgrade","options":"positions","omit_norms":true,"tokens":[{"t":"alpha"},{"t":"beta"}]},{"name":"sticky","tokens":[{"t":"kept"}]}]}
+{"note":"the field-infos downgrade, second half: frequencies only, and omit_norms sticky once true","fields":[{"name":"downgrade","options":"freqs","omit_norms":true,"tokens":[{"t":"alpha"},{"t":"gamma"}]},{"name":"sticky","omit_norms":true,"tokens":[{"t":"dropped"}]}]}
+{"note":"an empty document: no field at all","fields":[]}
+{"note":"the bulk, which carries the skip list's boundaries and floors the terms dictionary","count":8300,"fields":[{"name":":path","options":"docs","omit_norms":true,"tokens":[{"t":"/content/n{n}"}],"stored":{"text":"/content/n{n}"},"doc_value":{"sorted_text":"/content/n{n}"}},{"name":"body","options":"offsets","tokens":[{"t":"common"},{"t":"w{n}"}]},{"name":"count","indexed":false,"omit_norms":true,"doc_value":{"numeric":"{n}"}}]}

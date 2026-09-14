@@ -248,12 +248,18 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
                 open_term = Some(record.term.clone());
             }
             postings.start_document(record.document, record.frequency)?;
-            for position in &record.positions {
-                postings.add_position(
-                    position.position,
-                    position.start_offset,
-                    position.end_offset,
-                )?;
+            // A field whose options were downgraded after the positions
+            // were buffered writes none of them, which is what Lucene's own
+            // flush does: it reads the field's options at flush time and
+            // leaves what it buffered unwritten.
+            if self.fields[index].options.has_positions() {
+                for position in &record.positions {
+                    postings.add_position(
+                        position.position,
+                        position.start_offset,
+                        position.end_offset,
+                    )?;
+                }
             }
             postings.finish_document();
             sums.0 += i64::from(record.frequency);

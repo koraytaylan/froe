@@ -346,3 +346,51 @@ fn the_index_document_work_unit_reads_in_both_numbers() {
     assert_eq!(WorkUnit::IndexDocuments.noun_for(0), "index documents");
     assert_eq!(WorkUnit::IndexDocuments.noun_for(12), "index documents");
 }
+
+#[test]
+fn a_field_whose_options_downgrade_writes_none_of_the_positions_it_buffered() {
+    // The first document indexes with positions and the second without, so
+    // the segment-wide options end as the lesser — and the positions the
+    // first buffered are never written, which is what Lucene's own flush
+    // does when it reads the field's options at flush time.
+    let workspace = Workspace::new("downgrade");
+    let mut writer = LuceneIndexWriter::new(
+        Collected::default(),
+        workspace.runs("writer"),
+        SortBudget::of_bytes(ROOMY),
+    );
+    let mut first = Field::indexed(
+        "body",
+        IndexOptions::DocumentsAndFrequenciesAndPositions,
+        tokens(&["alpha", "beta"]),
+    );
+    first.omit_norms = true;
+    writer
+        .add_document(&Document::new().with(first))
+        .expect("the first document");
+
+    let mut second = Field::indexed(
+        "body",
+        IndexOptions::DocumentsAndFrequencies,
+        tokens(&["alpha"]),
+    );
+    second.omit_norms = true;
+    writer
+        .add_document(&Document::new().with(second))
+        .expect("the second document");
+
+    let (directory, written) = writer.finish().expect("finish");
+    assert_eq!(written.document_count, 2);
+    let data_length = directory.files["_0.cfs"].len() as i64;
+    let table = read_table_of_contents(&mut directory.reader("_0.cfe"), data_length)
+        .expect("read the .cfe");
+    let names: Vec<&str> = table
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(
+        !names.contains(&".pos"),
+        "no field ends with positions, so there is no .pos at all: {names:?}"
+    );
+}
