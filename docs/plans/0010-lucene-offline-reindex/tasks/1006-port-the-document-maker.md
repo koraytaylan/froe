@@ -9,9 +9,13 @@ touches:
   - crates/froe/src/index/lucene/documents/document_maker.rs
   - crates/froe/src/index/lucene/documents/facets.rs
   - crates/froe/src/index/lucene/documents/binaries.rs
-  - crates/froe/tests/lucene_document_maker_tests.rs
-status: planned
-merged_as: ""
+  - crates/froe/tests/lucene_documents/main.rs
+  - crates/froe/tests/lucene_documents/fixtures.rs
+  - crates/froe/tests/lucene_documents/fields.rs
+  - crates/froe/tests/lucene_documents/branches.rs
+  - crates/froe/src/index/lucene/documents/rules.rs
+status: done
+merged_as: "e38c1c6"
 ---
 # Port Oak's Document Maker
 
