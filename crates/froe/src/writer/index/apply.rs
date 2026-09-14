@@ -54,6 +54,45 @@ const WRITE_STEP: &str = "writing index records";
 /// The step opened while the rebuilt subtrees are verified.
 const VERIFY_STEP: &str = "verifying the rebuilt indexes";
 
+/// Fired once the sort has returned its iterator and before the first index
+/// record is appended: every spill file is on disk and the store is
+/// untouched. The sort itself takes no cutpoint, which is what keeps it
+/// independent of the segment-store write path.
+const BEFORE_SPILL_CLEANUP: &str = "index-reindex.before-spill-cleanup";
+
+/// Fired after every record and the spine are written and verified, and
+/// before the head moves: the store is unchanged plus unreferenced archives.
+const BEFORE_HEAD_PUBLISH: &str = "index-reindex.before-head-publish";
+
+/// Fired between `compare_and_set_head`, which changes nothing on disk, and
+/// `flush`, which seals, fsyncs and appends the journal line. The on-disk
+/// prefix here is the same one [`BEFORE_HEAD_PUBLISH`] observes.
+const AFTER_HEAD_PUBLISH_BEFORE_FLUSH: &str = "index-reindex.after-head-publish-before-flush";
+
+/// Fired after the store is final and before it is read back: a failure here
+/// is reported, never repaired.
+const BEFORE_APPLIED_VERIFICATION: &str = "index-reindex.before-applied-verification";
+
+/// One durability boundary of the mutation table, for the fault probes.
+#[cfg(test)]
+fn probe(cutpoint: &str) -> Result<()> {
+    crate::writer::fault_injection::fail_if_armed(cutpoint)?;
+    crate::writer::fault_injection::crash_if_armed(cutpoint);
+    Ok(())
+}
+
+/// Outside a test build there are no cutpoints and this compiles to nothing.
+#[cfg(not(test))]
+#[inline]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the sibling this stands in for can fail, and the caller is the same either way"
+)]
+fn probe(cutpoint: &str) -> Result<()> {
+    let _ = cutpoint;
+    Ok(())
+}
+
 /// What one definition's rebuild produced.
 pub struct RebuiltDefinition {
     /// The definition's path.
@@ -224,7 +263,22 @@ fn store_name_hash(directory: &Path) -> u64 {
     hash
 }
 
+/// What a run published, for the tail that runs after the store is closed.
+struct PublishedRun {
+    rebuilt: Vec<RebuiltDefinition>,
+    head_before: RecordIdentifier,
+    head_after: RecordIdentifier,
+    journal_lines_before: usize,
+}
+
 /// The whole mutating sequence, with the store open.
+///
+/// The session is always closed, on every path. That matters because a
+/// failed run has appended records: closing writes the archive's graph,
+/// catalog and index trailers, so what it leaves behind is an *unreferenced*
+/// archive rather than a damaged one — the difference between a store a
+/// later `froe compact` quietly retires and a store it refuses until an
+/// operator authorizes an index repair.
 fn apply_under_the_lock(
     prepared: &PreparedReindex,
     run: &RunDirectory,
@@ -236,6 +290,59 @@ fn apply_under_the_lock(
         prepared.certified_archive_number,
     )?;
     let head_before = store.head();
+
+    let published = build_and_publish(&store, prepared, run, observer, head_before);
+
+    // On the way out of a failure, put the session's head back where it was
+    // found. The head lives in memory until `flush` appends the journal
+    // line, so a run that failed *after* `compare_and_set_head` must undo it
+    // before closing — otherwise closing publishes the very run that failed.
+    if published.is_err() {
+        let current = store.head();
+        if current != head_before {
+            store.compare_and_set_head(current, head_before);
+        }
+    }
+    let closed = store.close();
+
+    let published = published?;
+    closed?;
+
+    if published.head_after == published.head_before {
+        return Ok(ReindexOutcome {
+            definitions: Vec::new(),
+            head_before,
+            head_after: head_before,
+        });
+    }
+
+    probe(BEFORE_APPLIED_VERIFICATION)?;
+    verification::verify_after_reopen(
+        &prepared.directory,
+        published.head_after,
+        &published.rebuilt,
+        published.journal_lines_before,
+    )?;
+
+    Ok(ReindexOutcome {
+        definitions: published
+            .rebuilt
+            .iter()
+            .map(|definition| (definition.path.clone(), definition.report.clone()))
+            .collect(),
+        head_before: published.head_before,
+        head_after: published.head_after,
+    })
+}
+
+/// Everything that needs the store open: build, rewrite, verify, publish.
+fn build_and_publish(
+    store: &WritableRepository,
+    prepared: &PreparedReindex,
+    run: &RunDirectory,
+    observer: &mut dyn ProgressObserver,
+    head_before: RecordIdentifier,
+) -> Result<PublishedRun> {
     let journal_lines_before =
         crate::journal::read_journal(&prepared.directory.join("journal.log"))?.len();
 
@@ -243,7 +350,7 @@ fn apply_under_the_lock(
         let mut writer = store.record_writer(store.writing_generation()?);
         let step = Step::new(WRITE_STEP, WorkUnit::Nodes);
         let rebuilt = observe(observer, &step, |observer| {
-            rebuild_every_definition(&store, &mut writer, prepared, run, observer)
+            rebuild_every_definition(store, &mut writer, prepared, run, observer)
         })?;
         // The index records have to be in the store before the spine that
         // references them is written: the spine writer's segment carries
@@ -254,10 +361,11 @@ fn apply_under_the_lock(
     };
 
     if rebuilt.is_empty() {
-        return Ok(ReindexOutcome {
-            definitions: Vec::new(),
+        return Ok(PublishedRun {
+            rebuilt,
             head_before,
             head_after: head_before,
+            journal_lines_before,
         });
     }
 
@@ -265,18 +373,20 @@ fn apply_under_the_lock(
     // tail runs — so the tail reads a perturbed subtree exactly the way it
     // reads a builder's, out of the store rather than out of an open
     // segment. Compiles to nothing outside a test build.
-    verification::perturb_all(&store, &mut rebuilt)?;
+    verification::perturb_all(store, &mut rebuilt)?;
 
     // One spine rewrite over every rebuilt definition, then one publication.
     let mut writer = store.record_writer(store.writing_generation()?);
-    let super_root = rewrite_the_spine(&store, &mut writer, head_before, &rebuilt)?;
+    let super_root = rewrite_the_spine(store, &mut writer, head_before, &rebuilt)?;
 
     let step = Step::new(VERIFY_STEP, WorkUnit::Nodes);
     observe(observer, &step, |observer| {
-        verification::verify_before_publication(&store, &rebuilt, observer)
+        verification::verify_before_publication(store, &rebuilt, observer)
     })?;
 
     writer.finish()?;
+
+    probe(BEFORE_HEAD_PUBLISH)?;
     if !store.compare_and_set_head(head_before, super_root) {
         return Err(Error::InvalidFormat {
             details: "the head moved while the reindex held the lock, which cannot happen \
@@ -284,23 +394,16 @@ fn apply_under_the_lock(
                 .to_owned(),
         });
     }
-    store.flush()?;
-    drop(store);
+    // `compare_and_set_head` changed nothing on disk, so a fault here
+    // observes exactly the prefix the boundary before it observes. There is
+    // no third state.
+    probe(AFTER_HEAD_PUBLISH_BEFORE_FLUSH)?;
 
-    verification::verify_after_reopen(
-        &prepared.directory,
-        super_root,
-        &rebuilt,
-        journal_lines_before,
-    )?;
-
-    Ok(ReindexOutcome {
-        definitions: rebuilt
-            .iter()
-            .map(|definition| (definition.path.clone(), definition.report.clone()))
-            .collect(),
+    Ok(PublishedRun {
+        rebuilt,
         head_before,
         head_after: super_root,
+        journal_lines_before,
     })
 }
 
@@ -519,6 +622,9 @@ fn build_property_index<Sink: SegmentSink>(
         },
         observer,
     )?;
+    // The sort has returned its iterator and every spill file is on disk;
+    // not one index record has been appended.
+    probe(BEFORE_SPILL_CLEANUP)?;
     let CollectedEntries::Sorted(sorted) = collected else {
         unreachable!("the run sink sorts");
     };
@@ -561,6 +667,7 @@ fn build_reference_index<Sink: SegmentSink>(
         },
         observer,
     )?;
+    probe(BEFORE_SPILL_CLEANUP)?;
     let CollectedReferences::Sorted(mut sets) = collected else {
         unreachable!("the run sink sorts");
     };

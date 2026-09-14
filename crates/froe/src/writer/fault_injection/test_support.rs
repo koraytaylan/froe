@@ -232,6 +232,10 @@ pub(crate) fn cleanup_fault_child() {
         run_postcompaction_sweep_child(&directory, &cutpoint, &mode);
         return;
     }
+    if scenario == REINDEX_SCENARIO {
+        run_reindex_child(&directory, &cutpoint, &mode);
+        return;
+    }
     run_compaction_child(&directory, &scenario, &cutpoint, &mode);
 }
 
@@ -476,6 +480,228 @@ pub(crate) fn write_orphaned_history_fixture(directory: &Path) {
     assert!(store.compare_and_set_head(previous, head));
     store.flush().expect("flush");
     store.close().expect("close the purge fixture");
+}
+
+pub(crate) const REINDEX_SCENARIO: &str = "reindex";
+
+/// A single-valued property of `property_type`, written from its text.
+fn single_valued<Sink: crate::writer::SegmentSink>(
+    writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
+    name: &str,
+    property_type: crate::content::property::PropertyType,
+    value: &str,
+) -> crate::writer::record_writer::PropertyToWrite {
+    let value = writer.write_string(value).expect("write a string");
+    crate::writer::record_writer::PropertyToWrite {
+        name: name.to_owned(),
+        property_type,
+        values: crate::writer::record_writer::PropertyValuesToWrite::Single(value),
+    }
+}
+
+/// A single-entry multi-valued `NAME` property, which is what
+/// `propertyNames` is.
+fn one_name<Sink: crate::writer::SegmentSink>(
+    writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
+    name: &str,
+    value: &str,
+) -> crate::writer::record_writer::PropertyToWrite {
+    let value = writer.write_string(value).expect("write a string");
+    crate::writer::record_writer::PropertyToWrite {
+        name: name.to_owned(),
+        property_type: crate::content::property::PropertyType::Name,
+        values: crate::writer::record_writer::PropertyValuesToWrite::Multiple(vec![value]),
+    }
+}
+
+/// The fixture's content: enough titled pages that a small sort budget
+/// spills and merges rather than sorting one resident run.
+fn write_flagged_index_content<Sink: crate::writer::SegmentSink>(
+    writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
+) -> RecordIdentifier {
+    use crate::content::property::PropertyType;
+    use crate::writer::record_writer::ChildNodesToWrite;
+
+    let mut pages = Vec::new();
+    for serial in 0..64u32 {
+        let properties = vec![
+            single_valued(
+                writer,
+                "jcr:primaryType",
+                PropertyType::Name,
+                "nt:unstructured",
+            ),
+            single_valued(
+                writer,
+                "jcr:title",
+                PropertyType::String,
+                &format!("title-{serial:04}"),
+            ),
+        ];
+        let page = writer
+            .write_node(None, &[], &ChildNodesToWrite::Zero, &properties)
+            .expect("write a page");
+        pages.push((format!("page-{serial:04}"), page));
+    }
+    let content_properties = vec![single_valued(
+        writer,
+        "jcr:primaryType",
+        PropertyType::Name,
+        "nt:unstructured",
+    )];
+    writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(pages),
+            &content_properties,
+        )
+        .expect("write the content")
+}
+
+/// The fixture's `/oak:index`: the flagged `title` definition a run
+/// rebuilds, and the `nodetype` definition the path service reads.
+fn write_flagged_index_definitions<Sink: crate::writer::SegmentSink>(
+    writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
+) -> RecordIdentifier {
+    use crate::content::property::PropertyType;
+    use crate::writer::record_writer::ChildNodesToWrite;
+
+    let title_definition = vec![
+        single_valued(
+            writer,
+            "jcr:primaryType",
+            PropertyType::Name,
+            "oak:QueryIndexDefinition",
+        ),
+        single_valued(writer, "type", PropertyType::String, "property"),
+        single_valued(writer, "reindex", PropertyType::Boolean, "true"),
+        one_name(writer, "propertyNames", "jcr:title"),
+    ];
+    let title = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &title_definition)
+        .expect("write the flagged definition");
+
+    let nodetype_definition = vec![
+        single_valued(
+            writer,
+            "jcr:primaryType",
+            PropertyType::Name,
+            "oak:QueryIndexDefinition",
+        ),
+        single_valued(writer, "type", PropertyType::String, "property"),
+        one_name(writer, "propertyNames", "jcr:primaryType"),
+    ];
+    let nodetype = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &nodetype_definition)
+        .expect("write the nodetype definition");
+
+    writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(vec![
+                ("nodetype".to_owned(), nodetype),
+                ("title".to_owned(), title),
+            ]),
+            &[],
+        )
+        .expect("write oak:index")
+}
+
+/// A store with enough indexed content that the sort spills, plus the one
+/// flagged definition a run rebuilds.
+///
+/// Laid out with the store one level below `root`, so the run's work
+/// directory is its sibling rather than a subdirectory of the store: a
+/// probe has to be able to look at the spill files without looking inside
+/// the repository.
+pub(crate) fn write_flagged_index_fixture(root: &Path) -> PathBuf {
+    use crate::writer::record_writer::ChildNodesToWrite;
+
+    let directory = root.join("store");
+    std::fs::create_dir_all(&directory).expect("create the reindex fixture store directory");
+    std::fs::create_dir_all(reindex_work_directory(&directory))
+        .expect("create the reindex fixture work directory");
+
+    let store = WritableRepository::open(&directory).expect("bootstrap the reindex fixture");
+    let generation = store.writing_generation().expect("writing generation");
+    let mut writer = store.record_writer(generation);
+
+    let content = write_flagged_index_content(&mut writer);
+    let oak_index = write_flagged_index_definitions(&mut writer);
+    let root_node = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::Many(vec![
+                ("content".to_owned(), content),
+                (crate::index::INDEX_DEFINITIONS_NAME.to_owned(), oak_index),
+            ]),
+            &[],
+        )
+        .expect("write the root");
+    let head = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "root".to_owned(),
+                node: root_node,
+            },
+            &[],
+        )
+        .expect("write the super root");
+    writer.finish().expect("finish");
+    let previous = store.head();
+    assert!(store.compare_and_set_head(previous, head));
+    store.flush().expect("flush");
+    store.close().expect("close the reindex fixture");
+    directory
+}
+
+/// The work directory a reindex probe's child uses: a sibling of the store,
+/// so the parent knows where to look for the run's spill files without
+/// being told.
+pub(crate) fn reindex_work_directory(store: &Path) -> PathBuf {
+    store
+        .parent()
+        .expect("the fixture store always has a parent")
+        .join("work")
+}
+
+/// The reindex scenario: rebuild the fixture's one flagged definition with
+/// the cutpoint armed.
+pub(crate) fn run_reindex_child(store: &Path, cutpoint: &str, mode: &str) {
+    use crate::writer::index::{ReindexOptions, WorkDirectory, reindex};
+
+    let options = ReindexOptions::new()
+        .with_work_directory(WorkDirectory::OperatorNamed(reindex_work_directory(store)))
+        // Small, so the sort spills and the boundary before the spill
+        // cleanup has files to observe.
+        .with_sort_budget_bytes(64);
+    let outcome = reindex(store, options);
+    match mode {
+        ERROR_MODE => {
+            let error = outcome.expect_err("the reindex completed without the injected error");
+            assert!(
+                error.to_string().contains(cutpoint),
+                "the reindex failed before {cutpoint}: {error}"
+            );
+        }
+        #[cfg(unix)]
+        CRASH_MODE => match outcome {
+            Ok(_) => panic!("the reindex completed without reaching {cutpoint}"),
+            Err(error) => panic!("the reindex failed before {cutpoint}: {error}"),
+        },
+        other => panic!("unsupported reindex fault mode {other}"),
+    }
+    // SAFETY: `_exit` has no memory-safety preconditions and this is an
+    // isolated child whose error path was checked above.
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(VERIFIED_EXIT_CODE)
+    }
 }
 
 pub(crate) const JOURNAL_SCENARIO: &str = "journal";

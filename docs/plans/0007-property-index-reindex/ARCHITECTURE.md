@@ -90,10 +90,10 @@ The plan follows compaction's open protocol exactly, canonicalizing the director
 
 | Boundary / cutpoint | Preconditions | Published or durable change | Returned-error state and named regression | Abrupt-exit state and named regression | Reconciliation |
 | --- | --- | --- | --- | --- | --- |
-| Spill files written in the run's subdirectory under `--work-directory`, which `apply` creates before the first spill (after `open_prepared`; a cancelled confirmation leaves nothing behind); `index-reindex.before-spill-cleanup` fires once the sort has returned its iterator and before the first index record is appended, with every spill file still on disk | plan replanned under the lock; residue policy evaluated in the plan (the plan refuses a froe-named subdirectory left by an earlier run in an operator-named directory and warns about one under the default) | files outside the store only | subdirectory removed on return — `a_spill_failure_removes_the_run_subdirectory_and_leaves_the_store_unchanged` (0708) | leftover files in the run's subdirectory, never in the store — `a_death_before_spill_cleanup_leaves_no_file_in_the_store` (0708) | operator removes the subdirectory |
-| Index records appended (`index-reindex.before-head-publish`), then the definition rewritten — hidden children replaced or dropped unless flagged `retainNodeInReindex`, `reindex` set to `false`, `reindexCount` incremented, `corrupt` removed, a counter's `seed` created when absent, `:disableIndexesOnNextCycle` under the disabler's verdict, a parked `async = async-reindex` property removed, every other property and visible child preserved by identity (under a reset: only the rewritten definition node, its hidden children gone, and the spine) | fresh archive number above every physical name, at the head's generation | new archives only, unreachable from the head | store unchanged plus unreferenced archives at the head's generation — `an_error_before_head_publish_leaves_the_head_and_every_definition_as_they_were` (0708) | same — `a_death_before_head_publish_leaves_the_head_resolving_the_old_records` (0708) | a later `froe compact` copies the live content into a fresh generation and retires every older archive, these included; they are never referenced by a checkpoint, having never been published (the superseded records of a *successful* run are the ones every lane checkpoint pins, which the Resources section states); they are not "interrupted-run residue" to the planner, which reserves that name for segments stamped *ahead* of the head |
-| Head publication (`compare_and_set_head`, then `flush`; `index-reindex.after-head-publish-before-flush`) | every new subtree verified through the open session; the store was opened with `open_prepared` | `compare_and_set_head` changes nothing on disk; `flush` seals and fsyncs the archive, syncs the directory, validates the finalized session, then appends one journal line naming the new head | old head before the journal append, new head after it, never partial — `an_error_after_head_publish_before_flush_leaves_the_journal_naming_the_old_head` (0708) | same — `a_death_between_head_publish_and_flush_leaves_one_resolvable_head` (0708) | either head resolves; the loser's records are garbage |
-| Applied-state verification (`index-reindex.before-applied-verification`) | head published | none | reports the mismatch, store already final — `a_failed_applied_state_verification_reports_rather_than_repairs` (0708) | not applicable — the head is published and durable before this boundary | rerun the check |
+| Spill files written in the run's subdirectory under `--work-directory`, which `apply` creates before the first spill (after `open_prepared`; a cancelled confirmation leaves nothing behind); `index-reindex.before-spill-cleanup` fires once the sort has returned its iterator and before the first index record is appended, with every spill file still on disk | plan replanned under the lock; residue policy evaluated in the plan (the plan refuses a froe-named subdirectory left by an earlier run in an operator-named directory and warns about one under the default) | files outside the store only | subdirectory removed on return — `a_spill_failure_removes_the_run_subdirectory_and_leaves_the_store_unchanged` (armed, 0708) | leftover files in the run's subdirectory, never in the store — `a_death_before_spill_cleanup_leaves_no_file_in_the_store` (armed, 0708; the retry against the leftover subdirectory is asserted there too) | operator removes the subdirectory |
+| Index records appended (`index-reindex.before-head-publish`), then the definition rewritten — hidden children replaced or dropped unless flagged `retainNodeInReindex`, `reindex` set to `false`, `reindexCount` incremented, `corrupt` removed, a counter's `seed` created when absent, `:disableIndexesOnNextCycle` under the disabler's verdict, a parked `async = async-reindex` property removed, every other property and visible child preserved by identity (under a reset: only the rewritten definition node, its hidden children gone, and the spine) | fresh archive number above every physical name, at the head's generation | new archives only, unreachable from the head | store unchanged plus unreferenced archives at the head's generation — `an_error_before_head_publish_leaves_the_head_and_every_definition_as_they_were` (armed, 0708; it runs the later `froe compact` and asserts the orphan archives are gone by name) | same — `a_death_before_head_publish_leaves_the_head_resolving_the_old_records` (armed, 0708) | a later `froe compact` copies the live content into a fresh generation and retires every older archive, these included; they are never referenced by a checkpoint, having never been published (the superseded records of a *successful* run are the ones every lane checkpoint pins, which the Resources section states); they are not "interrupted-run residue" to the planner, which reserves that name for segments stamped *ahead* of the head |
+| Head publication (`compare_and_set_head`, then `flush`; `index-reindex.after-head-publish-before-flush`) | every new subtree verified through the open session; the store was opened with `open_prepared` | `compare_and_set_head` changes nothing on disk; `flush` seals and fsyncs the archive, syncs the directory, validates the finalized session, then appends one journal line naming the new head | old head before the journal append, new head after it, never partial — `an_error_after_head_publish_before_flush_leaves_the_journal_naming_the_old_head` (armed, 0708) | same — `a_death_between_head_publish_and_flush_leaves_one_resolvable_head` (armed, 0708) | either head resolves; the loser's records are garbage |
+| Applied-state verification (`index-reindex.before-applied-verification`) | head published | none | reports the mismatch, store already final — `a_failed_applied_state_verification_reports_rather_than_repairs` (armed, 0708) | not applicable — the head is published and durable before this boundary | rerun the check |
 
 ### Task graph
 
@@ -234,8 +234,25 @@ store changed.
 The [`### Mutation and publication order`](#mutation-and-publication-order)
 section above **is** this safety case's table. It is cited rather than copied,
 so a later edit cannot leave two versions to review. Each row names the
-regression test the task that arms its cutpoint will add; task 0708 fills
-those names in as it arms them.
+regression test that arms its cutpoint. Task 0708 armed all four —
+`index-reindex.before-spill-cleanup`, `index-reindex.before-head-publish`,
+`index-reindex.after-head-publish-before-flush` and
+`index-reindex.before-applied-verification` — in
+`writer/fault_injection/index_reindex.rs`, each in both fault models where
+the states differ, and each verified to fail when its cutpoint is removed.
+
+One fact the table's **Reconciliation** column depends on, which task 0708
+had to add to the apply to make true: the session is closed on *every* path,
+not only the successful one. Closing writes the open archive's graph, catalog
+and index trailers, so what a returned error leaves behind is an
+*unreferenced* archive rather than a damaged one — and a later `froe compact`
+retires it silently instead of refusing the store until an operator
+authorizes an index repair. A run that failed after `compare_and_set_head`
+puts the session's head back before closing, since the head lives in memory
+until `flush` appends the journal line and closing would otherwise publish
+the run that just failed. Abrupt death is the other story and always was:
+it leaves an archive without trailers, which is the damage froe's compact
+already recognizes and repairs under an operator's authorization.
 
 #### Interruption prefixes
 
@@ -343,9 +360,26 @@ output.
 
 #### Fault and subprocess tests
 
+Every row is a test in `writer/fault_injection/index_reindex.rs`, run in the
+framework's forked child: the error child exits `VERIFIED_EXIT_CODE` after its
+own assertions and the crash child `CRASH_EXIT_CODE` at the cutpoint itself,
+so a test whose cutpoint was removed fails on the exit code rather than
+passing quietly. Each was checked that way — the cutpoint deleted, the test
+run, the failure observed, the cutpoint restored.
+
 | Cutpoint | Fault model | Named test | Asserted prefix |
 | --- | --- | --- | --- |
-| *To be filled by task 0708 as it arms each cutpoint named in the mutation table above.* | | | |
+| `index-reindex.before-spill-cleanup` | returned error | `a_spill_failure_removes_the_run_subdirectory_and_leaves_the_store_unchanged` | Every file of the store byte-identical (`repo.lock` excepted, which the child held), `/oak:index/title` digesting exactly as the run found it, and the run's subdirectory gone — a returned error removes it. |
+| `index-reindex.before-spill-cleanup` | abrupt `_exit` | `a_death_before_spill_cleanup_leaves_no_file_in_the_store` | The same store prefix, and the spill files still in the run's subdirectory, since nothing ran to remove them. The test then reacquires the lock through a retry and asserts the operator-named directory refuses the residue, clears it, and reruns to the same published post-state. |
+| `index-reindex.before-head-publish` | returned error | `an_error_before_head_publish_leaves_the_head_and_every_definition_as_they_were` | The same store prefix, plus new archives holding records nothing reachable from the head refers to. The test then runs a full `froe compact` and asserts every archive the failed run added is gone by name — which only holds because the session is closed on the error path and the archive therefore carries its trailers. |
+| `index-reindex.before-head-publish` | abrupt `_exit` | `a_death_before_head_publish_leaves_the_head_resolving_the_old_records` | The same store prefix, and the retry assertion above. Death leaves the archive without trailers, which is the writer-killed damage `froe compact` already repairs under an operator's authorization — so the compaction assertion is deliberately not made here. |
+| `index-reindex.after-head-publish-before-flush` | returned error | `an_error_after_head_publish_before_flush_leaves_the_journal_naming_the_old_head` | Byte for byte the same prefix as the pre-publication row, asserted by the same helper: `compare_and_set_head` writes nothing, so there is no third state to assert. The failed run puts the session's head back before closing, so closing cannot publish it. |
+| `index-reindex.after-head-publish-before-flush` | abrupt `_exit` | `a_death_between_head_publish_and_flush_leaves_one_resolvable_head` | The same prefix, one resolvable head, and the retry assertion. |
+| `index-reindex.before-applied-verification` | returned error | `a_failed_applied_state_verification_reports_rather_than_repairs` | The head *has* moved — this boundary is after publication — the rebuilt `:index` is published and stays published, and the store passes `check_consistency`. Nothing was rolled back: the run reports. |
+
+There is no abrupt-death row for `index-reindex.before-applied-verification`:
+the head is published and durable before the boundary, so death there leaves
+the successful run's post-state and there is no distinct prefix to assert.
 
 #### Interoperability
 

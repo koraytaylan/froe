@@ -16,6 +16,8 @@ use std::ffi::OsStr;
 // harness is Unix-only. The `*_if_armed` helpers below stay available on
 // every target, because production code calls them under `cfg(test)`.
 #[cfg(unix)]
+mod index_reindex;
+#[cfg(unix)]
 mod journal;
 #[cfg(unix)]
 mod manifest;
