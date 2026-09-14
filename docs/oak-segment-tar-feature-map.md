@@ -131,7 +131,7 @@ proves and the exit codes `froe index check` contracts.
 | `--index-definitions` | `IndexDefinitionPrinter`, `JsonSerializer` | `froe index definitions` | **Implemented** |
 | `--index-consistency-check` | `IndexConsistencyChecker` | `froe index check` | **Implemented** (Lucene level 1; level 2 **Planned** in plan 0008. The property family's check is froe's own: oak-run ignores every definition whose type is not `lucene`.) |
 | `--index-dump` | `LuceneIndexDumper` | — | **Planned** in plan 0008 |
-| `--reindex` | `OutOfBandIndexer`, `IndexUpdate` | — | **Planned** in plans 0007 and 0009 |
+| `--reindex` | `OutOfBandIndexer`, `IndexUpdate` | `froe index reindex` | **Implemented** for the property family — `property`, `unique`, `reference`, `counter` (beta until plan 0007's review freezes). A froe extension: Oak has no offline reindex that writes the result back, and rebuilds synchronously inside the first commit after startup instead. Fulltext-enabled `lucene` definitions are **Planned** in plans 0009 and 0010. |
 | `--index-import` | `IndexImporter`, `IndexDefinitionUpdater` | — | **Planned** in plan 0010 |
 
 ### The `froe` command surface
@@ -175,6 +175,7 @@ safely; archive rewrites have the additional hard-link requirement noted below:
 | Command | Purpose |
 | --- | --- |
 | `froe compact REPOSITORY [--tail] [--dry-run] [--yes] [--skip-*]` | The one maintenance command: offline full or tail compaction, the reclamation it makes possible, and the journal retirement, in one run. Every plan reports orphaned version histories, and every confirmed full run purges them; an index-less archive is repaired and old recovery backups are removed, each behind its own yes/no question (`--yes` answers all, `--skip-purging-orphaned-version-histories` / `--skip-repairing-archive-indexes` / `--skip-removing-recovery-backups` decline one). A full compaction that would only swap identical generations is gated off with `the head is already fully compacted` in the plan (`--always-copy` overrides). `--dry-run` previews it read-only. Archive rewrites require same-directory hard-link support. |
+| `froe index reindex REPOSITORY [--index PATH]… [--dry-run] [--yes] [--work-directory DIRECTORY] [--from-head] [--sort-budget-mebibytes N]` | Rebuild flagged property, unique, reference and counter indexes offline, from the state Oak's own editors would index — one head move under the lock, one journal line, the content tree untouched. `--dry-run` previews it read-only without the lock. `--from-head` is consulted only for a definition whose lane cannot be resolved, and resets a counter rather than rebuilding it. See [`index.md`](index.md) §5. Beta until plan 0007's review freezes. |
 | `froe backup SOURCE TARGET` | Copy a repository's head into a target store. |
 | `froe restore BACKUP TARGET` | Copy a backup's head into an existing store. |
 | `froe recover-journal REPOSITORY` | Rebuild `journal.log` from the segments. |

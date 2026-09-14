@@ -57,6 +57,72 @@ pub(crate) enum IndexAction {
         #[arg(long = "index", value_name = "PATH")]
         indexes: Vec<String>,
     },
+    /// Rebuild flagged indexes offline, from the state Oak's own editors
+    /// would index.
+    ///
+    /// Takes the repository lock and moves the head exactly once. The
+    /// repository must be offline: no Oak instance may be running against
+    /// it, and no other froe run may hold the lock.
+    ///
+    /// The one irreversible consequence: the index records this run
+    /// replaces become unreachable from the head. They stay live through
+    /// every checkpoint that references them — each lane's checkpoint does,
+    /// by construction, since a checkpoint pins the content root — and are
+    /// reclaimed only by a `froe compact` run after those checkpoints are
+    /// released. A reindex therefore grows the store until then, and the
+    /// summary names the checkpoints that pin the old records.
+    Reindex {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Restrict to this definition path; repeatable. A definition named
+        /// here is always answered — rebuilt, or refused by name with the
+        /// reason. Without it, every definition flagged `reindex = true` is
+        /// considered, exactly as Oak's own cycle considers them.
+        #[arg(long = "index", value_name = "PATH")]
+        indexes: Vec<String>,
+        /// Plan without taking the lock and without writing anything, then
+        /// print what a run would do.
+        #[arg(long)]
+        dry_run: bool,
+        /// Answer yes to the plan confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Spill the sort's runs here instead of in the system temporary
+        /// directory.
+        ///
+        /// The run creates one subdirectory named from the store's path and
+        /// holds a lock in it, so runs on different stores never collide
+        /// and a live run is never mistaken for residue. A froe-named
+        /// subdirectory left by an earlier run is refused here, because the
+        /// directory is yours: under the default it is only a warning.
+        ///
+        /// The default is the system temporary directory, which on many
+        /// Linux systems is a tmpfs held in memory — a large reindex can
+        /// exhaust it. Name a directory on disk for a large store.
+        #[arg(long, value_name = "DIRECTORY")]
+        work_directory: Option<PathBuf>,
+        /// Rebuild from the head when a definition's lane checkpoint is
+        /// dangling, or its lane is absent from `/:async`.
+        ///
+        /// Consulted only then: a definition whose lane resolves is always
+        /// rebuilt from that lane's checkpoint, and this flag is ignored.
+        ///
+        /// For a mirror or unique index this is the explicit choice to
+        /// index the head instead: the lane's own replay leaves every entry
+        /// unchanged, and only the randomized `:count_*` estimates drift.
+        /// For a counter it is the choice to *reset* — the hidden children
+        /// are removed and nothing is built, so Oak's own replay rebuilds
+        /// the counter from scratch. A rebuilt counter would be doubled by
+        /// that replay whether or not froe ran.
+        #[arg(long)]
+        from_head: bool,
+        /// How much of the sort may stay resident before it spills, in
+        /// mebibytes. Higher is faster and uses more memory; the run's
+        /// residency does not otherwise grow with the number of indexed
+        /// nodes.
+        #[arg(long, value_name = "N")]
+        sort_budget_mebibytes: Option<usize>,
+    },
 }
 
 impl IndexAction {
@@ -65,7 +131,8 @@ impl IndexAction {
         match self {
             IndexAction::List { repository, .. }
             | IndexAction::Definitions { repository, .. }
-            | IndexAction::Check { repository, .. } => repository,
+            | IndexAction::Check { repository, .. }
+            | IndexAction::Reindex { repository, .. } => repository,
         }
     }
 }

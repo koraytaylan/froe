@@ -15,6 +15,7 @@ mod compaction_report;
 mod compaction_summary;
 mod content_display;
 mod index_display;
+mod index_reindex;
 mod inspection;
 mod mutation;
 mod output;
@@ -362,6 +363,32 @@ pub(crate) fn run_mutating_command(
 /// refused.
 fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode> {
     let repository_path = action.repository().to_path_buf();
+    // The reindex takes the lock and writes, so it must not go through the
+    // read-only open every other `index` subcommand shares.
+    if let IndexAction::Reindex {
+        indexes,
+        dry_run,
+        yes,
+        work_directory,
+        from_head,
+        sort_budget_mebibytes,
+        ..
+    } = action
+    {
+        let command_line = index_reindex::ReindexCommandLine {
+            indexes,
+            dry_run,
+            assume_yes: yes,
+            work_directory,
+            from_head,
+            sort_budget_mebibytes,
+        };
+        return if index_reindex::run_reindex(&repository_path, &command_line, reporter)? {
+            Ok(ExitCode::SUCCESS)
+        } else {
+            Ok(ExitCode::FAILURE)
+        };
+    }
     let repository = open_repository(&repository_path, reporter)?;
     match action {
         IndexAction::List { indexes, .. } => {
@@ -382,6 +409,7 @@ fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode>
             let outcome = index_display::check_indexes(&repository, &indexes, reporter)?;
             return Ok(ExitCode::from(outcome.exit_code()));
         }
+        IndexAction::Reindex { .. } => unreachable!("handled above, before the read-only open"),
     }
     Ok(ExitCode::SUCCESS)
 }

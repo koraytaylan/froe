@@ -246,12 +246,150 @@ justifies.
 A budget refusal names the definition, and the remedy is to narrow `--index`
 past it.
 
-## 5. What is not here yet
+## 5. `froe index reindex`
+
+The one `index` subcommand that writes. It rebuilds the indexes Oak has
+flagged, offline, from the state Oak's own editors would have indexed —
+without an Oak runtime, and without the hours of blocked startup Oak's own
+synchronous reindex costs on a large store.
+
+> **Beta.** The rebuild is proven against Oak's own reindex of the same
+> store, but the review that freezes that evidence has not run yet. Take a
+> backup first, and compare with `froe index check` afterwards.
+
+```
+froe index reindex REPOSITORY [--index PATH]… [--dry-run] [--yes]
+                   [--work-directory DIRECTORY] [--from-head]
+                   [--sort-budget-mebibytes N]
+```
+
+The repository must be offline: no Oak instance may be running against it.
+The run takes the repository lock from planning through publication and
+moves the head exactly once, appending one journal line.
+
+### 5.1 What it rebuilds, and from what
+
+| `type` | What is written | Indexed from |
+| --- | --- | --- |
+| `property` | `:index/<key>/<path…>` with `match = true` — Oak's `ContentMirrorStoreStrategy` | the head, or the definition's lane checkpoint |
+| `property` with a strict `BOOLEAN` `unique = true` | `:index/<key>` with `entry` holding the absolute path — `UniqueEntryStoreStrategy` | the same |
+| `reference` | `:references` and `:weakreferences`, keyed by the referenced identifier unencoded | the same |
+| `counter` | `:index`, one node per counted path carrying `:cnt` | the same |
+
+A definition with no `async` property is rebuilt from the head. One that
+names a lane is rebuilt from **that lane's checkpoint**, not the head:
+an asynchronous index is exactly as current as its lane, and indexing the
+head would move it forward silently, past entries Oak's own lane has not
+reached.
+
+Everything else is refused by name rather than approximated — `lucene`
+(plan 0010), `elasticsearch`, `disabled`, `ordered`, an unknown type, a
+`valuePattern` regular expression froe does not evaluate, a definition
+carrying a composite mount's index data, a path filter Oak cannot construct,
+a definition nested under a content node, a node that is not an
+`oak:QueryIndexDefinition`, a lane mid-run at `/:async/async-reindex`, and a
+multi-valued `reindexCount`. A definition you name with `--index` is always
+answered: rebuilt, or refused with the reason. Without `--index`, every
+definition flagged `reindex = true` is considered, exactly as Oak's own
+cycle considers them.
+
+### 5.2 `--from-head`
+
+Consulted only when a definition's lane checkpoint is dangling, or its lane
+is absent from `/:async`. A definition whose lane resolves ignores it.
+
+For a mirror or unique index it is the explicit choice to index the head
+instead. That is safe: the lane's own replay re-inserts the same entries,
+leaving `match` and `entry` unchanged, and only the randomized `:count_*`
+estimates drift.
+
+For a **counter** it is the choice to *reset*. The hidden children are
+removed, nothing is built, and Oak's own replay rebuilds the counter from
+scratch. That is not a lesser outcome: Oak's replay after a lost checkpoint
+doubles every counter on the lane whether or not froe ran, so a rebuilt
+counter would be wrong and a removed one is right. The visible properties
+are untouched and `reindexCount` is left alone. A rerun reports
+`nothing to do`.
+
+### 5.3 The work directory
+
+The sort spills to disk so a rebuild's memory does not grow with the number
+of indexed nodes. `--work-directory` says where; the default is the system
+temporary directory, **which on many Linux systems is a tmpfs held in
+memory** — name a directory on disk for a large store.
+
+The run creates one subdirectory there, named from the store's path and
+locked for the run's duration, so runs against different stores never
+collide and a live run is never mistaken for residue. It is removed on
+return, whatever the outcome.
+
+A froe-named subdirectory left behind by a run that was killed is
+**refused** in a directory you named — it is your directory, and froe does
+not delete what it did not create in it — and only **warned about** under
+the default. The remedy either way: remove the subdirectory and rerun.
+
+`--sort-budget-mebibytes` raises how much stays resident before spilling.
+Higher is faster and uses more memory.
+
+### 5.4 What the plan prints, and what the summary reports
+
+`--dry-run` plans read-only, takes no lock and writes nothing. Otherwise the
+plan is printed under the lock, before the confirmation, so what you approve
+is what will run:
+
+```
+reindex plan for /var/aem/segmentstore
+  rebuild /oak:index/uuid from the head: 51,204 entries, 2.1 MiB to sort
+  nothing to do for /oak:index/counter: it has no hidden child to remove
+  warning: /oak:index/lucene-fulltext is a lucene definition, which this froe version does not rebuild
+  work directory /var/tmp (up to 130 MiB for one definition's spill)
+  the index records this run replaces stay live through every checkpoint that references them, and are reclaimed only by a later `froe compact`
+```
+
+A scripted run without `--yes` plans and cancels, naming the flag. The
+summary afterwards is built from what happened, not from the plan:
+
+```
+  /oak:index/uuid: 51,204 entries, 51,204 distinct keys, 68,391 index nodes
+reindexed 1 index; head 8f3c….0000002a -> 2b91….0000010c
+the replaced index records stay live through 2 checkpoints: …, …. They are
+reclaimed only by a `froe compact` run after those are released.
+```
+
+### 5.5 What a run refuses, after it has started
+
+Two refusals land during the apply rather than the plan, because neither can
+be known until the entries are read:
+
+A **duplicate unique key** — two distinct nodes carrying the same value for
+a definition with `unique = true`. Oak's own commit refuses to create the
+second, so a store holding both is one Oak could not have produced, and froe
+will not write an index asserting otherwise. The refusal names the key and
+the paths, and lands before anything is published.
+
+An **entry budget** exhaustion from the publication tail, which verifies the
+subtree it just built against the content it indexes under a budget of the
+collected entry count plus one. Reaching it means the written index holds
+more entries than the walk produced, which is a bug rather than a data
+condition; the head does not move, and the run should be reported.
+
+### 5.6 What a reindex costs
+
+The records the run replaces become unreachable from the head — but they are
+not garbage. Every checkpoint that references them keeps them live, and each
+lane's checkpoint does by construction, since a checkpoint pins the content
+root. They are reclaimed only by a `froe compact` run after those
+checkpoints are released.
+
+So **a reindex grows the store until the next compaction**. That is the
+honest cost, the plan says so, and the summary names the checkpoints that
+pin them.
+
+## 6. What is not here yet
 
 | Subcommand | Plan |
 | --- | --- |
 | `froe index dump` — Lucene index data to a filesystem directory | 0008 |
-| `froe index reindex` — offline rebuild of the property family | 0007 |
 | `froe index reindex` for fulltext-enabled Lucene definitions | 0009 |
 | `froe index import` — oak-run's filesystem transport back into a store | 0010 |
 

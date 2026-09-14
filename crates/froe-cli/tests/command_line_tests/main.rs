@@ -11,6 +11,7 @@ mod compaction_decisions;
 mod diagnostics;
 mod export;
 mod index;
+mod index_reindex;
 mod reporting;
 mod support;
 
