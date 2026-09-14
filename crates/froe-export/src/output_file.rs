@@ -7,26 +7,11 @@ use std::path::Path;
 /// An already existing directory outside the repository is fine; only
 /// files are guarded against reuse, by [`create_export_output`].
 pub fn create_export_directory(repository_path: &Path, directory: &Path) -> froe::Result<()> {
-    let repository_directory = std::fs::canonicalize(repository_path)?;
-    // The directory may not exist yet, and only existing paths
-    // canonicalize; check the nearest existing ancestor, so symlinks on
-    // the way in cannot smuggle the directory into the repository.
-    let mut existing_ancestor = directory;
-    while !existing_ancestor.exists() {
-        existing_ancestor = match existing_ancestor.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-    }
-    if std::fs::canonicalize(existing_ancestor)?.starts_with(&repository_directory) {
-        return Err(froe::Error::InvalidFormat {
-            details: format!(
-                "output directory {} is inside the repository directory; a stray entry \
-                 there could be mistaken for damage at the next open",
-                directory.display()
-            ),
-        });
-    }
+    // The inside-the-repository rule lives in `froe`, because
+    // `froe index dump` needs the same one and this crate depends on that
+    // one. The error text and the nearest-existing-ancestor canonicalization
+    // are unchanged; only their home is.
+    froe::tooling::output_directory::refuse_output_inside_repository(repository_path, directory)?;
     std::fs::create_dir_all(directory)?;
     Ok(())
 }

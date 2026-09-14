@@ -12,6 +12,7 @@ pub mod check;
 pub mod diff;
 pub mod digest;
 pub mod history;
+pub mod output_directory;
 pub mod search;
 pub mod segment_dump;
 
