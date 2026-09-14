@@ -241,4 +241,31 @@ addressing, and building), `content` (records to node states), `journal`,
 status nodes, the property family's and Lucene's index storage, and the
 inventory over them).
 Custom backends implement the `SegmentProvider` and `SegmentSink` traits and
-reuse the whole content and writer layers unchanged.
+reuse the whole content and writer layers unchanged. Rebuilding an index from
+a program rather than from the command line goes through `writer::reindex`
+and its planned and observed twins; §7 says what each type's rebuild
+produces.
+
+## 7. Indexing
+
+What the library rebuilds, as distinct from §3's commands. oak-run's
+`--reindex` drives Oak's own `IndexUpdate` through `OutOfBandIndexer`; froe
+rebuilds the same storage from the same state without an Oak runtime, under
+`froe compact`'s open protocol — one lock, one head move, one journal line,
+and a content tree that is never rewritten.
+
+| Feature | Java | froe | Status |
+| --- | --- | --- | --- |
+| Property index rebuild (`ContentMirrorStoreStrategy`) | `PropertyIndexEditor`, `ContentMirrorStoreStrategy` | `writer::index::reindex`, `plan_reindex`, `PreparedReindex` | **Implemented** (beta until plan 0007's review freezes) |
+| Unique index rebuild (`UniqueEntryStoreStrategy`) | `PropertyIndexEditor`, `UniqueEntryStoreStrategy` | the same entry point, selected by the definition's strict `unique` | **Implemented** (beta; a duplicate key is an apply-time refusal, before publication) |
+| Reference index rebuild | `ReferenceEditor` | the same entry point, `:references` and `:weakreferences` | **Implemented** (beta) |
+| Counter index rebuild | `NodeCounterEditor`, `SipHash` | the same entry point; a definition with no `seed` gains one | **Implemented** (beta; a counter on an unresolvable lane is reset for Oak's replay rather than rebuilt) |
+| Lucene index rebuild | `LuceneIndexEditor` | — | **Planned** in plan 0010 |
+| Out-of-band indexing to a new store | `OutOfBandIndexer` | — | **Not planned**; froe rebuilds in place under the repository lock |
+| Async lane checkpoint as the indexed state | `AsyncIndexUpdate`, `/:async` | the lane's checkpoint, or the head under `from_head` | **Implemented** |
+
+The rebuild is bounded in memory rather than in the JVM heap: entries spill
+to a work directory and merge k-way, so a rebuild's residency does not grow
+with the number of indexed nodes. See
+[`plans/0007-property-index-reindex/ARCHITECTURE.md`](plans/0007-property-index-reindex/ARCHITECTURE.md)
+for the safety case and what each mutation is guarded by.

@@ -18,7 +18,7 @@ mod apply;
 mod apply_identity;
 mod checkpoints;
 mod file_removal;
-mod gate_observation;
+pub(crate) mod gate_observation;
 mod indexless_refusal;
 /// Everything maintenance does with the journal: classifying its lines,
 /// and rewriting the file that holds them.
@@ -39,15 +39,6 @@ mod temporaries;
 pub(crate) use self::options::MaintenanceTask;
 // The open protocol's gates, for the index module's own prepare. See
 // `planning/mod.rs` for why they are widened rather than moved.
-//
-// The expectations name task 0707, whose `PreparedReindex::prepare` is their
-// first caller: this is a `refactor:` commit that lands the exposure apart
-// from the mutating diff it serves, as `CONTRIBUTING.md` asks, so the
-// re-exports are deliberately ahead of their use and say so.
-#[expect(
-    unused_imports,
-    reason = "task 0707's PreparedReindex::prepare is the first caller"
-)]
 pub(crate) use self::apply_identity::{
     validate_apply_environment, validate_apply_identity, validate_metadata_source_apply_identity,
 };
@@ -57,10 +48,6 @@ pub use self::plan::{
     ExternalBinaryFootprint, FileDeletionFailure, JournalLineRemoval, JournalRemovalReason,
     OrphanedVersionHistoryReport, StaleArchiveReason,
 };
-#[expect(
-    unused_imports,
-    reason = "task 0707's PreparedReindex::prepare is the first caller"
-)]
 pub(crate) use self::planning::{
     DirectoryFingerprint, available_filesystem_bytes, canonical_repository_directory,
     directory_fingerprint, validate_repository_shape,

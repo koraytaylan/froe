@@ -20,6 +20,7 @@ use froe::checksum::crc32;
 pub(crate) mod filesystem_snapshot;
 pub(crate) mod observation_log;
 pub(crate) mod property_index_layout;
+pub(crate) mod reindex_fixtures;
 
 /// The map-entry hash, implemented independently of the production
 /// `froe::hashing` module: `(String.hashCode(name) ^ M) * M + A` with the

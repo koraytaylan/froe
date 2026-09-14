@@ -213,14 +213,8 @@ pub(super) fn planned_metadata_sources(
 /// `flush`, so without the gate the failure would surface only after every
 /// record had been written.
 #[cfg(unix)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "task 0707's PreparedReindex::prepare is the first production caller"
-    )
-)]
 pub(crate) fn validate_metadata_source_apply_identity(directory: &Path) -> Result<()> {
+    super::gate_observation::record("validate_metadata_source_apply_identity", directory);
     validate_metadata_source_apply_identity_for_credentials(
         directory,
         &current_apply_credentials()?,
@@ -230,13 +224,6 @@ pub(crate) fn validate_metadata_source_apply_identity(directory: &Path) -> Resul
 /// The same gate against supplied credentials, so a test can model an
 /// identity the process does not have.
 #[cfg(unix)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reached through validate_metadata_source_apply_identity, task 0707's"
-    )
-)]
 pub(super) fn validate_metadata_source_apply_identity_for_credentials(
     directory: &Path,
     credentials: &ApplyCredentials,
@@ -279,15 +266,8 @@ pub(super) fn validate_metadata_source_apply_identity_for_credentials(
 /// On a platform without Unix ownership there is nothing to preserve and
 /// nothing to refuse.
 #[cfg(not(unix))]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "task 0707's PreparedReindex::prepare is the first production caller"
-    )
-)]
 pub(crate) fn validate_metadata_source_apply_identity(directory: &Path) -> Result<()> {
-    let _ = directory;
+    super::gate_observation::record("validate_metadata_source_apply_identity", directory);
     Ok(())
 }
 

@@ -9,11 +9,17 @@ touches:
   - crates/froe/src/writer/index/plan.rs
   - crates/froe/src/writer/index/prepared.rs
   - crates/froe/src/writer/index/apply.rs
+  - crates/froe/src/writer/index/apply/verification.rs
   - crates/froe/src/writer/index/apply/tests.rs
   - crates/froe/src/writer/index/mod.rs
   - crates/froe/src/writer/mod.rs
   - crates/froe/src/lib.rs
+  - crates/froe/src/writer/maintenance/mod.rs
+  - crates/froe/src/writer/maintenance/apply_identity.rs
   - crates/froe/tests/index_reindex_tests.rs
+  - crates/froe/tests/index_reindex_selection_tests.rs
+  - crates/froe/tests/support/mod.rs
+  - crates/froe/tests/support/reindex_fixtures.rs
   - docs/oak-segment-tar-feature-map.md
 status: planned
 merged_as: ""
