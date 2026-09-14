@@ -675,3 +675,58 @@ pub(crate) fn a_purge_is_reported_selected_by_default_and_summarized() {
         "the purge converges with the gate: {repeat_stdout}"
     );
 }
+
+/// A compaction plan warns about every definition Oak has flagged for
+/// reindex, because that is the one fact predicting a multi-hour AEM
+/// startup and the operator is holding the store open right now.
+#[test]
+pub(crate) fn a_compaction_plan_warns_about_a_pending_reindex() {
+    let directory = TestDirectory::new("cleanup-pending-reindex");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    crate::index_reindex::build_flagged_store(&store);
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--dry-run"])
+        .output()
+        .expect("run the compaction dry-run");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    assert!(
+        stderr.contains(
+            "pending reindex: /oak:index/subject (property; froe index reindex rebuilds it offline)"
+        ),
+        "the warning names the definition, its type and the remedy: {stderr}"
+    );
+    // Advisory: the plan's own output is unchanged, and nothing was added
+    // to what the run would do.
+    assert!(
+        !stdout.contains("pending reindex"),
+        "a warning must not reach standard output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("froe index reindex"),
+        "the plan gains no action and no remedy of its own: {stdout}"
+    );
+}
+
+/// And a store with nothing flagged prints nothing new.
+#[test]
+pub(crate) fn a_compaction_plan_without_a_flagged_definition_warns_about_nothing() {
+    let directory = TestDirectory::new("cleanup-no-pending-reindex");
+    let store = directory.path.join("segmentstore");
+    std::fs::create_dir_all(&store).expect("create store directory");
+    populate(&store);
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_froe"))
+        .args(["compact", store.to_str().expect("path"), "--dry-run"])
+        .output()
+        .expect("run the compaction dry-run");
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    assert!(
+        !stderr.contains("pending reindex"),
+        "nothing is flagged, so nothing is warned about: {stderr}"
+    );
+}

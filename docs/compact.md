@@ -109,6 +109,24 @@ line, structured reason, optional record identifier, and an exact bounded
 byte-string prefix; non-ASCII and control bytes are escaped rather than decoded
 or sent to the terminal.
 
+A plan also warns about every index definition Oak has flagged for reindex:
+
+```
+froe: warning: pending reindex: /oak:index/uuid (property; froe index reindex rebuilds it offline)
+```
+
+That is the one fact predicting a multi-hour AEM startup, and an operator
+compacting before a restart is holding the store open at exactly the moment
+it is cheap to read. Oak rebuilds a flagged definition synchronously inside
+the first commit after startup; `froe index reindex` rebuilds the property
+family offline instead (see [`index.md`](index.md) §5), and the warning says
+so — or says the type is one froe does not rebuild, so Oak will.
+
+The warning is **advisory**. It adds no action to the plan, changes no byte
+the run writes, and decides nothing; it goes to standard error with the
+other warnings, so a plan's standard output is byte-identical whether or not
+a definition is flagged. `froe compact` never reindexes.
+
 ## The convergence gate
 
 A selected copy is dropped from the plan when the planner proves it would
@@ -276,7 +294,7 @@ $ froe compact /path/to/segmentstore --yes
 ## What one run does
 
 There is nothing to select. Every run performs the same sequence, and the
-flags under [Opt-in behavior](#opt-in-behavior) add to it rather than replace
+flags under [The questions and their skip flags](#the-questions-and-their-skip-flags) add to it rather than replace
 it:
 
 | Stage | Behavior |

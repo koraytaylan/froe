@@ -623,6 +623,67 @@ fn gather_plan_facts(
     })
 }
 
+/// Warns about every definition Oak has flagged for reindex.
+///
+/// An operator running `froe compact` before restarting AEM has, at that
+/// moment, the one fact that predicts a multi-hour startup: whether any
+/// definition carries `reindex = true`. Oak rebuilds those synchronously
+/// inside the first commit after startup. The planner already has the head
+/// open, so reading the definitions costs nothing worth measuring.
+///
+/// Advisory only. This adds no action, changes no byte the run writes, and
+/// decides nothing — and it goes to standard error with the other warnings,
+/// so a plan's standard output is byte-identical whether or not a definition
+/// is flagged.
+///
+/// The flag is read exactly as `froe index reindex` reads it, through
+/// `IndexDefinition`, so the warning can never name a definition the reindex
+/// would not select or stay silent about one it would. A definition that
+/// cannot be modelled is passed over: diagnosing index definitions is
+/// `froe index list`'s job, not a compaction plan's.
+fn warn_about_pending_reindexes(repository: &crate::store::Repository, warnings: &mut Vec<String>) {
+    let Ok(Some(oak_index)) =
+        repository.node_at_path(&format!("/{}", crate::index::INDEX_DEFINITIONS_NAME))
+    else {
+        return;
+    };
+    let Ok(entries) = oak_index.child_node_entries() else {
+        return;
+    };
+    for (name, node) in entries {
+        let path = format!("/{}/{name}", crate::index::INDEX_DEFINITIONS_NAME);
+        let Ok(definition) = crate::index::IndexDefinition::read(&node, &path) else {
+            continue;
+        };
+        if !definition.reindex.flagged {
+            continue;
+        }
+        // The stored `type` verbatim, so the warning names what the
+        // definition says rather than what froe made of it.
+        let stored_type = node.property("type").ok().flatten();
+        let index_type =
+            crate::index::strict_string(stored_type.as_ref()).unwrap_or("no readable type");
+        let rebuildable = matches!(
+            definition.index_type,
+            Some(
+                crate::index::IndexType::Property
+                    | crate::index::IndexType::Reference
+                    | crate::index::IndexType::Counter
+            )
+        );
+        warnings.push(if rebuildable {
+            format!(
+                "pending reindex: {path} ({index_type}; froe index reindex rebuilds it offline)"
+            )
+        } else {
+            format!(
+                "pending reindex: {path} ({index_type}, which froe index reindex does not \
+                 rebuild; Oak rebuilds it at startup)"
+            )
+        });
+    }
+}
+
 pub(super) fn build_plan_collecting(
     directory: &Path,
     options: &CompactionOptions,
@@ -643,6 +704,7 @@ pub(super) fn build_plan_collecting(
         recovery_backups,
         manifest_upgrade,
     } = gather_plan_facts(directory, options, now, observer, warnings)?;
+    warn_about_pending_reindexes(&repository, warnings);
     let (orphaned_version_histories, version_history_purge) = version_history_plan_parts(
         &repository,
         current_head,

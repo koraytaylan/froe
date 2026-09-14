@@ -531,6 +531,14 @@ impl CompactionPlan {
     }
 
     /// Non-fatal deferrals and malformed metadata retained for safety.
+    ///
+    /// Also carries one advisory line per index definition Oak has flagged
+    /// for reindex — `pending reindex: <path> (<type>; …)` — because an
+    /// operator compacting before an AEM restart is holding the store open
+    /// at the moment that fact is cheap to read and expensive to miss. It
+    /// is advisory in the strict sense: no action is added to the plan, no
+    /// byte the run writes changes, and nothing about the run is decided by
+    /// it.
     #[must_use]
     pub fn warnings(&self) -> &[String] {
         &self.warnings
