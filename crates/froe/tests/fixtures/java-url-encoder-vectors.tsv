@@ -1,0 +1,98 @@
+# Known-answer vectors for java.net.URLEncoder.encode(String, StandardCharsets.UTF_8),
+# the last step of Oak's property-index key derivation
+# (docs/analysis/index-property-storage.md section 4).
+#
+# Columns, tab-separated: name, input as space-separated four-digit hexadecimal
+# UTF-16 code units (empty for the empty string), expected encoding.
+#
+# The input is given as code units rather than as text because the truncation
+# that precedes this step can cut a surrogate pair in half, and a lone
+# surrogate has no UTF-8 spelling to put in a file. Java replaces an unpaired
+# surrogate with the single byte 0x3F, so it encodes as %3F.
+#
+# Generated with the JDK inside the digest-pinned Sling image the interop suite
+# runs against, Temurin 21.0.10, by saving the jshell program below as
+# vectors.jsh and running:
+#
+#   podman run --rm -e HOME=/tmp -v "$PWD/vectors.jsh:/tmp/vectors.jsh:ro,Z" \
+#     --entrypoint jshell \
+#     docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9 \
+#     -s -J-Djava.util.prefs.userRoot=/tmp /tmp/vectors.jsh
+#
+# then prepending this header to its standard output. The program:
+#
+#   import java.net.URLEncoder;
+#   import java.nio.charset.StandardCharsets;
+#   import java.util.ArrayList;
+#   import java.util.List;
+#
+#   List<String[]> cases = new ArrayList<>();
+#   java.util.function.BiConsumer<String, String> add = (n, v) -> cases.add(new String[] {n, v});
+#   java.util.function.IntFunction<String> unit = cp -> new String(new char[] {(char) cp});
+#
+#   add.accept("empty", "");
+#   add.accept("unreserved-alphanumeric", "azAZ09");
+#   add.accept("unreserved-punctuation", ".-*_");
+#   add.accept("space", "a b");
+#   add.accept("plus-sign", "a+b");
+#   add.accept("colon", "sling:Folder");
+#   add.accept("slash", "a/b");
+#   add.accept("percent-sign", "100%");
+#   add.accept("tilde-is-encoded", "~");
+#   add.accept("exclamation-is-encoded", "!");
+#   add.accept("quote-and-backslash", "\"\\");
+#   add.accept("tab-and-newline", "\t\n");
+#   add.accept("nul", unit.apply(0x0000));
+#   add.accept("unit-separator", unit.apply(0x001F));
+#   add.accept("delete", unit.apply(0x007F));
+#   add.accept("c1-next-line", unit.apply(0x0085));
+#   add.accept("latin1-two-byte", "äöü");
+#   add.accept("greek-two-byte", "αβγ");
+#   add.accept("cjk-three-byte", "中文");
+#   add.accept("astral-four-byte", new String(new char[] {(char) 0xD83D, (char) 0xDE00}));
+#   add.accept("lone-high-surrogate", unit.apply(0xD83D));
+#   add.accept("lone-low-surrogate", unit.apply(0xDE00));
+#   add.accept("pair-then-lone-high", new String(new char[] {(char) 0xD83D, (char) 0xDE00, (char) 0xD83D}));
+#   add.accept("lone-low-then-pair", new String(new char[] {(char) 0xDE00, (char) 0xD83D, (char) 0xDE00}));
+#   add.accept("two-lone-highs", new String(new char[] {(char) 0xD83D, (char) 0xD83D}));
+#   add.accept("mixed", "a b:c/ä" + new String(new char[] {(char) 0xD83D, (char) 0xDE00}));
+#
+#   StringBuilder out = new StringBuilder();
+#   for (String[] c : cases) {
+#     StringBuilder units = new StringBuilder();
+#     for (int i = 0; i < c[1].length(); i++) {
+#       if (i > 0) units.append(' ');
+#       units.append(String.format("%04X", (int) c[1].charAt(i)));
+#     }
+#     out.append(c[0]).append('\t').append(units).append('\t')
+#        .append(URLEncoder.encode(c[1], StandardCharsets.UTF_8)).append('\n');
+#   }
+#   System.out.print(out);
+#   /exit
+#
+empty		
+unreserved-alphanumeric	0061 007A 0041 005A 0030 0039	azAZ09
+unreserved-punctuation	002E 002D 002A 005F	.-*_
+space	0061 0020 0062	a+b
+plus-sign	0061 002B 0062	a%2Bb
+colon	0073 006C 0069 006E 0067 003A 0046 006F 006C 0064 0065 0072	sling%3AFolder
+slash	0061 002F 0062	a%2Fb
+percent-sign	0031 0030 0030 0025	100%25
+tilde-is-encoded	007E	%7E
+exclamation-is-encoded	0021	%21
+quote-and-backslash	0022 005C	%22%5C
+tab-and-newline	0009 000A	%09%0A
+nul	0000	%00
+unit-separator	001F	%1F
+delete	007F	%7F
+c1-next-line	0085	%C2%85
+latin1-two-byte	00E4 00F6 00FC	%C3%A4%C3%B6%C3%BC
+greek-two-byte	03B1 03B2 03B3	%CE%B1%CE%B2%CE%B3
+cjk-three-byte	4E2D 6587	%E4%B8%AD%E6%96%87
+astral-four-byte	D83D DE00	%F0%9F%98%80
+lone-high-surrogate	D83D	%3F
+lone-low-surrogate	DE00	%3F
+pair-then-lone-high	D83D DE00 D83D	%F0%9F%98%80%3F
+lone-low-then-pair	DE00 D83D DE00	%3F%F0%9F%98%80
+two-lone-highs	D83D D83D	%3F%3F
+mixed	0061 0020 0062 003A 0063 002F 00E4 D83D DE00	a+b%3Ac%2F%C3%A4%F0%9F%98%80
