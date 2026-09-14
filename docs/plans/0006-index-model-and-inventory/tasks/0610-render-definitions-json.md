@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe/src/index/definitions_json.rs
   - crates/froe/tests/index_definitions_json_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "019489b3cd63e6d7fe4f4e331f78a4183fc7d8ea"
 ---
 # Render Index Definitions In oak-run's JSON Form
 

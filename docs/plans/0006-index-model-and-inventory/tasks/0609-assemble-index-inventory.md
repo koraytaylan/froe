@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe/src/index/inventory.rs
   - crates/froe/tests/index_inventory_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "a69fa787d0360d5cf6f63f4fdcfe1abd4c1377d2"
 ---
 # Assemble The Index Inventory
 
