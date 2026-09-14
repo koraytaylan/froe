@@ -280,12 +280,11 @@ fn plan_one(
         });
     }
 
-    // Definition drift, against the file's copy.
-    if let Some(_parsed) = definitions_file.definitions.get(index_path) {
-        // The parsed tree is compared through `drift` once the import
-        // materializes it; the plan's job is to say the file carries this
-        // definition at all.
-    } else {
+    // Definition drift, against the file's copy. The file's definition is
+    // materialized into memory so both sides are node states, and the
+    // comparison runs here — before the first record is appended to the
+    // store — so a drifting file leaves the store byte-identical.
+    let Some(parsed) = definitions_file.definitions.get(index_path) else {
         return Err(Error::InvalidFormat {
             details: format!(
                 "{index_path} has an index directory but no entry in \
@@ -293,6 +292,11 @@ fn plan_one(
                  describe every directory"
             ),
         });
+    };
+    let materialized = crate::writer::index::lucene_import::materialize::materialize(parsed)?;
+    let verdict = super::drift::compare(&materialized.node(), &node).map_err(index_error)?;
+    if !verdict.is_clean() {
+        return Err(index_error(super::drift::refusal(index_path, &verdict)));
     }
 
     let Mappings {

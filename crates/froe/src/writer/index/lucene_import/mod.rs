@@ -35,6 +35,7 @@
 
 pub mod apply;
 pub mod drift;
+pub(crate) mod materialize;
 pub mod plan;
 pub mod prepared;
 

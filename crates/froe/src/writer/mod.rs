@@ -25,6 +25,9 @@ pub mod index;
 /// everything it reclaims. Its surface is re-exported below, so callers name
 /// the operation rather than the module it happens to live in.
 pub(crate) mod maintenance;
+/// Segments written and read back in memory, for a caller that must turn a
+/// tree it holds into node states without touching a store.
+pub(crate) mod memory_segments;
 pub mod record_writer;
 pub mod repository_lock;
 pub mod segment_builder;

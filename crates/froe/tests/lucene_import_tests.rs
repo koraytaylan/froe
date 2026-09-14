@@ -555,3 +555,59 @@ fn a_dry_plan_takes_no_lock_and_writes_nothing() {
         "planning wrote to the store"
     );
 }
+
+/// Rewrites the dumped `index-definitions.json`, inserting `line` as the
+/// first member of the `lucene` definition's object.
+fn insert_into_the_definitions_file(input: &Path, line: &str) {
+    let path = input.join("index-definitions.json");
+    let content = std::fs::read_to_string(&path).expect("read the definitions file");
+    let opening = "\"/oak:index/lucene\": {";
+    let at = content
+        .find(opening)
+        .expect("the file carries the definition")
+        + opening.len();
+    let mut edited = content;
+    edited.insert_str(at, &format!("\n    {line},"));
+    std::fs::write(&path, edited).expect("rewrite the definitions file");
+}
+
+/// The drift refusal, through the plan — the production caller.
+///
+/// The comparison exists so that an import never installs data built
+/// against a definition the store no longer holds. A property in the file
+/// that the store lacks is exactly that, and it is refused before the
+/// first record is appended.
+#[test]
+fn a_definitions_file_that_drifts_from_the_store_is_refused() {
+    let directory = TestDirectory::new("drift-refused");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+    insert_into_the_definitions_file(&input, "\"evaluatePathRestrictions\": true");
+
+    let error = plan_lucene_import(&store, &LuceneImportOptions::new(input))
+        .expect_err("a file that describes a different definition must be refused");
+    let text = error.to_string();
+    assert!(
+        text.contains("does not describe /oak:index/lucene as the store holds it")
+            && text.contains("/evaluatePathRestrictions"),
+        "the refusal names the definition and the difference: {text}"
+    );
+    assert!(
+        text.contains("froe imports index *data*, never a definition change"),
+        "the refusal names the remedy: {text}"
+    );
+}
+
+/// And the direction that is not drift: the lane revert sets `refresh` on
+/// the file's side, so a file carrying one the store lacks is accepted.
+#[test]
+fn a_refresh_the_lane_revert_set_is_accepted() {
+    let directory = TestDirectory::new("drift-refresh");
+    let store = build_store(&directory, Shape::default());
+    let input = dump(&directory, &store);
+    insert_into_the_definitions_file(&input, "\"refresh\": true");
+
+    let plan = plan_lucene_import(&store, &LuceneImportOptions::new(input))
+        .expect("a file-side refresh is what an honest out-of-band build leaves");
+    assert_eq!(plan.imports.len(), 1);
+}

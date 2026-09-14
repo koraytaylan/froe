@@ -28,10 +28,15 @@ crates/froe/src/writer/index/
 └── lucene_import/
     ├── mod.rs           re-exports; the state rule, definition drift, bookkeeping
     ├── plan.rs          plan_lucene_import, LuceneImportOptions, LuceneImportPlan
+    ├── drift.rs         the file-against-store comparison and its five directional tolerances
+    ├── materialize.rs   the file's definition written into memory, so both sides are node states
     ├── prepared.rs      PreparedLuceneImport (the wiring unit test lives here)
     └── apply.rs         apply, LuceneImportOutcome, and the cutpoints task 0806 arms
 crates/froe/src/writer/fault_injection/lucene_import.rs   cutpoints
 crates/froe/src/writer/record_writer/values.rs   write_binary_stream(Read) — streaming binaries
+crates/froe/src/writer/memory_segments.rs        segments written and read back without a store,
+                                                 promoted out of the record writer's test support
+                                                 so the drift comparison can run before any write
 crates/froe/src/index/inventory.rs                the Lucene document count filled in (0802)
 crates/froe-cli/src/index_display.rs               the check's document-count column (0803)
 crates/froe-cli/src/index_import.rs              plan/confirm/apply flow of the import command
@@ -121,6 +126,7 @@ Covers `crates/froe/src/index/lucene/**`,
 `crates/froe/src/writer/index/lucene_import/**`,
 `crates/froe/src/writer/fault_injection/lucene_import.rs`,
 `crates/froe/src/writer/record_writer/values.rs`,
+`crates/froe/src/writer/memory_segments.rs`,
 `crates/froe/src/tooling/output_directory.rs` and
 `crates/froe-cli/src/index_import.rs`.
 
