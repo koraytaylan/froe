@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe/src/index/lucene/codec/postings.rs
   - crates/froe/tests/lucene_postings_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "c06a822"
 ---
 # Write Lucene41 Postings With Skip Data
 
