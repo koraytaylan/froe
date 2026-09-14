@@ -127,7 +127,7 @@ proves and the exit codes `froe index check` contracts.
 
 | oak-run option | Java | froe command | Status |
 | --- | --- | --- | --- |
-| `--index-info` | `IndexPrinter`, `IndexInfoServiceImpl` | `froe index list` | **Implemented** (no Lucene entry count; **Planned** in plan 0008) |
+| `--index-info` | `IndexPrinter`, `IndexInfoServiceImpl` | `froe index list` | **Implemented** |
 | `--index-definitions` | `IndexDefinitionPrinter`, `JsonSerializer` | `froe index definitions` | **Implemented** |
 | `--index-consistency-check` | `IndexConsistencyChecker` | `froe index check` | **Implemented** (Lucene level 1; level 2 **Planned** in plan 0008. The property family's check is froe's own: oak-run ignores every definition whose type is not `lucene`.) |
 | `--index-dump` | `LuceneIndexDumper` | — | **Planned** in plan 0008 |

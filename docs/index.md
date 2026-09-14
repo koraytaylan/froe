@@ -58,8 +58,10 @@ that silently listed nothing would read as an index that exists and is empty.
 Fields worth knowing:
 
 * **estimated entries** is what the type's own information provider computes,
-  which is not a count. For a property index it is Oak's own estimate; for
-  Lucene it is not filled in yet (plan 0008 adds the document count).
+  which is not a count. For a property index it is Oak's own estimate. For
+  Lucene it is the **document count**: the sum over the index's segments of
+  documents minus deletions, read out of the commit file's table of
+  contents, which is how Oak's own count over a directory computes it.
 * **estimated nodes**, shown for a counter definition, is the approximate
   descendant count at the content root. It is a *sampling* estimate, and it
   counts only what Oak's visible-editor wrap passes — no hidden child, so no
@@ -198,10 +200,19 @@ Two halves:
 **Lucene** gets Oak's **level 1** (`IndexConsistencyChecker.BLOBS_ONLY`): every
 binary property under the definition subtree, hidden children included, is
 streamed to its end and its length compared with the length it declares. It
-proves the index data is readable and complete. It proves nothing about the
-Lucene 4.7.2 bytes inside those blobs — that is level 2, which needs the file
-format, and plan 0008 adds it. The interop suite gets the level-2 verdict
-from Lucene's own `CheckIndex` in the meantime.
+proves the index data is readable and complete.
+
+Beside it, froe now reads the index's **table of contents** — `segments_N`,
+each segment's `.si`, and the compound file's entries — and reports whether
+the directory is a coherent set of Lucene files: every file the segments name
+is present and every present file is named, every codec header is valid, and
+each segment's deletion count is within its document count. An unregistered
+codec name is reported rather than refused, because the files are coherent
+and it is Oak that would fail at open.
+
+That is still short of Oak's **level 2**, which is Lucene's own `CheckIndex`
+reading the postings, and which needs a JVM. The interop suite gets that
+verdict from `CheckIndex` itself.
 
 The Lucene check is deliberately independent of the lane: it reads the
 definition subtree at the head and needs no lane state, so a dangling lane

@@ -234,23 +234,15 @@ fn compare_one_field(
             froe_value("property index"),
             "{path}: property index"
         ),
-        "Estimated entry count" => {
-            if froe_fields.get("type").is_some_and(|kind| kind == "lucene") {
-                // Task 0802 fills this in and turns this assertion into an
-                // equality in the same commit, so the chain never goes red.
-                assert!(
-                    !froe_fields.contains_key("estimated entries"),
-                    "{path}: froe now reports a Lucene entry count — task 0802 must \
-                     turn this assertion into an equality against Oak's {oak_value}"
-                );
-            } else {
-                assert_eq!(
-                    oak_value,
-                    froe_value("estimated entries").replace(',', ""),
-                    "{path}: estimated entry count"
-                );
-            }
-        }
+        // Task 0802 gave froe the commit-file reader this number needs, so
+        // a Lucene definition is compared the same way every other type is.
+        // Oak's own count over the directory is documents minus deletions,
+        // which is what froe's structural check computes.
+        "Estimated entry count" => assert_eq!(
+            oak_value,
+            froe_value("estimated entries").replace(',', ""),
+            "{path}: estimated entry count"
+        ),
         // Oak emits these two only for Lucene and froe reports them
         // elsewhere; neither is a field both compute.
         "Async" | "Size" | "Suggest size" | "Index size" => {}

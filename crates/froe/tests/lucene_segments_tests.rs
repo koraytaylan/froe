@@ -734,3 +734,108 @@ fn a_corrupt_commit_file_is_reported_as_unreadable_with_the_reason() {
         "the reason travels with the file: {report:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The committed sample index, written by Oak's own IndexWriter
+// ---------------------------------------------------------------------------
+
+/// The directory holding the sample index.
+fn sample_index_directory() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lucene-4-7-sample-index")
+}
+
+/// A reader over one of its files.
+fn sample_file(name: &str) -> Reader<std::fs::File> {
+    let path = sample_index_directory().join(name);
+    let file = std::fs::File::open(&path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let length = file.metadata().expect("read the file's length").len();
+    Reader::new(file, name, length)
+}
+
+/// The document count the judge reported when the fixture was captured.
+///
+/// `tests/fixtures/lucene-4-7-sample-index/README.md` records the command.
+const SAMPLE_DOCUMENT_COUNT: i64 = 5;
+
+#[test]
+fn the_committed_sample_index_parses_to_the_count_the_judge_reported() {
+    // The whole point of this fixture: these bytes were written by Oak's own
+    // `IndexWriter`, so agreement here is agreement with Oak rather than
+    // with froe's own writer.
+    let listing: Vec<String> = std::fs::read_dir(sample_index_directory())
+        .expect("read the fixture directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != "README.md")
+        .collect();
+
+    let hint = read_segments_gen(&mut sample_file("segments.gen"));
+    assert_eq!(hint, Some(1), "the hint's two copies agree on generation 1");
+
+    let generation = commit_generation(&listing, hint).expect("a commit generation");
+    assert_eq!(generation, 1);
+
+    let commit = read_commit_file(&mut sample_file("segments_1"), "segments_1", |name| {
+        Ok(sample_file(name))
+    })
+    .expect("read Oak's own commit file");
+
+    assert_eq!(
+        commit.segments.len(),
+        1,
+        "one segment, un-merged on purpose"
+    );
+    assert_eq!(
+        commit.segments[0].codec_name, "oakCodec",
+        "the judge refuses to capture a sample Oak did not write with oakCodec"
+    );
+    assert_eq!(commit.live_document_count(), SAMPLE_DOCUMENT_COUNT);
+    assert!(
+        commit.segments[0].info.compound,
+        "the sample is compound, which is the shape a real Oak index's dump has"
+    );
+}
+
+#[test]
+fn the_sample_indexs_compound_file_lists_the_codec_files_inside_it() {
+    let data_length = std::fs::metadata(sample_index_directory().join("_0.cfs"))
+        .expect("read the compound file's length")
+        .len();
+    let table = read_table_of_contents(&mut sample_file("_0.cfe"), data_length as i64)
+        .expect("read Oak's own table of contents");
+
+    assert!(
+        !table.entries.is_empty(),
+        "a real segment has codec files inside its compound file"
+    );
+    // Every entry is segment-stripped, which is what §8.6 says and what the
+    // reader refuses to accept otherwise. Oak's own writer produced these.
+    for entry in &table.entries {
+        assert!(
+            !entry.name.starts_with('_'),
+            "Oak's own writer strips the segment prefix: {:?}",
+            entry.name
+        );
+        assert!(
+            entry.offset + entry.length <= data_length as i64,
+            "{:?} spans past the compound file",
+            entry.name
+        );
+    }
+    // The field infos are always present in a Lucene segment.
+    assert!(
+        table.entry(".fnm").is_some() || table.entry("_0.fnm").is_some(),
+        "either spelling reaches the field infos: {:?}",
+        table
+            .entries
+            .iter()
+            .map(|entry| &entry.name)
+            .collect::<Vec<_>>()
+    );
+}
