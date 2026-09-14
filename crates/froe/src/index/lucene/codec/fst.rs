@@ -126,7 +126,14 @@ impl FstBuilder {
         Self {
             frontier: vec![UnCompiledNode::default()],
             last_input: Vec::new(),
-            bytes: Vec::new(),
+            // `FST`'s writing constructor pads the store with one zero
+            // byte: "ensure no node gets address 0 which is reserved to
+            // mean the stop state w/ no arcs". Every node address is
+            // therefore one higher than the bytes alone would give, and a
+            // transducer carrying only the empty key has a one-byte store
+            // rather than an empty one — which is what Lucene's reader
+            // needs to construct a `BytesStore` at all.
+            bytes: vec![0],
             dedup: HashMap::new(),
             last_frozen_node: 0,
             node_count: 0,

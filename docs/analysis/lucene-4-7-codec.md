@@ -1399,6 +1399,24 @@ node and arc counts, the **reversed byte store**, and then the arcs
 themselves with their flag bytes (`BIT_FINAL_ARC` and the rest) and
 byte-string outputs.
 
+**The byte store opens with one pad byte**, written by the constructor
+before any node:
+
+```java
+bytes = new BytesStore(bytesPageBits);
+// pad: ensure no node gets address 0 which is reserved to mean
+// the stop state w/ no arcs
+bytes.writeByte((byte) 0);
+```
+
+A node's address is the index of its last byte, so the pad shifts every
+address by one and keeps a real node from colliding with
+`NON_FINAL_END_NODE`, which is the address 0. It also means **no
+transducer's store is ever empty**: one carrying only the empty key has a
+one-byte store, and Lucene's reading `BytesStore` — which indexes the last
+block of the store it just read — cannot be constructed over a store of no
+bytes at all. §10.4 records what omitting the pad costs.
+
 Two choices froe makes, both recorded in §9 and both honoured by the reader:
 
 * **Unpacked.** Lucene's own terms writer builds unpacked transducers, so
@@ -1604,20 +1622,29 @@ segment. Neither belongs in an "unread, so anything goes" list.
 | transducer arcs | the fixed-array form (`ARCS_AS_FIXED_ARRAY`, a `VInt` arc count, a `VInt` bytes-per-arc) for a node with ≥5 arcs at depth ≤3 or ≥10 deeper | linear arcs only | the reader dispatches on the flags byte **per node**; linear is slower to seek and correct everywhere |
 | transducer packing | unpacked, from its own terms writer | unpacked | Lucene's own choice here, not a concession |
 
-### 10.4 A shape Lucene writes and cannot read
+### 10.4 The transducer pad, and what omitting it costs
 
-**A transducer whose byte store is empty is write-only.** Lucene's builder
-produces one for an automaton accepting only the empty string —
-`Builder.finish` does not bail out when `emptyOutput` is present, and
-`FST.finish` forces the start node to 0 over the empty store — but
-`BytesStore`'s reading constructor then indexes the last block of a store
-that has no blocks and throws `IndexOutOfBoundsException`.
+**A transducer's byte store opens with one zero byte** (§7.6), so no node
+gets the address 0 that `NON_FINAL_END_NODE` already means.
 
-Found by running Lucene's own reader over froe's output during task 0903.
-It costs nothing: the terms writer saves a transducer only under a positive
-term count, so the shape never reaches a `.tip`. froe writes the bytes —
-they are pinned by a unit test, because the serialization is specified — and
-keeps the shape out of the corpus the reader is asked to enumerate.
+Task 0903 omitted it, and the omission looked harmless: every address was
+one lower than Lucene's, consistently, and the reader follows addresses
+rather than checking them. The one shape it broke was the transducer
+carrying **only the empty key**, whose store was then empty — and
+`BytesStore`'s reading constructor indexes the last block of a store with no
+blocks. Running Lucene's own reader over froe's output found it, and task
+0903 recorded the shape as write-only on the reasoning that a `.tip` never
+holds one.
+
+**That reasoning was wrong, and task 0905 is where it showed.** A field
+whose terms all fit in one root block — every field of fewer than 49 terms,
+which is most of them — produces exactly that transducer: the root block's
+prefix is empty, so its code becomes the empty output and there is no other
+key. froe would have written an unreadable `.tip` for the common case.
+
+The pad is the whole fix. With it, froe's node addresses are Lucene's, the
+empty-key-only transducer has a one-byte store, and Lucene's reader
+enumerates it like any other — which the corpus now includes it to check.
 
 ### 10.5 The raw-bits rule
 

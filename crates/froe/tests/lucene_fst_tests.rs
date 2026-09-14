@@ -82,7 +82,10 @@ fn a_transducer_carrying_only_the_empty_key() {
     expected.push(0x00); // nodeCount
     expected.push(0x00); // arcCount
     expected.push(0x00); // arcWithOutputCount
-    expected.push(0x00); // numBytes
+    // One byte, not none: the store opens with the pad every transducer
+    // carries, which is the whole of this one.
+    expected.push(0x01); // numBytes
+    expected.push(0x00); // the pad
     assert_bytes("only the empty key", &produced, &expected);
 }
 
@@ -104,14 +107,15 @@ fn a_single_key_with_no_output() {
     expected.push(0x00); // unpacked
     expected.push(0x00); // no empty output
     expected.push(0x00); // BYTE1
-    // The root's address is the index of its **last** byte, which for a
-    // two-byte store is 1 — not 0. `addNode` returns
+    // The root's address is the index of its **last** byte: the pad takes
+    // index 0, the node takes 1 and 2. `addNode` returns
     // `bytes.getPosition() - 1`, and the root is the last node compiled.
-    expected.push(0x01); // startNode
+    expected.push(0x02); // startNode
     expected.push(0x01); // nodeCount
     expected.push(0x01); // arcCount
     expected.push(0x00); // arcWithOutputCount
-    expected.push(0x02); // numBytes
+    expected.push(0x03); // numBytes
+    expected.push(0x00); // the pad
     // The node is `flags, label` written forward and then reversed.
     expected.extend_from_slice(&[b'a', flags]);
     assert_bytes("a single key", &produced, &expected);
@@ -127,11 +131,12 @@ fn a_single_key_with_an_output() {
     expected.push(0x00);
     expected.push(0x00);
     expected.push(0x00);
-    expected.push(0x03); // startNode: the last byte of a four-byte store
+    expected.push(0x04); // startNode: the last byte of a five-byte store
     expected.push(0x01); // nodeCount
     expected.push(0x01); // arcCount
     expected.push(0x01); // arcWithOutputCount
-    expected.push(0x04); // numBytes
+    expected.push(0x05); // numBytes
+    expected.push(0x00); // the pad
     // Forward: flags, 'a', vint 1, 'Z'. Reversed:
     expected.extend_from_slice(&[b'Z', 0x01, b'a', flags]);
     assert_bytes("a single key with an output", &produced, &expected);
@@ -153,11 +158,12 @@ fn two_keys_sharing_no_prefix() {
     expected.push(0x00);
     expected.push(0x00);
     expected.push(0x00);
-    expected.push(0x03); // startNode: the last byte of a four-byte store
+    expected.push(0x04); // startNode: the last byte of a five-byte store
     expected.push(0x01); // nodeCount
     expected.push(0x02); // arcCount
     expected.push(0x00); // arcWithOutputCount
-    expected.push(0x04); // numBytes
+    expected.push(0x05); // numBytes
+    expected.push(0x00); // the pad
     // Forward: (first, 'a'), (last, 'b'). Reversed over the whole node:
     expected.extend_from_slice(&[b'b', last, b'a', first]);
     assert_bytes("two keys", &produced, &expected);
@@ -225,17 +231,17 @@ fn a_key_that_is_a_prefix_of_another() {
     // is.
     let a_flags = 0b0000_0111;
 
-    let mut store = Vec::new();
-    store.extend_from_slice(&[b'b', b_flags]); // reversed node at 0..2
-    store.extend_from_slice(&[b'a', a_flags]); // reversed node at 2..4
+    let mut store = vec![0x00]; // the pad
+    store.extend_from_slice(&[b'b', b_flags]); // reversed node at 1..3
+    store.extend_from_slice(&[b'a', a_flags]); // reversed node at 3..5
 
     let mut expected = HEADER.to_vec();
     expected.extend_from_slice(&[0x00, 0x00, 0x00]); // unpacked, no empty output, BYTE1
-    expected.push(0x03); // startNode: the root's last byte
+    expected.push(0x04); // startNode: the root's last byte
     expected.push(0x02); // nodeCount
     expected.push(0x02); // arcCount
     expected.push(0x00); // arcWithOutputCount
-    expected.push(0x04); // numBytes
+    expected.push(0x05); // numBytes
     expected.extend_from_slice(&store);
     assert_bytes("a key that prefixes another", &produced, &expected);
 }
@@ -267,11 +273,12 @@ fn outputs_that_share_a_prefix_are_pushed_up() {
 
     let mut expected = HEADER.to_vec();
     expected.extend_from_slice(&[0x00, 0x00, 0x00]);
-    expected.push(0x0b); // startNode: 11, the root's last byte
+    expected.push(0x0c); // startNode: 12, the root's last byte
     expected.push(0x02); // nodeCount
     expected.push(0x03); // arcCount
     expected.push(0x03); // arcWithOutputCount — every arc has one
-    expected.push(0x0c); // numBytes
+    expected.push(0x0d); // numBytes
+    expected.push(0x00); // the pad
     expected.extend_from_slice(&inner);
     expected.extend_from_slice(&root);
     assert_bytes("outputs sharing a prefix", &produced, &expected);
@@ -299,11 +306,12 @@ fn an_empty_key_beside_ordinary_keys() {
     expected.push(0x05); // its serialized length
     expected.extend_from_slice(&empty);
     expected.push(0x00); // BYTE1
-    expected.push(0x01); // startNode
+    expected.push(0x02); // startNode
     expected.push(0x01); // nodeCount
     expected.push(0x01); // arcCount
     expected.push(0x00); // arcWithOutputCount
-    expected.push(0x02); // numBytes
+    expected.push(0x03); // numBytes
+    expected.push(0x00); // the pad
     expected.extend_from_slice(&[b'a', flags]);
     assert_bytes("an empty key beside ordinary keys", &produced, &expected);
 }
@@ -394,14 +402,11 @@ type CorpusCase = (&'static str, Vec<(&'static [u8], &'static [u8])>);
 /// The cases, in corpus order.
 fn corpus_cases() -> Vec<CorpusCase> {
     vec![
-        // `empty-key-only` is deliberately **not** here. Lucene serializes
-        // that shape — its own builder produces it, and the unit test above
-        // pins the bytes — but its reader cannot load one: `BytesStore`'s
-        // constructor indexes the last block of a store that has no blocks.
-        // A transducer whose store is empty is therefore write-only, which
-        // is recorded in the specification's quirks register. It never
-        // reaches a `.tip`, where the terms writer saves one only under a
-        // positive term count.
+        // The shape a field with a single root block produces, which is
+        // every field of fewer than 49 terms: the root block's code as the
+        // empty output and no other key. It is first because it is the
+        // common case, not a corner one.
+        ("empty-key-only", vec![(&b""[..], &b"xy"[..])]),
         ("single", vec![(&b"a"[..], &b""[..])]),
         ("single-with-output", vec![(&b"a"[..], &b"Z"[..])]),
         (
