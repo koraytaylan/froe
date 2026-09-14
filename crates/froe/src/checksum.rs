@@ -111,8 +111,8 @@ impl Crc32 {
 /// resuming with the next chunk is still the same polynomial. That is what
 /// makes [`Crc32`] agree with [`crc32`] at any chunking.
 fn fold(mut checksum: u32, bytes: &[u8]) -> u32 {
-    let mut blocks = bytes.chunks_exact(STRIDE);
-    for block in &mut blocks {
+    let (blocks, remainder) = bytes.as_chunks::<STRIDE>();
+    for block in blocks {
         // The first four bytes are folded into the running checksum before
         // the lookup; the remaining twelve index their tables directly.
         checksum ^= u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
@@ -133,7 +133,7 @@ fn fold(mut checksum: u32, bytes: &[u8]) -> u32 {
             ^ CRC32_TABLES[1][block[14] as usize]
             ^ CRC32_TABLES[0][block[15] as usize];
     }
-    for &byte in blocks.remainder() {
+    for &byte in remainder {
         let table_index = ((checksum ^ u32::from(byte)) & 0xFF) as usize;
         checksum = (checksum >> 8) ^ CRC32_TABLES[0][table_index];
     }
