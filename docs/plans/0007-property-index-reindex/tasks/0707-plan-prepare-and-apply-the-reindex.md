@@ -21,8 +21,8 @@ touches:
   - crates/froe/tests/support/mod.rs
   - crates/froe/tests/support/reindex_fixtures.rs
   - docs/oak-segment-tar-feature-map.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "e67a5892ce1c3d967e54ce1f556c4b32aa90094d"
 ---
 # Plan, Prepare And Apply The Reindex In One Head Move
 
