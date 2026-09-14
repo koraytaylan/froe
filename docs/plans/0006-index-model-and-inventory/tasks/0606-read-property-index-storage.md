@@ -15,8 +15,8 @@ touches:
   - crates/froe/tests/property_index_reader_tests.rs
   - crates/froe/tests/support/mod.rs
   - crates/froe/tests/support/property_index_layout.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "6c3c482ae897b3616c2efa41a5f6c120a0e5aab4"
 ---
 # Read Property And Unique Index Storage
 

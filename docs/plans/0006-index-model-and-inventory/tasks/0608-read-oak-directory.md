@@ -11,8 +11,8 @@ touches:
   - crates/froe/src/content/value/stream.rs
   - crates/froe/src/index/lucene/layout.rs
   - crates/froe/tests/oak_directory_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "1aad23b7ddbc39817ed1df1b4043c1b7de9119a0"
 ---
 # Read Lucene Index Files From The Repository
 

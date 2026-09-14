@@ -20,8 +20,8 @@ touches:
   - crates/froe/src/index/inventory.rs
   - crates/froe/src/index/definitions_json.rs
   - crates/froe/src/index/definitions_json_reader.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "8437641fd13d40d0e8b574713e9bb15d67dd8d67"
 ---
 # Model Index Definitions, Lanes, Status And Path Filters
 

@@ -10,8 +10,8 @@ touches:
   - crates/froe/src/index/counter/sip_hash.rs
   - crates/froe/tests/counter_index_tests.rs
   - crates/froe/tests/fixtures/oak-sip-hash-vectors.tsv
-status: planned
-merged_as: ""
+status: done
+merged_as: "ba664734fadd3cc056ef7002621e7c0b53a06c2f"
 ---
 # Read The Counter Index And Its SipHash
 
