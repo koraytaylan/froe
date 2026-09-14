@@ -14,8 +14,8 @@ touches:
   - crates/froe/tests/support/mod.rs
   - crates/froe/tests/support/observation_log.rs
   - crates/froe/tests/progress_api_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "eef46e5fd444431f582cf215c2774b56c94a49fa"
 ---
 # Expose The Maintenance Gates To The Index Module
 
