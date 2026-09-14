@@ -231,6 +231,57 @@ impl IndexInventory {
         })
     }
 
+    /// Collects exactly the definitions at `paths`, in the order given.
+    ///
+    /// The path service is **never consulted**, and neither is its nodetype
+    /// precondition — which is how oak-run behaves when it is given
+    /// `--index-paths`, and what lets `froe index definitions --index …`
+    /// succeed on a store whose `/oak:index/nodetype` index is disabled
+    /// while an unnarrowed run refuses exactly as Oak's printer does.
+    ///
+    /// A path naming no node yields a record carrying that as its model
+    /// error, exactly as an enumerated definition that vanished would:
+    /// deciding what a caller's own list means is the caller's, and
+    /// `froe index` refuses an unknown path by name before it gets here.
+    pub fn collect_selected(
+        provider: &dyn SegmentProvider,
+        super_root: &NodeState<'_>,
+        paths: &[String],
+        observer: &mut dyn ProgressObserver,
+    ) -> IndexResult<Self> {
+        let content_root = super_root.child_node("root")?.ok_or_else(|| {
+            IndexError::Record(crate::Error::InvalidFormat {
+                details: "the super-root has no \"root\" child node".to_owned(),
+            })
+        })?;
+        let lanes = AsyncLanes::read(&content_root)?;
+        let dangling_checkpoints = AsyncLanes::dangling_checkpoints(&content_root, super_root)?;
+
+        let step = Step::new(INVENTORY_STEP, WorkUnit::Nodes).with_total(count(paths.len()));
+        let indexes = observe(observer, &step, |observer| {
+            let mut indexes = Vec::with_capacity(paths.len());
+            for (position, path) in paths.iter().enumerate() {
+                observer.step_advanced(count(position));
+                indexes.push(collect_one(
+                    provider,
+                    &content_root,
+                    path,
+                    &lanes,
+                    &dangling_checkpoints,
+                )?);
+            }
+            observer.step_advanced(count(indexes.len()));
+            Ok::<_, IndexError>(indexes)
+        })?;
+
+        Ok(Self {
+            indexes,
+            lanes,
+            dangling_checkpoints,
+            warnings: Vec::new(),
+        })
+    }
+
     /// One record by definition path.
     #[must_use]
     pub fn index_at(&self, path: &str) -> Option<&IndexInfo> {

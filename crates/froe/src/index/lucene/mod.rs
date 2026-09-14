@@ -7,9 +7,11 @@
 //! file is stored in and nothing about the bytes inside one, which are the
 //! Lucene 4.7.2 format.
 
+pub mod check;
 pub mod directory;
 pub mod layout;
 
+pub use check::{BlobFault, LuceneBlobReport, check_blobs};
 pub use directory::{FileEncoding, OakDirectory, OakIndexFile, OakIndexFileReader};
 pub use layout::{IndexDetails, IndexerInfo, filesystem_directory_name, index_folder_base_name};
 

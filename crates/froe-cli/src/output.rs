@@ -167,6 +167,28 @@ fn civil_date_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// Converts a `BrokenPipe` returned to Rust into a quiet diagnostic exit.
+///
+/// Unix normally terminates the CLI with `SIGPIPE` before this fallback sees
+/// an error because `main` restores the conventional default disposition.
+/// Platforms that report the closed pipe to [`std::io::Write`] instead use
+/// this path. Other output errors remain failures.
+///
+/// It lives here rather than beside one command because every command that
+/// streams data to standard output needs it: the digest, the segment graph
+/// and now the index listing.
+pub(crate) fn write_diagnostic_handling_observed_broken_pipe(
+    output: &mut dyn std::io::Write,
+    write_output: impl FnOnce(&mut dyn std::io::Write) -> froe::Result<()>,
+) -> froe::Result<()> {
+    match write_output(output) {
+        Err(froe::Error::InputOutput(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

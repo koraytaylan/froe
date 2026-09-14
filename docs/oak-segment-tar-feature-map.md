@@ -7,7 +7,7 @@ Experience Manager — and maps each feature to `froe`. It was produced by
 a systematic analysis of the Java sources (the `org.apache.jackrabbit.oak.segment`
 package tree) and the official storage documentation.
 
-Every entry carries one of four statuses:
+Every entry carries one of three statuses:
 
 | Status | Meaning |
 | --- | --- |
@@ -120,6 +120,20 @@ after which a normal AEM start consumes the result cleanly.
 | `iotrace` | `tool/iotrace` | — | **Not applicable** (measures the Java store's IO behavior) |
 | `segment-copy` (remote persistences) | `oak-segment-azure` tooling | — | **Planned** alongside remote persistence support |
 
+### Oak indexes (oak-run `index`)
+
+oak-run's other half. See [`index.md`](index.md) for what each subcommand
+proves and the exit codes `froe index check` contracts.
+
+| oak-run option | Java | froe command | Status |
+| --- | --- | --- | --- |
+| `--index-info` | `IndexPrinter`, `IndexInfoServiceImpl` | `froe index list` | **Implemented** (no Lucene entry count; **Planned** in plan 0008) |
+| `--index-definitions` | `IndexDefinitionPrinter`, `JsonSerializer` | `froe index definitions` | **Implemented** |
+| `--index-consistency-check` | `IndexConsistencyChecker` | `froe index check` | **Implemented** (Lucene level 1; level 2 **Planned** in plan 0008. The property family's check is froe's own: oak-run ignores every definition whose type is not `lucene`.) |
+| `--index-dump` | `LuceneIndexDumper` | — | **Planned** in plan 0008 |
+| `--reindex` | `OutOfBandIndexer`, `IndexUpdate` | — | **Planned** in plans 0007 and 0009 |
+| `--index-import` | `IndexImporter`, `IndexDefinitionUpdater` | — | **Planned** in plan 0010 |
+
 ### The `froe` command surface
 
 Every command accepts the global `-s`/`--silent` and
@@ -149,6 +163,9 @@ introduction above):
 | `froe difference REPOSITORY BEFORE AFTER [--path P]` | Changes between two revisions. |
 | `froe history REPOSITORY PATH` | A node's record across journal revisions. |
 | `froe search-nodes REPOSITORY [--has-property N]… [--value N=V]…` | Nodes matching predicates, over every segment. |
+| `froe index list REPOSITORY [--index PATH]…` | Every index definition with its type, lane, lane checkpoint, sizes, estimates and drift verdict, plus warnings on standard error. |
+| `froe index definitions REPOSITORY [--output FILE] [--index PATH]…` | The definitions in oak-run's own JSON form, byte-compatible with `oak-run index --index-definitions-file` and Oak's definition updater. `--output` refuses an existing file rather than truncating it. |
+| `froe index check REPOSITORY [--index PATH]…` | Each index against the state it indexes — the head for a synchronous definition, the lane's checkpoint for an asynchronous one. Exits 0 when every checked index is consistent, 3 when any is inconsistent, 4 when none is inconsistent but some index with an applicable check could not be run. |
 
 Maintenance (mutating forms require a stopped repository and confirmation).
 Every mutating command requires same-directory hard-link and durable
@@ -219,7 +236,9 @@ The crate exposes each layer independently: `tar_archive` (archives,
 indexes, graphs, binary reference catalogs), `segment` (segment parsing,
 addressing, and building), `content` (records to node states), `journal`,
 `gc_journal`, `store` (the read-only repository), `writer` (the write path),
-and `tooling` (check, diff, history, search, `tooling::segment_dump` /
-`dump_segment`, archive debug).
+`tooling` (check, diff, history, search, `tooling::segment_dump` /
+`dump_segment`, archive debug), and `index` (index definitions, async lanes,
+status nodes, the property family's and Lucene's index storage, and the
+inventory over them).
 Custom backends implement the `SegmentProvider` and `SegmentSink` traits and
 reuse the whole content and writer layers unchanged.

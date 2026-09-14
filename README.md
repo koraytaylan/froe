@@ -70,6 +70,17 @@ checkpoints beyond what the runtime exposes. Every mutating command
 requires a *stopped* repository and a `store.version=2` store; the
 read-only commands write nothing and are safe against a live instance.
 
+**Read Oak's indexes.** `froe index list` shows every index definition a
+store holds with its type, async lane, lane checkpoint, sizes, estimates and
+whether the definition has drifted from the clone Oak keeps beside it.
+`froe index definitions` prints them in oak-run's own JSON form, byte-
+compatible with `oak-run index --index-definitions-file` and Oak's
+definition updater. `froe index check` checks each index against the state it
+indexes — the head for a synchronous definition, the lane's checkpoint for an
+asynchronous one — and exits 0, 3 or 4 so a runbook can gate on it, a
+contract oak-run's `--index-consistency-check` never had. All three are
+read-only and take no lock. See the [index guide](docs/index.md).
+
 **Reclaim what online GC leaves behind.** Oak's online garbage collector
 runs opportunistically and only sweeps segments — it does not prune the
 journal, remove stale archives from failed compactions, expire
@@ -388,6 +399,9 @@ fn main() -> froe::Result<()> {
 * [`docs/cli-output.md`](docs/cli-output.md)
   — which stream carries what, how progress is reported and silenced, and
   what each command says while it works.
+* [`docs/index.md`](docs/index.md)
+  — what an Oak index is in `froe`'s terms, the read-only index commands,
+  and what `froe index check` proves, does not prove, and exits with.
 
 ## Relationship to Apache Jackrabbit Oak
 

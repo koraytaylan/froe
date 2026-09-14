@@ -438,6 +438,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: CheckpointAction,
     },
+    /// Inspect Oak's indexes (read-only).
+    Index {
+        #[command(subcommand)]
+        action: index::IndexAction,
+    },
 }
 
 /// The formats `froe export` writes.
@@ -532,6 +537,8 @@ pub(crate) fn parse_value_predicate(
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .ok_or_else(|| format!("expected NAME=VALUE, got {argument:?}"))
 }
+
+pub(crate) mod index;
 
 #[cfg(test)]
 mod tests;

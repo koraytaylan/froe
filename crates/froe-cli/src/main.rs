@@ -14,6 +14,7 @@ mod compaction;
 mod compaction_report;
 mod compaction_summary;
 mod content_display;
+mod index_display;
 mod inspection;
 mod mutation;
 mod output;
@@ -37,7 +38,7 @@ mod export;
 
 use command_line::{
     ArchiveRewritePolicyArgument, CheckpointAction, Command, CommandLine, ExportFormat,
-    parse_value_predicate,
+    index::IndexAction, parse_value_predicate,
 };
 use export::run_export_command;
 
@@ -184,6 +185,9 @@ pub(crate) fn run_diagnostic_command(
             )? {
                 return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::Index { action } => {
+            return run_index(action, reporter);
         }
         Command::Digest {
             repository,
@@ -346,6 +350,38 @@ pub(crate) fn run_mutating_command(
         // Unreachable: every dispatcher above delegates here only after
         // excluding the commands it handles itself.
         other => unreachable!("{other:?} is not a mutating command"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Dispatches an index subcommand.
+///
+/// Read-only throughout, exactly like `froe summary`: the repository lock is
+/// never taken, no manifest is written, and no file is created — except the
+/// one `definitions --output` names, which is created outside the store or
+/// refused.
+fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode> {
+    let repository_path = action.repository().to_path_buf();
+    let repository = open_repository(&repository_path, reporter)?;
+    match action {
+        IndexAction::List { indexes, .. } => {
+            index_display::print_index_list(&repository, &indexes, reporter)?;
+        }
+        IndexAction::Definitions {
+            output, indexes, ..
+        } => {
+            index_display::print_index_definitions(
+                &repository,
+                &repository_path,
+                output.as_deref(),
+                &indexes,
+                reporter,
+            )?;
+        }
+        IndexAction::Check { indexes, .. } => {
+            let outcome = index_display::check_indexes(&repository, &indexes, reporter)?;
+            return Ok(ExitCode::from(outcome.exit_code()));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

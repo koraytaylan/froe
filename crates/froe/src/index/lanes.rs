@@ -180,6 +180,121 @@ impl AsyncLanes {
     }
 }
 
+/// Which state a definition's index data must be checked against.
+///
+/// A **synchronous** definition is maintained inside the commit that changes
+/// content, so its storage always corresponds to the head. An
+/// **asynchronous** one lags by design: its lane's checkpoint names the
+/// revision the indexer last got to, and comparing its storage against the
+/// head would report every commit since that checkpoint as a missing entry.
+/// The checkpoint is therefore not an optimization — it is the only state
+/// the comparison means anything against.
+///
+/// No `PartialEq`: a variant carries a `NodeState`, which is a cursor into a
+/// segment rather than a value, and two cursors comparing unequal would say
+/// nothing about the states they name.
+#[derive(Clone, Debug)]
+pub enum CheckState<'provider> {
+    /// The head: a synchronous definition, or one Oak maintains in the
+    /// commit itself.
+    Head(NodeState<'provider>),
+    /// The lane's checkpoint, for an asynchronous definition.
+    LaneCheckpoint {
+        /// The lane name.
+        lane: String,
+        /// The checkpoint name.
+        checkpoint: String,
+        /// The checkpoint's own content root.
+        root: NodeState<'provider>,
+    },
+    /// There is no state to check against, and saying so is the honest
+    /// answer: reporting an index as inconsistent because its lane cannot be
+    /// resolved would send an operator to reindex something that may be
+    /// perfectly correct.
+    Uncheckable {
+        /// What went wrong, phrased for an operator.
+        reason: String,
+    },
+}
+
+impl<'provider> CheckState<'provider> {
+    /// The state root to check against, or `None` when there is none.
+    #[must_use]
+    pub fn root(&self) -> Option<&NodeState<'provider>> {
+        match self {
+            CheckState::Head(root) | CheckState::LaneCheckpoint { root, .. } => Some(root),
+            CheckState::Uncheckable { .. } => None,
+        }
+    }
+}
+
+/// The state `definition`'s index data must be compared against.
+///
+/// `lanes` is read once by the caller, because a listing checks many
+/// definitions against the same `/:async` node.
+///
+/// The three uncheckable cases are kept apart in the message, because the
+/// remedies differ: a lane with no checkpoint property has never run, a
+/// checkpoint that `/checkpoints` no longer holds is the dangling case Oak
+/// silently reindexes from, and a checkpoint node without a `root` child is
+/// damage.
+pub fn checked_state_root<'provider>(
+    super_root: &NodeState<'provider>,
+    lanes: &AsyncLanes,
+    definition: &crate::index::IndexDefinition,
+) -> IndexResult<CheckState<'provider>> {
+    let head = super_root.child_node("root")?.ok_or_else(|| {
+        crate::index::IndexError::Record(crate::Error::InvalidFormat {
+            details: "the super-root has no \"root\" child node".to_owned(),
+        })
+    })?;
+    let Some(lane_name) = definition.lane.as_deref() else {
+        return Ok(CheckState::Head(head));
+    };
+    let Some(lane) = lanes.lane(lane_name) else {
+        return Ok(CheckState::Uncheckable {
+            reason: format!(
+                "its lane {lane_name:?} has no state on /:async, so nothing says which \
+                 revision its data corresponds to"
+            ),
+        });
+    };
+    let Some(checkpoint) = lane.checkpoint.as_deref() else {
+        return Ok(CheckState::Uncheckable {
+            reason: format!(
+                "its lane {lane_name:?} names no checkpoint, so the lane has not completed \
+                 a run"
+            ),
+        });
+    };
+    let checkpoints = super_root.child_node("checkpoints")?;
+    let checkpoint_node = match &checkpoints {
+        None => None,
+        Some(checkpoints) => checkpoints.child_node(checkpoint)?,
+    };
+    let Some(checkpoint_node) = checkpoint_node else {
+        return Ok(CheckState::Uncheckable {
+            reason: format!(
+                "its lane {lane_name:?} resumes from checkpoint {checkpoint:?}, which no \
+                 longer exists; Oak reindexes from scratch here rather than failing"
+            ),
+        });
+    };
+    let Some(root) = checkpoint_node.child_node("root")? else {
+        return Ok(CheckState::Uncheckable {
+            reason: format!(
+                "checkpoint {checkpoint:?}, which lane {lane_name:?} resumes from, has no \
+                 \"root\" child node"
+            ),
+        });
+    };
+    Ok(CheckState::LaneCheckpoint {
+        lane: lane_name.to_owned(),
+        checkpoint: checkpoint.to_owned(),
+        root,
+    })
+}
+
 /// Which of a lane's four properties a name is.
 enum LaneField {
     Checkpoint,

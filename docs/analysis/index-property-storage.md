@@ -1018,6 +1018,38 @@ froe's rebuild — must use `(int) -7610761686379641542` sign-extended back to
    (§9.4) all occur in stores Oak itself wrote. Reporting any of them as
    corruption would make `froe index check` fail on a healthy store — and a
    check that cries wolf is a check an operator stops running.
+7. **A covered node that no entry names is an observation, never a verdict.**
+   The three entry-side faults are unambiguous, because each is the index
+   contradicting content that is there to read: a *stale* entry names a node
+   that does not exist, a *mismatched* entry names a node that does not carry
+   the key, a *duplicate* is a unique key holding several paths, which Oak
+   refuses commits on. A *missing* entry is not in that class — it may be an
+   entry the index lost, or a node Oak never indexed.
+
+   This is not a hypothetical. The generated Oak 1.90.0 fixture, written by
+   Sling and never touched by froe, has **eighteen** of them under
+   `/oak:index/nodetype`, in two clusters: the `indexRules` subtree of the
+   `lucene` definition (nine `nt:unstructured` nodes, while the definition
+   node `/oak:index/lucene` itself *is* indexed under
+   `oak:QueryIndexDefinition`), and the `rep:permissionStore` nodes under
+   `/jcr:system` (nine, `rep:PermissionStore` and `rep:Permissions`). The
+   definition carries no `declaringNodeTypes`, no `valuePattern` and no path
+   filter, so nothing in the definition excuses them, and nothing in
+   `IndexUpdate`, `VisibleEditor` or `PropertyIndexEditor` excludes an index
+   definition's own visible subtree or the permission store — each of those
+   was read at the pinned commit and none of them filters here. **The
+   mechanism is therefore not established; the observation is.** Oak's own
+   tooling makes no claim either way: `IndexConsistencyCheckPrinter` adds
+   every definition whose `type` is not `lucene` to `ignoredIndexes` and
+   checks nothing about it, so the property family's consistency check is
+   froe's own and has no Oak verdict to match.
+
+   `PropertyIndexReport::has_definite_faults` is therefore what decides
+   `froe index check`'s exit code, and `is_consistent` — which includes the
+   missing set — is the strict all-clear a store Oak wrote can fail. Task
+   0615 asks Oak itself, through the judge, which of the two explanations is
+   right; until it answers, froe reports the count and says plainly that it
+   cannot tell.
 7. **A property index's `:index` is never absent** (§2.3). That asymmetry with
    invariant 6 is real and is the one case where absence *is* reportable.
 8. **Never write a value froe cannot prove Oak would have written.** The

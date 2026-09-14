@@ -131,14 +131,44 @@ pub struct PropertyIndexReport {
 }
 
 impl PropertyIndexReport {
-    /// Whether the index is consistent with the state it was checked
-    /// against.
+    /// Whether the index agrees with the state it was checked against in
+    /// every respect, missing entries included.
+    ///
+    /// This is the strict all-clear, and **a store Oak itself wrote can fail
+    /// it**: see [`Self::has_definite_faults`] for why, and use that for a
+    /// pass/fail verdict.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
-        self.stale_entries.is_empty()
-            && self.mismatched_entries.is_empty()
-            && self.missing_entries.is_empty()
-            && self.duplicate_entries.is_empty()
+        !self.has_definite_faults() && self.missing_entries.is_empty()
+    }
+
+    /// Whether the check found damage rather than a disagreement it cannot
+    /// attribute.
+    ///
+    /// The three categories here are unambiguous, because each is the index
+    /// contradicting content that is right there to read: a **stale** entry
+    /// names a node that does not exist, a **mismatched** entry names a node
+    /// that does not carry the key, and a **duplicate** is a unique key
+    /// holding several paths, which Oak refuses commits on.
+    ///
+    /// A **missing** entry is not in that class. A node the definition
+    /// covers that no entry names may be an entry the index lost — or a node
+    /// Oak never indexed in the first place. The generated Oak 1.90.0
+    /// fixture, freshly written by Sling and never touched by froe, has
+    /// eighteen of them under `/oak:index/nodetype`: the `indexRules`
+    /// subtree of the `lucene` definition, and the `rep:permissionStore`
+    /// nodes under `/jcr:system`. Oak's own tooling makes no claim here
+    /// either — `oak-run`'s `--index-consistency-check` ignores every
+    /// definition whose type is not `lucene`. So froe reports missing
+    /// entries as an observation and never as a verdict, which is invariant
+    /// 6 of `docs/analysis/index-property-storage.md` §13 applied to the
+    /// covered-node half: a check that cries wolf is a check an operator
+    /// stops running.
+    #[must_use]
+    pub fn has_definite_faults(&self) -> bool {
+        !self.stale_entries.is_empty()
+            || !self.mismatched_entries.is_empty()
+            || !self.duplicate_entries.is_empty()
     }
 }
 

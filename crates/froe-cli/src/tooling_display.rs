@@ -22,7 +22,9 @@ use froe::tooling::{
 
 use froe_export::json::append_json_values;
 
-use crate::output::{format_timestamp, sanitize_terminal_text};
+use crate::output::{
+    format_timestamp, sanitize_terminal_text, write_diagnostic_handling_observed_broken_pipe,
+};
 use crate::progress::Reporter;
 
 /// `froe segment --hex`: Oak-compatible `SegmentDump` output.
@@ -146,22 +148,6 @@ fn render_archive_debug(
         }
     }
     Ok(())
-}
-
-/// Converts a `BrokenPipe` returned to Rust into a quiet diagnostic exit.
-///
-/// Unix normally terminates the CLI with `SIGPIPE` before this fallback sees
-/// an error because `main` restores the conventional default disposition.
-/// Platforms that report the closed pipe to [`io::Write`] instead use this
-/// path. Other output errors remain failures.
-fn write_diagnostic_handling_observed_broken_pipe(
-    output: &mut dyn io::Write,
-    write_output: impl FnOnce(&mut dyn io::Write) -> froe::Result<()>,
-) -> froe::Result<()> {
-    match write_output(output) {
-        Err(froe::Error::InputOutput(error)) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        result => result,
-    }
 }
 
 fn write_available_graph_row(
