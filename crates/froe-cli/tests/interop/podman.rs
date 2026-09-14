@@ -180,6 +180,7 @@ pub(crate) fn wait_for_sling(port: u16, container_name: &str) {
                 // Sling ships one fragment; ready when resolved count is 0.
                 if let Some(resolved) = extract_bundle_count(&body, 3)
                     && resolved == 0
+                    && serves_content(port)
                 {
                     return;
                 }
@@ -187,6 +188,36 @@ pub(crate) fn wait_for_sling(port: u16, container_name: &str) {
         }
         std::thread::sleep(Duration::from_secs(5));
     }
+}
+
+/// Whether Sling's own servlet is serving the repository yet.
+///
+/// Every bundle being active is necessary and **not sufficient**: Felix
+/// reports a bundle as active before its components have all registered, so
+/// the console answers `200` while the `SlingMainServlet` is not yet mapped
+/// and Jetty answers content requests with its own bare `404`. A run that
+/// started posting there fails with `Error 404 Not Found` on an arbitrary
+/// node — observed at `/content/interop/pages/page5` and, on another run, at
+/// `/content/interop/throwaway/0/0/child3`, which is the same fault landing
+/// at whichever post happened to be first.
+///
+/// So the probe asks the thing the suite is about to use: the repository
+/// root, rendered by Sling. A `200` means the resolution chain that every
+/// later post depends on is up.
+fn serves_content(port: u16) -> bool {
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-u",
+            "admin:admin",
+            &format!("http://localhost:{port}/.json"),
+        ])
+        .output();
+    output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "200")
 }
 
 /// Parse the Felix web console JSON to extract a count from the "s" array.

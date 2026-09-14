@@ -17,24 +17,49 @@ use super::*;
 /// turns an HTTP error into a curl exit status, which the assertion
 /// turns into a `generate` failure naming the path that did not land.
 pub(crate) fn sling_post(port: u16, path: &str, primary_type: &str, title: &str) {
+    sling_post_fields(
+        port,
+        path,
+        &[("jcr:primaryType", primary_type), ("jcr:title", title)],
+    );
+}
+
+/// Posts `fields` to `path` and refuses anything but a 2xx, naming the
+/// status and the body.
+///
+/// The status is what makes a failure attributable. An assertion that says
+/// only "posting X failed" cannot distinguish a servlet that is not up yet
+/// (404), a repository that has not finished starting (503), a rejected
+/// value (500) and a wrong credential (401) — and every phase copies the
+/// fixture this builds, so a post that silently failed poisons a *later*
+/// phase. The Aug 20 run whose binary upload never landed recorded a
+/// 14-entry baseline instead of 21 and failed 90 s later in `read` as
+/// `tree shows nt:file`, attributed to the wrong operation.
+fn post_or_refuse(port: u16, path: &str, fields: &[(&str, &str)]) {
     let url = format!("http://localhost:{port}{path}");
-    let status = Command::new("curl")
-        .args([
-            "-s",
-            "--fail",
-            "-o",
-            "/dev/null",
-            "-u",
-            "admin:admin",
-            "-F",
-            &format!("jcr:primaryType={primary_type}"),
-            "-F",
-            &format!("jcr:title={title}"),
-            &url,
-        ])
-        .status()
-        .expect("curl POST");
-    assert!(status.success(), "posting {path} failed");
+    let mut command = Command::new("curl");
+    // `-w` appends the status after the body, and no `--fail`, so the body
+    // of an error response survives to be reported rather than discarded.
+    command.args(["-s", "-u", "admin:admin", "-w", "\nHTTP %{http_code}"]);
+    for (name, value) in fields {
+        command.args(["-F", &format!("{name}={value}")]);
+    }
+    command.arg(&url);
+    let output = command.output().expect("curl POST");
+    assert!(
+        output.status.success(),
+        "curl itself failed posting {path}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = String::from_utf8_lossy(&output.stdout);
+    let status = response
+        .rsplit_once("HTTP ")
+        .map_or("unknown", |(_, code)| code.trim());
+    assert!(
+        status.starts_with('2'),
+        "posting {path} returned HTTP {status}\nfields: {fields:?}\nresponse:\n{}",
+        &response[..response.len().min(2000)]
+    );
 }
 
 /// Churn content: create subtrees, then delete them. Produces orphaned
@@ -263,15 +288,7 @@ pub(crate) fn sling_node_identifier(port: u16, path: &str) -> String {
 /// `propertyNames` strictly as `NAMES`, so a value that arrived as a
 /// `STRING` produces a fixture that looks right and indexes nothing.
 pub(crate) fn sling_post_fields(port: u16, path: &str, fields: &[(&str, &str)]) {
-    let url = format!("http://localhost:{port}{path}");
-    let mut command = Command::new("curl");
-    command.args(["-s", "--fail", "-o", "/dev/null", "-u", "admin:admin"]);
-    for (name, value) in fields {
-        command.args(["-F", &format!("{name}={value}")]);
-    }
-    command.arg(&url);
-    let status = command.status().expect("curl POST fields");
-    assert!(status.success(), "posting {path} with {fields:?} failed");
+    post_or_refuse(port, path, fields);
 }
 
 /// Adds the reference shapes: a `mix:referenceable` target and a sibling
@@ -345,15 +362,7 @@ pub(crate) fn populate_group_with_members(port: u16) {
 }
 
 fn sling_user_manager(port: u16, path: &str, fields: &[(&str, &str)]) {
-    let url = format!("http://localhost:{port}{path}");
-    let mut command = Command::new("curl");
-    command.args(["-s", "--fail", "-o", "/dev/null", "-u", "admin:admin"]);
-    for (name, value) in fields {
-        command.args(["-F", &format!("{name}={value}")]);
-    }
-    command.arg(&url);
-    let status = command.status().expect("curl POST user manager");
-    assert!(status.success(), "posting {path} with {fields:?} failed");
+    post_or_refuse(port, path, fields);
 }
 
 /// Posts a property index definition over `jcr:title` **after** the content
