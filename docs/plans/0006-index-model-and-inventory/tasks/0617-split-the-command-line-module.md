@@ -8,8 +8,8 @@ gated: false
 touches:
   - crates/froe-cli/src/command_line.rs
   - crates/froe-cli/src/command_line/tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "8aa859a7533dc8efc1c83b5c92a478ead9a20a73"
 ---
 # Split The Command-Line Module Before The Index Commands
 
