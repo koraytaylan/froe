@@ -10,8 +10,8 @@ touches:
   - crates/froe/src/writer/index/selection.rs
   - crates/froe/src/writer/commit.rs
   - crates/froe/tests/index_definition_update_tests.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "e84d0a51885c56bde88cb0676eaf3e16c2257276"
 ---
 # Rewrite The Definition Node As A Reindex Does
 
