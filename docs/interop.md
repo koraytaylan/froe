@@ -120,6 +120,13 @@ index_inventory
    │  Oak's index editors and a fixture froe has written to is
    │  legitimately short an index entry.
    ▼
+property_reindex
+   │  Oak rebuilds every property-family definition in the fixture; froe
+   │  rebuilds the same extracted bytes and the two must render identically
+   │  If this fails: froe's offline rebuild is not what Oak's own reindex
+   │  produces, which is the whole claim of `froe index reindex`. Runs
+   │  before commit for the same reason index_inventory does.
+   ▼
 commit
    │  froe adds nodes with typed properties to the content tree via
    │  the library's commit API, then Sling reads them back
@@ -408,6 +415,76 @@ froe's reading of index structures against Oak's own, over a store Oak wrote.
 
 The phase asserts it runs before `commit`, and that the store's file snapshot
 is byte-identical afterwards — the first read-only phase to assert the latter.
+
+### property_reindex
+
+froe's offline rebuild held against the strongest oracle available: Oak
+rebuilding the same definitions over the same bytes.
+
+**Both rebuilds must index the very same store.** A booted Sling writes
+content of its own before any request arrives — discovery, job and
+distribution nodes under `/var`, each keyed by that instance's fresh
+identifier — so a rebuild on an un-booted copy could never match a rebuild
+on a booted one. The phase therefore boots Sling on a copy of the fixture,
+flags every rebuildable definition through the POST servlet, waits for each
+`reindex` flag to clear *and* its `reindexCount` to advance, stops Sling,
+extracts **that** store, and gives froe a copy of it.
+
+* **The definitions are discovered, not listed.** Every direct child of
+  `/oak:index` whose modelled type is `property`, `reference` or `counter`.
+  A hardcoded set would quietly stop covering a definition the fixture
+  gained; the fixture currently yields 23.
+
+* **The bookkeeping is put back before froe runs.** `definition_edits.rs`
+  re-flags each definition and sets `reindexCount` to Oak's value *minus
+  one*, so froe's own single increment lands back on exactly Oak's value —
+  whatever attempt produced it. Everything else, hidden children included,
+  is re-attached by record identity.
+
+* **The counter is checked canonical first.** A lane cycle running between
+  Oak's rebuild and the stop maintains the counter incrementally, and Oak's
+  editor removes a `:cnt` that reached zero without removing the node it sat
+  on. That leaves a mirror node no rebuild produces. Plan 0006's counter
+  reader reports exactly those nodes, so the phase repeats the
+  boot-flag-wait-stop cycle up to three times and then **fails naming the
+  condition** — it never compares against a store it knows is not canonical,
+  and never skips the comparison.
+
+* **The comparison.** For every definition, `froe digest` restricted to
+  `/oak:index/<name>` must be identical between the extracted store and
+  froe's copy, under `--exclude-property-prefix :count_`. The approximate
+  counters Oak's mirror strategy keeps are seeded from a random number, so
+  two rebuilds of the same content disagree on them by construction; that is
+  a recorded deviation, not a difference the phase can assert away.
+  `reindexCount` *is* compared, and so is the presence or absence of
+  `:index`, `:references` and `:weakreferences`, since Oak creates the
+  latter two and the counter's data node lazily.
+
+* **Nothing outside the definitions moved**, proven by the full digest
+  before and after froe's run with `/oak:index` as the only declared scope,
+  and `froe check` passes at the new head.
+
+* **The query probe.** The Sling GET servlet in this image ships no query
+  servlet, so the phase installs a JSP that runs a JCR-SQL2 statement and
+  prints one path per row, or the `plan` column for an `EXPLAIN`. It is
+  installed **before anything is flagged**, so Oak's rebuild and froe's
+  rebuild index it symmetrically and the comparison step only reads. Oak's
+  own answers are collected from the session that did the rebuild rather
+  than from a second boot of the extracted copy.
+
+* **Oak must accept froe's index rather than rebuild it.** Booting Sling on
+  froe's store asserts `Reindexing will be performed` absent from the log.
+  Without that, every row compared afterwards would be Oak's own rebuild
+  answering itself.
+
+**What this phase does not prove.** Query semantics beyond the sampled
+statements: the samples cover one shape per storage strategy, not the query
+language. Cost estimation is explicitly excluded — a property index's plan
+text prints an `estimatedCost:` the mirror strategy derives from the
+randomized `:count_*` counters, and index selection between competing mirror
+indexes can differ for the same reason, so only plans carrying no
+counter-derived number are compared. And it proves nothing about Lucene,
+which `froe index reindex` refuses by name until plan 0010.
 
 ### commit
 

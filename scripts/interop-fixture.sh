@@ -17,9 +17,10 @@
 # and a failure that cannot be reproduced in isolation cannot be attributed
 # to anything.
 #
-#   generate, read, judge_smoke, index_inventory, commit, checkpoint,
-#   compact, compact_tail, checkpoint_removal, cleanup, journal_retention,
-#   compact_convergence, version_history_purge, repair, backup, recover
+#   generate, read, judge_smoke, index_inventory, property_reindex, commit,
+#   checkpoint, compact, compact_tail, checkpoint_removal, cleanup,
+#   journal_retention, compact_convergence, version_history_purge, repair,
+#   backup, recover
 #
 # Prerequisites:
 #   - podman installed and runnable by the current user
@@ -62,7 +63,7 @@ else
     # Run a single phase.
     phase="$1"
     case "$phase" in
-        generate|read|judge_smoke|index_inventory|commit|checkpoint|compact|compact_tail|checkpoint_removal|cleanup|journal_retention|compact_convergence|version_history_purge|repair|backup|recover)
+        generate|read|judge_smoke|index_inventory|property_reindex|commit|checkpoint|compact|compact_tail|checkpoint_removal|cleanup|journal_retention|compact_convergence|version_history_purge|repair|backup|recover)
             # generate must run first for all other phases.
             if [[ "$phase" != "generate" ]]; then
                 echo "Running 'generate' first (required by all phases)..."
@@ -72,9 +73,10 @@ else
             ;;
         *)
             echo "Unknown phase: $phase" >&2
-            echo "Phases: generate, read, judge_smoke, index_inventory, commit," >&2
-            echo "        checkpoint, compact, compact_tail, checkpoint_removal," >&2
-            echo "        cleanup, journal_retention, compact_convergence," >&2
+            echo "Phases: generate, read, judge_smoke, index_inventory," >&2
+            echo "        property_reindex, commit, checkpoint, compact," >&2
+            echo "        compact_tail, checkpoint_removal, cleanup," >&2
+            echo "        journal_retention, compact_convergence," >&2
             echo "        version_history_purge, repair, backup, recover" >&2
             exit 1
             ;;

@@ -370,6 +370,11 @@ pub(crate) fn interop_full() {
     // side's reading. `index_inventory` asserts its own position too.
     judge_smoke();
     index_inventory();
+    // Before `commit` for the same reason `index_inventory` is: froe's
+    // direct commits run none of Oak's index editors, so afterwards the
+    // fixture is legitimately short an entry and the oracle would report a
+    // difference that says nothing about either rebuild.
+    property_reindex();
     commit();
     checkpoint();
     compact();
@@ -413,6 +418,11 @@ pub(crate) fn write_run_record() {
         .find_map(|line| line.trim().strip_prefix("store.version="))
         .unwrap_or("unknown")
         .to_owned();
+    let canonical_index = std::fs::read_to_string(work_root().join("canonical-index-property.txt"))
+        .map_or_else(
+            |_| "verdict not recorded in this process".to_owned(),
+            |verdict| verdict.trim().to_owned(),
+        );
     let seconds_since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -440,6 +450,20 @@ pub(crate) fn write_run_record() {
          \x20             a valid Lucene index ({lucene_documents} documents), and Oak's own index\n\
          \x20             update was asked whether its editor covers the subtrees whose\n\
          \x20             nodes the fixture's node-type index does not name — it does\n\
+         \x20 property_   Oak rebuilt every property-family definition in the fixture\n\
+         \x20 reindex     and froe's own offline rebuild of the *same extracted bytes*\n\
+         \x20             rendered identically for every one of them, under\n\
+         \x20             --exclude-property-prefix :count_ for the randomized\n\
+         \x20             approximate counters froe omits by recorded deviation. The\n\
+         \x20             definitions were discovered from the store, not listed. Before\n\
+         \x20             froe's rebuild each definition's bookkeeping was put back to\n\
+         \x20             what Oak started from — reindex flagged, reindexCount one\n\
+         \x20             below Oak's value — so froe's single increment landed on\n\
+         \x20             exactly Oak's. The counter was checked canonical first\n\
+         \x20             ({canonical_index}), because a lane cycle between Oak's\n\
+         \x20             rebuild and the stop can leave a :cnt-less mirror node no\n\
+         \x20             rebuild produces. Nothing outside /oak:index changed, and\n\
+         \x20             froe check passed at the new head\n\
          \x20 commit      Oak served content froe committed\n\
          \x20 checkpoint  froe created a checkpoint, listed by name\n\
          \x20 compact     Oak served the exact baseline tree after full compaction\n\
