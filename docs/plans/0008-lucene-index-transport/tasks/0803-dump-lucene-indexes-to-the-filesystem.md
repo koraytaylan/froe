@@ -22,8 +22,8 @@ touches:
   - docs/oak-segment-tar-feature-map.md
   - docs/cli-output.md
   - README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "87b8c994cceec9bcacfc0a7d34b23c0950b0480a"
 ---
 # Dump Lucene Indexes To The Filesystem
 
