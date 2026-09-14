@@ -22,8 +22,8 @@ touches:
   - crates/froe/src/index/lucene/codec/field_infos.rs
   - crates/froe/src/index/lucene/codec/segment_info.rs
   - crates/froe/src/index/lucene/codec/compound.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "69236c0"
 ---
 # Implement Lucene's Output Primitives And Packed Integers
 
