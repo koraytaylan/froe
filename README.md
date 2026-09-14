@@ -101,6 +101,13 @@ compacted and drops the pointless copy instead of running it.
 `--dry-run` previews the whole plan without writing a byte or taking the
 lock.
 
+**Move a Lucene index out without a JVM.** `froe index dump` writes a
+definition's index data to the filesystem in the layout oak-run's importer
+reads, straight out of the segment store — no Oak runtime, and not one byte
+written inside the repository. It reads the index's own table of contents on
+the way, so `froe index check` can say whether the files are a coherent
+Lucene index rather than only whether their blobs resolve.
+
 **Rebuild a flagged index without waiting for Oak to do it.** Oak rebuilds a
 flagged property index synchronously inside the first commit after startup,
 and on a large store that blocks AEM for hours. `froe index reindex` does it

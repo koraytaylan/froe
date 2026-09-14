@@ -64,7 +64,11 @@ pub enum WorkUnit {
     JournalLines,
     /// Named checkpoints.
     Checkpoints,
-    /// Files in the repository directory.
+    /// Files: in the repository directory, or in an index dump or import
+    /// directory.
+    ///
+    /// The second reading arrived with `froe index dump`, which counts the
+    /// index files it streams out rather than anything in the store.
     Files,
     /// Bytes of content.
     Bytes,

@@ -307,6 +307,17 @@ fn select_definitions<'store>(
         selected.push((path, node, definition));
     }
     selected.sort_by(|left, right| left.0.cmp(&right.0));
+
+    // Every explicitly named path is answered. A path naming nothing is a
+    // typo or a definition somebody removed, and reporting "nothing to
+    // dump" for it would send an operator away believing they had a backup.
+    for wanted in requested {
+        if !selected.iter().any(|(path, _, _)| path == wanted) {
+            return Err(Error::InvalidFormat {
+                details: format!("{wanted} names no lucene definition in this store"),
+            });
+        }
+    }
     Ok(selected)
 }
 

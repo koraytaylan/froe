@@ -409,6 +409,17 @@ fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode>
             let outcome = index_display::check_indexes(&repository, &indexes, reporter)?;
             return Ok(ExitCode::from(outcome.exit_code()));
         }
+        IndexAction::Dump {
+            output, indexes, ..
+        } => {
+            index_display::print_index_dump(
+                &repository,
+                &repository_path,
+                &output,
+                &indexes,
+                reporter,
+            )?;
+        }
         IndexAction::Reindex { .. } => unreachable!("handled above, before the read-only open"),
     }
     Ok(ExitCode::SUCCESS)

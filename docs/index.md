@@ -396,11 +396,78 @@ So **a reindex grows the store until the next compaction**. That is the
 honest cost, the plan says so, and the summary names the checkpoints that
 pin them.
 
-## 6. What is not here yet
+## 6. `froe index dump`
+
+Lucene index data out of the repository and onto the filesystem, in the
+layout oak-run's importer reads.
+
+> **Beta.** Byte identity with Oak's own dumper is proven by the interop
+> suite, but the review that freezes that evidence has not run yet.
+
+```
+froe index dump REPOSITORY --output DIRECTORY [--index PATH]…
+```
+
+**Read-only, and testably so.** The dump opens the store exactly as
+`froe summary` does — no lock, no manifest write — and writes nothing inside
+it. The regression that holds it to that compares a file snapshot of the
+store before and after, `repo.lock` included, and a second test runs a dump
+while another process holds the lock.
+
+### 6.1 What it writes
+
+```
+<output>/index-dumps/
+├── index-definitions.json      every dumped definition, in the out-of-band variant
+├── indexer-info.properties     the checkpoint the data was taken at
+└── <base name>/                one per definition; `/oak:index/lucene` gives `lucene`
+    ├── index-details.txt       the JCR path and the directory-name mapping
+    ├── data/                   `:data`
+    └── suggest-data/           `:suggest-data`, when there is one
+```
+
+`<output>/index-dumps` is the directory to hand to
+`froe index import --input` or to oak-run's `--index-import-dir`: both scan
+its direct children for `index-details.txt`.
+
+A mount-decorated `:data` — a composite store's other mount — is **reported
+and skipped**, never copied into a directory claiming to be this mount's.
+
+### 6.2 The one-checkpoint rule
+
+`indexer-info.properties` names **one** checkpoint for the whole directory,
+while whether an index can be imported is a question about each definition
+separately. So froe writes the file only when every dumped definition is
+asynchronous, on the same lane, and that lane's checkpoint resolves in the
+store.
+
+Otherwise the files are still written — they are a backup, and worth having
+— but the properties file is not, and the dump says which of four reasons
+applied: the selection spans several lanes, a definition is synchronous, the
+lane's checkpoint is dangling, or the lane has no state on `/:async`. Such a
+directory cannot be imported by oak-run either; oak-run warns the same way
+when the checkpoint is `head`.
+
+**The remedy is to dump one lane at a time with `--index`.** A definition
+you name that is not a `lucene` definition, or names nothing at all, is
+refused by name rather than quietly producing an empty dump.
+
+### 6.3 An interrupted dump
+
+An existing dump is **never** written over, and a partially populated
+`index-dumps` is refused just as a complete one is: completing an
+interrupted dump would leave a directory that is part one dump and part
+another, which looks importable and is not.
+
+Each file is streamed to a froe-named temporary and renamed into place, so
+a file under its real name was written whole. A returned error removes its
+temporary; abrupt death leaves it. Either way the remedy is the same —
+**delete the output directory and rerun**.
+
+## 7. What is not here yet
 
 | Subcommand | Plan |
 | --- | --- |
-| `froe index dump` — Lucene index data to a filesystem directory | 0008 |
 | `froe index reindex` for fulltext-enabled Lucene definitions | 0009 |
 | `froe index import` — oak-run's filesystem transport back into a store | 0010 |
 

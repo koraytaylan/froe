@@ -12,6 +12,7 @@ mod diagnostics;
 mod export;
 mod index;
 mod index_reindex;
+mod index_transport;
 mod reporting;
 mod support;
 

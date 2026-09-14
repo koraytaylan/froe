@@ -792,3 +792,66 @@ fn render_lucene_verdict(path: &str, report: &lucene::LuceneBlobReport) -> Strin
     }
     verdict
 }
+
+/// Renders a Lucene dump: what was written, and what could not be recorded.
+///
+/// The plan's shape, printed after the fact rather than before, because a
+/// dump asks nothing — it is read-only against the store and writes only
+/// where the operator pointed it.
+pub(crate) fn print_index_dump(
+    repository: &Repository,
+    repository_path: &Path,
+    output: &Path,
+    requested: &[String],
+    reporter: &Reporter,
+) -> froe::Result<()> {
+    let _ = repository_path;
+    let options =
+        froe::index::lucene::dump::DumpOptions::new(requested.to_vec(), output.to_owned());
+    let outcome = froe::index::lucene::dump::dump_lucene_indexes_with_progress(
+        repository,
+        &options,
+        &mut reporter.clone(),
+    )?;
+    // The data is the operator's evidence: end every report before a line
+    // of it is written.
+    reporter.finish();
+
+    if outcome.indexes.is_empty() {
+        println!("no lucene definition was dumped");
+        return Ok(());
+    }
+
+    println!("dumped to {}", outcome.directory.display());
+    for index in &outcome.indexes {
+        let bytes: u64 = index.files.iter().map(|(_, size)| size).sum();
+        println!(
+            "  {} -> {}/: {}, {}",
+            index.path,
+            index.directory,
+            crate::output::count_noun(index.files.len() as u64, "file", "files"),
+            froe::format_byte_size(bytes),
+        );
+        for skipped in &index.skipped_directories {
+            println!(
+                "    skipped {skipped}: a composite mount's index data, which this dump \
+                 does not claim as its own"
+            );
+        }
+    }
+
+    match (&outcome.checkpoint, &outcome.no_checkpoint_reason) {
+        (Some(checkpoint), _) => {
+            println!("recorded checkpoint {checkpoint}; this directory can be imported");
+        }
+        (None, Some(reason)) => {
+            println!("no indexer-info.properties was written: {reason}");
+            println!(
+                "the files are a backup and cannot be imported; dump one lane at a time \
+                 with --index to produce an importable directory"
+            );
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}

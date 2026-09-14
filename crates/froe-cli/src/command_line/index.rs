@@ -57,6 +57,37 @@ pub(crate) enum IndexAction {
         #[arg(long = "index", value_name = "PATH")]
         indexes: Vec<String>,
     },
+    /// Write Lucene index data to the filesystem in oak-run's layout
+    /// (read-only).
+    ///
+    /// Opens the store exactly as `froe summary` does: no lock, no manifest
+    /// write, and not one byte written inside the repository. Everything
+    /// goes under `--output`, which must not be inside the store.
+    ///
+    /// The directory oak-run's importer reads is `<output>/index-dumps`;
+    /// pass that to `froe index import --input` or to oak-run's
+    /// `--index-import-dir`.
+    ///
+    /// An existing dump is never written over. A run that was interrupted
+    /// leaves a partial file set, and the next run refuses it rather than
+    /// completing it into a directory that is part one dump and part
+    /// another — delete the output directory and rerun.
+    Dump {
+        /// The segment store directory.
+        repository: PathBuf,
+        /// Where to write. Must not be inside the store.
+        #[arg(long)]
+        output: PathBuf,
+        /// Restrict to this definition path; repeatable. A path naming a
+        /// definition that is not `lucene` is refused by name.
+        ///
+        /// `indexer-info.properties` names one checkpoint for the whole
+        /// directory, so dump one lane at a time when the store has
+        /// definitions on several: a mixed selection is still written as a
+        /// backup, but without that file it cannot be imported.
+        #[arg(long = "index", value_name = "PATH")]
+        indexes: Vec<String>,
+    },
     /// Rebuild flagged indexes offline, from the state Oak's own editors
     /// would index.
     ///
@@ -132,7 +163,8 @@ impl IndexAction {
             IndexAction::List { repository, .. }
             | IndexAction::Definitions { repository, .. }
             | IndexAction::Check { repository, .. }
-            | IndexAction::Reindex { repository, .. } => repository,
+            | IndexAction::Reindex { repository, .. }
+            | IndexAction::Dump { repository, .. } => repository,
         }
     }
 }
