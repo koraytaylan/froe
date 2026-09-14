@@ -432,14 +432,12 @@ fn a_relative_name_carries_its_ancestors() {
 #[test]
 fn the_definition_level_settings_are_read() {
     let definition = default_definition()
-        .string("valueRegex", "^abc.*$")
         .long("maxFieldLength", 500)
         .child("tika", Node::new().string("maxExtractLength", "1000"))
         .child("analyzers", Node::new().boolean("indexOriginalTerm", true))
         .child("suggestion", Node::new().boolean("suggestAnalyzed", true));
     let (_directory, rules) = read_rules("settings", &definition, None);
     let rules = rules.expect("the definition reads");
-    assert_eq!(rules.value_regex.as_deref(), Some("^abc.*$"));
     assert_eq!(rules.maximum_field_length, Some(500));
     assert!(
         rules.has_tika_configuration,
@@ -447,6 +445,18 @@ fn the_definition_level_settings_are_read() {
     );
     assert!(rules.index_original_term);
     assert!(rules.suggest_analyzed);
+}
+
+/// A definition-level `valueRegex` gates the per-property fulltext loop
+/// with a regular expression froe does not evaluate.
+#[test]
+fn a_definition_level_value_regex_is_refused_by_name() {
+    let definition = default_definition().string("valueRegex", "^abc.*$");
+    let (_directory, rules) = read_rules("value-regex", &definition, None);
+    let Err(refusal) = rules else {
+        panic!("a definition-level valueRegex is refused");
+    };
+    assert!(refusal.to_string().contains("^abc.*$"), "{refusal}");
 }
 
 /// `suggestAnalyzed` on the definition root is where older definitions

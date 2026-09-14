@@ -7,23 +7,15 @@
 //!
 //! # What is here
 //!
-//! The definition-side model the maker consults: [`rules`] for the
-//! indexing rules and their property definitions, [`name_pattern`] for
-//! `isRegexp` names, and [`aggregate`] for the node aggregates. The maker
-//! itself, the facets and the binaries are task 1006's.
+//! [`rules`] for the indexing rules and their property definitions,
+//! [`name_pattern`] for `isRegexp` names, [`aggregate`] for the node
+//! aggregates, [`document_maker`] for the maker itself, [`facets`] for the
+//! facet fields and [`binaries`] for the text a binary property
+//! contributes.
 
 pub mod aggregate;
+pub mod binaries;
+pub mod document_maker;
+pub mod facets;
 pub mod name_pattern;
 pub mod rules;
-
-/// The document maker: from a node state to the exact set of fields.
-/// Task 1006 owns it.
-pub mod document_maker {}
-
-/// The facet fields and the configuration that persists beside them.
-/// Task 1006 owns it.
-pub mod facets {}
-
-/// Binary text extraction, and the marker froe writes in its place.
-/// Task 1006 owns it.
-pub mod binaries {}

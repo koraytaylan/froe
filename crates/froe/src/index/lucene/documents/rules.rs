@@ -89,6 +89,12 @@ pub struct IndexingRule {
     /// `aggregate.hasNodeAggregates() || hasAnyFullTextEnabledProperty()`,
     /// which is what selects `oakCodec`.
     pub fulltext_enabled: bool,
+    /// `aggregate.hasNodeAggregates() || anyNodeScopeIndexedProperty()`.
+    pub node_fulltext_indexed: bool,
+    /// `areAlMatchingNodeByTypeIndexed`: whether **every** node the rule
+    /// covers is indexed, which is what lets an otherwise empty document
+    /// be written at all.
+    pub indexes_all_nodes_of_matching_type: bool,
 }
 
 impl IndexingRule {
@@ -216,8 +222,6 @@ pub struct IndexingRules {
     pub evaluate_path_restrictions: bool,
     /// `maxFieldLength`, as stored; `None` for the default.
     pub maximum_field_length: Option<i64>,
-    /// `valueRegex`, the definition-level value restriction.
-    pub value_regex: Option<String>,
     /// Whether a `tika` child was present. Nothing is read from it, and an
     /// operator wants to know that froe saw it.
     pub has_tika_configuration: bool,
@@ -447,6 +451,20 @@ impl IndexingRule {
                 .values()
                 .chain(patterns.iter().map(|(_, definition)| definition))
                 .any(PropertyDefinition::fulltext_enabled);
+        let node_fulltext_indexed = aggregate.has_node_aggregates()
+            || properties
+                .values()
+                .chain(patterns.iter().map(|(_, definition)| definition))
+                .any(|definition| definition.node_scope_index);
+        // `jcr:primaryType` is on every node, so a rule that indexes it
+        // covers every node it applies to; so does a non-relative
+        // `nullCheckEnabled` property, which OAK-1085 is about.
+        let indexes_all_nodes_of_matching_type = node_type_index
+            || node_fulltext_indexed
+            || properties
+                .values()
+                .any(|definition| definition.null_check_enabled && !definition.relative)
+            || properties.contains_key(&fold_case("jcr:primaryType"));
         let node_name_indexed = optional_boolean(node, "indexNodeName", false)?
             || properties
                 .values()
@@ -465,6 +483,8 @@ impl IndexingRule {
             patterns,
             aggregate,
             fulltext_enabled,
+            node_fulltext_indexed,
+            indexes_all_nodes_of_matching_type,
         };
         rule.validate(definition_path)?;
         Ok(rule)
@@ -588,6 +608,18 @@ impl IndexingRules {
                 }
             )));
         }
+        if let Some(pattern) = strict_string(definition.property("valueRegex")?.as_ref()) {
+            // A definition-level regular expression, applied with
+            // `Matcher.find` inside the per-property fulltext loop. froe
+            // evaluates no value regular expression — plans 0006 and 0007
+            // refuse `valuePattern` for the same reason — and a value
+            // wrongly kept or dropped here is a term that should not be
+            // in the index or one that should.
+            return Err(refuse(format!(
+                "it restricts values with the regular expression {pattern:?}, which froe does \
+                 not evaluate"
+            )));
+        }
         let maximum_field_length = converting_long(definition.property("maxFieldLength")?.as_ref());
         if maximum_field_length == Some(0) {
             return Err(refuse(
@@ -627,8 +659,6 @@ impl IndexingRules {
                 false,
             )?,
             maximum_field_length,
-            value_regex: strict_string(definition.property("valueRegex")?.as_ref())
-                .map(str::to_owned),
             has_tika_configuration: definition.child_node("tika")?.is_some(),
         };
         rules.refuse_conflicting_doc_value_types(definition_path)?;
