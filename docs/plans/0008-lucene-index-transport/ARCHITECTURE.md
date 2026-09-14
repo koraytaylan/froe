@@ -356,22 +356,319 @@ links against, which cite the in-crate test by name.
 
 #### Interoperability
 
-*To be written by task 0811, recording the runs of tasks 0808 and 0809: the
-Oak build, the image digest, the direction, the froe-side edits made before
-the operation under test, and what Oak's own dumper, Lucene's own index
-checker, Oak's own consistency check at level 2 and a live Oak answering
-fulltext queries each agreed with.*
+**The loop.** Apache Sling 14 with `oak-segment-tar` 1.90.0, image
+`docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9`,
+`store.version=2`. Every oracle is Oak itself, compiled and run inside that
+same image from the bundles it ships — not a second implementation and not a
+second image. The fixture is the store `generate` produces, stopped cleanly
+and extracted.
+
+**`lucene_dump` — froe to the filesystem, against Oak's own dumper.**
+Direction: read-only, out of the store. No froe-side edit: the fixture is
+read as it stands, and the store's file snapshot is byte-identical
+afterwards.
+
+| Oracle | Agreement |
+| --- | --- |
+| Oak's own `LuceneIndexDumper`, over the same `:data` | Every file of `/oak:index/lucene` byte-identical — the name set and the contents both. Nine files, 1.9 MB. |
+| `index-details.txt` | The same `indexPath` and the same `dir.*` mappings, compared as *parsed* Java properties: both sides write it through `java.util.Properties`, whose `saveConvert` escapes `:` in values, so a line comparison would compare an encoding. |
+| Lucene 4.7.2's own `CheckIndex`, over froe's output | Clean. |
+| Oak's own `IndexConsistencyChecker` at `FULL` | `clean=true`, and the `CheckIndex` pass **reached** rather than skipped — asserted separately, because the checker runs it only once the directory's content is consistent and a blob failure would otherwise read as a quiet pass. |
+| Oak's own document count over froe's output | 8,369, equal to the count froe computes from `segments_N` and each `.si`. `:status/indexedNodes` is deliberately not compared: it is a per-cycle counter. |
+
+A negative control runs in the same phase: one byte flipped in a copy of
+froe's dump, and the comparison names the file and the offset.
+
+**`lucene_import` — the filesystem into a stopped store, both directions.**
+
+*Round trip.* froe-side edits to the copy before the operation: the
+definition's hidden children removed, which is the state a lost index
+leaves. froe dumps, the index is lost, froe imports it back. Verified
+post-state: nine files read back out of the store byte-identical to the
+files on disk; the definition renders as the original did apart from
+`uniqueKey`, `jcr:lastModified`, the status `uid`, `dirListing`'s order
+(compared as a set) and `jcr:data` (whose stored blob carries the fresh
+key, so it is compared by length in the digest and by bytes through the
+reader); `reindexCount` one above the original; `:status` carrying the
+fresh `uid` and none of the three per-cycle properties; every checkpoint
+still present; the whole-store digest differing in 13 lines over 52,875
+nodes, every one under `/oak:index/lucene`; `froe check` and
+`froe index check` clean.
+
+*Out of band.* froe-side edits to the copy: `corrupt` forged as a `DATE`,
+the type Oak's own async lane writes — the standard reason to reach for an
+out-of-band build, and what makes the drift comparison's tolerance
+load-bearing, since the judge builds from the lane checkpoint's state,
+which predates the flag. The judge reproduces `IndexerSupport`'s sequence
+from the classes the image ships: an in-memory copy of the lane
+checkpoint's state, the lane switch and `reindex` flag, Oak's own cycle
+under the visible-editor filter, the lanes switched back, then Oak's own
+`LuceneIndexDumper` and `JsonSerializer` under the printer's out-of-band
+filter for the artefact. **One recorded departure**, at the judge: oak-run
+hands the editor provider a filesystem directory factory; this lets the
+provider write into the copy's `:data` as it ordinarily would and dumps
+that. The file bytes are the same — `lucene_dump` is what says so — and it
+makes `index-details.txt` Oak's own output rather than the judge's guess at
+its format. Verified post-state: `reindexCount` **two** above the original,
+exactly as oak-run's own import leaves it; `corrupt` cleared; the lane's
+checkpoint still present and no checkpoint released; the digest delta
+confined to the definition; Oak's own `IndexConsistencyChecker` clean at
+`FULL`.
+
+*Oak consumption, on each imported store.* A real Oak boots, logs none of
+its repair markers, no reindex marker, and none of the three index-failure
+markers. Through the query probe it answers
+`CONTAINS(*, 'Page')` over `/content/interop/pages` with the same five rows
+the pristine store answers, `EXPLAIN` naming `lucene:lucene` on both sides.
+The pristine store is asserted to answer five rows through that index
+first, so the comparison is never vacuous.
+
+*Refusals*, each leaving the store byte-identical: a checkpoint the store
+does not hold; a checkpoint that resolves and is not the attachment state,
+refused naming both checkpoints and both roots; a drifting definitions
+file, refused naming the property; and a definition made synchronous.
+
+**What the interop runs found.** Three defects no froe-only test could
+have reached.
+
+1. **A segment's deletions file is derived, never listed.** froe's dump was
+   byte-identical and both Oak oracles clean, and froe's own structural
+   check called the same index incoherent, reporting `_0_1.del` as a file
+   no segment names. Because the import refuses an incoherent directory
+   before copying a byte, `froe index import` would have refused every real
+   Oak index whose segments carry deletions. Fixed, with §8.8 of
+   `index-lucene-storage.md` quoting the Lucene source.
+2. **The state rule had no regression that reached it** — in the froe-only
+   tests and again in this phase. Both refusals named a checkpoint the
+   store does not hold, which resolution rejects first. Both now use a
+   checkpoint that resolves and is not the lane's.
+3. **A log marker that fires on a pristine store.** `FileNotFoundException`
+   is `java.io`'s and the image's ESAPI logs one at boot, so it counts only
+   on a line that also names Lucene. The pristine control caught it.
 
 #### Verification report
 
-*To be written by task 0811: what was run, on what, with which results, under
-the guide's five separations, and what the coverage of the fault tests is and
-is not.*
+**The frozen range** is `dd70dbf..8aba820` — 34 commits, 94 files,
++13,167/−287. `git diff --check dd70dbf..8aba820` is clean and
+`git status --porcelain` is empty, so there is no untracked candidate file.
+
+**The stable host gate** ran on `x86_64-unknown-linux-gnu` before every
+commit in the range: `cargo +stable fmt --all -- --check`,
+`cargo +stable test --workspace --all-features --no-fail-fast`, the same
+`--release`, `cargo +stable clippy --workspace --all-targets --all-features
+-- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo +stable doc --workspace
+--all-features --no-deps`, `scripts/oversized-files.sh`, and
+`git diff --check HEAD`. Every section passed.
+
+From the middle of this range onward the gate was run **section by
+section** rather than as one script. This host's memory watchdog keys on
+*free* memory, which the page cache holds near zero while 110+ GB remains
+available, and it killed the single-invocation gate twice. Each section's
+command and status is the same; only the invocation differs.
+
+**Not run in this range, and therefore not claimed.**
+
+* *The MSRV gate.* The declared minimum is 1.89 and no 1.89 toolchain is
+  installed on this host; the oldest present is 1.94.
+* *The i686 width sentinel.* Attempted:
+  `cargo +stable check --workspace --all-features --target
+  i686-unknown-linux-gnu` fails in `zstd-sys`'s build script, which needs a
+  32-bit C toolchain this host does not have. **No froe code was compiled
+  for the target**, so the attempt says nothing about this range's width
+  behaviour either way — it is a gap, not a pass.
+* *`scripts/interop-fixture.sh` as a whole chain.* Every phase from
+  `generate` through `lucene_import` has been run and passed individually
+  against a freshly generated fixture, and the chain reaches
+  `property_reindex` before the watchdog kills it in that phase's
+  23-definition digest loop.
+
+**The five separations this report is held to.**
+
+*Execution from cross-compilation.* Everything claimed above was executed
+on `x86_64-unknown-linux-gnu`. Nothing in this range was cross-compiled,
+and the one cross-target attempt is recorded as a gap above rather than as
+a result.
+
+*Synthetic credentials from execution as root.* The journal-owner and
+metadata-source gates are exercised through the `_for_credentials` twins
+plan 0007 added, which model an identity the process does not have. No test
+in this range depends on the runner's uid and none ran as root. What that
+proves is the predicate, not the behaviour of a real foreign-owned file.
+
+*Process-exit or syscall injection from true power loss.* Task 0806's four
+cutpoints inject a returned error or an abrupt `_exit` in a forked child.
+That proves the code's ordering around each boundary. It does **not** prove
+the platform's write ordering under power loss: no test here cuts power,
+and none can.
+
+*File existence from durability.* The probes assert a reopened store's
+head, journal lines and subtrees through a fresh read-only open. That a
+file is present and parses is not that its bytes reached the medium; the
+fsync calls `flush` makes are asserted to have been *made*, not to have
+been honoured by the device.
+
+*froe-to-froe from real Oak.* The round trip, the guard tests and the fault
+probes are froe reading what froe wrote — necessary, and never sufficient.
+Every claim about the *format* in this range rests on the interoperability
+section above, where the oracle is Oak's own dumper, Oak's own consistency
+checker, Lucene's own index checker and a live Oak answering queries. The
+three defects that section lists are what a froe-only suite had already
+passed over.
+
+**Per claim.** Each fault row above records its cutpoint, its model —
+returned error or `_exit` — and the prefix it proves. Each guard row
+records its production callers, its named regression, the neutralization
+applied and the failure that neutralization produced, with two rows saying
+plainly that their neutralization was caught by a different refusal or that
+no input can produce one.
+
+**What the fault coverage is and is not.** It covers the four boundaries
+the mutation table names, under two models each where the states differ. It
+does not cover a fault inside `flush`'s own syscall sequence, a fault in
+the filesystem beneath it, or concurrent writers — the last excluded by the
+exclusive `repo.lock` the run holds from `prepare` through `flush`, which
+is also why the moved-head guard has no neutralization.
 
 #### Known gaps
 
-*To be written by task 0811.*
+**Guards with no synthetic regression.**
+
+* *The fsync-capability gate.* No test in this range makes `fsync` fail or
+  makes a filesystem lack it. The gate is asserted to run, not to be right
+  about a filesystem that lies.
+* *The moved-head `compare_and_set_head`.* The import holds `repo.lock`
+  exclusively from `prepare` through `flush`, so no second writer can move
+  the head inside the window and no test can make one. The residual is a
+  writer that ignores the lock, which froe cannot defend against and does
+  not claim to.
+* *The read-back verification before publication.* No input makes the bytes
+  disagree: the only way to produce a mismatch is a writer/reader
+  disagreement, which is what the check exists to catch.
+
+**The state rule is stricter than Oak's semantics.** It compares the
+checkpoint root and the lane root by *record identity*. Two states that are
+equal but were written independently have different records, so a directory
+built at an equal-but-not-identical state is refused. The error is in the
+safe direction — it refuses rather than accepts — and every real lane
+checkpoint shares the content root's record by construction, which is the
+case the rule is for.
+
+**Recorded departures from oak-run**, each documented at its site:
+
+* `:suggest-data` is never imported. Oak's own Lucene writer rebuilds the
+  suggestions whenever their `lastUpdated` is missing, so the suggester is
+  absent only until the next cycle.
+* **No checkpoint is released.** oak-run's importer releases the one
+  `indexer-info.properties` names as its fourth step; the only checkpoint
+  froe accepts is a lane's, and the lane owns it.
+* The **single-blob** encoding is written, which is what Oak's own buffered
+  directory produces by default. The buffered encoding — what oak-run's
+  importer writes when it copies a directory — is read, never written.
+* `dirListing` is written in **name order**. Oak stores it in a concurrent
+  hash set's iteration order and reads it back as a set, so only its
+  contents are a claim.
+* The file's `refresh` is **not copied**; froe refreshes the stored
+  definition by cloning it.
+* `:status` carries `uid` alone. `lastUpdated`, `indexedNodes` and
+  `reindexCompletionTimestamp` are absent, because Oak's own importer
+  leaves no post-import state to copy them from.
+* The out-of-band judge builds into the copy's `:data` and dumps that,
+  where oak-run writes to a filesystem directory factory. Recorded in the
+  interoperability section with the reason.
+
+**Every refusal the scope lists** is a gap in capability rather than in
+evidence: a synchronous definition, a hybrid definition, a mixed-lane
+directory and a drifting definitions file are refused by name, not
+approximated.
+
+**Standing environment axes**, unchanged from plans 0006 and 0007 and
+listed again because this range's claims inherit them: no AEM build (the
+loop is Apache Sling with Oak), no external blob store, no local macOS
+execution — CI's `macos-latest` job is the authority — and no native
+Windows execution. To these this range adds the three the verification
+report names: no MSRV gate, no i686 width sentinel, and no single
+uninterrupted run of the whole interop chain on this host.
 
 #### Review
 
-*To be written by task 0811, which freezes the range.*
+Four adversarial lenses were run over the frozen range by passes that did
+not author it. **Three found real defects; all three are fixed in the
+range.** The pass is recorded as automated.
+
+**Lens 1 — the state rule: can any input attach an index to a state it
+does not reflect?**
+
+No path bypasses it: every selected definition goes through `plan_one`, a
+directory with no definition is refused and a definition with no directory
+is never imported. One checkpoint governs a whole directory, so a
+mixed-lane directory can satisfy at most one definition and the rest are
+refused by name. The rule is replanned under the lock, and the fingerprint
+and path-identity rechecks close the confirmation window.
+
+*Finding (fixed).* The rule had **no regression that reached it**. Both the
+froe-only test and the interop phase named a checkpoint the store does not
+hold, which `resolve_checkpoint_root` rejects before the rule is evaluated
+— so neutralizing the rule left both passing. Both now use a checkpoint
+that resolves and is not the lane's, and both fail when the rule is
+removed.
+
+*Recorded, not fixed.* The comparison is by record identity, which is
+stricter than state equality. See the known gaps.
+
+**Lens 2 — the file round trip: can a length, key or listing disagree with
+what Oak reads?**
+
+The two encodings' declared lengths were re-derived against
+`OakStreamingIndexFile` and `OakBufferedIndexFile`; the buffered
+arithmetic reduces as its comment claims, and a last chunk shorter than
+the key is a refusal rather than an underflow. The sixteen key bytes are
+appended once and subtracted once, held by nine files reading back
+byte-identically and by byte identity against Oak's own dumper. The
+listing is written in name order and compared as a set; when
+`saveDirectoryListing` is off the reader takes the child names as the
+listing, which is what Oak does, and does not read a stale property.
+
+*Finding (fixed).* A segment's deletions file is **derived from its
+deletion generation and named nowhere**. `referenced_files` collected only
+the strings the commit file lists, so froe's structural check called a real
+Oak index incoherent — and since the plan refuses an incoherent directory
+before copying, `froe index import` would have refused every Oak index
+whose segments carry deletions.
+
+**Lens 3 — interruption prefixes against the code.**
+
+Read against `apply_prepared` rather than against the tests. The session is
+closed on **every** path — `let closed = store.close(); let written =
+written?; closed?;` — so a returned error leaves an *unreferenced* archive
+rather than a damaged one, which is the failure plan 0007 bought the hard
+way. A run that fails after `compare_and_set_head` restores the head before
+closing, so closing seals rather than publishes. The two cutpoints around
+publication observe one on-disk prefix, and the two tests assert the same
+thing deliberately. The `before-applied-verification` cutpoint sits after
+`closed?`, so its prefix is the final store, which is what "reports rather
+than repairs" means.
+
+**Lens 4 — evidence wording.**
+
+The guards table quotes each neutralization's own output and says, in the
+two rows where it is true, that the quote names a *different* refusal or
+that no input can produce one. The fault table's mid-copy row states that
+at this fixture's scale nothing reaches disk, and pins the claim that holds
+at every scale instead of the one that happens to hold here.
+
+*Finding (fixed).* An index-failure marker that **fires on a pristine
+store**. `FileNotFoundException` is `java.io`'s, and the image's ESAPI logs
+one at boot looking for a properties file. Unqualified it would have failed
+the scan on every store, froe's and Oak's alike — a marker that proves
+nothing while appearing to prove something. It now counts only on a line
+that also names Lucene, and the assertion reports the matching lines rather
+than the marker.
+
+**The gate is open.** This review's work is done and committed. The
+**freeze itself**, and lifting the beta framing from `docs/index.md` §6 and
+§7 and the feature map's rows, is the maintainer's decision: those rows
+tell a reader that `froe index dump` and `froe index import` are ready for
+a production store, and the evidence behind them has the gaps recorded
+above — no MSRV gate, no i686 sentinel, and no single uninterrupted run of
+the whole interop chain on this host. The interoperability record itself is
+complete and every oracle passed.
