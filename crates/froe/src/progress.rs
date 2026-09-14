@@ -75,6 +75,9 @@ pub enum WorkUnit {
     /// Index entries: one `(key, path)` pair of a rebuilt property,
     /// unique or reference index.
     IndexEntries,
+    /// Documents handed to the Lucene index writer, one per node the
+    /// definition matches.
+    IndexDocuments,
 }
 
 impl WorkUnit {
@@ -93,6 +96,7 @@ impl WorkUnit {
             Self::Files => "files",
             Self::Bytes => "bytes",
             Self::IndexEntries => "index entries",
+            Self::IndexDocuments => "index documents",
         }
     }
 
@@ -109,6 +113,7 @@ impl WorkUnit {
             Self::Files => "file",
             Self::Bytes => "byte",
             Self::IndexEntries => "index entry",
+            Self::IndexDocuments => "index document",
         }
     }
 

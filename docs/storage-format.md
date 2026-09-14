@@ -1,7 +1,8 @@
-# The segment-tar storage format
+# The on-disk formats froe writes
 
-The on-disk format of Apache Jackrabbit Oak's TarMK, as implemented by
-this workspace. Derived from the `oak-segment-tar` Java sources and the
+The formats Apache Jackrabbit Oak keeps on disk, as implemented by this
+workspace: TarMK's segment store, which is the whole of this document, and
+the Lucene 4.7.2 index format §8 points at. Derived from the `oak-segment-tar` Java sources and the
 official format documentation, then cross-verified; where the two
 disagree, the code is authoritative and the discrepancy is noted.
 
@@ -298,3 +299,29 @@ subsequent Oak (or AEM) start depends on:
 
 The full write-path contract, with the AEM safety invariant checklist for
 each subsystem, is in [`analysis/`](analysis/) (`write-*.md`).
+
+## 8. The second on-disk format: Lucene indexes
+
+A Lucene index is not part of TarMK's format: it is a directory of Lucene
+files, which Oak stores as `:data` node content inside the segment store
+and which froe reads, transports and — since plan 0009 — writes.
+
+**The specification is
+[`analysis/lucene-4-7-codec.md`](analysis/lucene-4-7-codec.md)**, extracted
+byte for byte from the Lucene 4.7.2 sources `oak-lucene` vendors at the
+pinned Oak commit. It covers the `oakCodec` composition Oak selects for a
+fulltext-enabled definition — `Lucene46` with the postings format
+replaced — and every file in it: the postings, the block-tree terms
+dictionary, the stored fields, the doc values, the norms, the field infos,
+the compound file, the segment descriptor and the commit.
+
+The table of contents a reader needs — the commit file, the `.si`, the
+compound directory and the base-36 generation naming — is in
+[`analysis/index-lucene-storage.md`](analysis/index-lucene-storage.md) §8,
+which came first: froe read these structures before it wrote them.
+
+Two conventions differ from TarMK's and are easy to carry across wrongly.
+Lucene's `VInt` and `VLong` are **little-endian by groups of seven bits**,
+where every integer in this document is big-endian; and a Lucene file opens
+with a codec header of a magic number, a name and a version, where a
+segment-store file opens with nothing.

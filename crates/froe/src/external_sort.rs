@@ -264,15 +264,7 @@ impl<Record: SpillRecord> SortedRuns<Record> {
     /// Plan 0009's doc-value and norms writers make a statistics pass, a
     /// missing-bitset pass and a write pass over the same input, so the runs
     /// are kept until the [`SortedPasses`] is dropped rather than unlinked as
-    /// each cursor is exhausted — which is also why nothing in this plan
-    /// calls it yet.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "plan 0009's doc-value and norms writers are the first callers"
-        )
-    )]
+    /// each cursor is exhausted.
     pub(crate) fn into_sorted_passes(mut self) -> Result<SortedPasses<Record>> {
         self.spill()?;
         let spilled = std::mem::take(&mut self.spilled);

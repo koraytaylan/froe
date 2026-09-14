@@ -101,15 +101,19 @@ pub use content::{
     PropertyValues, SegmentProvider, Template, read_binary_stream,
 };
 pub use error::{Error, Result};
-/// The sorted sequences plan 0009's writers consume.
+/// What a caller of the Lucene index writer needs from the external sort.
 ///
-/// The sort itself stays crate-internal — its budget, its spill directory
-/// and its run merge are froe's business — but a consumer that takes a
-/// sorted sequence has to be callable, and its vector tests live in
-/// separate integration-test crates. These three names are what such a
-/// caller needs and no more.
-pub use external_sort::{SortedPass, SortedPasses, SpillRecord};
+/// The sort itself stays crate-internal — its run merge and its spill
+/// format are froe's business — but the writer takes a location and a
+/// budget, and the consumers it drives take sorted sequences their vector
+/// tests must be able to build. These five names are what such a caller
+/// needs and no more.
+pub use external_sort::{RunLocation, SortBudget, SortedPass, SortedPasses, SpillRecord};
 pub use gc_journal::GarbageCollectionJournalEntry;
+pub use index::lucene::writer::{
+    DocValue, Document, Field as LuceneField, IndexWriterStatistics, LuceneIndexWriter,
+    MAXIMUM_TERM_LENGTH, StoredValue, Token, WrittenIndex, index_writer,
+};
 pub use journal::JournalEntry;
 pub use progress::{DiscardedProgress, ProgressObserver, Step, WorkUnit};
 pub use segment::{

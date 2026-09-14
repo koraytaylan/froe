@@ -16,6 +16,7 @@ pub mod dump;
 pub mod layout;
 pub mod read;
 pub mod segments;
+pub mod writer;
 
 pub use check::{BlobFault, LuceneBlobReport, check_blobs};
 pub use codec_header::{CODEC_MAGIC, CodecHeader, header_length, read_codec_header};

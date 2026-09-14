@@ -213,6 +213,26 @@ pub struct DocValuesFiles<Sink> {
     pub metadata: Sink,
 }
 
+/// A dictionary the terms-dictionary branch can walk more than once.
+///
+/// It measures the shortest and longest value before it writes any, so one
+/// walk is never enough — and the writer that feeds it may be deriving the
+/// distinct values from a sorted run as it goes, which is why this is a
+/// stream rather than a sequence.
+pub trait DictionaryStream {
+    /// Calls `visit` once per value, in ascending value order.
+    fn walk(&mut self, visit: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>;
+}
+
+impl DictionaryStream for SortedPasses<DictionaryRecord> {
+    fn walk(&mut self, visit: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        for record in self.pass()? {
+            visit(&record?.value)?;
+        }
+        Ok(())
+    }
+}
+
 /// A stream of values the numeric branch can walk more than once.
 ///
 /// The branch measures before it writes and puts a missing bitset between
@@ -442,7 +462,7 @@ impl<Sink: Write> DocValuesConsumer<Sink> {
     pub fn add_sorted(
         &mut self,
         field_number: i32,
-        values: &mut SortedPasses<DictionaryRecord>,
+        values: &mut impl DictionaryStream,
         ordinals: &mut SortedPasses<OrdinalRecord>,
     ) -> Result<()> {
         let mut stream = MappedStream {
@@ -457,7 +477,7 @@ impl<Sink: Write> DocValuesConsumer<Sink> {
     pub fn add_sorted_set(
         &mut self,
         field_number: i32,
-        values: &mut SortedPasses<DictionaryRecord>,
+        values: &mut impl DictionaryStream,
         document_ordinals: &mut SortedPasses<SetOrdinalRecord>,
     ) -> Result<()> {
         self.metadata.write_vint(field_number)?;
@@ -585,7 +605,7 @@ impl<Sink: Write> DocValuesConsumer<Sink> {
     fn write_sorted(
         &mut self,
         field_number: i32,
-        values: &mut SortedPasses<DictionaryRecord>,
+        values: &mut impl DictionaryStream,
         ordinals: &mut dyn NumericStream,
     ) -> Result<()> {
         self.metadata.write_vint(field_number)?;
@@ -750,15 +770,16 @@ impl<Sink: Write> DocValuesConsumer<Sink> {
     fn add_terms_dictionary(
         &mut self,
         field_number: i32,
-        values: &mut SortedPasses<DictionaryRecord>,
+        values: &mut impl DictionaryStream,
     ) -> Result<()> {
         let mut minimum = i32::MAX;
         let mut maximum = i32::MIN;
-        for record in values.pass()? {
-            let length = record?.value.len() as i32;
+        values.walk(&mut |value| {
+            let length = value.len() as i32;
             minimum = minimum.min(length);
             maximum = maximum.max(length);
-        }
+            Ok(())
+        })?;
         if minimum == maximum {
             return self.add_fixed_length_dictionary(field_number, values, minimum);
         }
@@ -778,17 +799,24 @@ impl<Sink: Write> DocValuesConsumer<Sink> {
     fn add_fixed_length_dictionary(
         &mut self,
         field_number: i32,
-        values: &mut SortedPasses<DictionaryRecord>,
+        values: &mut impl DictionaryStream,
         length: i32,
     ) -> Result<()> {
         self.metadata.write_vint(field_number)?;
         self.metadata.write_byte(BINARY)?;
         let start = self.data.position();
         let mut count = 0u64;
-        for record in values.pass()? {
-            let record = record?;
-            self.data.write_bytes(&record.value)?;
+        let mut failure = None;
+        let data = &mut self.data;
+        values.walk(&mut |value| {
+            if let Err(error) = data.write_bytes(value) {
+                failure = Some(error);
+            }
             count += 1;
+            Ok(())
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
         }
         self.metadata.write_vint(BINARY_FIXED_UNCOMPRESSED)?;
         // A dictionary has no missing values.
@@ -805,7 +833,7 @@ impl<Sink: Write> DocValuesConsumer<Sink> {
     fn add_prefix_compressed_dictionary(
         &mut self,
         field_number: i32,
-        values: &mut SortedPasses<DictionaryRecord>,
+        values: &mut impl DictionaryStream,
         minimum: i32,
         maximum: i32,
     ) -> Result<()> {
@@ -818,21 +846,33 @@ impl<Sink: Write> DocValuesConsumer<Sink> {
         let mut addresses: Vec<i64> = Vec::new();
         let mut last: Vec<u8> = Vec::new();
         let mut count = 0u64;
-        for record in values.pass()? {
-            let record = record?;
-            if count.is_multiple_of(ADDRESS_INTERVAL as u64) {
-                addresses.push((self.data.position() - start) as i64);
-                // Emptying the running term forces the first of each block
-                // to be written whole, so a reader can start there.
+        let mut failure = None;
+        let data = &mut self.data;
+        values.walk(&mut |value| {
+            let mut write = || -> Result<()> {
+                if count.is_multiple_of(ADDRESS_INTERVAL as u64) {
+                    addresses.push((data.position() - start) as i64);
+                    // Emptying the running term forces the first of each
+                    // block to be written whole, so a reader can start
+                    // there.
+                    last.clear();
+                }
+                let shared = common_prefix_length(&last, value);
+                data.write_vint(shared as i32)?;
+                data.write_vint((value.len() - shared) as i32)?;
+                data.write_bytes(&value[shared..])?;
                 last.clear();
+                last.extend_from_slice(value);
+                count += 1;
+                Ok(())
+            };
+            if let Err(error) = write() {
+                failure = Some(error);
             }
-            let shared = common_prefix_length(&last, &record.value);
-            self.data.write_vint(shared as i32)?;
-            self.data.write_vint((record.value.len() - shared) as i32)?;
-            self.data.write_bytes(&record.value[shared..])?;
-            last.clear();
-            last.extend_from_slice(&record.value);
-            count += 1;
+            Ok(())
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
         }
         let index_start = self.data.position();
         write_monotonic_blocks(&mut self.data, &addresses)?;
