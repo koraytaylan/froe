@@ -1428,6 +1428,262 @@ Two choices froe makes, both recorded in §9 and both honoured by the reader:
   that only ever emits linear arcs produces a transducer Lucene reads
   correctly and seeks through more slowly.
 
+### 7.7 How terms become blocks
+
+`BlockTreeTermsWriter.TermsWriter.FindBlocks`, which replaces the
+transducer builder's `freezeTail`. **The block partition is a side effect of
+building a transducer that is then thrown away**: the writer feeds every
+term into a `Builder<Object>` whose outputs are `NoOutputs`, and keeps only
+what its frontier tells it.
+
+The frontier is one node per depth. Adding a term walks it:
+
+```java
+int pos1 = 0;
+int pos2 = input.offset;
+final int pos1Stop = Math.min(lastInput.length, input.length);
+while(true) {
+  frontier[pos1].inputCount++;
+  if (pos1 >= pos1Stop || lastInput.ints[pos1] != input.ints[pos2]) break;
+  pos1++; pos2++;
+}
+final int prefixLenPlus1 = pos1+1;
+
+freezeTail(prefixLenPlus1);
+
+for(int idx=prefixLenPlus1;idx<=input.length;idx++) {
+  frontier[idx-1].addArc(input.ints[input.offset+idx-1], frontier[idx]);
+  frontier[idx].inputCount++;
+}
+…
+lastNode.isFinal = true;
+```
+
+so every node from the root down to the term's own depth counts the term,
+the nodes below the shared prefix are frozen, and the node at the term's
+length is marked final. An **empty term** takes a separate path that only
+marks the root final and counts it.
+
+Freezing is where blocks are decided:
+
+```java
+for(int idx=lastInput.length; idx >= prefixLenPlus1; idx--) {
+  final Builder.UnCompiledNode<Object> node = frontier[idx];
+  long totCount = 0;
+  if (node.isFinal) {
+    totCount++;
+  }
+  for(int arcIdx=0;arcIdx<node.numArcs;arcIdx++) {
+    final Builder.UnCompiledNode<Object> target = (…) node.arcs[arcIdx].target;
+    totCount += target.inputCount;
+    target.clear();
+    node.arcs[arcIdx].target = null;
+  }
+  node.numArcs = 0;
+
+  if (totCount >= minItemsInBlock || idx == 0) {
+    writeBlocks(lastInput, idx, (int) totCount);
+    node.inputCount = 1;
+  } else {
+    // stragglers!  carry count upwards
+    node.inputCount = totCount;
+  }
+  frontier[idx] = new Builder.UnCompiledNode<Object>(blockBuilder, idx);
+}
+```
+
+Deepest first. A node's count is **one per term ending exactly there plus
+the counts its frozen children carry**, so the unit being counted is
+"entries" — terms *and* the sub-blocks already written beneath. A node that
+reaches the minimum writes its blocks and then reports **1** upward, because
+what remains of it is a single sub-block entry; a node that does not reports
+its whole count, and those stragglers are counted again by its parent.
+
+`idx == 0` forces a block whatever the count, so **every field ends with
+exactly one root block at the empty prefix**, however few entries it holds —
+and, by §7.8's first condition, never a floored one. Finishing the field is
+`freezeTail(0)`, which freezes the last term's whole path.
+
+The assignment `node.inputCount = 1` is read by the *parent* on the next
+turn of the same loop, through the arc that still points at the node; the
+fresh node that replaces it at `frontier[idx]` is for the terms still to
+come. A writer that replaces the node before its parent has read it loses
+every count.
+
+### 7.8 The floor partition, exactly
+
+```java
+void writeBlocks(IntsRef prevTerm, int prefixLength, int count) throws IOException {
+  if (prefixLength == 0 || count <= maxItemsInBlock) {
+    final PendingBlock nonFloorBlock = writeBlock(prevTerm, prefixLength, prefixLength, count, count, 0, false, -1, true);
+    nonFloorBlock.compileIndex(null, scratchBytes);
+    pending.add(nonFloorBlock);
+  } else {
+    …
+  }
+  lastBlockIndex = pending.size()-1;
+}
+```
+
+**`prefixLength == 0` short-circuits first**, so the root block is a single
+block however many entries it holds. Only a non-empty prefix with more than
+`maxItemsInBlock` entries is floored.
+
+The entries are then grouped by the byte following the prefix:
+
+```java
+int lastSuffixLeadLabel = -1;
+int termCount = 0, subCount = 0, numSubs = 0;
+for(PendingEntry ent : slice) {
+  final int suffixLeadLabel = …;   // -1 when the term *is* the prefix
+  if (suffixLeadLabel != lastSuffixLeadLabel && (termCount + subCount) != 0) {
+    subBytes[numSubs] = lastSuffixLeadLabel;
+    lastSuffixLeadLabel = suffixLeadLabel;
+    subTermCounts[numSubs] = termCount;
+    subSubCounts[numSubs] = subCount;
+    termCount = subCount = 0;
+    numSubs++;
+  }
+  if (ent.isTerm) termCount++; else subCount++;
+}
+subBytes[numSubs] = lastSuffixLeadLabel;
+subTermCounts[numSubs] = termCount;
+subSubCounts[numSubs] = subCount;
+numSubs++;
+```
+
+**`subBytes[0]` is always `-1`.** The guard `(termCount + subCount) != 0`
+suppresses the flush for the first entry, so `lastSuffixLeadLabel` is still
+its initial `-1` when group 0 is closed — even when that entry's suffix
+starts with an ordinary byte. Group 0 therefore holds exactly **one** entry
+whenever the first entry's suffix is non-empty, and it carries a label that
+is not its own.
+
+That is harmless, and it is harmless for one reason: the segmenter below
+cuts only when a group's running total reaches `minItemsInBlock`, which is
+25, and a one-entry group never does. So group 0 always merges into the
+first floor block, the lead byte it borrowed is never used as a key, and no
+lead byte is split across two floor blocks — the thing §7.2 says a writer
+must not do. Lucene's own `assert minItemsInBlock == 1 || subCount > 1`
+says the same in the other direction.
+
+The consequence that *is* used: the first floor block's `startLabel` is
+`subBytes[0]`, which is `-1`, so its index prefix is the plain prefix and
+not the prefix plus a lead byte. The `.tip` entry for a floored prefix is
+therefore keyed exactly where an unfloored one would be.
+
+```java
+int pendingCount = 0;
+int startLabel = subBytes[0];
+int curStart = count;
+for(int sub=0;sub<numSubs;sub++) {
+  pendingCount += subTermCounts[sub] + subSubCounts[sub];
+  if (pendingCount >= minItemsInBlock) {
+    final int curPrefixLength = startLabel == -1 ? prefixLength : 1+prefixLength;
+    if (startLabel != -1) prevTerm.ints[prevTerm.offset + prefixLength] = startLabel;
+    final PendingBlock floorBlock = writeBlock(prevTerm, prefixLength, curPrefixLength, curStart, pendingCount,
+                                               subTermCountSums[1+sub], true, startLabel, curStart == pendingCount);
+    if (firstBlock == null) firstBlock = floorBlock; else floorBlocks.add(floorBlock);
+    curStart -= pendingCount;
+    pendingCount = 0;
+    startLabel = subBytes[sub+1];
+    if (curStart == 0) break;
+    if (curStart <= maxItemsInBlock) {
+      prevTerm.ints[prevTerm.offset + prefixLength] = startLabel;
+      floorBlocks.add(writeBlock(prevTerm, prefixLength, prefixLength+1, curStart, curStart, 0, true, startLabel, true));
+      break;
+    }
+  }
+}
+```
+
+Greedy and forward: a block closes at the first group boundary that reaches
+the minimum, and the remainder becomes one last block as soon as it fits
+under the maximum — which may leave it **below** the minimum, a shape the
+reader accepts and Lucene's own comment calls out. `isLastInFloor` is
+`curStart == pendingCount`: this block consumes everything left.
+
+Only `firstBlock` is added to `pending` and only it is indexed; the rest ride
+in its floor payload (§7.5).
+
+### 7.9 A block's body
+
+```java
+out.writeVInt((length<<1)|(isLastInFloor ? 1:0));
+…
+out.writeVInt((int) (suffixWriter.getFilePointer() << 1) | (isLeafBlock ? 1:0));
+suffixWriter.writeTo(out);
+out.writeVInt((int) statsWriter.getFilePointer());
+statsWriter.writeTo(out);
+out.writeVInt((int) metaWriter.getFilePointer());
+metaWriter.writeTo(out);
+```
+
+Three length-prefixed sections after the two flagged counts of §7.3. The
+sections are built in scratch buffers because each length precedes its
+bytes.
+
+**A block is a leaf when no entry in its slice is a sub-block.** Lucene
+decides it from `lastBlockIndex`, the index in `pending` of the most
+recently written block, with two short-circuits — a slice entirely below
+that index has no sub-block, and a non-floor slice, which always runs to the
+end of `pending`, necessarily contains it. Both reduce to the same
+predicate.
+
+**The suffix section**, per entry, with the prefix stripped:
+
+| | leaf block | non-leaf block |
+| --- | --- | --- |
+| term | `VInt` suffix length, then the bytes | `VInt` `length << 1`, then the bytes |
+| sub-block | — | `VInt` `(length << 1) \| 1`, the bytes, then a `VLong` of `startFP - block.fp` |
+
+A leaf block spends no bit on the distinction because it has nothing to
+distinguish. The sub-block pointer is a **backward** delta: the sub-block
+was written before its parent, so the reader subtracts.
+
+**The stats section**, terms only, sub-blocks contributing nothing:
+
+```java
+statsWriter.writeVInt(state.docFreq);
+if (fieldInfo.getIndexOptions() != IndexOptions.DOCS_ONLY) {
+  statsWriter.writeVLong(state.totalTermFreq - state.docFreq);
+}
+```
+
+The total term frequency is stored as its **excess over the document
+frequency**, which is never negative, and is omitted entirely for a
+`DOCS_ONLY` field — the same omission as the directory's `sumTotalTermFreq`
+in §7.4.
+
+**The metadata section**, terms only, is §6.4's two halves interleaved per
+term: `longsSize` `VLong`s of the pointer deltas, then that term's byte
+stream. `absolute` is true for the **first term of each block** and false
+after, and setting it resets the postings writer's previous state to the
+empty one — so each block's first term carries absolute pointers and the
+reader can start anywhere.
+
+### 7.10 Building `.tip`, and the root code
+
+`PendingBlock.compileIndex` builds one transducer per block: the block's own
+prefix mapped to the §7.5 output bytes, then **every key of every sub-block's
+transducer copied in**, enumerated with `BytesRefFSTEnum`. A floor head also
+copies the keys of each following floor block's sub-indices.
+
+Because a block's prefix is a prefix of all its sub-blocks' prefixes, and
+sub-indices are merged in the order their entries appeared, the keys arrive
+sorted and the merge is a concatenation. The field's root block therefore
+ends up holding **one entry per indexed block in the field**, and that is
+the transducer saved to `.tip`.
+
+The root block's prefix is empty, so its output is the transducer's **empty
+output** — and that is `rootCode` in §7.4's directory. It is written twice:
+once inside the transducer and once in the directory, and a reader uses the
+directory's copy to find the root block without consulting the index.
+
+`indexStartFP` is where the field's transducer begins in `.tip`; the
+directory loop of §7.4 writes one `VLong` per field, in the same field order
+as `.tim`'s directory.
+
 ---
 
 ## 8. Doc values and norms
