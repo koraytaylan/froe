@@ -9,8 +9,8 @@ touches:
   - crates/froe-cli/tests/interop/phase_index_inventory.rs
   - crates/froe-cli/tests/interop/main.rs
   - crates/froe-cli/tests/interop/phase_maintenance.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "09f69d181d4e85f5bbc4839b2e94e1f148b52130"
 ---
 # Add The Index Inventory Interop Phase
 
