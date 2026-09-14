@@ -27,6 +27,7 @@
 pub mod data_output;
 pub mod doc_values;
 pub mod fst;
+pub mod norms;
 pub mod packed;
 pub mod postings;
 pub mod stored_fields;
@@ -36,9 +37,6 @@ pub mod terms;
 // module tree is the one the specification describes from the start, and so
 // a reader looking for a format finds where it will live rather than
 // wondering whether it exists.
-
-/// `.nvm` and `.nvd` (§8.2). Task 0908.
-pub mod norms {}
 
 /// `.fnm` (§4). Task 0909.
 pub mod field_infos {}
