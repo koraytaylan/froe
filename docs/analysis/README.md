@@ -92,6 +92,8 @@ Index specifications:
 | [`index-property-storage.md`](index-property-storage.md) | `property`, unique, node-type, `reference` and `counter` index storage, and the computation that produces it |
 | [`index-lucene-storage.md`](index-lucene-storage.md) | Lucene index data as repository content, and the filesystem layouts oak-run moves it through |
 | [`lucene-4-7-codec.md`](lucene-4-7-codec.md) | The Lucene 4.7.2 `oakCodec` composition from the write side: every file a fresh single-segment index carries, byte for byte |
+| [`lucene-oak-analysis.md`](lucene-oak-analysis.md) | Oak's analysis chain and numeric encodings: what a string becomes on its way to the terms Oak writes, and what a number becomes |
+| [`lucene-oak-documents.md`](lucene-oak-documents.md) | Oak's Lucene document model: from a node state to the exact set of Lucene fields, in the order Oak adds them |
 
 Write-path specifications:
 
