@@ -8,8 +8,8 @@ gated: false
 touches:
   - docs/analysis/lucene-oak-documents.md
   - docs/analysis/README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "15aaca8"
 ---
 # Specify Oak's Lucene Document Model
 
