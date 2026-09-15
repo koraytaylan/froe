@@ -289,6 +289,10 @@ pub(crate) fn populate_lucene_variant_definition(port: u16) {
         &[
             ("jcr:primaryType", "oak:QueryIndexDefinition"),
             ("type", "lucene"),
+            // The codec named outright, which is what AEM's own
+            // definitions carry and what `Codec.forName` resolves to the
+            // composition froe writes.
+            ("codec", "oakCodec"),
             ("async", "async"),
             ("compatVersion@TypeHint", "Long"),
             ("compatVersion", "2"),

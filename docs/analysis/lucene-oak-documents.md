@@ -70,13 +70,18 @@ Four outcomes, in order:
    cannot observe the JVM that will read the index. **A recorded
    departure**: froe writes as though it were unset, which is what every
    consumer that has not set it sees.
-2. **an explicit `codec` property** — resolved by registered name.
+2. **an explicit `codec` property** — resolved by registered name, and
+   the name `OakCodec` registers under is `oakCodec`, so a definition
+   naming it outright selects the same composition a fulltext-enabled one
+   does, **whether or not its rules are fulltext-enabled**: `forName` runs
+   before that test.
 3. **fulltext-enabled and no explicit codec** — `oakCodec`.
 4. **otherwise** — `null`, which leaves Lucene's default, `Lucene46`.
 
 **froe refuses by name any definition whose verdict is not `oakCodec`**,
 because `oakCodec` is the composition plan 0009 writes. In practice that
-means: fulltext-enabled, with no `codec` property naming something else.
+means: fulltext-enabled, or naming `oakCodec` itself, with no `codec`
+property naming something else.
 
 "Fulltext-enabled" is `IndexingRule.fulltextEnabled`:
 

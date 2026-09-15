@@ -304,6 +304,38 @@ fn an_explicit_codec_is_refused_by_name() {
     assert!(refusal.to_string().contains("Lucene46"), "{refusal}");
 }
 
+/// An explicit `codec` naming **`oakCodec`** resolves, through
+/// `Codec.forName`, to the composition froe writes — so it is the one
+/// explicit codec that is not a refusal. AEM's own definitions carry it,
+/// and refusing it refused a definition byte-for-byte identical to the
+/// one beside it that omits the property.
+#[test]
+fn an_explicit_oak_codec_is_the_composition_froe_writes() {
+    let definition = default_definition().string("codec", "oakCodec");
+    let (_directory, rules) = read_rules("explicit-oak-codec", &definition, None);
+    let rules = rules.expect("an explicit oakCodec is accepted");
+    assert_eq!(rules.codec, CodecVerdict::OakCodec);
+}
+
+/// And it is what the definition selects whether or not the rules are
+/// fulltext-enabled, because `Codec.forName` runs before that test.
+#[test]
+fn an_explicit_oak_codec_does_not_need_a_fulltext_rule() {
+    let definition = definition_with_properties(
+        Node::new().child(
+            "title",
+            Node::new()
+                .string("name", "jcr:title")
+                .boolean("propertyIndex", true),
+        ),
+    )
+    .string("codec", "oakCodec");
+    let (_directory, rules) = read_rules("explicit-oak-codec-plain", &definition, None);
+    let rules = rules.expect("an explicit oakCodec is accepted without a fulltext rule");
+    assert_eq!(rules.codec, CodecVerdict::OakCodec);
+    assert!(!rules.rules[0].fulltext_enabled);
+}
+
 /// A rule whose property definitions are written by a closure over one
 /// `properties` node, so a case below states only what it changes.
 fn definition_with_properties(properties: Node) -> Node {

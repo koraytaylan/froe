@@ -36,6 +36,10 @@ pub const DEFAULT_BOOST: f32 = 1.0;
 /// run; it is carried because a definition may state it.
 pub const DEFAULT_PROPERTY_WEIGHT: i64 = 5;
 
+/// The name `OakCodec` registers under in `META-INF/services`, which is
+/// what `Codec.forName` resolves an explicit `codec` property through.
+pub const OAK_CODEC_NAME: &str = "oakCodec";
+
 /// `FulltextIndexConstants.PROPDEF_PROP_NODE_NAME`.
 pub const NODE_NAME_PROPERTY: &str = ":nodeName";
 
@@ -643,6 +647,12 @@ impl IndexingRules {
         }
         let fulltext_enabled = rules.iter().any(|rule| rule.fulltext_enabled);
         let codec = match strict_string(definition.property("codec")?.as_ref()) {
+            // `Codec.forName` resolves the registered name, and the name
+            // `OakCodec` registers under is the composition froe writes —
+            // so a definition that names it outright is the one froe
+            // writes for, whether or not it is fulltext-enabled. AEM's own
+            // definitions carry it.
+            Some(OAK_CODEC_NAME) => CodecVerdict::OakCodec,
             Some(name) => CodecVerdict::Named(name.to_owned()),
             None if fulltext_enabled => CodecVerdict::OakCodec,
             None => CodecVerdict::Lucene46,
