@@ -10,9 +10,15 @@ struct SparseJournalFixture(std::path::PathBuf);
 
 impl SparseJournalFixture {
     fn new() -> Self {
+        // The thread is part of the name because the clock is not enough
+        // on its own: two cases of this binary run concurrently, and a
+        // platform whose `SystemTime` is coarser than a nanosecond hands
+        // them the same path — where one expects the file to be missing
+        // and the other has just made it enormous.
         let unique = format!(
-            "froe-gc-journal-api-{}-{}",
+            "froe-gc-journal-api-{}-{:?}-{}",
             std::process::id(),
+            std::thread::current().id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system time after Unix epoch")

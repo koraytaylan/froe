@@ -138,8 +138,11 @@ mod tests {
 
     #[test]
     fn a_missing_directory_is_reported_as_not_a_repository() {
-        let missing =
-            std::env::temp_dir().join(format!("froe-survey-absent-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!(
+            "froe-survey-absent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let error = survey_archive_indexes(&missing).expect_err("absent directory must refuse");
         assert!(
             error.to_string().contains("is not a repository directory"),
