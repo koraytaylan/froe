@@ -9,11 +9,11 @@
 //! from `Blocks.txt`, sha256 `f0c573bbcc71fcbdab285e4390f49bf711e66bf502d18d8b8c303eaf47661027`.
 //!
 //! This file's own sha256, over every line below this header:
-//! `fd15b28bf4b9fca3fac460007ba1451cc988e32af72c26b919a65539c0003847`.
+//! `c157683ed02cae0c9a7d8bbd6d46c791135588427200bf6fe9ed22aab283f888`.
 
 /// The ranges, ascending, non-overlapping, and total over the code
 /// point space by way of the default every uncovered point takes.
 #[rustfmt::skip]
 pub(crate) const TABLE: &[(u32, u32, bool)] = &[
-    (0x0ff00,0x0ffef,true), 
+    (0x0ff00,0x0ffef,true),
 ];

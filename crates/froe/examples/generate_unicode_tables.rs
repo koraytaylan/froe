@@ -237,10 +237,23 @@ fn write_table(
         for (first, last, value) in chunk {
             let _ = write!(body, "({first:#07x},{last:#07x},{value}), ");
         }
-        body.push('\n');
+        end_the_line(&mut body);
     }
     body.push_str("];\n");
     emit(&output.join(file), &header, &body);
+}
+
+/// Closes a table line, without the separator the last entry wrote.
+///
+/// A line ending in a space is a `git diff --check` finding, which the
+/// contributing guide runs over every review range — so a generated file
+/// that carries one puts a permanent exception in every later range that
+/// touches it.
+fn end_the_line(body: &mut String) {
+    while body.ends_with(' ') {
+        body.pop();
+    }
+    body.push('\n');
 }
 
 fn read(directory: &Path, name: &str) -> String {
@@ -434,7 +447,7 @@ fn write_lower_case(fixtures: &Path, output: &Path) {
         for (point, lower) in chunk {
             let _ = write!(body, "({point:#07x},{lower:#07x}), ");
         }
-        body.push('\n');
+        end_the_line(&mut body);
     }
     body.push_str("];\n");
     emit(&output.join("lower_case.rs"), &header, &body);
@@ -478,7 +491,7 @@ fn write_character_class(fixtures: &Path, output: &Path) {
         for (first, last, class) in chunk {
             let _ = write!(body, "({first:#07x},{last:#07x},{class}), ");
         }
-        body.push('\n');
+        end_the_line(&mut body);
     }
     body.push_str("];\n");
     emit(&output.join("character_class.rs"), &header, &body);

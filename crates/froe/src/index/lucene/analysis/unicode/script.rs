@@ -8,7 +8,7 @@
 //! from `Scripts.txt`, sha256 `3996337cf6bcf9134a3f0826d82c16e873558f0d020a1799450ceb3edc549651`.
 //!
 //! This file's own sha256, over every line below this header:
-//! `b2720f21d21a6718fc04ae2c2345d5253a247bba9ad76ae170e2826307a7e2bb`.
+//! `407ffce6d8895eee595cbed6d67c1716453b50e5152a9b32a4c74ae1a17ed4f0`.
 
 use super::Script;
 
@@ -16,13 +16,13 @@ use super::Script;
 /// point space by way of the default every uncovered point takes.
 #[rustfmt::skip]
 pub(crate) const TABLE: &[(u32, u32, Script)] = &[
-    (0x01100,0x011ff,Script::Hangul), (0x02e80,0x02e99,Script::Han), (0x02e9b,0x02ef3,Script::Han), (0x02f00,0x02fd5,Script::Han), 
-    (0x03005,0x03005,Script::Han), (0x03007,0x03007,Script::Han), (0x03021,0x03029,Script::Han), (0x0302e,0x0302f,Script::Hangul), 
-    (0x03038,0x0303a,Script::Han), (0x0303b,0x0303b,Script::Han), (0x03041,0x03096,Script::Hiragana), (0x0309d,0x0309e,Script::Hiragana), 
-    (0x0309f,0x0309f,Script::Hiragana), (0x03131,0x0318e,Script::Hangul), (0x03200,0x0321e,Script::Hangul), (0x03260,0x0327e,Script::Hangul), 
-    (0x03400,0x04db5,Script::Han), (0x04e00,0x09fcc,Script::Han), (0x0a960,0x0a97c,Script::Hangul), (0x0ac00,0x0d7a3,Script::Hangul), 
-    (0x0d7b0,0x0d7c6,Script::Hangul), (0x0d7cb,0x0d7fb,Script::Hangul), (0x0f900,0x0fa6d,Script::Han), (0x0fa70,0x0fad9,Script::Han), 
-    (0x0ffa0,0x0ffbe,Script::Hangul), (0x0ffc2,0x0ffc7,Script::Hangul), (0x0ffca,0x0ffcf,Script::Hangul), (0x0ffd2,0x0ffd7,Script::Hangul), 
-    (0x0ffda,0x0ffdc,Script::Hangul), (0x1b001,0x1b001,Script::Hiragana), (0x1f200,0x1f200,Script::Hiragana), (0x20000,0x2a6d6,Script::Han), 
-    (0x2a700,0x2b734,Script::Han), (0x2b740,0x2b81d,Script::Han), (0x2f800,0x2fa1d,Script::Han), 
+    (0x01100,0x011ff,Script::Hangul), (0x02e80,0x02e99,Script::Han), (0x02e9b,0x02ef3,Script::Han), (0x02f00,0x02fd5,Script::Han),
+    (0x03005,0x03005,Script::Han), (0x03007,0x03007,Script::Han), (0x03021,0x03029,Script::Han), (0x0302e,0x0302f,Script::Hangul),
+    (0x03038,0x0303a,Script::Han), (0x0303b,0x0303b,Script::Han), (0x03041,0x03096,Script::Hiragana), (0x0309d,0x0309e,Script::Hiragana),
+    (0x0309f,0x0309f,Script::Hiragana), (0x03131,0x0318e,Script::Hangul), (0x03200,0x0321e,Script::Hangul), (0x03260,0x0327e,Script::Hangul),
+    (0x03400,0x04db5,Script::Han), (0x04e00,0x09fcc,Script::Han), (0x0a960,0x0a97c,Script::Hangul), (0x0ac00,0x0d7a3,Script::Hangul),
+    (0x0d7b0,0x0d7c6,Script::Hangul), (0x0d7cb,0x0d7fb,Script::Hangul), (0x0f900,0x0fa6d,Script::Han), (0x0fa70,0x0fad9,Script::Han),
+    (0x0ffa0,0x0ffbe,Script::Hangul), (0x0ffc2,0x0ffc7,Script::Hangul), (0x0ffca,0x0ffcf,Script::Hangul), (0x0ffd2,0x0ffd7,Script::Hangul),
+    (0x0ffda,0x0ffdc,Script::Hangul), (0x1b001,0x1b001,Script::Hiragana), (0x1f200,0x1f200,Script::Hiragana), (0x20000,0x2a6d6,Script::Han),
+    (0x2a700,0x2b734,Script::Han), (0x2b740,0x2b81d,Script::Han), (0x2f800,0x2fa1d,Script::Han),
 ];
