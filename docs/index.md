@@ -265,8 +265,14 @@ without an Oak runtime, and without the hours of blocked startup Oak's own
 synchronous reindex costs on a large store.
 
 > **Beta.** The rebuild is proven against Oak's own reindex of the same
-> store, but the review that freezes that evidence has not run yet. Take a
-> backup first, and compare with `froe index check` afterwards.
+> store, and the adversarial review that freezes that evidence has run —
+> it is recorded in
+> [plan 0007](plans/0007-property-index-reindex/ARCHITECTURE.md) and
+> [plan 0010](plans/0010-lucene-offline-reindex/ARCHITECTURE.md), with the
+> known gaps it could not close. `v0.12.0` is the first release to ship
+> this command, and that review is its own, so the label stays for one
+> release. Take a backup first, and compare with `froe index check`
+> afterwards.
 
 ```
 froe index reindex REPOSITORY [--index PATH]… [--dry-run] [--yes]
@@ -600,7 +606,10 @@ Lucene index data out of the repository and onto the filesystem, in the
 layout oak-run's importer reads.
 
 > **Beta.** Byte identity with Oak's own dumper is proven by the interop
-> suite, but the review that freezes that evidence has not run yet.
+> suite, and the review that freezes that evidence is recorded in
+> [plan 0008](plans/0008-lucene-index-transport/ARCHITECTURE.md).
+> `v0.12.0` is the first release to ship this command, so the label stays
+> for one release.
 
 ```
 froe index dump REPOSITORY --output DIRECTORY [--index PATH]…
@@ -668,8 +677,11 @@ Lucene index data built out of band, installed back into a **stopped**
 store.
 
 > **Beta.** The round trip and the guards are covered by froe's own tests,
-> and the comparison against Oak's own importer is proven by the interop
-> suite, but the review that freezes that evidence has not run yet.
+> the comparison against Oak's own importer is proven by the interop
+> suite, and the review that freezes that evidence is recorded in
+> [plan 0008](plans/0008-lucene-index-transport/ARCHITECTURE.md) with its
+> known gaps. `v0.12.0` is the first release to ship this command, so the
+> label stays for one release.
 
 ```
 froe index import REPOSITORY --input DIRECTORY [--index PATH]… [--dry-run] [--yes]

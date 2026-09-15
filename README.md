@@ -117,7 +117,8 @@ froe requires that there is nothing to catch up on: the index must have been
 built at the checkpoint the definition's lane resumes from, and a directory
 built at any other state is refused naming both. Every copied file is read
 back out of the store and compared byte for byte before the head moves.
-Beta until plan 0008's review freezes its evidence.
+Labelled **beta** in `v0.12.0`, the release that first ships it: the
+range's frozen adversarial review is this release's own.
 
 **Rebuild a flagged index without waiting for Oak to do it.** Oak rebuilds a
 flagged property index synchronously inside the first commit after startup,
@@ -138,8 +139,8 @@ and says what a binary contributes; `--pre-extracted-text-directory` reads
 Oak's own extracted text first. Everything froe cannot rebuild exactly — a
 `valuePattern` regular expression, a composite mount's index data, a
 definition whose codec verdict is not `oakCodec`, and each unported Lucene
-feature by name — is refused rather than approximated. Beta until plans
-0007 and 0010's reviews freeze their evidence.
+feature by name — is refused rather than approximated. Labelled
+**beta** in `v0.12.0` for the same reason as the transport above.
 
 Exactly one generation is retained — the value Oak's own offline tool uses
 (`SegmentGCOptions.setOffline`) — and, unlike Oak, froe rewrites *every*
