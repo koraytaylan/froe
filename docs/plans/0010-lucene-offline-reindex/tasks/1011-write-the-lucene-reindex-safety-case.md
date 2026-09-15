@@ -7,8 +7,8 @@ depends_on: []
 gated: false
 touches:
   - docs/plans/0010-lucene-offline-reindex/ARCHITECTURE.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "e788acc"
 ---
 # Write The Lucene Reindex Safety Case
 
