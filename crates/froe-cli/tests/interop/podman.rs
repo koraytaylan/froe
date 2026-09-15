@@ -7,6 +7,27 @@ use super::*;
 // Podman orchestration
 // ---------------------------------------------------------------------------
 
+/// Run a podman command, returning its exit status and both streams.
+///
+/// For a caller that decides what a failure means. `podman kill` on a
+/// container that has already exited is the case this exists for: podman
+/// reports it as its own usage error (125), and whether that is a fault
+/// depends on *why* the container is gone, which only the caller knows.
+pub(crate) fn podman_attempt(args: &[&str]) -> (bool, String, String) {
+    let output = Command::new("podman")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to spawn podman {args:?}: {error}"));
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 /// Run a podman command; assert success and return stdout.
 pub(crate) fn podman(args: &[&str]) -> String {
     let output = Command::new("podman")
@@ -139,7 +160,19 @@ impl PodmanContainer {
     /// the JVM, so PID 1 in the container *is* Oak and the signal lands on
     /// it with no shell in between.
     pub(crate) fn kill_uncleanly(&self) {
-        podman(&["kill", "-s", "KILL", &self.name]);
+        // A container that is *already* gone makes `kill` a usage error,
+        // and the phase's own assertion below is the one that knows
+        // whether that matters: it holds the JVM to having died on the
+        // signal, and an exit code of anything else fails there with the
+        // reason rather than here with podman's.
+        let (killed, _, complaint) = podman_attempt(&["kill", "-s", "KILL", &self.name]);
+        if !killed {
+            eprintln!(
+                "    the container was no longer running when the kill was sent; \
+                 its exit code decides whether that is the same condition: {}",
+                complaint.trim()
+            );
+        }
         // Reaping is not synchronous with the kill returning. The exit code
         // is the evidence that the JVM died on the signal rather than
         // exiting, so it is read before `Drop` removes the container.

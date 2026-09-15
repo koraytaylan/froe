@@ -579,16 +579,20 @@ randomized `:count_*` counters, and index selection between competing mirror
 indexes can differ for the same reason, so the plans are compared with
 every counter-derived number replaced by a placeholder.
 
-The one sampled plan is then compared **asymmetrically**, because even
-that is not deterministic: `ApproximateCounter` records a count on two
-random gates, so a small index is sometimes left unpriced by a rebuild —
-Oak's own included. A difference is accepted when **Oak's** rebuild is
-the unpriced one and the run says so; a difference the other way is a
-failure, because an index Oak prices from its own rebuild and not from
-froe's is froe's rebuild being unusable. That is the defect the
-comparison was added for: froe's first reindex wrote no counters at all,
-and Oak planned `traverse allNodes` over its store where it planned
-`property uuid` over its own. And it proves nothing about Lucene,
+The one sampled plan is compared **symmetrically**, and only against the
+draw: `ApproximateCounter` records a count on two random gates, so a
+small index is left unpriced often enough to see, froe's rebuild and
+Oak's own alike, and the plan is then a traversal over an index that is
+perfectly good. A difference is accepted when either side is the
+traversal and refused when neither is.
+
+What catches the defect the comparison was added for — froe's first
+reindex wrote **no** counters at all, and Oak planned `traverse allNodes`
+over its store where it planned `property uuid` over its own — is a
+separate assertion that no draw can produce: the rebuilt store carries at
+least one `:count_*` property. The plan comparison was asked to prove
+that for one release and could not; a CI run failed on froe's side of the
+coin toss over a store whose counters were there. And it proves nothing about Lucene,
 which `froe index reindex` refuses by name until plan 0010.
 
 ### lucene_dump

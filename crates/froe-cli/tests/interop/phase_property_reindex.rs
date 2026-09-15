@@ -122,6 +122,7 @@ pub(crate) fn property_reindex() {
         "property_reindex",
     );
     assert_check_passes(&froe_store);
+    assert_the_rebuild_wrote_approximate_counters(&froe_store);
     assert_oak_answers_queries_from_froes_index(&froe_store);
     assert_a_rerun_is_identical(&froe_store, &work, &definitions);
     assert_the_counter_reset_lets_oak_rebuild_from_scratch(&work, &oak_rebuilt);
@@ -210,20 +211,22 @@ fn assert_oak_answers_queries_from_froes_index(froe_store: &Path) {
     // what caught it — over froe's store Oak planned `traverse allNodes`
     // where over its own it planned `property uuid`.
     //
-    // The comparison is **asymmetric**, for the same reason the number is
-    // replaced. `ApproximateCounter` records a count on two random gates,
-    // so a small index — the fixture's `uuid` has a few dozen entries —
-    // is sometimes left unpriced by a rebuild, Oak's own included, and
-    // Oak then plans a traversal over an index that is perfectly good. A
-    // run where *Oak's* rebuild is the unpriced one says nothing about
-    // froe's, and failing on it would be failing on a coin toss.
+    // A difference is accepted when **either** side is the unpriced one,
+    // and that symmetry is forced by the same randomness as the number.
+    // `ApproximateCounter` records a count on two random gates, so a small
+    // index — the fixture's `uuid` has a few dozen entries — is left
+    // unpriced by a rebuild often enough to see, froe's and Oak's own
+    // alike, and Oak then plans a traversal over an index that is
+    // perfectly good. This assertion once accepted only Oak's side, on the
+    // reasoning that the other direction is froe's rebuild being unusable;
+    // a CI run then failed on froe's side of the same coin toss, over a
+    // store whose counters were there. Failing on a draw is not evidence
+    // either way, whichever way it falls.
     //
-    // What it must never be is the other way round: an index Oak prices
-    // from its own rebuild and does not price from froe's is froe's
-    // rebuild being unusable, which is exactly the defect this comparison
-    // was added for — froe's first reindex wrote no counters at all, and
-    // over its store Oak planned `traverse allNodes` where over its own
-    // it planned `property uuid`.
+    // What survives as the defect detector is the assertion below, which
+    // is about the counters themselves rather than about one plan: froe's
+    // first reindex wrote **no** `:count_*` at all, and no draw can
+    // produce that.
     for (statement, (oak_plan, froe_plan)) in DETERMINISTIC_PLAN_SAMPLES
         .iter()
         .zip(from_oak.plans.iter().zip(from_froe.plans.iter()))
@@ -233,15 +236,45 @@ fn assert_oak_answers_queries_from_froes_index(froe_store: &Path) {
             continue;
         }
         assert!(
-            plans_a_traversal(&theirs),
+            plans_a_traversal(&theirs) || plans_a_traversal(&ours),
             "{statement}: Oak chose a different plan over froe's index than over its own, and \
-             its own is not the unpriced one\n  oak:  {theirs:?}\n  froe: {ours:?}"
+             neither is a traversal — so the difference is not the counter draw\n  \
+             oak:  {theirs:?}\n  froe: {ours:?}"
         );
+        let unpriced = if plans_a_traversal(&theirs) {
+            "Oak's own"
+        } else {
+            "froe's"
+        };
         eprintln!(
-            "    declared: Oak left its own rebuild of this index unpriced and traversed; \
-             froe's was priced and chosen"
+            "    declared: {unpriced} rebuild of this index was left unpriced by the counter \
+             draw and traversed; the other was priced and chosen"
         );
     }
+}
+
+/// The approximate counters exist at all in the store froe rebuilt.
+///
+/// This is what the plan comparison above used to be asked to prove and
+/// could not: `ApproximateCounter` records on two random gates, so any one
+/// index may come out unpriced on either side, but a rebuild that writes
+/// *no* counter anywhere is not a draw — it is the defect task 1009 found,
+/// where froe's rebuild omitted the prefix entirely and Oak stopped
+/// choosing every property index in the store.
+fn assert_the_rebuild_wrote_approximate_counters(store: &Path) {
+    let digest =
+        froe_tolerating_dangling_lane_checkpoints(&["digest", store.to_str().expect("utf-8")]);
+    let counters = digest
+        .lines()
+        .filter(|line| line.contains(RANDOMIZED_PROPERTY_PREFIX))
+        .count();
+    assert!(
+        counters > 0,
+        "froe's rebuild wrote no {RANDOMIZED_PROPERTY_PREFIX} property anywhere in the \
+         store; Oak reads their absence without complaint and then stops choosing the \
+         index (index-property-storage.md section 11)"
+    );
+    eprintln!("    froe's rebuild wrote {counters} approximate-counter properties");
 }
 
 /// Whether an `EXPLAIN` names a traversal rather than an index.

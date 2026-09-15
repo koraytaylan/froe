@@ -810,6 +810,9 @@ The others: the ground-truth analysis still carried the rule-based
 aggregate lookup the range's own fix reversed; the unported-feature guard
 row's neutralization covers four of eleven refusals; the mid-copy error
 reports neither file nor offset on this path; the query comparison's
-exclusions and the plan sample's asymmetry were in the code and in no
-document; and the observed interoperability figures were superseded inside
+exclusions and the plan sample's one-sided acceptance were in the code and
+in no document — and stating it is what showed the acceptance to be wrong:
+CI then failed on the side it refused, over a store whose counters were
+there, so the sample is judged symmetrically now and the counters have an
+assertion of their own that no draw can satisfy; and the observed interoperability figures were superseded inside
 the range.
