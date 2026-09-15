@@ -11,7 +11,10 @@
 //! Jackrabbit 2 did before it.
 
 use crate::content::node::NodeState;
-use crate::index::{IndexResult, converting_boolean, converting_long, strict_name, strict_string};
+use crate::index::{
+    IndexResult, children_in_tree_order, converting_boolean, converting_long, strict_name,
+    strict_string,
+};
 
 /// `Aggregate.MATCH_ALL`.
 const MATCH_ALL: &str = "*";
@@ -90,7 +93,7 @@ impl Aggregate {
     /// Propagates a read of the aggregate's children.
     pub fn read(node_type_name: &str, node: &NodeState<'_>) -> IndexResult<Self> {
         let mut includes = Vec::new();
-        for (name, child) in node.child_node_entries()? {
+        for (name, child) in children_in_tree_order(node)? {
             if !name.starts_with("include") {
                 continue;
             }
@@ -197,7 +200,7 @@ pub fn read_aggregates(definition: &NodeState<'_>) -> IndexResult<Vec<Aggregate>
         return Ok(Vec::new());
     };
     let mut produced = Vec::new();
-    for (name, child) in aggregates.child_node_entries()? {
+    for (name, child) in children_in_tree_order(&aggregates)? {
         produced.push(Aggregate::read(&name, &child)?);
     }
     Ok(produced)

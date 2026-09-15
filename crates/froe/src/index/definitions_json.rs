@@ -40,7 +40,7 @@ use crate::content::node::{NodeState, PropertyState};
 use crate::content::property::{PropertyType, PropertyValue, double_to_text};
 use crate::content::value::BinaryValue;
 use crate::content::{PropertyValues, SegmentProvider, read_binary_stream};
-use crate::index::{IndexError, IndexResult, values_of};
+use crate::index::{IndexError, IndexResult, children_in_tree_order};
 
 /// `oak.serializer.maxBlobSize`, the default limit Oak's blob serializer
 /// refuses **at or above**: the test is `blob.length() < maxSize`.
@@ -193,25 +193,7 @@ fn ordered_children<'provider>(
     node: &NodeState<'provider>,
     options: RenderOptions,
 ) -> IndexResult<Vec<(String, NodeState<'provider>)>> {
-    let entries = node.child_node_entries()?;
-    let order = node.property(":childOrder")?;
-    let ordered = match &order {
-        None => entries,
-        Some(property) => {
-            let named: Vec<String> = values_of(property)
-                .iter()
-                .filter_map(PropertyValue::as_text)
-                .collect();
-            let mut ordered = Vec::with_capacity(named.len());
-            for name in named {
-                if let Some((_, child)) = entries.iter().find(|(entry, _)| *entry == name) {
-                    ordered.push((name, *child));
-                }
-            }
-            ordered
-        }
-    };
-    Ok(ordered
+    Ok(children_in_tree_order(node)?
         .into_iter()
         .filter(|(name, _)| options.child_filter.includes(name))
         .collect())

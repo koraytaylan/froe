@@ -23,8 +23,8 @@ use crate::index::lucene::documents::aggregate::{self, Aggregate};
 use crate::index::lucene::documents::name_pattern::{ALL_PROPERTIES, NamePattern};
 use crate::index::value_pattern::ValuePattern;
 use crate::index::{
-    IndexError, IndexResult, IndexWarning, converting_boolean, converting_long, converting_strings,
-    strict_name, strict_names, strict_string, values_of,
+    IndexError, IndexResult, IndexWarning, children_in_tree_order, converting_boolean,
+    converting_long, converting_strings, strict_name, strict_names, strict_string, values_of,
 };
 
 /// `PropertyDefinition.DEFAULT_BOOST`.
@@ -491,7 +491,7 @@ impl IndexingRule {
                 });
             }
         } else if let Some(property_node) = node.child_node("properties")? {
-            for (name, child) in property_node.child_node_entries()? {
+            for (name, child) in children_in_tree_order(&property_node)? {
                 if properties.contains_key(&fold_case(&name)) {
                     // `collectPropConfigs` guards on the **child's** name
                     // against a map keyed by each definition's `name`, and
@@ -661,7 +661,7 @@ impl IndexingRules {
         };
         let aggregates = aggregate::read_aggregates(definition)?;
         let mut rules = Vec::new();
-        for (node_type_name, node) in rule_node.child_node_entries()? {
+        for (node_type_name, node) in children_in_tree_order(&rule_node)? {
             rules.push(IndexingRule::read(
                 definition_path,
                 &node_type_name,

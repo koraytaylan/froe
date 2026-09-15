@@ -42,7 +42,7 @@
 
 use std::fmt;
 
-use crate::content::node::{PropertyState, PropertyValues};
+use crate::content::node::{NodeState, PropertyState, PropertyValues};
 use crate::content::property::{PropertyType, PropertyValue};
 
 pub mod counter;
@@ -430,6 +430,41 @@ pub(crate) fn stored_type_name(property: &PropertyState) -> String {
         PropertyValues::Single(_) => base.to_owned(),
         PropertyValues::Multiple(_) => format!("{base}[]"),
     }
+}
+
+/// The children of `node` as Oak's `Tree` API yields them: in the order
+/// `:childOrder` names when the property is there, in stored order when it
+/// is not.
+///
+/// `AbstractTree.getChildNames` reads `:childOrder` strictly as `NAMES`,
+/// keeps only the names that are children, and drops a child the property
+/// does not name — so an ordered node's unlisted child is invisible to
+/// every read that goes through a `Tree`, which is how Oak reads an index
+/// definition. Stored order in a segment store is the map record's *hash*
+/// order, so a read that skips this does not merely lose the operator's
+/// ordering: it takes an arbitrary one.
+///
+/// `docs/analysis/lucene-oak-documents.md` §2.1 and §2.4, which make rule
+/// order and property-definition order this order.
+pub(crate) fn children_in_tree_order<'provider>(
+    node: &NodeState<'provider>,
+) -> crate::Result<Vec<(String, NodeState<'provider>)>> {
+    let entries = node.child_node_entries()?;
+    let Some(order) = node.property(":childOrder")? else {
+        return Ok(entries);
+    };
+    let Some(named) = strict_names(Some(&order)) else {
+        return Ok(entries);
+    };
+    Ok(named
+        .into_iter()
+        .filter_map(|name| {
+            entries
+                .iter()
+                .find(|(entry, _)| *entry == name)
+                .map(|(_, child)| (name, *child))
+        })
+        .collect())
 }
 
 /// The values of `property` as the slice every read below iterates.

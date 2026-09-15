@@ -361,6 +361,105 @@ fn analyzed_property() -> Node {
 }
 
 #[test]
+fn child_order_decides_which_pattern_a_name_resolves_through() {
+    // Stored order in a segment store is the map record's *hash* order, so
+    // a read that ignores `:childOrder` does not keep the operator's
+    // ordering or reverse it — it takes an arbitrary one. Two patterns
+    // that both match `myTags` therefore have to be separated by the
+    // property Oak's own `Tree` reads them through
+    // (`lucene-oak-documents.md` §2.4), and the case is written twice so
+    // that neither answer can come from the stored order by luck.
+    for (order, expected) in [
+        (["tags", "everything"], "tags"),
+        (["everything", "tags"], "everything"),
+    ] {
+        let definition = definition_with_properties(
+            Node::new()
+                .names(":childOrder", &order)
+                .child(
+                    "tags",
+                    Node::new()
+                        .string("name", ".*Tags")
+                        .boolean("isRegexp", true)
+                        .boolean("analyzed", true),
+                )
+                .child(
+                    "everything",
+                    Node::new()
+                        .string("name", ALL_PROPERTIES)
+                        .boolean("isRegexp", true)
+                        .boolean("analyzed", true),
+                ),
+        );
+        let (_directory, rules) = read_rules("child-order-properties", &definition, None);
+        let rules = rules.expect("the definition reads");
+        let found = rules.rules[0]
+            .config_of("myTags")
+            .expect("both patterns match the name");
+        assert_eq!(
+            found.node_name, expected,
+            "the first pattern in :childOrder {order:?} wins"
+        );
+    }
+}
+
+#[test]
+fn child_order_decides_which_rule_covers_a_node_type() {
+    // An `nt:base` rule is `inherited` by default, so it registers under
+    // every type in the hierarchy and collides with every other rule in
+    // the same definition. Which of the two covers a `cq:Page` node is
+    // then decided by rule order alone, and rule order is `:childOrder`.
+    let node_types = Node::new().child(
+        "nt:base",
+        Node::new().names("rep:primarySubtypes", &["cq:Page"]),
+    );
+    for (order, expected) in [
+        (["cq:Page", "nt:base"], "cq:Page"),
+        (["nt:base", "cq:Page"], "nt:base"),
+    ] {
+        let definition = Node::new()
+            .with(
+                "jcr:primaryType",
+                PropertyType::Name,
+                "oak:QueryIndexDefinition",
+            )
+            .string("type", "lucene")
+            .child(
+                "indexRules",
+                Node::new()
+                    .names(":childOrder", &order)
+                    .child(
+                        "cq:Page",
+                        Node::new().child(
+                            "properties",
+                            Node::new().child("analyzed", analyzed_property()),
+                        ),
+                    )
+                    .child(
+                        "nt:base",
+                        Node::new().child(
+                            "properties",
+                            Node::new().child("analyzed", analyzed_property()),
+                        ),
+                    ),
+            );
+        let (_directory, rules) = read_rules("child-order-rules", &definition, Some(&node_types));
+        let rules = rules.expect("the definition reads");
+        // What `applicable_rule` does for a node's primary type: the
+        // first rule, in rule order, registered under the name.
+        let rule = rules
+            .rules
+            .iter()
+            .find(|rule| rule.registers_under("cq:Page"))
+            .expect("a rule covers the type");
+        assert_eq!(
+            rule.node_type_name, expected,
+            "the first rule in :childOrder {order:?} covers the node"
+        );
+    }
+}
+
+#[test]
 fn a_name_resolves_case_insensitively_and_a_duplicate_leaves_one() {
     // One child is named for the property; the other names it through its
     // `name` property, in another case. Oak guards on the **child's** name
