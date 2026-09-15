@@ -772,8 +772,25 @@ A node no rule covers is aggregated whole.
 An aggregated node whose covering rule declares an aggregate of its own
 contributes that aggregate's nodes too — into the **same fields**, a
 relative include's `fullnode:<path>` included, and after its own
-properties. `reaggregateLimit`, five by default, is how many levels deep
-that goes.
+properties. `Matcher.nextSet` is where it happens:
+
+```java
+if (status == Status.MATCH_FOUND) {
+    Aggregate nextAgg = currentInclude.getAggregate(matchedNodeState);
+    if (nextAgg != null && aggregateStack.size() < rootState.rootAggregate.reAggregationLimit) {
+        for (Include include : nextAgg.getIncludes()) matchers.add(new Matcher(this, include, currentPath));
+    }
+}
+```
+
+Three things follow. The aggregate entered is the one the **matched
+node's own** type resolves to, through `AggregateMapper.getAggregate(String)`
+— which is its applicable indexing rule's, and that rule's aggregate is
+the *combined* one of §4.2. The bound is the number of aggregates already
+entered, so a self-recursive aggregate is stopped by depth alone and not
+by a "seen this one" test. And the limit compared is the **root**
+aggregate's — the one the document's own rule declares — however deep the
+walk is, so an inner rule's own `reaggregateLimit` is never read.
 
 Oak's own rebuild pins the field set: the `meta` child above is reached by
 a `relativeNode` include, its rule declares `include0 = inner`, and the

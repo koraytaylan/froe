@@ -79,7 +79,7 @@ impl DocumentMaker<'_> {
                         let names: Vec<&str> = std::iter::once(FULLTEXT_FIELD)
                             .chain(relative.as_deref())
                             .collect();
-                        self.aggregate_node(&child, &names, 0, state)?;
+                        self.aggregate_node(&child, walk.writing_into(&names), state)?;
                     }
                 }
             }
@@ -148,10 +148,10 @@ impl DocumentMaker<'_> {
     fn aggregate_node(
         &self,
         node: &NodeState<'_>,
-        names: &[&str],
-        reaggregation_depth: usize,
+        into: AggregatedInto<'_>,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
+        let names = into.names;
         let covering = self.rules.applicable_rule(node)?;
         let has_mime_type = node.property("jcr:mimeType")?.is_some();
         for property in node.properties()? {
@@ -182,7 +182,7 @@ impl DocumentMaker<'_> {
                 }
             }
         }
-        self.reaggregate(node, covering, names, reaggregation_depth, state)
+        self.reaggregate(node, covering, into, state)
     }
 
     /// The **re-aggregation**: an aggregated node whose own rule declares
@@ -190,37 +190,32 @@ impl DocumentMaker<'_> {
     /// fields, after its own properties.
     ///
     /// `reaggregateLimit` — five by default — is how many levels deep that
-    /// goes, and it is read from the aggregate being entered, as Oak's own
-    /// `canRecurse` reads it. Oak's rebuild of the interop fixture pins
-    /// both halves: a `meta` child of type `sling:Folder` whose rule
-    /// declares `include0 = inner` puts that grandchild's values in the
-    /// page's `:fulltext` **and** in the `fullnode:meta` of the relative
-    /// include that reached `meta`.
+    /// goes, and the one compared is the **root** aggregate's, however
+    /// deep the walk is:
+    ///
+    /// ```java
+    /// Aggregate nextAgg = currentInclude.getAggregate(matchedNodeState);
+    /// if (nextAgg != null && aggregateStack.size() < rootState.rootAggregate.reAggregationLimit)
+    /// ```
+    ///
+    /// Oak's rebuild of the interop fixture pins the rest: a `meta` child
+    /// of type `sling:Folder` whose rule declares `include0 = inner` puts
+    /// that grandchild's values in the page's `:fulltext` **and** in the
+    /// `fullnode:meta` of the relative include that reached `meta`.
     fn reaggregate(
         &self,
         node: &NodeState<'_>,
         covering: Option<&IndexingRule>,
-        names: &[&str],
-        reaggregation_depth: usize,
+        into: AggregatedInto<'_>,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
         let Some(rule) = covering else {
             return Ok(());
         };
-        if !rule.aggregate.has_node_aggregates() {
+        if !rule.aggregate.has_node_aggregates() || into.depth >= into.limit {
             return Ok(());
         }
-        let limit = usize::try_from(rule.aggregate.reaggregation_limit).unwrap_or(0);
-        if reaggregation_depth >= limit {
-            return Ok(());
-        }
-        self.walk_reaggregate(
-            node,
-            &rule.aggregate.matcher(),
-            names,
-            reaggregation_depth + 1,
-            state,
-        )
+        self.walk_reaggregate(node, &rule.aggregate.matcher(), into.deeper(), state)
     }
 
     /// One level of a re-aggregation's own walk, which carries the field
@@ -229,8 +224,7 @@ impl DocumentMaker<'_> {
         &self,
         node: &NodeState<'_>,
         matcher: &Matcher<'_>,
-        names: &[&str],
-        reaggregation_depth: usize,
+        into: AggregatedInto<'_>,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
         for (name, child) in node.child_node_entries()? {
@@ -239,14 +233,44 @@ impl DocumentMaker<'_> {
                 Match::Stop => continue,
                 Match::Continue => {}
                 Match::Aggregate(includes) => {
-                    for _ in includes {
-                        self.aggregate_node(&child, names, reaggregation_depth, state)?;
+                    // Once per include that ended here, as at the top
+                    // level — a node two includes name is aggregated
+                    // twice — and into the **outer** include's fields,
+                    // because the field name a re-aggregated value takes
+                    // is the one the walk entered with.
+                    for _ended in includes {
+                        self.aggregate_node(&child, into, state)?;
                     }
                 }
             }
-            self.walk_reaggregate(&child, &next, names, reaggregation_depth, state)?;
+            self.walk_reaggregate(&child, &next, into, state)?;
         }
         Ok(())
+    }
+}
+
+/// What a matched node's values are written into: the fields, and how
+/// deep a re-aggregation from it may still go.
+#[derive(Clone, Copy)]
+struct AggregatedInto<'walk> {
+    /// `:fulltext`, and the `fullnode:<path>` of the include that reached
+    /// the node this descends from.
+    names: &'walk [&'walk str],
+    /// The **root** aggregate's `reAggregationLimit`, which is the one Oak
+    /// compares its stack against however deep the stack is.
+    limit: usize,
+    /// How many aggregates the walk has entered, which is that stack's
+    /// size.
+    depth: usize,
+}
+
+impl AggregatedInto<'_> {
+    /// The same fields, one aggregate deeper.
+    const fn deeper(self) -> Self {
+        Self {
+            depth: self.depth + 1,
+            ..self
+        }
     }
 }
 
@@ -260,6 +284,18 @@ struct AggregateWalk<'rule> {
     root_has_mime_type: bool,
     /// The relative definitions, in Oak's own combined order.
     property_includes: Vec<PropertyInclude<'rule>>,
+}
+
+impl AggregateWalk<'_> {
+    /// The fields an include of this walk writes into, at the top of the
+    /// aggregate stack.
+    fn writing_into<'names>(&self, names: &'names [&'names str]) -> AggregatedInto<'names> {
+        AggregatedInto {
+            names,
+            limit: usize::try_from(self.rule.aggregate.reaggregation_limit).unwrap_or(0),
+            depth: 0,
+        }
+    }
 }
 
 /// One level of the walk: where each include kind has matched to.
