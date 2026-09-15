@@ -14,8 +14,8 @@ touches:
   - docs/oak-segment-tar-feature-map.md
   - docs/cli-output.md
   - README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "36d3ed9"
 ---
 # Expose The Lucene Reindex In The Command With Its Binary-Text Flags
 
