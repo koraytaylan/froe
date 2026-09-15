@@ -128,7 +128,16 @@ pub(crate) fn lucene_reindex() {
         PHASE,
     );
     assert_check_passes_at_head(&froe_store, PHASE);
-    lucene_reindex_queries::assert_oak_answers_queries_from_froes_index(&froe_store, FROE_PORT);
+    let after_boot = work.join("froe-after-boot");
+    lucene_reindex_queries::assert_oak_answers_queries_from_froes_index(
+        &froe_store,
+        FROE_PORT,
+        &after_boot,
+    );
+    lucene_reindex_queries::assert_oak_rebuilt_the_suggester(
+        &after_boot,
+        LUCENE_VARIANT_DEFINITION,
+    );
     lucene_reindex_reset::assert_the_lane_reset_lets_oak_rebuild_from_scratch(
         judge,
         &work,

@@ -205,10 +205,46 @@ fn read_oracle_answers() -> QueryAnswers {
 /// Oak boots on froe's store, accepts the indexes as written, and answers
 /// every sample with the same rows and the same plan it answers from its
 /// own rebuild.
-pub(crate) fn assert_oak_answers_queries_from_froes_index(froe_store: &Path, port: u16) {
+pub(crate) fn assert_oak_answers_queries_from_froes_index(
+    froe_store: &Path,
+    port: u16,
+    extract_to: &Path,
+) {
     let from_oak = read_oracle_answers();
-    let from_froe = query_a_booted_store(froe_store, "froe-lucene-reindex-froe", port);
+    let from_froe = query_a_booted_store_then(
+        froe_store,
+        "froe-lucene-reindex-froe",
+        port,
+        AfterQuerying::ProvokeALaneCycleAndExtract(extract_to),
+    );
     assert_answers_agree(&from_oak, &from_froe);
+}
+
+/// The dictionary froe removes and never builds, which Oak's own suggester
+/// is left to rebuild — `docs/index.md` §5.6.
+const SUGGESTER_NODE: &str = ":suggest-data";
+
+/// The word the lane-cycle provocation writes, which nothing else holds.
+const LANE_CYCLE_WORD: &str = "suggestercorn";
+
+/// Oak's suggester rebuilds the dictionary froe removed, on the first
+/// cycle of the lane that writes the index.
+///
+/// The claim is froe's, not Oak's: the rebuild removes `:suggest-data`
+/// because the dictionary is Lucene's own suggester artifact rather than
+/// an index froe writes, and what makes that safe rather than lossy is
+/// that Oak builds it again. `DEFAULT_SUGGESTER_UPDATE_FREQUENCY_MINUTES`
+/// is ten in the pinned build, and the gate it feeds reads the timestamp
+/// of a node that is no longer there — so the first cycle is when it
+/// happens, and this is where that is checked rather than assumed.
+pub(crate) fn assert_oak_rebuilt_the_suggester(after_boot: &Path, definition: &str) {
+    let node = format!("/oak:index/{definition}/{SUGGESTER_NODE}");
+    let rendered = digest_store(after_boot);
+    assert!(
+        rendered.lines().any(|line| line.starts_with(&node)),
+        "{node} is still absent after Oak ran a cycle of the lane, so removing it in the          rebuild loses the suggester rather than handing it back to Oak"
+    );
+    eprintln!("    Oak's own suggester rebuilt {node} on the first cycle");
 }
 
 /// The comparison itself, over two collected sets of answers.
@@ -255,8 +291,29 @@ pub(crate) fn assert_answers_agree(from_oak: &QueryAnswers, from_froe: &QueryAns
     );
 }
 
+/// What a boot does once its answers are collected.
+#[derive(Clone, Copy)]
+pub(crate) enum AfterQuerying<'a> {
+    /// Nothing: the container is dropped where it stands.
+    Stop,
+    /// Content the index covers is written and waited for, so the lane
+    /// runs a cycle over it, and the store is then extracted to the path —
+    /// which is how the phase sees what Oak wrote **back**.
+    ProvokeALaneCycleAndExtract(&'a Path),
+}
+
 /// Boots Sling on `store` and runs every sample through the query probe.
 pub(crate) fn query_a_booted_store(store: &Path, container: &str, port: u16) -> QueryAnswers {
+    query_a_booted_store_then(store, container, port, AfterQuerying::Stop)
+}
+
+/// The same, with something to do before the container goes.
+pub(crate) fn query_a_booted_store_then(
+    store: &Path,
+    container: &str,
+    port: u16,
+    after: AfterQuerying<'_>,
+) -> QueryAnswers {
     let volume = PodmanVolume::new(&format!("{container}-volume"));
     let bootstrap =
         PodmanContainer::run_detached(&format!("{container}-bootstrap"), port, &volume.name);
@@ -273,6 +330,40 @@ pub(crate) fn query_a_booted_store(store: &Path, container: &str, port: u16) -> 
     assert_oak_reported_no_index_failure(container, "lucene_reindex");
 
     let answers = collect_query_answers(port);
+    if let AfterQuerying::ProvokeALaneCycleAndExtract(extract_to) = after {
+        provoke_a_lane_cycle(port);
+        sling.stop();
+        store_from_volume(&volume.name, extract_to);
+    }
     drop(sling);
     answers
+}
+
+/// Writes one node the variant definition indexes and waits until that
+/// definition answers for it, which is the lane having run a cycle that
+/// wrote the index — and closed the writer, which is where Oak decides
+/// about the suggester.
+fn provoke_a_lane_cycle(port: u16) {
+    let path = format!("{LUCENE_VARIANT_SUBTREE}/items/cycle");
+    sling::sling_post_fields(
+        port,
+        &path,
+        &[
+            ("jcr:primaryType", LUCENE_VARIANT_NODE_TYPE),
+            ("variantText", LANE_CYCLE_WORD),
+        ],
+    );
+    let statement = format!(
+        "SELECT * FROM [nt:unstructured] WHERE ISDESCENDANTNODE('{LUCENE_VARIANT_SUBTREE}')          AND CONTAINS([variantText], '{LANE_CYCLE_WORD}')"
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        if sling::sling_query(port, &statement).contains(&path) {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    panic!(
+        "the async lane never indexed {path} within 120s, so no cycle ran and what Oak's          suggester does after one is untested"
+    );
 }

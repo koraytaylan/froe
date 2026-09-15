@@ -487,6 +487,31 @@ pub(crate) fn populate_rebuilt_property_index(port: u16) {
             ("reindex", "true"),
         ],
     );
+    // A second one for the gates the twenty-three definitions Sling ships
+    // never exercise: every one of those is a bare `propertyNames`, four
+    // of them `unique` and four `declaringNodeTypes`, and none restricts a
+    // path or a value. Each of these is a branch of the collector that
+    // decides what an entry is made of.
+    sling_post_fields(
+        port,
+        "/oak:index/interopFiltered",
+        &[
+            ("jcr:primaryType", "oak:QueryIndexDefinition"),
+            ("type", "property"),
+            ("propertyNames@TypeHint", "Name[]"),
+            ("propertyNames", "variantCategory"),
+            ("declaringNodeTypes@TypeHint", "Name[]"),
+            ("declaringNodeTypes", "nt:unstructured"),
+            ("includedPaths@TypeHint", "String[]"),
+            ("includedPaths", "/content/interop/variant"),
+            ("excludedPaths@TypeHint", "String[]"),
+            ("excludedPaths", "/content/interop/variant/pages"),
+            ("valueExcludedPrefixes@TypeHint", "String[]"),
+            ("valueExcludedPrefixes", "beta"),
+            ("reindex@TypeHint", "Boolean"),
+            ("reindex", "true"),
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------
