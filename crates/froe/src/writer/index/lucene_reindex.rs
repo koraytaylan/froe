@@ -545,49 +545,52 @@ fn write_status_node<Sink: SegmentSink>(
 }
 
 /// The `facets` subtree the document maker's configuration persists.
+///
+/// `NodeStateFacetsConfig` writes in exactly two places, and the difference
+/// between them is the whole shape of this node:
+///
+/// * its **constructor** takes `nodeBuilder.child("facets")` and gives it
+///   `jcr:primaryType = nt:unstructured` if it has none. So the node exists
+///   as soon as one facet property made the maker consult the
+///   configuration, whatever that property's arity — which is why the
+///   caller writes it for a non-empty dimension list rather than for a
+///   non-empty child list.
+/// * its `setMultiValued` override writes **only when the value is true**,
+///   and then walks `PathUtils.elements(dimension)` from the `facets` node
+///   down, creating each element's child, giving it the same primary type
+///   if it has none, and setting `multivalued = true` on **every** element
+///   along the way — not on the last alone.
+///
+/// `setIndexFieldName` is not overridden and persists nothing, so a
+/// single-valued dimension leaves no child at all. Oak's own rebuild of the
+/// interop fixture's faceted definition writes an empty `facets` node, which
+/// is what caught an earlier version of this function writing a child per
+/// dimension.
 fn write_facet_configuration<Sink: SegmentSink>(
     writer: &mut RecordWriter<Sink>,
     dimensions: &[FacetDimension],
 ) -> Result<RecordIdentifier> {
     let mut children = Vec::new();
     for dimension in dimensions {
-        // A dimension is a path, and the configuration carries one node per
-        // element of it.
-        let mut properties = Vec::new();
-        if dimension.multi_valued {
-            let truth = writer.write_string("true")?;
-            properties.push(PropertyToWrite {
-                name: "multivalued".to_owned(),
-                property_type: crate::PropertyType::Boolean,
-                values: PropertyValuesToWrite::Single(truth),
-            });
+        if !dimension.multi_valued {
+            continue;
         }
-        let mut record = writer.write_node(
-            Some(UNSTRUCTURED_TYPE),
-            &[],
-            &crate::writer::record_writer::ChildNodesToWrite::Zero,
-            &properties,
-        )?;
         let elements: Vec<&str> = dimension
             .name
             .split('/')
             .filter(|element| !element.is_empty())
             .collect();
-        let Some((last, above)) = elements.split_last() else {
+        let Some((first, below)) = elements.split_first() else {
             continue;
         };
-        for element in above.iter().rev() {
-            record = writer.write_node(
-                Some(UNSTRUCTURED_TYPE),
-                &[],
-                &crate::writer::record_writer::ChildNodesToWrite::One {
-                    name: (*element).to_owned(),
-                    node: record,
-                },
-                &[],
-            )?;
+        // Bottom-up, because a record names the children it is written
+        // with: the deepest element first, then each element above it
+        // carrying the one below under its own name.
+        let mut record = write_multi_valued_element(writer, None)?;
+        for element in below.iter().rev() {
+            record = write_multi_valued_element(writer, Some(((*element).to_owned(), record)))?;
         }
-        children.push(((*last).to_owned(), record));
+        children.push(((*first).to_owned(), record));
     }
     writer.write_node(
         Some(UNSTRUCTURED_TYPE),
@@ -601,6 +604,31 @@ fn write_facet_configuration<Sink: SegmentSink>(
             many => crate::writer::record_writer::ChildNodesToWrite::Many(many.to_vec()),
         },
         &[],
+    )
+}
+
+/// One element of a multi-valued dimension's path, with the element below
+/// it when there is one.
+fn write_multi_valued_element<Sink: SegmentSink>(
+    writer: &mut RecordWriter<Sink>,
+    below: Option<(String, RecordIdentifier)>,
+) -> Result<RecordIdentifier> {
+    let truth = writer.write_string("true")?;
+    let properties = vec![PropertyToWrite {
+        name: "multivalued".to_owned(),
+        property_type: crate::PropertyType::Boolean,
+        values: PropertyValuesToWrite::Single(truth),
+    }];
+    writer.write_node(
+        Some(UNSTRUCTURED_TYPE),
+        &[],
+        &match below {
+            None => crate::writer::record_writer::ChildNodesToWrite::Zero,
+            Some((name, node)) => {
+                crate::writer::record_writer::ChildNodesToWrite::One { name, node }
+            }
+        },
+        &properties,
     )
 }
 

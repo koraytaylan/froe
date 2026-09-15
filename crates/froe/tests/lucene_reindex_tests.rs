@@ -317,3 +317,75 @@ fn the_plan_reports_a_work_directory_proxy_for_a_lucene_definition() {
     );
     assert!(plan.work_directory_estimate_bytes > 0);
 }
+
+/// `NodeStateFacetsConfig`'s constructor writes the `facets` node;
+/// `setIndexFieldName` writes nothing. So a single-valued facet dimension
+/// leaves the node there and childless.
+///
+/// Oak's own rebuild of the interop fixture's faceted definition writes
+/// exactly that, which is what caught the earlier version of
+/// `write_facet_configuration` writing a child per dimension whatever its
+/// arity.
+#[test]
+fn a_single_valued_facet_leaves_the_configuration_node_childless() {
+    let directory = TestDirectory::new("lucene-facets-single");
+    let store = write_lucene_store(&directory, faceted_definition("jcr:title"));
+
+    reindex(&store, lucene_options(&directory)).expect("reindex");
+
+    let facets = digest_lines(&store, "/oak:index/lucene/facets");
+    assert_eq!(
+        facets,
+        vec!["\tjcr:primaryType=Name:nt:unstructured".to_owned()],
+        "a single-valued dimension writes the configuration node and nothing under it"
+    );
+}
+
+/// `setMultiValued` writes only when the value is true, and then one child
+/// per path element of the dimension, each carrying `multivalued = true`.
+#[test]
+fn a_multi_valued_facet_writes_one_child_carrying_multivalued() {
+    let directory = TestDirectory::new("lucene-facets-multi");
+    let store = support::reindex_fixtures::write_lucene_store_with_extra_content(
+        &directory,
+        faceted_definition("tags"),
+        &[(
+            "tags",
+            support::property_index_layout::Property::Texts(vec![
+                "alpha".to_owned(),
+                "beta".to_owned(),
+            ]),
+        )],
+    );
+
+    reindex(&store, lucene_options(&directory)).expect("reindex");
+
+    let facets = digest_lines(&store, "/oak:index/lucene/facets");
+    assert_eq!(
+        facets,
+        vec![
+            "\tjcr:primaryType=Name:nt:unstructured".to_owned(),
+            "/tags\tjcr:primaryType=Name:nt:unstructured\tmultivalued=Boolean:true".to_owned(),
+        ],
+        "a multi-valued STRINGS dimension writes its own child with multivalued = true"
+    );
+}
+
+/// The `lucene` definition with one facet property over `name`.
+fn faceted_definition(name: &str) -> support::property_index_layout::Node {
+    use support::property_index_layout::{Node, Property};
+    support::reindex_fixtures::lucene_definition(
+        Vec::new(),
+        vec![(
+            "category",
+            Node::new()
+                .with(
+                    "jcr:primaryType",
+                    Property::Name("nt:unstructured".to_owned()),
+                )
+                .with("name", Property::Text(name.to_owned()))
+                .with("propertyIndex", Property::Boolean(true))
+                .with("facets", Property::Boolean(true)),
+        )],
+    )
+}

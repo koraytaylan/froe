@@ -433,6 +433,19 @@ pub(crate) fn lucene_definition_over(
 /// `nodetype` definition the path service requires, a small content tree
 /// and the node types the rules resolve through.
 pub(crate) fn write_lucene_store(directory: &TestDirectory, definition_node: Node) -> PathBuf {
+    write_lucene_store_with_extra_content(directory, definition_node, &[])
+}
+
+/// The same, with extra properties on `/content` in both the head and the
+/// state the lane checkpoint pins.
+///
+/// Both, because a Lucene rebuild indexes the checkpoint's state: a
+/// property added to the head alone would never reach a document.
+pub(crate) fn write_lucene_store_with_extra_content(
+    directory: &TestDirectory,
+    definition_node: Node,
+    extra: &[(&str, Property)],
+) -> PathBuf {
     let store = directory.store();
     // A Lucene definition is rebuilt from its lane's checkpoint, so the
     // fixture carries the lane, the checkpoint it names and the state that
@@ -444,12 +457,14 @@ pub(crate) fn write_lucene_store(directory: &TestDirectory, definition_node: Nod
         )
     };
     let content_tree = || {
-        typed()
-            .with("jcr:title", Property::Text("Alpha One".to_owned()))
-            .with_child(
-                "page",
-                typed().with("jcr:title", Property::Text("Beta Two".to_owned())),
-            )
+        let mut node = typed().with("jcr:title", Property::Text("Alpha One".to_owned()));
+        for (name, value) in extra {
+            node = node.with(name, value.clone());
+        }
+        node.with_child(
+            "page",
+            typed().with("jcr:title", Property::Text("Beta Two".to_owned())),
+        )
     };
     let content = Node::new()
         .with_child("content", content_tree())
