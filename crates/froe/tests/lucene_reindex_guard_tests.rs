@@ -122,6 +122,26 @@ fn a_hybrid_definition_is_refused_by_name() {
 }
 
 #[test]
+fn a_definition_parked_on_the_reindex_lane_is_refused_by_name() {
+    // A property family's definition parked there is rebuilt from the
+    // head: its lane's later replay leaves `match` and `entry` unchanged.
+    // A Lucene definition's replay *appends*, and froe does not remove
+    // `async`, so a rebuild would leave an index on a lane no ordinary
+    // cycle maintains and the lane's own next cycle would double it.
+    let directory = TestDirectory::new("guard-parked");
+    let definition = lucene_definition(
+        vec![("async", Property::Text("async-reindex".to_owned()))],
+        Vec::new(),
+    );
+    let store = write_lucene_store(&directory, definition);
+    let message = refusal(&directory, &store, true);
+    assert!(
+        message.contains("parked on the async-reindex lane"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_definition_without_async_is_refused_by_name() {
     let directory = TestDirectory::new("guard-synchronous");
     let definition = lucene_definition(vec![("no-async", Property::Boolean(true))], Vec::new());

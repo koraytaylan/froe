@@ -293,11 +293,17 @@ fn render_binary_text_policy(options: &ReindexOptions) -> String {
         crate::index::lucene::documents::binaries::BinaryTextFallback::Marker => {
             "the extraction-error marker"
         }
-        crate::index::lucene::documents::binaries::BinaryTextFallback::Skip => "nothing",
+        crate::index::lucene::documents::binaries::BinaryTextFallback::Skip => {
+            "none: a binary contributes no field"
+        }
     };
     match policy.pre_extracted_text_directory() {
         None => fallback.to_owned(),
-        Some(directory) => format!("{} under {}", fallback, directory.display()),
+        Some(directory) => format!(
+            "{} for a binary Oak's own extracted text under {} does not cover",
+            fallback,
+            directory.display()
+        ),
     }
 }
 

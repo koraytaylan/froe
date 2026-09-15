@@ -673,6 +673,69 @@ pub(crate) fn the_binary_text_flag_reaches_the_library_and_the_run_rebuilds() {
         "the summary reports what happened: {}",
         run.stdout
     );
+    assert!(
+        run.stdout.contains("binary text was not extracted")
+            && run
+                .stdout
+                .contains("do not match what Oak's own index matches"),
+        "the summary states what the binary policy costs a query: {}",
+        run.stdout
+    );
+}
+
+/// A mistyped pre-extracted directory would otherwise produce an index
+/// identical to one built without the flag, under a plan line naming a
+/// directory nothing read.
+#[test]
+pub(crate) fn a_pre_extracted_directory_that_is_not_there_is_refused() {
+    let (directory, store, work) = fixture("reindex-lucene-missing-store", Subject::FlaggedLucene);
+    let missing = directory.path.join("no-such-extracted-text");
+    let run = froe_reindex(
+        &store,
+        &[
+            "--yes",
+            "--binary-text",
+            "marker",
+            "--pre-extracted-text-directory",
+            missing.to_str().expect("path"),
+            "--work-directory",
+            work.to_str().expect("path"),
+        ],
+    );
+    assert!(!run.status.success(), "{}", run.stdout);
+    assert!(
+        run.stderr.contains("--pre-extracted-text-directory")
+            && run.stderr.contains("is not a directory"),
+        "the refusal names the flag and what is wrong with it: {}",
+        run.stderr
+    );
+}
+
+/// The prompt that authorizes taking the lock names the work, and a
+/// Lucene rebuild is work.
+#[test]
+pub(crate) fn the_prompt_counts_a_lucene_rebuild_rather_than_saying_none() {
+    let (_directory, store, work) = fixture("reindex-lucene-prompt", Subject::FlaggedLucene);
+    // No `--yes`: the run plans, asks, and cancels on the empty answer a
+    // non-interactive standard input gives it.
+    let run = froe_reindex(
+        &store,
+        &[
+            "--binary-text",
+            "marker",
+            "--work-directory",
+            work.to_str().expect("path"),
+        ],
+    );
+    let printed = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        printed.contains("about to rebuild 1 index in"),
+        "the prompt counts the Lucene rebuild: {printed}"
+    );
+    assert!(
+        !printed.contains("rebuild 0 indexes"),
+        "a Lucene-only run is not a run that rebuilds nothing: {printed}"
+    );
 }
 
 /// The pre-extracted directory is a refinement of the fallback, not a

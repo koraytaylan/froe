@@ -200,6 +200,12 @@ pub enum SelectionRefusal {
         /// The lane with no state.
         lane: String,
     },
+    /// A Lucene definition is parked on `async-reindex`, the lane an
+    /// out-of-band reindex moves a definition onto.
+    LuceneParkedOnTheReindexLane {
+        /// The definition.
+        path: String,
+    },
     /// A lane is mid-run: `/:async/async-reindex` carries a checkpoint.
     ReindexLaneInProgress {
         /// The definition.
@@ -226,6 +232,7 @@ impl SelectionRefusal {
             | Self::NotADefinition { path }
             | Self::DanglingLaneCheckpoint { path, .. }
             | Self::LaneAbsent { path, .. }
+            | Self::LuceneParkedOnTheReindexLane { path }
             | Self::ReindexLaneInProgress { path } => path,
         }
     }
@@ -300,6 +307,12 @@ impl std::fmt::Display for SelectionRefusal {
                 formatter,
                 "{path} indexes on lane {lane}, which has no state on /:async; rerun \
                  with --from-head to authorize a rebuild from the head"
+            ),
+            Self::LuceneParkedOnTheReindexLane { path } => write!(
+                formatter,
+                "{path} is a lucene definition parked on the async-reindex lane, which no \
+                 ordinary indexing cycle maintains; restore the lane it belongs on before \
+                 rebuilding it"
             ),
             Self::ReindexLaneInProgress { path } => write!(
                 formatter,
@@ -625,10 +638,22 @@ fn resolve_state(
 ) -> crate::Result<std::result::Result<(IndexingState, Option<RecordIdentifier>), SelectionRefusal>>
 {
     let _ = provider;
-    // A definition parked at `async = async-reindex` is treated as
-    // synchronous: the lane runs only when an operator triggers it, and its
-    // completion removes `async` again — which is the state this run
-    // produces. A lane *mid-run* carries a checkpoint, and that is refused.
+    // A definition parked at `async = async-reindex` is rebuilt from the
+    // head: the lane runs only when an operator triggers it, so the
+    // definition is as current as the head and its later replay leaves a
+    // property family's `match` and `entry` unchanged. A lane *mid-run*
+    // carries a checkpoint, and that is refused.
+    //
+    // A **Lucene** definition is refused outright instead. froe does not
+    // remove `async`, so the definition stays on a lane
+    // `IndexUpdate.isIncluded` admits to no ordinary cycle
+    // (`index-definitions.md` §2.2): the index froe built would go stale
+    // silently, and the lane's own next cycle diffs from a missing before
+    // state, which is the branch `FulltextIndexEditor` re-enters reindex
+    // mode on and `DefaultIndexWriter` *appends* through — doubling the
+    // index, the same hazard the lost-checkpoint reset below exists for.
+    // A reset is not the answer either, because nothing runs that lane
+    // unless an operator asks it to.
     if definition.lane.as_deref() == Some(ASYNC_REINDEX_LANE) {
         if lanes
             .lane(ASYNC_REINDEX_LANE)
@@ -636,6 +661,11 @@ fn resolve_state(
             .is_some()
         {
             return Ok(Err(SelectionRefusal::ReindexLaneInProgress {
+                path: definition.path.clone(),
+            }));
+        }
+        if definition.index_type.as_ref() == Some(&IndexType::Lucene) {
+            return Ok(Err(SelectionRefusal::LuceneParkedOnTheReindexLane {
                 path: definition.path.clone(),
             }));
         }
@@ -714,16 +744,19 @@ fn resolve_state(
         }));
     }
 
-    // A counter is refused outright here, and this is the one place
-    // `--from-head` does not authorize something.
+    // A counter is **reset** rather than rebuilt from the head: Oak's own
+    // replay adds to a counter rather than replacing it, so a rebuilt one
+    // would be doubled, and a number nobody can trust is worse than a
+    // number Oak rebuilds itself.
     //
-    // froe will not rebuild a counter: Oak's own replay would double it.
-    // The first version therefore *reset* it — removed the hidden children
-    // and left Oak to rebuild from scratch — and the interop scenario that
-    // finally ran showed Oak does not. A lane whose checkpoint is gone
-    // never completes a cycle, so the reset removed an index nothing
-    // restored. Clearing the lane's own state does not help either; the
-    // measurements are on the refusal's own documentation.
+    // This branch once refused instead, on a measurement that a lane whose
+    // checkpoint is gone never completes a cycle. Plan 0010's task 1009
+    // found that measurement to be a symptom of froe's own defect — the
+    // definition had been rewritten with its template property names out
+    // of Oak's sorted order, so Oak's conflict merge failed the lane's
+    // commit — and with the writer corrected Oak rebuilds on the first
+    // cycle. `docs/index.md` §5.9 records that the behaviour changed
+    // twice.
     if definition.index_type.as_ref() == Some(&IndexType::Counter) {
         return Ok(Ok((
             IndexingState::ResetForReplay {

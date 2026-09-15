@@ -77,6 +77,23 @@ pub(crate) fn run_reindex(
          the run holds the repository lock from planning through publication",
     );
     let confirmation = Confirmation::from_assume_yes_flag(command.assume_yes);
+    if let Some(directory) = &command.pre_extracted_text_directory
+        && !directory.is_dir()
+    {
+        // The store is read with `read_to_string(...).ok()`, so a
+        // directory that is not there covers no blob and every binary
+        // falls back to `--binary-text` — an index identical to the one
+        // the run would have built without the flag, reported with a plan
+        // line naming a directory that was never read. A mistyped path
+        // has to be a refusal, because nothing downstream can tell it
+        // from a store that was consulted and held nothing.
+        eprintln!(
+            "froe: --pre-extracted-text-directory {} is not a directory; a store that \
+             cannot be read covers no binary, and nothing in the run would say so",
+            crate::output::sanitize_terminal_path(directory)
+        );
+        return Ok(false);
+    }
     let options = command.options();
 
     if command.dry_run {
@@ -100,8 +117,8 @@ pub(crate) fn run_reindex(
 
     let answer = confirm(
         &format!(
-            "about to rebuild {} in {}",
-            count_noun(prepared.plan().rebuild_count() as u64, "index", "indexes"),
+            "about to {} in {}",
+            describe_the_work(prepared.plan()),
             crate::output::sanitize_terminal_path(&prepared.plan().directory)
         ),
         confirmation,
@@ -158,6 +175,27 @@ fn report_pinning_checkpoints(directory: &Path) {
         count_noun(names.len() as u64, "checkpoint", "checkpoints"),
         names.join(", "),
     );
+}
+
+/// What the run is about to do, for the prompt that authorizes taking the
+/// lock and moving the head.
+///
+/// A reset is named separately from a rebuild because it *removes* an
+/// index's data and leaves the rebuild to Oak's own next cycle: an
+/// operator answering this prompt is authorizing a deletion, and the two
+/// read differently. Counting rebuilds alone would tell a Lucene-only or
+/// reset-only run that it is about to rebuild `0 indexes`.
+fn describe_the_work(plan: &ReindexPlan) -> String {
+    let rebuilt = plan.rebuild_count() + plan.lucene_rebuild_count();
+    let discarded = plan.reset_count();
+    let rebuilding = format!("rebuild {}", count_noun(rebuilt as u64, "index", "indexes"));
+    let resetting = format!("reset {}", count_noun(discarded as u64, "index", "indexes"));
+    match (rebuilt, discarded) {
+        (0, 0) => "run".to_owned(),
+        (_, 0) => rebuilding,
+        (0, _) => resetting,
+        _ => format!("{rebuilding} and {resetting}"),
+    }
 }
 
 /// Prints the plan: one line per definition, then the warnings and the work
@@ -270,6 +308,7 @@ fn print_summary(outcome: &ReindexOutcome) {
     let mut rebuilt = 0u64;
     let mut reset = 0u64;
     let mut nothing = 0u64;
+    let mut rebuilt_a_lucene_index = false;
     for (path, report) in &outcome.definitions {
         match report {
             DefinitionReport::Rebuilt {
@@ -292,6 +331,7 @@ fn print_summary(outcome: &ReindexOutcome) {
                 segment_bytes,
             } => {
                 rebuilt += 1;
+                rebuilt_a_lucene_index = true;
                 println!(
                     "  {path}: {}, {} visited, {} in {}",
                     count_noun(*documents, "document", "documents"),
@@ -322,6 +362,16 @@ fn print_summary(outcome: &ReindexOutcome) {
         }
     }
 
+    if rebuilt_a_lucene_index {
+        // The plan line before the prompt names the policy, and under
+        // `--yes` in a script nobody reads it. This is the line that
+        // survives in a run log, so it states the consequence rather than
+        // the mechanism.
+        println!(
+            "  binary text was not extracted: fulltext queries over the binaries in these \
+             indexes do not match what Oak's own index matches"
+        );
+    }
     let mut line = format!("reindexed {}", count_noun(rebuilt, "index", "indexes"));
     if reset > 0 {
         let _ = write!(line, ", reset {reset}");
