@@ -457,6 +457,22 @@ definition — whose one property definition is the catch-all pattern
 The second arm, `!analyzed`, is unreachable from this caller: the call
 site is already inside the `pd.analyzed` branch.
 
+**No boost reaches this field.** `indexAnalyzedProperty` passes the value
+and the two flags and nothing else, and both of `FieldFactory`'s types omit
+norms — where Lucene's own `Field.setBoost` throws:
+
+```java
+public void setBoost(float boost) {
+    if (boost != 1.0f && (type.indexed() == false || type.omitNorms())) {
+        throw new IllegalArgumentException("You cannot set an index-time boost: this field is not indexed or omits norms");
+    }
+```
+
+The one place a property definition's boost is applied at index time is the
+aggregate value of §4, whose `TextField` keeps norms. Oak's own rebuild of
+the interop fixture's `boost = 2.0` definition confirms it: it completes,
+and a boosted `full:` field would have thrown.
+
 ### 3.4 The two inclusion tests
 
 ```java
@@ -693,6 +709,101 @@ The matcher is a small state machine over the include's elements, and an
 aggregated property contributes through `Aggregate.PropertyInclude` with
 the same property-definition rules as §2.5.
 
+### 4.1 `relativeNode` writes **both** fields
+
+The ternary above reads as an either/or, and it is not one: Oak's own
+rebuild of a definition whose aggregate names `jcr:content` twice — once
+plainly, once with `relativeNode` — writes that child's values into the
+page's `:fulltext` **twice** and into `fullnode:jcr:content` once. A second
+relative include over a path no other include names writes its child's
+values into `:fulltext` as well as into its own `fullnode:` field. So a
+relative include contributes to `:fulltext` *beside* its own field, and a
+node named by two includes is aggregated once per include.
+
+This is pinned by the oracle rather than by a line of Java: the interop
+suite's `lucene_reindex` phase carries both shapes, and froe reproducing
+only the `fullnode:` half made Oak's own rebuild differ on the page
+document's `:fulltext` positions.
+
+### 4.1.1 Whose rule decides what is excluded
+
+`indexAggregatedNode` resolves the rule covering **the aggregated node** —
+`definition.getApplicableIndexingRule(result.nodeState)` — and asks *that*
+rule whether a property is `excludeFromAggregation`, not the rule the
+document is being made under. Oak's own rebuild pins it: a `meta` child of
+type `sling:Folder`, aggregated into an `nt:unstructured` page, loses its
+`jcr:title` because the definition's **`sling:Folder`** rule excludes it,
+while the `nt:unstructured` rule's definition of the same name does not.
+
+A node no rule covers is aggregated whole.
+
+### 4.1.2 Re-aggregation
+
+An aggregated node whose covering rule declares an aggregate of its own
+contributes that aggregate's nodes too — into the **same fields**, a
+relative include's `fullnode:<path>` included, and after its own
+properties. `reaggregateLimit`, five by default, is how many levels deep
+that goes.
+
+Oak's own rebuild pins the field set: the `meta` child above is reached by
+a `relativeNode` include, its rule declares `include0 = inner`, and the
+grandchild's values appear in the page's `:fulltext` **and** in
+`fullnode:meta`.
+
+What is **not** carried up is the re-aggregated rule's own property
+includes: `full:inner/jcr:title` appears on the `meta` node's own document
+and on no page's.
+
+### 4.2 Property includes: the relative property definitions
+
+A **relative** property definition — a `name` holding a `/`, which is the
+shape AEM's own definitions are written in — reaches nothing through
+`IndexingRule.getConfig`: that is asked about a node's own property name,
+whose parent path is `""`, and §2.4's match begins with a parent-path
+equality. Its only path into a document is the aggregate walk:
+
+```java
+List<Aggregate.Include> propIncludes = newArrayList();
+for (PropertyDefinition pd : propConfigs.values()) {
+    if (pd.relative) propIncludes.add(new Aggregate.PropertyInclude(pd));
+}
+…
+includes.addAll(propAggregate.getIncludes());
+if (nodeAggregate != null) includes.addAll(nodeAggregate.getIncludes());
+```
+
+A `PropertyInclude`'s elements are the definition's **ancestors**; the last
+name is the property. At the node its ancestor path ends on, an exact
+definition takes the property of that name and a regular-expression one
+takes every property whose own name the name expression matches. Each
+result is then indexed exactly as a node's own property is, under the
+**relative path** as the field name:
+
+```java
+public void onResult(PropertyIncludeResult result) {
+    if (result.pd.ordered) addTypedOrderedFields(fields, result.propertyState, result.propertyPath, result.pd);
+    indexProperty(path, fields, state, result.propertyState, result.propertyPath, result.pd);
+}
+```
+
+Three things follow, and Oak's own rebuild of the interop fixture pins each
+of them — a `jcr:content/jcr:title` definition with `ordered` and a
+`jcr:content/.*` pattern over a node carrying a hidden `:childOrder`:
+
+* the fields are `:dv<relative path>`, `<relative path>` and
+  `full:<relative path>`, in that order;
+* `propertyPath` is the definition's **own** parent path joined with the
+  property's **own** name, which differ for a pattern;
+* a **hidden** name contributes nothing here, where §2.3's per-property
+  pass lets one through to the patterns as bug compatibility;
+* the node state `indexProperty` is given is the **document's own** node,
+  so a binary reached this way is gated by the root's `jcr:mimeType`
+  rather than by its own node's.
+
+Because the combined list puts the property includes first, a child that
+ends both kinds contributes its property-include fields before its
+aggregated values.
+
 ---
 
 ## 5. Facets
@@ -717,6 +828,13 @@ if (tag == Type.STRINGS.tag() && property.isArray()) {
 
 An empty value is skipped rather than refused; the facet field's *index*
 field name is `<property>_facet`.
+
+**Both arms test the type tag**, and `Type.STRINGS.tag()` *is*
+`Type.STRING.tag()` — an array shares its scalar's tag — so the pair reads
+"a string array, else a string". A faceted property of any other type adds
+**no facet field at all**, while `getFacetsConfig()` is still consulted for
+it, so §5.3's `facets` node still appears. Oak's own rebuild of a faceted
+`LONG` in the interop fixture writes no `_facet` field for it.
 
 ### 5.2 What the build pass turns them into
 

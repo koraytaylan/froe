@@ -131,6 +131,54 @@ impl IndexingRule {
             .values()
             .chain(self.patterns.iter().map(|(_, definition)| definition))
     }
+
+    /// The **relative** definitions, which Oak turns into
+    /// `Aggregate.PropertyInclude`s and combines in front of the rule's
+    /// node aggregates:
+    ///
+    /// ```java
+    /// for (PropertyDefinition pd : propConfigs.values()) {
+    ///     if (pd.relative) propIncludes.add(new Aggregate.PropertyInclude(pd));
+    /// }
+    /// …
+    /// includes.addAll(propAggregate.getIncludes());
+    /// if (nodeAggregate != null) includes.addAll(nodeAggregate.getIncludes());
+    /// ```
+    ///
+    /// A relative name reaches nothing through [`Self::config_of`] — that
+    /// is asked about a node's own property name, whose parent is empty —
+    /// so this walk is the **only** way such a definition contributes a
+    /// field, and `jcr:content/…` is the shape AEM's own definitions are
+    /// written in.
+    #[must_use]
+    pub fn property_includes(&self) -> Vec<PropertyInclude<'_>> {
+        let exact = self.properties.values().map(|definition| PropertyInclude {
+            definition,
+            pattern: None,
+        });
+        let patterned = self
+            .patterns
+            .iter()
+            .map(|(pattern, definition)| PropertyInclude {
+                definition,
+                pattern: Some(pattern),
+            });
+        exact
+            .chain(patterned)
+            .filter(|include| include.definition.relative)
+            .collect()
+    }
+}
+
+/// One relative property definition as the aggregate walk needs it: the
+/// definition, and — for a regular-expression one — the compiled name
+/// expression its ancestor's property names are matched against.
+#[derive(Clone, Copy, Debug)]
+pub struct PropertyInclude<'rule> {
+    /// The definition itself.
+    pub definition: &'rule PropertyDefinition,
+    /// The pattern, for an `isRegexp` definition.
+    pub pattern: Option<&'rule NamePattern>,
 }
 
 /// One `properties/<name>` child of a rule.
