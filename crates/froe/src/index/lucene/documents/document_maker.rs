@@ -183,6 +183,43 @@ impl DocumentState {
 
 // ------------------------------------------------------- the field kinds
 
+/// `IndexHelper.NOT_TOKENIZED`: `jcr:uuid` plus
+/// `UserConstants.USER_PROPERTY_NAMES` and `GROUP_PROPERTY_NAMES`, read
+/// out of the pinned image rather than from the constant declarations,
+/// because the two collections are assembled from named constants across
+/// two interfaces.
+///
+/// Sorted, so a lookup is a binary search and a reader can see the set is
+/// complete.
+const NOT_TOKENIZED: [&str; 7] = [
+    "jcr:uuid",
+    "rep:authorizableId",
+    "rep:disabled",
+    "rep:impersonators",
+    "rep:members",
+    "rep:password",
+    "rep:principalName",
+];
+
+/// `PropertyDefinition.skipTokenization`:
+///
+/// ```java
+/// public boolean skipTokenization(String propertyName) {
+///     if (isRegexp && IndexHelper.skipTokenization(propertyName)) {
+///         return true;
+///     }
+///     return !analyzed;
+/// }
+/// ```
+///
+/// The name list applies to a **regular-expression** definition alone: a
+/// definition that names `jcr:uuid` outright and marks it `analyzed`
+/// tokenizes it. The `!analyzed` arm is unreachable from the one caller,
+/// which is inside the `analyzed` branch.
+fn skip_tokenization(property_name: &str, definition: &PropertyDefinition) -> bool {
+    definition.is_regexp && NOT_TOKENIZED.binary_search(&property_name).is_ok()
+}
+
 /// Lucene's `StringField`: untokenized, `DOCS_ONLY`, norms omitted.
 fn string_field(name: &str, value: &str, stored: bool) -> Field {
     let mut field = Field::indexed(
@@ -486,7 +523,23 @@ impl DocumentMaker<'_> {
         Ok(())
     }
 
-    /// `full:<name>`, analyzed, stored exactly when `useInExcerpt`.
+    /// `full:<name>`, analyzed, stored exactly when `useInExcerpt` — unless
+    /// the name is one `skipTokenization` refuses to tokenize.
+    ///
+    /// `LuceneDocumentMaker.indexAnalyzedProperty` passes
+    /// `!pd.skipTokenization(pname)` as `newPropertyField`'s `tokenized`
+    /// flag, and that factory ignores its `stored` argument entirely when
+    /// the flag is false:
+    ///
+    /// ```java
+    /// public static Field newPropertyField(String name, String value, boolean tokenized, boolean stored) {
+    ///     if (tokenized) return new OakTextField(name, value, stored);
+    ///     return new StringField(name, value, Field.Store.NO);
+    /// }
+    /// ```
+    ///
+    /// So such a name yields one untokenized `DOCS_ONLY` term of the whole
+    /// value, unstored whatever `useInExcerpt` says — §3.3.
     fn index_analyzed(
         &self,
         property_name: &str,
@@ -495,6 +548,10 @@ impl DocumentMaker<'_> {
         state: &mut DocumentState,
     ) {
         let name = format!("{ANALYZED_PREFIX}{property_name}");
+        if skip_tokenization(property_name, definition) {
+            state.add_dirty(string_field(&name, value, false));
+            return;
+        }
         let analyzed = self.analyzer.tokens(&name, value);
         let mut field =
             oak_text_field(&name, &analyzed, definition.use_in_excerpt.then_some(value));

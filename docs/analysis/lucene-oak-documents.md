@@ -307,7 +307,7 @@ one does not. Lucene's own `TextField` and `StringField` supply the rest:
 | Field | Built by | Kind | Options | Stored | Norms | Value |
 | --- | --- | --- | --- | --- | --- | --- |
 | `:path` | `newPathField` | `StringField` | `DOCS_ONLY` | **yes** | no | the node's path |
-| `full:<name>` | `newPropertyField(name, value, true, useInExcerpt)` | `OakTextField` | offsets when stored, positions when not | `useInExcerpt` | **no** | one analyzed property value |
+| `full:<name>` | `newPropertyField(name, value, !skipTokenization(name), useInExcerpt)` | `OakTextField`, or `StringField` for a name §3.3 never tokenizes | offsets when stored, positions when not — `DOCS_ONLY` untokenized | `useInExcerpt`, and never when untokenized | **no** | one analyzed property value |
 | `:fulltext` | `newFulltextField` | `TextField` | positions | no | **yes** | a `nodeScopeIndex` value, an aggregate value, or the node name |
 | `fullnode:<path>` | `newFulltextField(path, value)` | `TextField` | positions | no | **yes** | a `relativeNode` aggregate's value |
 | `:suggest` | `newSuggestField` | `OakTextField` unstored | positions | no | **no** | a `useInSuggest` value |
@@ -390,6 +390,72 @@ So per value, in this order: `full:<name>`, `:suggest`, `:spellcheck`,
 
 A **binary** property never reaches that loop: it is diverted earlier to
 §6's text extraction.
+
+#### The names Oak never tokenizes
+
+`indexAnalyzedProperty` does **not** always write an analyzed field:
+
+```java
+protected void indexAnalyzedProperty(Document doc, String pname, String value, PropertyDefinition pd) {
+    String analyzedPropName = constructAnalyzedPropertyName(pname);
+    doc.add(newPropertyField(analyzedPropName, value, !pd.skipTokenization(pname), pd.stored));
+}
+
+public static Field newPropertyField(String name, String value, boolean tokenized, boolean stored) {
+    if (tokenized) {
+        return new OakTextField(name, value, stored);
+    }
+    return new StringField(name, value, Field.Store.NO);
+}
+```
+
+and
+
+```java
+public boolean skipTokenization(String propertyName) {
+    if (isRegexp && IndexHelper.skipTokenization(propertyName)) {
+        return true;
+    }
+    return !analyzed;
+}
+
+// IndexHelper
+private static final Set<String> NOT_TOKENIZED = SetUtils.toSet("jcr:uuid");
+static {
+    NOT_TOKENIZED.addAll(UserConstants.USER_PROPERTY_NAMES);
+    NOT_TOKENIZED.addAll(UserConstants.GROUP_PROPERTY_NAMES);
+}
+public static boolean skipTokenization(String name) { return NOT_TOKENIZED.contains(name); }
+```
+
+The set, read out of the pinned image rather than assembled from the
+constant declarations by hand, is exactly:
+
+```
+jcr:uuid
+rep:authorizableId
+rep:disabled
+rep:impersonators
+rep:members
+rep:password
+rep:principalName
+```
+
+Three things follow, and each is observable in the fixture's own default
+definition — whose one property definition is the catch-all pattern
+`^[^\/]*$`, so **every** `jcr:uuid` in a Sling repository reaches it:
+
+* the exclusion applies to a **regular-expression** definition alone. A
+  definition that names `jcr:uuid` outright and marks it `analyzed`
+  tokenizes it.
+* the field written instead is a plain `StringField`: one untokenized
+  `DOCS_ONLY` term of the whole value, norms omitted.
+* `newPropertyField`'s `stored` argument is **ignored** on that arm, so
+  such a field is unstored whatever `useInExcerpt` said — and carries no
+  offsets, since it carries no positions.
+
+The second arm, `!analyzed`, is unreachable from this caller: the call
+site is already inside the `pd.analyzed` branch.
 
 ### 3.4 The two inclusion tests
 
@@ -694,14 +760,51 @@ an `IllegalArgumentException`.
 
 ### 5.3 The configuration that persists
 
-Oak's facet configuration is node-state-backed, so `setIndexFieldName` and
-`setMultiValued` write into the **visible** definition: a `facets` child
-with `jcr:primaryType = nt:unstructured`, created as soon as one facet
-property is indexed whatever its arity — the configuration is consulted for
-every facet property — and under it one child per path element of the
-dimension carrying `jcr:primaryType = nt:unstructured`, a `NAME` when
-absent, and `multivalued = true` for a multi-valued `STRINGS` dimension.
-Nothing on the query side reads it back.
+Oak's facet configuration is node-state-backed, so it writes into the
+**visible** definition — but in two places only, and `setIndexFieldName` is
+not one of them.
+
+`NodeStateFacetsConfig`'s **constructor** is the first:
+
+```java
+this.nodeBuilder = nodeBuilder.child(FulltextIndexConstants.PROP_FACETS);
+if (!nodeBuilder.hasProperty(JCR_PRIMARYTYPE)) {
+    nodeBuilder.setProperty(JCR_PRIMARYTYPE, NT_UNSTRUCTURED, Type.NAME);
+}
+readMVFacets(nodeBuilder, "");
+```
+
+So a `facets` child with `jcr:primaryType = nt:unstructured` as a `NAME`
+exists as soon as one facet property made the maker consult the
+configuration — the configuration is consulted for every facet property,
+whatever its arity.
+
+Its `setMultiValued` override is the second, and it writes **only when the
+value is true**:
+
+```java
+public synchronized void setMultiValued(String dimName, boolean v) {
+    super.setMultiValued(dimName, v);
+    if (v) {
+        NodeBuilder builder = nodeBuilder;
+        for (String element : PathUtils.elements(dimName)) {
+            NodeBuilder child = builder.child(element);
+            if (!child.hasProperty(JCR_PRIMARYTYPE)) {
+                child.setProperty(JCR_PRIMARYTYPE, NT_UNSTRUCTURED, Type.NAME);
+            }
+            child.setProperty(MULTIVALUED, Boolean.valueOf(true));
+            builder = child;
+        }
+    }
+}
+```
+
+One child per path element of the dimension, from the `facets` node
+downward, each with the same primary type when it has none and each —
+not the last alone — carrying `multivalued = true` as a `BOOLEAN`.
+`setIndexFieldName` is not overridden and persists nothing, so a
+**single-valued** dimension leaves a `facets` node with no child under it
+at all. Nothing on the query side reads any of it back.
 
 ---
 

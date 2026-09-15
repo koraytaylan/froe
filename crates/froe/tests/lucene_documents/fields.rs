@@ -279,3 +279,89 @@ fn an_unparseable_date_is_refused_by_name() {
     assert!(message.contains("jcr:created"), "{message}");
     assert!(message.contains("not a date"), "{message}");
 }
+
+/// §3.3's `skipTokenization`: a **regular-expression** definition never
+/// tokenizes one of `IndexHelper.NOT_TOKENIZED`, and the field it writes
+/// instead is `newPropertyField`'s untokenized arm — one `DOCS_ONLY` term
+/// of the whole value, unstored whatever `useInExcerpt` says.
+///
+/// Oak's own rebuild of the interop fixture writes `full:jcr:uuid` as
+/// `DOCS_ONLY`, which is what caught this: every `jcr:uuid` in a Sling
+/// repository reaches the default definition's catch-all pattern.
+#[test]
+fn a_regular_expression_definition_does_not_tokenize_the_names_oak_excludes() {
+    let definition = definition_with(vec![(
+        "all",
+        Node::new()
+            .string("name", ALL_PROPERTIES)
+            .boolean("isRegexp", true)
+            .boolean("analyzed", true)
+            .boolean("useInExcerpt", true),
+    )]);
+    let subject = Node::new()
+        .single("jcr:primaryType", PropertyType::Name, "nt:unstructured")
+        .string("jcr:uuid", "b4f8474f-885f-4725-a389-ce6deb1c3532")
+        .string("jcr:title", "Hello World");
+    let (_directory, made) = make("not-tokenized", &definition, &subject, marker_policy());
+    let made = made.expect("the node yields a document");
+
+    let uuid = made
+        .document
+        .fields
+        .iter()
+        .find(|field| field.name == "full:jcr:uuid")
+        .expect("the excluded name still reaches the catch-all");
+    assert_eq!(
+        describe(uuid),
+        (
+            "full:jcr:uuid".to_owned(),
+            IndexOptions::Documents,
+            // Unstored, because the untokenized arm passes `Store.NO`
+            // whatever `useInExcerpt` said.
+            false,
+            false,
+            vec!["b4f8474f-885f-4725-a389-ce6deb1c3532".to_owned()]
+        )
+    );
+    // Every other name under the same pattern is analyzed as before, so
+    // this is the name list and not the pattern.
+    let title = made
+        .document
+        .fields
+        .iter()
+        .find(|field| field.name == "full:jcr:title")
+        .expect("an ordinary name is still analyzed");
+    assert_eq!(
+        describe(title),
+        (
+            "full:jcr:title".to_owned(),
+            IndexOptions::DocumentsAndFrequenciesAndPositionsAndOffsets,
+            true,
+            false,
+            vec!["hello".to_owned(), "world".to_owned()]
+        )
+    );
+}
+
+/// The same name under a definition that names it outright **is**
+/// tokenized: `skipTokenization`'s first arm is guarded by `isRegexp`.
+#[test]
+fn a_named_definition_tokenizes_a_name_the_pattern_arm_would_exclude() {
+    let definition = definition_with(vec![("uuid", analyzed("jcr:uuid"))]);
+    let subject = Node::new()
+        .single("jcr:primaryType", PropertyType::Name, "nt:unstructured")
+        .string("jcr:uuid", "b4f8474f-885f-4725-a389-ce6deb1c3532");
+    let (_directory, made) = make("named-uuid", &definition, &subject, marker_policy());
+    let made = made.expect("the node yields a document");
+    let uuid = made
+        .document
+        .fields
+        .iter()
+        .find(|field| field.name == "full:jcr:uuid")
+        .expect("the named definition indexes it");
+    assert_eq!(
+        uuid.options,
+        IndexOptions::DocumentsAndFrequenciesAndPositions,
+        "a named definition tokenizes, so the field is the analyzed kind"
+    );
+}
