@@ -13,6 +13,7 @@
 mod support;
 
 use froe::index::lucene::documents::binaries::{BinaryTextFallback, BinaryTextPolicy};
+use froe::index::lucene::dump::{DumpOptions, dump_lucene_indexes};
 use froe::writer::index::plan::ReindexAction;
 use froe::writer::index::{DefinitionReport, plan_reindex, reindex};
 use support::reindex_fixtures::{
@@ -180,7 +181,8 @@ fn two_runs_produce_the_same_index() {
     reindex(&store_b, lucene_options(&second)).expect("reindex");
 
     // `uniqueKey`, the timestamps and the `uid` are drawn per run, so the
-    // comparison is over everything else.
+    // comparison of the `:data` node is over everything else — the file
+    // set and each file's length.
     let scrub = |lines: Vec<String>| -> Vec<String> {
         lines
             .into_iter()
@@ -199,6 +201,90 @@ fn two_runs_produce_the_same_index() {
         scrub(digest_lines(&store_b, "/oak:index/lucene/:data")),
         "two runs over one tree produce one index"
     );
+
+    // And the file **contents**, which the scrub above cannot reach: a
+    // blob's own bytes carry the random `uniqueKey` Oak appends, so the
+    // comparison goes through the dump, which is the file as Lucene reads
+    // it. Without this the claim is the file set's alone, and a writer
+    // whose output depended on a hash order would satisfy it.
+    assert_eq!(
+        dumped_files(&store_a, &first),
+        dumped_files(&store_b, &second),
+        "two runs over one tree produce one index, byte for byte"
+    );
+}
+
+/// Every dumped file of every definition, as `(path below the dump, byte
+/// count, digest)` — a digest rather than the bytes so a failure names the
+/// file that differs instead of printing two segments.
+fn dumped_files(store: &std::path::Path, directory: &TestDirectory) -> Vec<(String, usize, u64)> {
+    file_digests(dumped_bytes(store, directory))
+}
+
+/// The same files, hashed.
+fn file_digests(files: Vec<(String, Vec<u8>)>) -> Vec<(String, usize, u64)> {
+    files
+        .into_iter()
+        .map(|(name, bytes)| {
+            // FNV-1a, which is four lines and needs no dependency.
+            let mut digest = 0xcbf2_9ce4_8422_2325u64;
+            for byte in &bytes {
+                digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            (name, bytes.len(), digest)
+        })
+        .collect()
+}
+
+/// Every dumped file of every definition, as `(path below the dump,
+/// bytes)`, with the two files that record **when** the dump and the run
+/// happened left out: `index-details.txt` carries the dump's own
+/// timestamp, and `index-definitions.json` carries the definition's
+/// `:status`, whose `uid` and timestamps are drawn per run.
+fn dumped_bytes(store: &std::path::Path, directory: &TestDirectory) -> Vec<(String, Vec<u8>)> {
+    let output = directory.path.join("dump");
+    let repository = froe::store::Repository::open(store).expect("open the store");
+    let options = DumpOptions::new(Vec::new(), output.clone());
+    let dumps = dump_lucene_indexes(&repository, &options)
+        .expect("dump")
+        .directory;
+    let mut files = Vec::new();
+    collect_files(&dumps, &dumps, &mut files);
+    files.sort();
+    assert!(
+        files.iter().any(|(name, _)| std::path::Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension == "cfs")),
+        "the dump wrote no compound file at all: {:?}",
+        files.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
+    files
+}
+
+/// Every file below `root`, named by its path relative to it.
+fn collect_files(root: &std::path::Path, at: &std::path::Path, into: &mut Vec<(String, Vec<u8>)>) {
+    for entry in std::fs::read_dir(at).expect("read the dump directory") {
+        let entry = entry.expect("a dump directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, into);
+            continue;
+        }
+        // `index-details.txt` records when the dump ran, which is not the
+        // index.
+        if path
+            .file_name()
+            .is_some_and(|name| name == "index-details.txt" || name == "index-definitions.json")
+        {
+            continue;
+        }
+        let name = path
+            .strip_prefix(root)
+            .expect("below the dump")
+            .to_string_lossy()
+            .into_owned();
+        into.push((name, std::fs::read(&path).expect("read a dumped file")));
+    }
 }
 
 #[test]
