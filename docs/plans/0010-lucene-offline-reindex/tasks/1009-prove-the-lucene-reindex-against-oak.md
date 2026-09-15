@@ -13,8 +13,8 @@ touches:
   - crates/froe-cli/tests/interop/phase_recovery.rs
   - scripts/interop-fixture.sh
   - docs/interop.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "5b8e176"
 ---
 # Prove The Lucene Reindex Against Oak's Own Reindex
 
