@@ -825,13 +825,29 @@ if (status == Status.MATCH_FOUND) {
 ```
 
 Three things follow. The aggregate entered is the one the **matched
-node's own** type resolves to, through `AggregateMapper.getAggregate(String)`
-— which is its applicable indexing rule's, and that rule's aggregate is
-the *combined* one of §4.2. The bound is the number of aggregates already
-entered, so a self-recursive aggregate is stopped by depth alone and not
-by a "seen this one" test. And the limit compared is the **root**
-aggregate's — the one the document's own rule declares — however deep the
-walk is, so an inner rule's own `reaggregateLimit` is never read.
+node's own type declares**, through `Aggregate.NodeInclude.getAggregate`:
+
+```java
+Aggregate agg = aggMapper.getAggregate(ConfigUtil.getPrimaryTypeName(state));
+if (agg == null) {
+    for (String mixin : ConfigUtil.getMixinNames(state)) {
+        agg = aggMapper.getAggregate(mixin);
+        if (agg != null) break;
+    }
+}
+```
+
+`aggMapper` is the definition's own `aggregates` map and the lookup is by
+**name, exactly**: it is not the matched node's applicable indexing rule,
+and no type inheritance is applied. Two consequences follow that a
+rule-based reading gets backwards, and Oak's own rebuild pins both: an
+aggregate declared for a type **no rule covers** is still entered, and a
+rule matched *by inheritance* does **not** lend its aggregate. The bound
+is the number of aggregates already entered, so a self-recursive
+aggregate is stopped by depth alone and not by a "seen this one" test.
+And the limit compared is the **root** aggregate's — the one the
+document's own rule declares — however deep the walk is, so an inner
+rule's own `reaggregateLimit` is never read.
 
 Oak's own rebuild pins the field set: the `meta` child above is reached by
 a `relativeNode` include, its rule declares `include0 = inner`, and the

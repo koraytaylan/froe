@@ -486,8 +486,11 @@ Anything else is `Lucene46`, which froe does not write. Then:
 * any child of an `analyzers` node — froe reproduces no
   consumer-registered analyzer.
 
-A `tika` child is **accepted** and reported: nothing in it is read, because
-froe runs no Tika.
+A `tika` child is **accepted** and nothing in it is read, because froe runs
+no Tika. Nothing in the plan or the summary says so either: an operator
+whose definition configures which mime types Oak extracts is told only
+what `--binary-text` does, which is the same thing it does for a
+definition with no `tika` child at all.
 
 One refusal lands at document time rather than at load: **a `DATE`
 property value that does not parse**. One such value anywhere in the

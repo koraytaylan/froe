@@ -1,6 +1,14 @@
 # Norms Lucene's own default similarity produces, for froe to replay.
 #
-# Generated inside the pinned Sling image against its own oak-lucene jar:
+# Generated inside the pinned Sling image against its own oak-lucene jar.
+#
+# **`NormVectors.java` is not in the tree.** Every other vector fixture here
+# names a generator committed under `crates/froe-cli/tests/interop/judge/`;
+# this one was a throwaway, so the fixture cannot be regenerated or
+# re-audited from the repository as the others can. The command below is
+# what produced it, and reproducing it means writing the class again from
+# the description that follows.
+#
 #
 #   podman run --rm --user 0 --entrypoint /bin/sh \
 #     -v <work>:/work:z \

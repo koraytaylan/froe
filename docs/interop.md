@@ -437,9 +437,12 @@ Lucene's `CheckIndex`, a document count, and a commit through Oak's own index
 update. Since plan 0009 it also stands in for Lucene's own *writer*:
 `Corpus` builds the committed writer corpus through Lucene's `IndexWriter`
 under the `oakCodec` composition and enumerates any index into a canonical
-dump, `CodecVectors` replays froe's codec primitives through Lucene's own
-readers, and `FstCheck` enumerates froe's transducers back to the maps they
-were built from. Plan 0010 added three more, none of which needs a store at
+dump, `CodecVectors` prints the bytes Lucene's own `DataOutput` and `PackedInts`
+*writers* produce — a fixture generator run by hand inside the image, not a
+phase: froe replays its committed output in `lucene_codec_primitive_tests`,
+outside the suite — and `FstCheck` enumerates froe's transducers with
+Lucene's own reader, printing the pairs it found for the phase to compare
+against the corpus's own expected column. Plan 0010 added three more, none of which needs a store at
 all: `Analyze` puts a corpus through each of Oak's own analyzer chains and
 prints the tokens with their increments and offsets, `NumericVectors` prints
 Lucene's own prefix-coded numeric terms and Jackrabbit's own `ISO8601`
@@ -717,7 +720,7 @@ chosen to reach the places a writer goes wrong. 8,300 of them carry one
 term, which puts it three skip levels deep under the skip multiplier of 8
 and the interval of 128, and their 8,300 distinct terms floor the
 block-tree dictionary many times over. Beside the bulk are every index
-option, norms and omitted norms, every doc-value type, stored strings,
+option, norms and omitted norms, each doc-value type, stored strings,
 binaries, integers and a long beyond a double; several analyzed fields of
 one name and several boosted ones; a trailing increment and offset the next
 value starts past; overlapping tokens; a term above the maximum term
