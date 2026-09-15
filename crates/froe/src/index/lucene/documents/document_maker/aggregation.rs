@@ -22,7 +22,6 @@ impl DocumentMaker<'_> {
     pub(super) fn index_aggregates(
         &self,
         node: &NodeState<'_>,
-        path: &str,
         rule: &IndexingRule,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
@@ -44,7 +43,7 @@ impl DocumentMaker<'_> {
             nodes: rule.aggregate.matcher(),
             properties: PropertyIncludeMatcher::new(&walk.property_includes),
         };
-        self.walk_aggregate(&walk, &level, node, path, state)
+        self.walk_aggregate(&walk, &level, node, "", state)
     }
 
     /// One level of the aggregate walk.
@@ -58,7 +57,7 @@ impl DocumentMaker<'_> {
         walk: &AggregateWalk<'_>,
         level: &AggregateLevel<'_>,
         node: &NodeState<'_>,
-        path: &str,
+        matched: &str,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
         for (name, child) in node.child_node_entries()? {
@@ -67,7 +66,14 @@ impl DocumentMaker<'_> {
             for include in ended_properties {
                 self.index_property_include(&child, walk, include, state)?;
             }
-            let child_path = format!("{}/{name}", path.trim_end_matches('/'));
+            // `Matcher.getMatchedPath`: the path of the matched node
+            // **relative to the node the document is for**, which is what
+            // the document's own rule is asked about below.
+            let child_path = if matched.is_empty() {
+                name.clone()
+            } else {
+                format!("{matched}/{name}")
+            };
             match outcome {
                 Match::Stop if next_properties.is_exhausted() => continue,
                 Match::Stop | Match::Continue => {}
@@ -79,7 +85,7 @@ impl DocumentMaker<'_> {
                         let names: Vec<&str> = std::iter::once(FULLTEXT_FIELD)
                             .chain(relative.as_deref())
                             .collect();
-                        self.aggregate_node(&child, walk.writing_into(&names), state)?;
+                        self.aggregate_node(&child, walk.writing_into(&names, &child_path), state)?;
                     }
                 }
             }
@@ -153,17 +159,56 @@ impl DocumentMaker<'_> {
     ) -> IndexResult<()> {
         let names = into.names;
         let covering = self.rules.applicable_rule(node)?;
+        // `indexAggregatedNode`'s type gate is one rule's or the other's,
+        // not both: the rule covering the **aggregated** node when one
+        // does, and the document's own when none does.
+        //
+        // ```java
+        // if (ruleAggNode != null) { if (!ruleAggNode.includePropertyType(tag)) continue; }
+        // else if (!indexingRule.includePropertyType(tag)) continue;
+        // ```
+        let included_types = covering.map_or(&into.document_rule.include_property_types, |rule| {
+            &rule.include_property_types
+        });
         let has_mime_type = node.property("jcr:mimeType")?.is_some();
         for property in node.properties()? {
             if property.name.starts_with(':') {
                 continue;
             }
-            let definition = covering.and_then(|rule| rule.config_of(&property.name));
-            if definition.is_some_and(|definition| definition.exclude_from_aggregation) {
+            if !super::includes_property_type(included_types, &property) {
+                continue;
+            }
+            // The **document's** rule, asked with the property's path
+            // relative to the document's own node — so a
+            // `jcr:content/.*` pattern of that rule reaches an aggregated
+            // property, which is the shape it is written for.
+            //
+            // ```java
+            // PropertyDefinition pd = indexingRule.getConfig(PathUtils.concat(result.nodePath, pname));
+            // if (pd != null) { if (!pd.index) continue; if (pd.excludeFromAggregate) continue; }
+            // ```
+            let relative_path = format!("{}/{}", into.matched, property.name);
+            let from_document = into.document_rule.config_of(&relative_path);
+            if from_document
+                .is_some_and(|definition| !definition.index || definition.exclude_from_aggregation)
+            {
                 continue;
             }
             if property.property_type == PropertyType::Binary {
                 self.index_binary(&property, has_mime_type, names, state);
+                continue;
+            }
+            // And the rule covering the **aggregated** node, asked with
+            // the property's own name — a different rule, a different key
+            // and a different flag: `nodeScopeIndex`, which a definition
+            // that has one and does not set makes a skip.
+            //
+            // ```java
+            // PropertyDefinition pdAgg = ruleAggNode != null ? ruleAggNode.getConfig(pname) : null;
+            // if (pdAgg != null && !pdAgg.nodeScopeIndex) continue;
+            // ```
+            let definition = covering.and_then(|rule| rule.config_of(&property.name));
+            if definition.is_some_and(|definition| !definition.node_scope_index) {
                 continue;
             }
             for value in values_of(&property) {
@@ -217,7 +262,7 @@ impl DocumentMaker<'_> {
         if !aggregate.has_node_aggregates() || into.depth >= into.limit {
             return Ok(());
         }
-        self.walk_reaggregate(node, &aggregate.matcher(), into.deeper(), state)
+        self.walk_reaggregate(node, &aggregate.matcher(), into, state)
     }
 
     /// One level of a re-aggregation's own walk, which carries the field
@@ -231,6 +276,7 @@ impl DocumentMaker<'_> {
     ) -> IndexResult<()> {
         for (name, child) in node.child_node_entries()? {
             let (next, outcome) = matcher.step(&name, &child)?;
+            let child_path = format!("{}/{name}", into.matched);
             match outcome {
                 Match::Stop => continue,
                 Match::Continue => {}
@@ -241,11 +287,11 @@ impl DocumentMaker<'_> {
                     // because the field name a re-aggregated value takes
                     // is the one the walk entered with.
                     for _ended in includes {
-                        self.aggregate_node(&child, into, state)?;
+                        self.aggregate_node(&child, into.deeper(&child_path), state)?;
                     }
                 }
             }
-            self.walk_reaggregate(&child, &next, into, state)?;
+            self.walk_reaggregate(&child, &next, into.at(&child_path), state)?;
         }
         Ok(())
     }
@@ -258,6 +304,13 @@ struct AggregatedInto<'walk> {
     /// `:fulltext`, and the `fullnode:<path>` of the include that reached
     /// the node this descends from.
     names: &'walk [&'walk str],
+    /// The rule the **document** is being made under, which is the type
+    /// gate's fallback for an aggregated node no rule covers and the rule
+    /// the `index` and `excludeFromAggregation` flags are read from.
+    document_rule: &'walk IndexingRule,
+    /// The matched node's path **relative to the document's own node**,
+    /// which is the key that rule is asked with.
+    matched: &'walk str,
     /// The **root** aggregate's `reAggregationLimit`, which is the one Oak
     /// compares its stack against however deep the stack is.
     limit: usize,
@@ -266,13 +319,19 @@ struct AggregatedInto<'walk> {
     depth: usize,
 }
 
-impl AggregatedInto<'_> {
-    /// The same fields, one aggregate deeper.
-    const fn deeper(self) -> Self {
+impl<'walk> AggregatedInto<'walk> {
+    /// The same fields, one aggregate deeper, at the node `matched`.
+    fn deeper(self, matched: &'walk str) -> Self {
         Self {
+            matched,
             depth: self.depth + 1,
             ..self
         }
+    }
+
+    /// The same fields at a node of the current re-aggregation level.
+    const fn at(self, matched: &'walk str) -> Self {
+        Self { matched, ..self }
     }
 }
 
@@ -291,9 +350,15 @@ struct AggregateWalk<'rule> {
 impl AggregateWalk<'_> {
     /// The fields an include of this walk writes into, at the top of the
     /// aggregate stack.
-    fn writing_into<'names>(&self, names: &'names [&'names str]) -> AggregatedInto<'names> {
+    fn writing_into<'names>(
+        &'names self,
+        names: &'names [&'names str],
+        matched: &'names str,
+    ) -> AggregatedInto<'names> {
         AggregatedInto {
             names,
+            document_rule: self.rule,
+            matched,
             limit: usize::try_from(self.rule.aggregate.reaggregation_limit).unwrap_or(0),
             depth: 0,
         }

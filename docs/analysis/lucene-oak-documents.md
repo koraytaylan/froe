@@ -755,17 +755,58 @@ suite's `lucene_reindex` phase carries both shapes, and froe reproducing
 only the `fullnode:` half made Oak's own rebuild differ on the page
 document's `:fulltext` positions.
 
-### 4.1.1 Whose rule decides what is excluded
+### 4.1.1 The three gates on an aggregated property
 
-`indexAggregatedNode` resolves the rule covering **the aggregated node** —
-`definition.getApplicableIndexingRule(result.nodeState)` — and asks *that*
-rule whether a property is `excludeFromAggregation`, not the rule the
-document is being made under. Oak's own rebuild pins it: a `meta` child of
-type `sling:Folder`, aggregated into an `nt:unstructured` page, loses its
-`jcr:title` because the definition's **`sling:Folder`** rule excludes it,
-while the `nt:unstructured` rule's definition of the same name does not.
+`indexAggregatedNode`, read out of the pinned image's bytecode, asks about
+each property of a matched node **three times**, and no two of the
+questions take the same rule, key or flag:
 
-A node no rule covers is aggregated whole.
+```java
+IndexingRule ruleAggNode = definition.getApplicableIndexingRule(getPrimaryTypeName(result.nodeState));
+for (PropertyState property : result.nodeState.getProperties()) {
+    String pname = property.getName();
+    if (!isVisible(pname)) continue;
+    int tag = property.getType().tag();
+    if (ruleAggNode != null) { if (!ruleAggNode.includePropertyType(tag)) continue; }
+    else if (!indexingRule.includePropertyType(tag)) continue;
+
+    String propertyPath = PathUtils.concat(result.nodePath, pname);
+    PropertyDefinition pd = indexingRule.getConfig(propertyPath);
+    if (pd != null) { if (!pd.index) continue; if (pd.excludeFromAggregate) continue; }
+
+    if (property.getType() == Type.BINARY) { … }
+    else {
+        PropertyDefinition pdAgg = ruleAggNode != null ? ruleAggNode.getConfig(pname) : null;
+        if (pdAgg != null && !pdAgg.nodeScopeIndex) continue;
+        for (String value : property.getValue(Type.STRINGS)) indexAggregateValue(doc, result, value, pdAgg);
+    }
+}
+```
+
+1. **The type.** The rule covering the *aggregated node* when one covers
+   it, and the **document's own** rule when none does — an either/or, not
+   an and.
+2. **`index` and `excludeFromAggregate`.** The **document's own** rule,
+   asked with the property's path *relative to the document's node* —
+   which is how a `jcr:content/…` definition of that rule, exact or
+   patterned, reaches a property of an aggregated child.
+3. **`nodeScopeIndex`.** The rule covering the *aggregated node*, asked
+   with the property's own name: a definition it has that does not set the
+   flag **skips the value**. That definition is also the one whose `boost`
+   the value carries.
+
+Oak's own rebuild pins all three. A `meta` child of type `sling:Folder`
+loses its `jcr:title` because the `sling:Folder` rule defines it without
+`nodeScopeIndex` — gate 3, not gate 2 — and loses its `variantText` when
+the `nt:unstructured` rule the page is made under defines
+`meta/variantText` as `excludeFromAggregation` — gate 2. With the page's
+rule restricted to `includePropertyTypes = [String]`, the `NAME` and
+`DATE` properties of its `nt:unstructured` `jcr:content` child stop being
+aggregated while the same properties of the `sling:Folder` child, whose
+own rule restricts nothing, keep being — gate 1.
+
+A node no rule covers is gated by the document's own rule's types, and by
+nothing else.
 
 ### 4.1.2 Re-aggregation
 

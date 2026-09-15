@@ -298,7 +298,7 @@ fn a_binary_contributes_a_stored_fulltext_value_or_nothing() {
 /// `fullnode:<include path>` for a `relativeNode` include.
 #[test]
 fn an_aggregate_contributes_its_childrens_values() {
-    let mut definition = definition_with(vec![("title", analyzed("jcr:title"))]);
+    let mut definition = definition_with(vec![("title", node_scope("jcr:title"))]);
     definition = definition.child(
         "aggregates",
         Node::new().child(
@@ -319,7 +319,7 @@ fn an_aggregate_contributes_its_childrens_values() {
     );
 
     // A `relativeNode` include moves the values to their own field.
-    let mut relative = definition_with(vec![("title", analyzed("jcr:title"))]);
+    let mut relative = definition_with(vec![("title", node_scope("jcr:title"))]);
     relative = relative.child(
         "aggregates",
         Node::new().child(
@@ -362,7 +362,7 @@ fn an_aggregate_contributes_its_childrens_values() {
 fn a_boost_reaches_the_aggregate_value_and_not_the_analyzed_field() {
     let mut definition = definition_with(vec![(
         "title",
-        analyzed("jcr:title").single("boost", PropertyType::Double, "2.0"),
+        node_scope("jcr:title").single("boost", PropertyType::Double, "2.0"),
     )]);
     definition = definition.child(
         "aggregates",
@@ -404,11 +404,16 @@ fn a_boost_reaches_the_aggregate_value_and_not_the_analyzed_field() {
     assert!((aggregated.boost - 2.0).abs() < f32::EPSILON);
 }
 
-/// §4.1.1: the rule covering the **aggregated** node is the one whose
-/// `excludeFromAggregation` is read, not the rule the document is made
-/// under.
+/// §4.1.1: an aggregated property is asked about **twice**, and the two
+/// questions take different rules, different keys and different flags.
+///
+/// The document's own rule, by the property's path relative to the
+/// document's node, answers `index` and `excludeFromAggregation`; the
+/// rule covering the aggregated node, by the property's own name,
+/// answers `nodeScopeIndex` — and a definition it has that does not set
+/// it skips the value.
 #[test]
-fn an_aggregated_nodes_own_rule_is_what_excludes_its_property() {
+fn an_aggregated_property_is_gated_by_both_rules() {
     let definition = two_rule_definition().child(
         "aggregates",
         Node::new().child(
@@ -424,7 +429,7 @@ fn an_aggregated_nodes_own_rule_is_what_excludes_its_property() {
             .string("other", "keptcorn"),
     );
     let (_directory, made) = make(
-        "aggregate-exclusion",
+        "aggregate-two-rules",
         &definition,
         &subject,
         marker_policy(),
@@ -433,12 +438,55 @@ fn an_aggregated_nodes_own_rule_is_what_excludes_its_property() {
     let terms = every_term(&made, ":fulltext");
     assert!(
         terms.contains(&"keptcorn".to_owned()),
-        "the aggregated node's other property is indexed: {terms:?}"
+        "a property neither rule defines is aggregated: {terms:?}"
     );
     assert!(
         !terms.contains(&"excludedcorn".to_owned()),
-        "the sling:Folder rule excludes jcr:title from aggregation, and it is the rule that \
-         covers the aggregated node: {terms:?}"
+        "the `sling:Folder` rule defines `jcr:title` without `nodeScopeIndex`, and it is the \
+         rule covering the aggregated node: {terms:?}"
+    );
+}
+
+/// The other half: the **document's** rule, by the relative path, is what
+/// `excludeFromAggregation` is read from — which is how a
+/// `jcr:content/…` definition of the document's own rule reaches a
+/// property of an aggregated child.
+#[test]
+fn the_documents_own_rule_excludes_an_aggregated_property_by_its_path() {
+    let definition = definition_with(vec![
+        ("title", node_scope("jcr:title")),
+        (
+            "innerText",
+            Node::new()
+                .string("name", "inner/other")
+                .boolean("excludeFromAggregation", true),
+        ),
+    ])
+    .child(
+        "aggregates",
+        Node::new().child(
+            "nt:base",
+            Node::new().child("include0", Node::new().string("path", "inner")),
+        ),
+    );
+    let subject = unstructured().child(
+        "inner",
+        unstructured()
+            .string("jcr:title", "innercorn")
+            .string("other", "excludedcorn"),
+    );
+    let (_directory, made) = make(
+        "aggregate-path-exclusion",
+        &definition,
+        &subject,
+        marker_policy(),
+    );
+    let made = made.expect("the node yields a document");
+    let terms = every_term(&made, ":fulltext");
+    assert!(terms.contains(&"innercorn".to_owned()), "{terms:?}");
+    assert!(
+        !terms.contains(&"excludedcorn".to_owned()),
+        "`inner/other` of the document's own rule excludes it: {terms:?}"
     );
 }
 
@@ -529,7 +577,7 @@ fn a_reaggregated_type_needs_no_indexing_rule_of_its_own() {
 /// through type inheritance does not inherit that rule's aggregate.
 #[test]
 fn a_rule_matched_by_inheritance_does_not_lend_its_aggregate() {
-    let definition = definition_with(vec![("title", analyzed("jcr:title"))]).child(
+    let definition = definition_with(vec![("title", node_scope("jcr:title"))]).child(
         "aggregates",
         Node::new().child(
             "nt:base",
@@ -558,6 +606,15 @@ fn a_rule_matched_by_inheritance_does_not_lend_its_aggregate() {
     );
 }
 
+/// One analyzed, node-scope definition.
+///
+/// The flag is load-bearing for an **aggregated** value: the rule
+/// covering the aggregated node is asked about the property by name, and
+/// a definition it has that is not `nodeScopeIndex` skips the value.
+fn node_scope(name: &str) -> Node {
+    analyzed(name).boolean("nodeScopeIndex", true)
+}
+
 /// A definition whose second rule covers the node the first rule's
 /// aggregate reaches.
 fn two_rule_definition() -> Node {
@@ -575,7 +632,7 @@ fn two_rule_definition() -> Node {
                     "nt:unstructured",
                     Node::new().child(
                         "properties",
-                        Node::new().child("title", analyzed("jcr:title")),
+                        Node::new().child("title", node_scope("jcr:title")),
                     ),
                 )
                 .child(

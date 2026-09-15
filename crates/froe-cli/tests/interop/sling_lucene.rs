@@ -372,6 +372,13 @@ pub(crate) fn populate_lucene_variant_definition(port: u16) {
             // definition the fixture's own `lucene` reaches by pattern.
             ("indexNodeName@TypeHint", "Boolean"),
             ("indexNodeName", "true"),
+            // The **rule's** own type list, which gates the fulltext loop
+            // and nothing else: the typed fields of the long, the double,
+            // the date and the boolean below are written all the same,
+            // because the list that gates *them* is each property
+            // definition's own and defaults to every type.
+            ("includePropertyTypes@TypeHint", "String[]"),
+            ("includePropertyTypes", "String"),
         ],
     );
     sling_post_fields(port, &properties, &[("jcr:primaryType", "nt:unstructured")]);
@@ -627,6 +634,20 @@ fn variant_analyzed_property_definitions() -> Vec<(&'static str, Vec<(&'static s
                 ("propertyIndex", "true"),
                 ("analyzed@TypeHint", "Boolean"),
                 ("analyzed", "true"),
+            ],
+        ),
+        // A definition of the **document's** rule naming an aggregated
+        // node's property by its relative path, and excluding it from
+        // aggregation. Which rule Oak reads that flag from — this one, or
+        // the rule covering the aggregated node — is what this asks; it
+        // contributes no field of its own, indexing nothing.
+        (
+            "metaTextExcluded",
+            vec![
+                ("jcr:primaryType", "nt:unstructured"),
+                ("name", "meta/variantText"),
+                ("excludeFromAggregation@TypeHint", "Boolean"),
+                ("excludeFromAggregation", "true"),
             ],
         ),
         // A relative definition whose ancestor step is `*`, which the

@@ -233,6 +233,13 @@ pub struct PropertyDefinition {
     pub boost: f32,
     /// `weight`.
     pub weight: i64,
+    /// `oak.experimental.includePropertyTypes` on the definition itself,
+    /// empty for its default of **all** of them.
+    ///
+    /// Oak gates the typed fields and the analyzed field with this list
+    /// and the per-property fulltext loop with the **rule's**, which is a
+    /// different list with a different default — §3.3.
+    pub included_property_types: Vec<String>,
     /// `type`, the declared property type, which the ordered doc value
     /// takes whatever the property's own type is.
     pub declared_type: Option<String>,
@@ -414,6 +421,14 @@ impl PropertyDefinition {
             boost,
             weight,
             declared_type: strict_string(node.property("type")?.as_ref()).map(str::to_owned),
+            // `PropertyDefinition.includedPropertyTypes`, which is the
+            // definition's **own** `oak.experimental.includePropertyTypes`
+            // with a default of every type — not the rule's list, and not
+            // the index definition's.
+            included_property_types: converting_strings(
+                node.property("oak.experimental.includePropertyTypes")?
+                    .as_ref(),
+            ),
             unique,
             sync,
             value_pattern: ValuePattern::from_definition(node, definition_path, warnings)?,

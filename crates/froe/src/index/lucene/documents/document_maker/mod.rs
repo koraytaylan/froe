@@ -165,7 +165,7 @@ impl<'definition> DocumentMaker<'definition> {
         let mut state = DocumentState::new(path);
         state.add(string_field(PATH_FIELD, path, true));
         self.index_properties(node, path, rule, &mut state)?;
-        self.index_aggregates(node, path, rule, &mut state)?;
+        self.index_aggregates(node, rule, &mut state)?;
         Self::index_markers(node, rule, &mut state)?;
         Self::add_node_name_field(path, rule, &mut state);
         // The empty-document check, which stands **between** the node-name
@@ -485,7 +485,14 @@ impl DocumentMaker<'_> {
         has_mime_type: bool,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
-        let included_type = Self::includes_property_type(rule, property.property_type);
+        // Two lists, and they are not the same one. The **rule's** gates
+        // the binary branch and the per-property loop —
+        // `includeTypeForFullText` — and the **definition's own**, whose
+        // default is every type, gates the typed fields and the analyzed
+        // field inside that loop. §3.3.
+        let included_type = includes_property_type(&rule.include_property_types, property);
+        let included_by_definition =
+            includes_property_type(&definition.included_property_types, property);
         if property.property_type == PropertyType::Binary {
             if included_type && definition.fulltext_enabled() {
                 self.index_binary(property, has_mime_type, &[FULLTEXT_FIELD], state);
@@ -493,7 +500,7 @@ impl DocumentMaker<'_> {
             // A binary never reaches the per-value loop below.
             return Ok(());
         }
-        if definition.property_index && included_type {
+        if definition.property_index && included_by_definition {
             self.index_typed(property, definition, state)?;
         }
         if definition.fulltext_enabled() && included_type {
@@ -504,7 +511,7 @@ impl DocumentMaker<'_> {
                 if !self.includes_value(&text, definition) {
                     continue;
                 }
-                if definition.analyzed {
+                if definition.analyzed && included_by_definition {
                     self.index_analyzed(&property.name, &text, definition, state);
                 }
                 if definition.use_in_suggest {
@@ -734,6 +741,16 @@ fn pending_facet_field(property_name: &str, value: FacetValue) -> Field {
 /// the build pass replaces every one of them.
 const FACET_PENDING_PREFIX: &str = "\u{0}facet:";
 
+/// `includePropertyType`, over whichever of the two lists the caller is
+/// asking about: an empty one is Oak's "every type", which is what both
+/// default to when the property is absent.
+pub(super) fn includes_property_type(names: &[String], property: &PropertyState) -> bool {
+    names.is_empty()
+        || names
+            .iter()
+            .any(|name| type_of_name(name) == Some(property.property_type))
+}
+
 /// Oak's `Type.fromString` for the names a `type` property carries.
 fn type_of_name(name: &str) -> Option<PropertyType> {
     match name {
@@ -953,16 +970,5 @@ impl DocumentMaker<'_> {
         date_to_long(&text).map_err(|_| IndexError::UnparseableDate {
             value: format!("{path}@{property_name} = {text:?}"),
         })
-    }
-
-    /// `IndexingRule.includePropertyType`: the rule's
-    /// `includePropertyTypes`, which defaults to all of them.
-    fn includes_property_type(rule: &IndexingRule, property_type: PropertyType) -> bool {
-        if rule.include_property_types.is_empty() {
-            return true;
-        }
-        rule.include_property_types
-            .iter()
-            .any(|name| type_of_name(name) == Some(property_type))
     }
 }
