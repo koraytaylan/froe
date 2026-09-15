@@ -339,6 +339,9 @@ fn the_same_fixtures_pass_unperturbed() {
 /// what this plan has to show is that a Lucene definition *reaches* them
 /// rather than taking a path of its own. A dropped arm would rebuild
 /// correctly and simply never be interrupted where the case says it is.
+// Unix-only for the same reason the module's other Lucene case is: the
+// fixture comes from the fault-injection harness, which forks.
+#[cfg(unix)]
 #[test]
 fn a_lucene_selection_runs_through_the_prepared_wrapper() {
     use crate::index::lucene::documents::binaries::{BinaryTextFallback, BinaryTextPolicy};

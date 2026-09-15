@@ -679,7 +679,12 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + i64::from(month <= 2), month, day)
 }
 
-#[cfg(test)]
+// The fixture this module's one test builds on lives in the fault-injection
+// harness, which forks a child and is therefore Unix-only. A test that
+// cannot be built without it is Unix-only too, and saying so here is what
+// keeps `cargo check --all-targets` honest on Windows, where `cfg(test)`
+// code is still part of the compilation surface.
+#[cfg(all(test, unix))]
 mod tests {
     use crate::index::lucene::documents::binaries::{BinaryTextFallback, BinaryTextPolicy};
     use crate::writer::fault_injection::lucene_fixture::write_lucene_reindex_fixture;
