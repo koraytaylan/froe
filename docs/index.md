@@ -483,6 +483,14 @@ Anything else is `Lucene46`, which froe does not write. Then:
 * a definition with no `async`, and a **hybrid** one whose `async` lists
   `sync`, or any `sync` or `unique` property definition: Oak keeps a
   synchronous `:property-index` for those that froe does not build;
+* a definition **parked on the `async-reindex` lane** — the lane an
+  out-of-band reindex moves a definition onto. No ordinary indexing cycle
+  maintains it there, and froe does not move it back, so a rebuild would
+  leave an index nothing updates; the lane's own next cycle diffs from a
+  missing state and *appends* to what is already there. Restore the lane
+  the definition belongs on first. A property-family definition parked
+  there is still rebuilt, from the head: its replay is idempotent where a
+  fulltext one is not;
 * any child of an `analyzers` node — froe reproduces no
   consumer-registered analyzer.
 
