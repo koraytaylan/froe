@@ -430,10 +430,12 @@ whose grandchild reaches the page all the same. The content carries a **binary w
 `jcr:mimeType`**, so the gate Oak's extraction stops at is compared
 rather than excluded.
 
-**Observed, 2026-09-15.** Both definitions identical:
-`/oak:index/interopLucene`, 24 documents and 1,988 enumerated lines, no
-exclusion; `/oak:index/lucene`, 8,335 documents and 107,180 enumerated
-lines, identical outside 2,843 declared binary exclusions. Lucene's own
+**Observed in the frozen run of 2026-09-15**, which is the one the
+verification report below records; figures taken during the range itself
+were superseded by its own later document-model fixes. Both definitions
+identical: `/oak:index/interopLucene`, 24 documents and 1,986 enumerated
+lines, no exclusion; `/oak:index/lucene`, 8,358 documents and 107,575
+enumerated lines, identical outside 2,843 declared binary exclusions. Lucene's own
 `CheckIndex` clean over each froe rebuild, and `froe index check` clean
 over the store it wrote them into. Each definition node identical
 to Oak's beside its index, excluding `:data`, `:suggest-data`, the
@@ -572,12 +574,95 @@ its own against the final fixture: `read`, `judge_smoke`,
 
 #### Verification report
 
-*To be filled by task 1010, which freezes the range.*
+**The frozen range** is `d195c40..8f232e6` — 44 commits, the whole of plan
+0010. `git diff --check d195c40..8f232e6` is clean and `git status
+--porcelain` was empty when the review began, so there was no untracked
+candidate file. The findings below were answered in **follow-up commits
+after the range** — `a55b4a7`, `2a8a214`, `abb01fb`, `09094ad`,
+`aeb5422` — and the cumulative result was re-verified, including the whole
+interop chain.
+
+**The stable host gate**, executed on `x86_64-unknown-linux-gnu`, each
+command's own exit status recorded rather than a pipeline's:
+`cargo +stable fmt --all -- --check` (0),
+`cargo +stable clippy --workspace --all-targets --all-features -- -D warnings` (0),
+`cargo +stable test --workspace --all-features --no-fail-fast` (0),
+the same `--release` (0),
+`RUSTDOCFLAGS="-D warnings" cargo +stable doc --workspace --all-features --no-deps` (0),
+and `scripts/oversized-files.sh` (0).
+
+**The MSRV gate** ran, unlike in plans 0007 and 0008, because a
+`1.89.0-x86_64-unknown-linux-gnu` toolchain is installed on this host now:
+`fmt`, `clippy`, `test`, `test --release` and `doc` each exited 0 under
+`cargo +1.89`.
+
+**The i686 width sentinel** ran for the `froe` package on both toolchains —
+`check` and `clippy`, `+stable` and `+1.89`, all four exit 0 with
+`RUSTFLAGS="-D warnings"`. This is **compilation for a 32-bit target, not
+execution on one**. The workspace-wide attempt still fails in `zstd-sys`
+for want of a 32-bit C toolchain, so `froe-export` and `froe-cli` are not
+compiled for i686.
+
+**`scripts/interop-fixture.sh` ran as a whole chain**, `generate` through
+`recover`, reaching the completion sentinel. Its `lucene_reindex` record
+is the interoperability section above, restated below against this run.
+
+**The five separations this report is held to.**
+
+*Execution from cross-compilation.* Every test result above was executed
+on `x86_64-unknown-linux-gnu`; the i686 results are compilation only and
+say so where they are stated.
+
+*Synthetic credentials from execution as root.* The journal-owner and
+metadata-source gates this plan publishes through are plan 0007's, and are
+exercised through its `_for_credentials` twins, which model an identity the
+process does not have. No test here depends on the runner's uid and none
+ran as root: what is proved is the predicate, not the behaviour of a real
+foreign-owned file.
+
+*Process-exit or syscall injection from true power-loss ordering.* The
+four cutpoints inject a returned error or an abrupt `_exit` in a forked
+child, which proves the code's ordering around each boundary. No test cuts
+power, and none can. The `mid-file-copy` cutpoint fires **between** two
+files of the copy rather than inside one.
+
+*File existence from durability.* The probes assert a reopened store's
+head, journal line and subtrees through a fresh read-only open. The
+`fsync` calls are asserted to have been *made*, not to have been honoured
+by the device.
+
+*froe-to-froe round trips from real Oak interoperability.* The rebuild's
+own suites compare froe against froe and against the independent encoder.
+Every claim that the index is *Oak's* rests on the interoperability
+section: Oak's own reindex of the same store as the oracle, Lucene's own
+`CheckIndex`, and a booted Oak answering the same statements. The four
+defects that section records are what a froe-only suite had passed over.
+
+**Interoperability, re-run at the frozen tip plus its follow-ups,
+2026-09-15.**
+
+* **Oak build:** `docker.io/apache/sling@sha256:8722cd66ae0758e50784ac21df836c8f8d9e443d105e1a4292a4cb7f810a8cc9` (Apache Sling 14, Oak 1.90.0).
+* **Direction:** both. Oak builds the fixture and its own rebuild froe is
+  compared against (Oak-to-froe); a booted Oak then reads and queries the
+  index froe wrote (froe-to-Oak).
+* **froe-side edits to the copy before the operation under test:** the
+  definitions are flagged for reindex by froe's own definition edits, on a
+  copy of the store Oak wrote, and the original is kept for the digest.
+* **Verified post-state:** `/oak:index/interopLucene`, 24 documents,
+  **1,986 enumerated lines, identical, no exclusion**;
+  `/oak:index/lucene`, 8,358 documents, **107,575 enumerated lines,
+  identical outside 2,843 declared binary exclusions**. `CheckIndex` clean
+  over each froe rebuild and `froe check` clean at the new head.
+
+These figures supersede the ones recorded during the range: the corpus and
+the document model changed under `9b1e451`, `29d2a88`, `fc23055`,
+`729b715`, `8f5dfa9`, `220e7f8` and `de39236` after the earlier block was
+written.
 
 #### Known gaps
 
-*To be filled by task 1010.* Two are already known and are recorded here so
-that the freeze inherits them rather than discovers them:
+Three were known before the freeze and are kept; the rest are what the
+review added.
 
 * **No consumer-registered field augmentor is reproduced.** Oak's document
   maker calls `augmentCustomFields`, and an AEM deployment that registers one
@@ -594,6 +679,137 @@ that the freeze inherits them rather than discovers them:
   against Oak is the gate in front of it: a binary on a node with no
   `jcr:mimeType` is indexed by neither side, and the fixture carries one.
 
+**The `:childOrder` fix has no oracle in this suite.** `a55b4a7` makes the
+rule and property-definition reads take Oak's own `Tree` order, and the
+regressions state each order twice so that neither answer can come from
+the stored order by luck. The interop fixture cannot reach the question at
+all: its two rules are disjoint node types and its rules carry a single
+pattern, so no ordering decision arises. A fixture definition with an
+`nt:base` rule beside a specific one, and with two patterns that both
+match a name, would close this.
+
+**A definition carrying `refresh` gets a clone that still carries it.**
+`index-lucene-storage.md` §7.2 has Oak rewrite the `:index-definition`
+clone from the *builder* state on that branch and stamp a
+`creationTimestamp`; froe removes `refresh` from the definition and clones
+the pre-run state unconditionally, so the stored clone keeps `refresh`
+where the live definition no longer has it. Under §6.4's drift rule that
+is a `propertyDeleted` difference, and Oak's index-info provider reports
+the definition as changed until something rewrites the clone. froe writes
+no wrong index data; what it leaves is a definition Oak thinks has drifted.
+
+**`seed` is not created for a Lucene definition.** Oak's editor injects one
+for an asynchronous definition that has none, and every Lucene definition
+froe rebuilds is asynchronous. froe creates one only for a counter. The
+mutation table above says "created when absent, kept when present", which
+is true of the counter arm and not of this one; the gap is self-healing,
+since Oak's own next cycle injects it. The interop oracle cannot see it:
+the fixture's definitions come from a live Oak, which has already injected
+one.
+
+**A `--pre-extracted-text-directory` that exists but covers nothing is
+indistinguishable in the output from one that was consulted and had
+something.** A directory that is not there is now refused (`2a8a214`), but
+no count of covered and uncovered binaries is reported, before or after
+the run. Neither the plan nor the summary says how many binaries the
+policy touches at all.
+
+**The analyzer's own coverage beyond the vector corpus.** The corpus
+reaches 84 distinct code points. An adversarial pass probed froe against
+the specification on what it does not reach and found **no divergence**,
+but none of the following is confirmed against Oak's own analyzers: the
+fullwidth digits `U+FF10..U+FF19`, which are the only `\p{Nd}` code points
+that are not `WB:Numeric` and therefore tokenize through one term of the
+grammar alone; `Word_Break = Format` and `MidLetter` entirely; supplementary-plane
+`Extend`, `Format`, `Numeric` and `Katakana`; regional-indicator runs other
+than a pair; `ExtendNumLet` other than `U+005F`; Hebrew presentation forms;
+Complex_Context beyond Thai; Hangul conjoining jamo and tone marks; the
+suggest tokenizer's surrogate-straddling cut at 256 units; and a
+`:suggest` value ending in a newline. The five generated Unicode tables are
+checked against digests recorded at generation time rather than against the
+UCD, whose files are deliberately not committed.
+
 #### Review
 
-*To be filled by task 1010.*
+Five adversarial lenses were run over the frozen range by passes that did
+not author it, each briefed on a distinct question. **The pass is recorded
+as an automated one, not a second person**: it was briefed by the author,
+so it inherits the author's framing of what the range is for and cannot
+notice a question nobody thought to ask.
+
+**Lens 1 — rule resolution.** **One high-severity defect.** froe read
+`indexRules`, `properties` and the `aggregates` children with
+`child_node_entries`, which in a segment store is the map record's *hash*
+order, where Oak reads them through the `Tree` API — `:childOrder` when
+the property is there (§2.1, and the precedence paragraph of §2.4). That
+is not a lost ordering but an arbitrary one, and it decides which rule
+covers a node: an `nt:base` rule is `inherited` by default, so it
+registers under every type in the hierarchy and collides with every other
+rule in the same definition, and the whole field set of, say, a `cq:Page`
+document was decided by the hash. It decides pattern resolution too.
+Fixed in `a55b4a7`. The lens found the resolution order itself correct in
+every other respect it checked — the primary type before the mixins,
+`inherited` as expansion-at-read from the repository's own node-type
+registry, the exact-then-pattern name lookup with its hidden-name bug
+compatibility, both duplicate-definition clauses, the relative-name walk,
+`skipTokenization`'s seven-name set, and §4.1.1's three aggregation gates
+in Oak's own order.
+
+**Lens 2 — the lane rule and `:status`.** **One medium defect**: a Lucene
+definition parked at `async = async-reindex` was rebuilt from the head,
+under a comment claiming the lane's completion removes `async` again —
+"which is the state this run produces", except that froe removes no
+`async`. The definition would have stayed on a lane no ordinary cycle
+maintains, with an index nothing updates, and the lane's own next cycle
+appends to it. Refused by name in `2a8a214`. Two smaller findings from
+the same lens are known gaps above (`refresh`, `seed`), and one was a
+stale comment arguing for a refusal the range had already reverted. The
+lens found the state rule, the publication atomicity, the reset's raised
+flag, the `:status` timestamps — including that `lastUpdated` is the lane
+checkpoint's own `created` rather than wall-clock, which is the defect it
+was looking for — and the hybrid and synchronous refusals all sound.
+
+**Lens 3 — the binary policy's honesty.** **No defect in the gate**: the
+flag is genuinely required, refused rather than skipped, before anything
+is written, through every entry point. Three defects in what the operator
+is *told*: the summary never mentioned binaries at all, so a scripted run
+kept no record of the choice; a `--pre-extracted-text-directory` that does
+not exist was accepted, producing an index identical to one built without
+the flag under a plan line naming a directory nothing read; and
+`--binary-text skip` rendered as the bare word `nothing`. All three fixed
+in `2a8a214`. The lens confirmed that `marker` writes Oak's own
+`TextExtractionError` in Oak's own slot, behind Oak's own two gates, and
+that the guide's claim — `skip` reproduces Oak for the unsupported types,
+`marker` for the failed-extraction case, neither for a successful
+extraction — is exactly right.
+
+**Lens 4 — analyzer fidelity beyond the vector corpus.** **No divergence
+found.** The lens transcribed the JFlex word and number rules into an
+automaton and compared them against froe's state machine over every class
+sequence of length six and 120,000 longer random ones: no mismatch. It
+confirmed the tables are Unicode 6.3 (not 6.1) from the grammar's own
+directive and from the tables' contents, the lower-case table's one-to-one
+Java quirk at `U+0130`, the 255-UTF-16-unit token cap on both sides, and
+the token-count cap's stop-rather-than-drain end state. It established
+that the "consumer's JVM" risk the specification warns about is
+empirically unreachable: every code point whose JVM answer varies by
+Unicode version is unassigned in 6.3 and therefore never inside a token.
+Its coverage inventory is the last known gap above.
+
+**Lens 5 — the wording of the evidence.** **No accept-condition-cited-as-failure**
+of the kind this lens caught on the v0.8.0 range: all 25 tests named in
+the safety case exist, at the files their rows attribute them to, and each
+quoted failure is a real failure message. It found nine wording defects,
+corrected in `abb01fb`, `09094ad` and `aeb5422`. The sharpest was the
+fresh-segment-directory guard, recorded as unreachable because plan 0007's
+residue refusal stops a retry first — true only under an operator-named
+work directory, which is the only configuration the fault tests use, while
+the default one merely warns and the run subdirectory's name is
+deterministic. That row is now an evidence gap rather than a design note.
+The others: the ground-truth analysis still carried the rule-based
+aggregate lookup the range's own fix reversed; the unported-feature guard
+row's neutralization covers four of eleven refusals; the mid-copy error
+reports neither file nor offset on this path; the query comparison's
+exclusions and the plan sample's asymmetry were in the code and in no
+document; and the observed interoperability figures were superseded inside
+the range.

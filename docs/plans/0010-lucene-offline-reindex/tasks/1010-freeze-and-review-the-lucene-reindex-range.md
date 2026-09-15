@@ -9,7 +9,7 @@ touches:
   - docs/plans/0010-lucene-offline-reindex/ARCHITECTURE.md
   - docs/index.md
   - docs/oak-segment-tar-feature-map.md
-status: planned
+status: done
 merged_as: ""
 ---
 # Freeze And Adversarially Review The Lucene Reindex Range

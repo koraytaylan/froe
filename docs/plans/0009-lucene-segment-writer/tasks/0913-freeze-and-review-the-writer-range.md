@@ -8,7 +8,7 @@ gated: true
 touches:
   - docs/plans/0009-lucene-segment-writer/ARCHITECTURE.md
   - docs/oak-segment-tar-feature-map.md
-status: planned
+status: done
 merged_as: ""
 ---
 # Freeze And Adversarially Review The Writer Range

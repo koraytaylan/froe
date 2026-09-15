@@ -9,7 +9,7 @@ touches:
   - docs/plans/0007-property-index-reindex/ARCHITECTURE.md
   - docs/index.md
   - docs/oak-segment-tar-feature-map.md
-status: planned
+status: done
 merged_as: ""
 ---
 # Freeze And Adversarially Review The Reindex Range

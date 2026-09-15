@@ -585,9 +585,17 @@ approximated.
 listed again because this range's claims inherit them: no AEM build (the
 loop is Apache Sling with Oak), no external blob store, no local macOS
 execution — CI's `macos-latest` job is the authority — and no native
-Windows execution. To these this range adds the three the verification
-report names: no MSRV gate, no i686 width sentinel, and no single
-uninterrupted run of the whole interop chain on this host.
+Windows execution.
+
+**The three axes this range added have since been executed**, on the
+cumulative tree at the `v0.12.0` release candidate rather than on this
+range's own head. The MSRV gate ran (a 1.89 toolchain is installed on this
+host now); the i686 width sentinel ran for the `froe` package on both
+toolchains, as **compilation for a 32-bit target and not execution on
+one**, the workspace-wide form still failing in `zstd-sys`; and the whole
+interop chain ran uninterrupted, `generate` through `recover`, in 909
+seconds. Plan 0009's verification report states each command and its own
+exit status.
 
 #### Review
 
@@ -668,7 +676,8 @@ than the marker.
 **freeze itself**, and lifting the beta framing from `docs/index.md` §6 and
 §7 and the feature map's rows, is the maintainer's decision: those rows
 tell a reader that `froe index dump` and `froe index import` are ready for
-a production store, and the evidence behind them has the gaps recorded
-above — no MSRV gate, no i686 sentinel, and no single uninterrupted run of
-the whole interop chain on this host. The interoperability record itself is
-complete and every oracle passed.
+a production store, and the three gaps this section recorded
+have since been closed, on the cumulative tree rather than on this range's
+own head: the MSRV gate, the i686 width sentinel for the `froe` package
+(compilation only) and an uninterrupted run of the whole interop chain.
+The interoperability record itself is complete and every oracle passed.

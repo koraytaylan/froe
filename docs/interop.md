@@ -725,7 +725,7 @@ The plan's oracle for froe's own Lucene writer, and the one phase that
 touches the fixture not at all: it reads a committed corpus, writes it
 twice, and compares.
 
-`crates/froe/tests/fixtures/lucene-writer-corpus.jsonl` describes 8,311
+`crates/froe/tests/fixtures/lucene-writer-corpus.jsonl` describes 8,312
 documents in the writer's own model — already tokenized, already typed —
 chosen to reach the places a writer goes wrong. 8,300 of them carry one
 term, which puts it three skip levels deep under the skip multiplier of 8
@@ -751,7 +751,9 @@ Then:
 * **Lucene's own `CheckIndex` over froe's directory**, first, because a
   dump that matches is worth nothing if the index it came from is
   malformed.
-* **Both indexes enumerated and compared line for line** — 149,612 lines:
+* **Both indexes enumerated and compared line for line** — 157,944 lines
+  in the run of 2026-09-15, the figure the phase prints and the corpus
+  decides:
   every field with its options, every term with statistics recomputed from
   live postings, every posting with its frequency, positions and offsets,
   every stored value, every doc value beside its has-a-value bitset, every

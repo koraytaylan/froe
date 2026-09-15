@@ -565,6 +565,28 @@ i686 width sentinel, and `scripts/interop-fixture.sh` as a whole chain.
 no external blob store, no local macOS execution (CI's `macos-latest` job
 is the authority), and no native Windows execution.
 
+**Addendum, 2026-09-15 — the three axes this range recorded as unexecuted
+have since run**, on the cumulative tree at the `v0.12.0` release
+candidate rather than on this range's own head, which is what they can
+honestly be said about:
+
+* *The MSRV host gate.* A `1.89.0-x86_64-unknown-linux-gnu` toolchain is
+  installed on this host now. `fmt`, `clippy`, `test`, `test --release`
+  and `doc` each exited 0 under `cargo +1.89`.
+* *The i686 width sentinel.* `check` and `clippy` for the `froe` package,
+  `+stable` and `+1.89`, all four exit 0 with `RUSTFLAGS="-D warnings"` —
+  **compilation for a 32-bit target, not execution on one**. The
+  workspace-wide form still fails in `zstd-sys`.
+* *`scripts/interop-fixture.sh` as a whole chain.* `generate` through
+  `recover` reached the completion sentinel in 909 seconds, the
+  `property_reindex` phase among them.
+
+The `property_reindex` phase's query-level comparison and counter-reset
+scenario, recorded above as not run, have also both run — see this plan's
+`STATUS.md`, which records what each of them found in this plan's own
+code.
+
+
 #### Review
 
 **This task is gated, and the gate has not been closed.** What follows is
