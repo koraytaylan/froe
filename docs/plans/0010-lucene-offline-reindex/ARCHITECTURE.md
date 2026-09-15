@@ -513,8 +513,9 @@ definition naming `codec = oakCodec` outright — which `Codec.forName`
 resolves to the composition froe writes — was refused as though it named
 something else.
 
-**Three more came from reading the pinned image's own bytecode**, which
-is where a branch the fixture cannot reach has to be settled:
+**Five more came from reading the pinned image's own bytecode**, which
+is where a branch the fixture cannot reach has to be settled — and two of
+them the fixture *could* reach once the bytecode said what to look for:
 
 9. a sorted doc value over 32,766 bytes was cut mid-character, where
    `getTruncatedBytesRef` walks back off the character that straddles the
@@ -529,6 +530,18 @@ is where a branch the fixture cannot reach has to be settled:
     a rule through type inheritance borrowed an aggregate Oak would not
     have given it. The fixture now carries the first half and Oak's own
     rebuild proves it; the second is a named test.
+12. An **aggregated** property is gated three ways — §4.1.1 — and froe
+    gated it once, with the wrong rule, key and flag: no type gate at all,
+    `excludeFromAggregation` read from the aggregated node's rule by the
+    bare name instead of from the document's rule by the relative path,
+    and `nodeScopeIndex` — the gate that actually decides — not read at
+    all. The fixture carries a shape for each, and the third explains a
+    difference this review had attributed to the second.
+13. The **typed fields** and the analyzed field are gated by the property
+    definition's own `oak.experimental.includePropertyTypes`, whose
+    default is every type; froe used the rule's list, which gates the
+    per-property fulltext loop instead. A `propertyIndex` property of a
+    type outside a restricted rule's list lost its typed field.
 
 #### Verification report
 
