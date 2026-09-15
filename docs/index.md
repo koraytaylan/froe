@@ -425,10 +425,13 @@ a **relative** property definition such as `jcr:content/jcr:title`, whose
 value lives on a child and whose fields carry the relative path as their
 name; and an **aggregate**, whose matched nodes contribute their text to
 the aggregating node's `:fulltext` — and to `fullnode:<path>` beside it for
-a `relativeNode` include. An aggregated node whose own indexing rule
-declares an aggregate is followed in turn, as deep as `reaggregateLimit`
-allows, and its rule is also the one that decides what
-`excludeFromAggregation` leaves out.
+a `relativeNode` include. An aggregated node whose own **node type**
+declares an aggregate is followed in turn, as deep as the definition's
+`reaggregateLimit` allows — the type is looked up in the definition's own
+`aggregates` list, so an aggregate declared for a type no indexing rule
+covers is still entered. What `excludeFromAggregation` leaves out is
+decided by the **rule covering that node**, which is a different question
+and a different lookup.
 
 **`--binary-text` is required for every Lucene definition**, whether it
 indexes a binary or not:

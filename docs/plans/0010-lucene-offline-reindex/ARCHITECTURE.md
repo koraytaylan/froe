@@ -409,12 +409,14 @@ than the default; a **relative** property definition and a relative
 in; `indexNodeName`; `excludedPaths` inside the included subtree;
 `valueExcludedPrefixes`; `maxFieldLength`; `indexOriginalTerm` beside a
 word the delimiter filter splits; a `codec` naming `oakCodec` outright;
-an aggregate of five includes — a plain one, two `relativeNode` ones, a
-two-step `jcr:content/*`, and two carrying a `primaryType` that holds and
-one that does not — and a **second indexing rule** over the node type an
-aggregated child carries, with `excludeFromAggregation` on one property,
-a relative definition of its own, and an aggregate of its own, which is
-what re-aggregation is. The content carries a **binary with no
+an aggregate of seven includes — a plain one, two `relativeNode` ones, a
+two-step `jcr:content/*`, two carrying a `primaryType` that holds and one
+that does not, and one over a child whose type **no rule covers**; a
+**second indexing rule** over the node type another aggregated child
+carries, with `excludeFromAggregation` on one property, a relative
+definition of its own, and an aggregate of its own, which is what
+re-aggregation is; and an aggregate declared for that ruleless type,
+whose grandchild reaches the page all the same. The content carries a **binary with no
 `jcr:mimeType`**, so the gate Oak's extraction stops at is compared
 rather than excluded.
 
@@ -510,6 +512,23 @@ An eighth was found beside them without the oracle, and proved with it: a
 definition naming `codec = oakCodec` outright — which `Codec.forName`
 resolves to the composition froe writes — was refused as though it named
 something else.
+
+**Three more came from reading the pinned image's own bytecode**, which
+is where a branch the fixture cannot reach has to be settled:
+
+9. a sorted doc value over 32,766 bytes was cut mid-character, where
+   `getTruncatedBytesRef` walks back off the character that straddles the
+   cut — and off its lead byte whether or not it would have fitted;
+10. a re-aggregation was bounded by the limit of the aggregate it was
+    entering, where `Matcher.nextSet` compares the stack against the
+    **root** aggregate's;
+11. and it entered the aggregate of the matched node's **covering rule**,
+    where Oak looks the node's own primary type — then its mixins — up in
+    the definition's `aggregates` map. So an aggregate declared for a type
+    no `indexRules` child covers was never entered, and a node covered by
+    a rule through type inheritance borrowed an aggregate Oak would not
+    have given it. The fixture now carries the first half and Oak's own
+    rebuild proves it; the second is a named test.
 
 #### Verification report
 
