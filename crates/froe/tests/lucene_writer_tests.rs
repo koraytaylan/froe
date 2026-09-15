@@ -273,6 +273,89 @@ fn an_over_long_term_is_skipped_and_its_document_kept() {
     assert_eq!(written.statistics.skipped_over_long_terms, 1);
 }
 
+/// The one `.fnm` byte this suite reads, because Lucene's own writer
+/// cannot produce the value froe used to write here and the conformance
+/// judge prints `hasNorms()` rather than the bit.
+#[test]
+fn a_field_that_is_not_indexed_carries_no_omit_norms_bit() {
+    let workspace = Workspace::new("omit-norms-bit");
+    let mut writer = LuceneIndexWriter::new(
+        Collected::default(),
+        workspace.runs("writer"),
+        SortBudget::of_bytes(ROOMY),
+    );
+    let mut stored = Field::stored("blob", StoredValue::Integer(7));
+    stored.doc_value = Some(DocValue::Numeric(7));
+    writer
+        .add_document(&Document::new().with(stored))
+        .expect("add the document");
+    let (directory, _) = writer.finish().expect("finish");
+
+    let compound = &directory.files["_0.cfs"];
+    let data_length = compound.len() as i64;
+    let table = read_table_of_contents(&mut directory.reader("_0.cfe"), data_length)
+        .expect("read the .cfe");
+    let entry = table
+        .entries
+        .iter()
+        .find(|entry| entry.name == ".fnm")
+        .expect("the segment carries field infos");
+    let start = usize::try_from(entry.offset).expect("an offset inside the file");
+    let end = start + usize::try_from(entry.length).expect("a length inside the file");
+    let field_infos = &compound[start..end];
+    // Header, then a `VInt` field count, then the one field's name as a
+    // `VInt`-prefixed string, its number, and the bits byte.
+    let name = b"\x04blob";
+    let at = field_infos
+        .windows(name.len())
+        .position(|window| window == name)
+        .expect("the field's name is in the record");
+    let bits = field_infos[at + name.len() + 1];
+    assert_eq!(
+        bits, 0x00,
+        "a field that is not indexed carries neither IS_INDEXED (0x01) nor \
+         OMIT_NORMS (0x10): `FieldInfo`'s constructor stores false for a \
+         non-indexed field, so Oak's own writer never sets the bit"
+    );
+}
+
+#[test]
+fn a_term_at_the_maximum_length_is_kept_and_one_byte_over_is_skipped() {
+    // The skip test is `MAXIMUM_TERM_LENGTH + 1` above, which is
+    // expressed in the constant it should be pinning: it passes whatever
+    // the constant says. The value itself is only pinned by keeping the
+    // term one byte below it, where `BytesRefHash.add`'s own test
+    // (`length + 2 > BYTE_BLOCK_SIZE`, §7) still admits it.
+    let workspace = Workspace::new("term-limit");
+    let mut writer = LuceneIndexWriter::new(
+        Collected::default(),
+        workspace.runs("writer"),
+        SortBudget::of_bytes(ROOMY),
+    );
+    assert_eq!(
+        froe::MAXIMUM_TERM_LENGTH,
+        32_766,
+        "BYTE_BLOCK_SIZE - 2, which is what the writer's own limit is"
+    );
+    let longest = "x".repeat(froe::MAXIMUM_TERM_LENGTH);
+    let over = "y".repeat(froe::MAXIMUM_TERM_LENGTH + 1);
+    let mut field = Field::indexed(
+        "body",
+        IndexOptions::DocumentsAndFrequenciesAndPositions,
+        vec![token(&longest, 1, 0), token(&over, 1, 1)],
+    );
+    field.omit_norms = false;
+    writer
+        .add_document(&Document::new().with(field))
+        .expect("the document is kept");
+    let (_, written) = writer.finish().expect("finish");
+    assert_eq!(written.document_count, 1);
+    assert_eq!(
+        written.statistics.skipped_over_long_terms, 1,
+        "the term at the limit is kept and only the one past it is skipped"
+    );
+}
+
 #[test]
 fn a_boost_on_a_field_that_omits_norms_is_refused() {
     let workspace = Workspace::new("boost");

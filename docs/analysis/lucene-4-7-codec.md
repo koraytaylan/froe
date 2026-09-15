@@ -648,6 +648,18 @@ Per field, in order: **name** (string), **number** (`VInt`), **bits** (one
 byte), **the packed types** (one byte), **`dvGen`** (a fixed eight-byte
 `Long`), **attributes** (a string map).
 
+**The writer's three flags outside the `isIndexed()` guard are already
+normalized when it reads them.** `FieldInfo`'s constructor branches on
+`indexed` and, on the other side, stores `false` for `storeTermVector`,
+`storePayloads` and `omitNorms` whatever the caller passed — `javap -c
+org.apache.lucene.index.FieldInfo` in the pinned image disassembles the
+not-indexed branch to three `iconst_0` / `putfield` pairs. So a
+stored-only or doc-values-only field is written with **no `OMIT_NORMS`
+bit**, and a writer that sets the flag from "this field has no norms"
+produces a byte Oak does not. Reading the writer alone gets this
+backwards, because `fi.omitsNorms()` there looks free to be true for any
+field.
+
 The index-option bits are set **only when the field is indexed**, and only
 three of the five options have a bit at all. The mapping is therefore:
 

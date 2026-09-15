@@ -99,7 +99,18 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
                 number: field.number,
                 indexed: field.indexed,
                 options: field.options,
-                omits_norms: field.omit_norms || !field.indexed,
+                // A non-indexed field's flag is **false**, whatever the
+                // caller asked for. `FieldInfo`'s constructor branches on
+                // `indexed` and forces `storeTermVector`, `storePayloads`
+                // and `omitNorms` to false on the other side — verified in
+                // the pinned image, `javap -c org.apache.lucene.index.FieldInfo`,
+                // where the not-indexed branch is three `iconst_0`
+                // `putfield` pairs. `Lucene46FieldInfosWriter` then reads
+                // the field back, so Oak writes no `OMIT_NORMS` bit for a
+                // stored-only or doc-values-only field and neither does
+                // froe. A reader normalizes it away again, so what this
+                // buys is byte identity rather than behaviour.
+                omits_norms: field.indexed && field.omit_norms,
                 doc_values: field.doc_values,
                 norms: (field.indexed && !field.omit_norms).then_some(DocValuesType::Numeric),
                 doc_values_generation: -1,
