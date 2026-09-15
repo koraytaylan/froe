@@ -322,12 +322,17 @@ A Lucene index is not part of TarMK's format: it is a directory of Lucene
 files, which Oak stores as `:data` node content inside the segment store
 and which froe reads, transports and — since plan 0009 — writes.
 
+froe writes **one** segment and the commit over it. It never merges, and
+it never writes a deletions file: both stay Oak's own, and a rebuild that
+needs either is a rebuild Oak does.
+
 **The specification is
 [`analysis/lucene-4-7-codec.md`](analysis/lucene-4-7-codec.md)**, extracted
 byte for byte from the Lucene 4.7.2 sources `oak-lucene` vendors at the
 pinned Oak commit. It covers the `oakCodec` composition Oak selects for a
-fulltext-enabled definition — `Lucene46` with the postings format
-replaced — and every file in it: the postings, the block-tree terms
+fulltext-enabled definition — `Lucene41` postings, `Lucene45` doc values,
+`Lucene46` field infos and segment info, `Lucene42` norms and uncompressed
+`Lucene40` stored fields — and every file in it: the postings, the block-tree terms
 dictionary, the stored fields, the doc values, the norms, the field infos,
 the compound file, the segment descriptor and the commit.
 

@@ -12,10 +12,17 @@
 //!
 //! # What this composition is
 //!
-//! `Lucene46` with the postings format replaced. Oak selects it for a
-//! fulltext-enabled definition; every other definition takes plain
-//! `Lucene46`. Which files a segment carries, and which of them go inside the
-//! compound file, is §3 and §9 of the specification.
+//! The eight formats `OakCodec`'s constructor sets: `Lucene41` postings and
+//! `Lucene45` doc values selected by name — flat, where `Lucene46Codec`
+//! selects both per field — `Lucene46` field infos and segment info,
+//! `Lucene42` norms and term vectors, `Lucene40` live docs, and
+//! **uncompressed `Lucene40` stored fields** where `Lucene46Codec`'s own are
+//! LZ4-compressed. It is not `Lucene46` with one format replaced, and §3.4
+//! of the specification carries the disassembly.
+//!
+//! Oak selects it for a fulltext-enabled definition; every other definition
+//! takes plain `Lucene46`. Which files a segment carries, and which of them
+//! go inside the compound file, is §3 and §9 of the specification.
 //!
 //! # What it deliberately does not do
 //!

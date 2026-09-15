@@ -555,9 +555,31 @@ back to the directory listing.
 Oak's rule, not Lucene's, and specified in
 [`index-definitions.md`](index-definitions.md): an explicit `codec` property
 wins; otherwise a **fulltext-enabled** definition takes `oakCodec` and every
-other takes `Lucene46`. Plan 0009 writes the `oakCodec` composition, which is
-`Lucene46` with the postings format replaced — the composition itself is §4
-onward.
+other takes `Lucene46`. Plan 0009 writes the `oakCodec` composition, which
+is **not** `Lucene46` with one format replaced.
+
+`javap -c` over `OakCodec` in the pinned image
+(`apache/sling@sha256:8722cd66…`, `oak-lucene-1.90.0.jar`) disassembles its
+constructor to eight explicit assignments:
+
+| Format | What `OakCodec` sets |
+| --- | --- |
+| postings | `PostingsFormat.forName("Lucene41")` |
+| doc values | `DocValuesFormat.forName("Lucene45")` |
+| stored fields | `new Lucene40StoredFieldsFormat()` |
+| norms | `new Lucene42NormsFormat()` |
+| term vectors | `new Lucene42TermVectorsFormat()` |
+| field infos | `new Lucene46FieldInfosFormat()` |
+| segment info | `new Lucene46SegmentInfoFormat()` |
+| live docs | `new Lucene40LiveDocsFormat()` |
+
+It extends `FilterCodec` over a `Lucene46Codec` delegate and overrides all
+eight accessors, so nothing of the delegate's own composition is reached.
+Two differences from `Lucene46Codec` are load-bearing rather than
+cosmetic: the stored fields are **uncompressed `Lucene40`** where
+`Lucene46Codec`'s are `Lucene41`'s LZ4-compressed ones, and the postings
+and doc-values formats are **flat** where `Lucene46Codec` selects them per
+field. The composition itself is §4 onward.
 
 ---
 
@@ -807,8 +829,9 @@ A stored field with no binary, string or numeric value is an
 ## 6. Postings — `.doc`, `.pos`, `.pay`
 
 `codecs/lucene41/Lucene41PostingsWriter.java` and its format. This is the
-format `oakCodec` **keeps** — the composition replaces nothing here — and it
-is the largest single piece of the writer.
+format `oakCodec` selects by name — `PostingsFormat.forName("Lucene41")`
+in its constructor (§3.4), rather than the per-field selection
+`Lucene46Codec` makes — and it is the largest single piece of the writer.
 
 Four codec names and one version:
 

@@ -3,11 +3,12 @@
 //! `docs/analysis/lucene-4-7-codec.md` §5, from
 //! `codecs/lucene40/Lucene40StoredFieldsWriter.java`.
 //!
-//! `oakCodec` replaces the postings format and nothing else, so stored
-//! fields keep the **`Lucene40`** format — older than the `Lucene46` the
-//! rest of the composition uses, with its own version numbering that
+//! `OakCodec` sets this format explicitly — `new Lucene40StoredFieldsFormat()`
+//! in its constructor, where `Lucene46Codec`'s own are `Lucene41`'s
+//! LZ4-compressed ones (§3.4). It is older than the `Lucene46` two other
+//! members of the composition carry, with its own version numbering that
 //! restarts at zero, and **uncompressed**, which is the whole reason Oak
-//! chooses this composition.
+//! chooses it.
 //!
 //! What Oak stores: `:path` on every document, the property text for a
 //! `useInExcerpt` property, and for a binary the extracted text under
