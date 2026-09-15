@@ -9,6 +9,17 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 
+/// What a binary property contributes to a Lucene index.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub(crate) enum BinaryTextChoice {
+    /// Oak's own `TextExtractionError` marker, which keeps the field
+    /// present and makes the absence of text visible to a query.
+    Marker,
+    /// Nothing: the binary contributes no field, which is what Oak does
+    /// for a type Tika does not support.
+    Skip,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum IndexAction {
     /// List the index definitions and what froe can read about each
@@ -154,6 +165,34 @@ pub(crate) enum IndexAction {
         /// nodes.
         #[arg(long, value_name = "N")]
         sort_budget_mebibytes: Option<usize>,
+        /// What a binary property contributes to a Lucene index.
+        ///
+        /// **Required for every Lucene definition**, binaries or not:
+        /// froe extracts no text, so this is a decision only you can make
+        /// and `skip` is how you state that a definition indexes none.
+        ///
+        /// Oak runs Tika over a binary and indexes the text it gets; where
+        /// Tika does not support the type it indexes nothing, and where
+        /// Tika threw it indexes the marker `TextExtractionError`. So
+        /// `skip` reproduces Oak exactly for the unsupported types and
+        /// `marker` reproduces only the failed-extraction case — neither
+        /// reproduces a successful extraction, which is what
+        /// `--pre-extracted-text-directory` is for.
+        ///
+        /// A binary on a node with no `jcr:mimeType` is never indexed
+        /// whatever you choose here, because Oak's own extraction stops
+        /// there first.
+        #[arg(long, value_name = "marker|skip")]
+        binary_text: Option<BinaryTextChoice>,
+        /// Read Oak's own pre-extracted text store first, and fall back to
+        /// `--binary-text` for a blob it does not cover.
+        ///
+        /// Text in that store is text Oak extracted, so an index built
+        /// with it answers as Oak's does for every blob it holds. An
+        /// inline segment blob is never in it: the store is keyed by a
+        /// blob's content identity, which an inlined value has none of.
+        #[arg(long, value_name = "DIRECTORY", requires = "binary_text")]
+        pre_extracted_text_directory: Option<PathBuf>,
     },
     /// Import Lucene index data built out of band back into a stopped
     /// store.

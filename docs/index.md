@@ -271,6 +271,8 @@ synchronous reindex costs on a large store.
 ```
 froe index reindex REPOSITORY [--index PATH]… [--dry-run] [--yes]
                    [--work-directory DIRECTORY] [--from-head]
+                   [--binary-text marker|skip]
+                   [--pre-extracted-text-directory DIRECTORY]
                    [--sort-budget-mebibytes N]
 ```
 
@@ -286,6 +288,7 @@ moves the head exactly once, appending one journal line.
 | `property` with a strict `BOOLEAN` `unique = true` | `:index/<key>` with `entry` holding the absolute path — `UniqueEntryStoreStrategy` | the same |
 | `reference` | `:references` and `:weakreferences`, keyed by the referenced identifier unencoded | the same |
 | `counter` | `:index`, one node per counted path carrying `:cnt` | the same |
+| `lucene` | `:data`, one Lucene 4.7.2 compound segment and the commit over it | **the definition's lane checkpoint**, always — §5.9 |
 
 A definition with no `async` property is rebuilt from the head. One that
 names a lane is rebuilt from **that lane's checkpoint**, not the head:
@@ -293,8 +296,8 @@ an asynchronous index is exactly as current as its lane, and indexing the
 head would move it forward silently, past entries Oak's own lane has not
 reached.
 
-Everything else is refused by name rather than approximated — `lucene`
-(plan 0010), `elasticsearch`, `disabled`, `ordered`, an unknown type, a
+Everything else is refused by name rather than approximated —
+`elasticsearch`, `disabled`, `ordered`, an unknown type, a
 `valuePattern` regular expression froe does not evaluate, a definition
 carrying a composite mount's index data, a path filter Oak cannot construct,
 a definition nested under a content node, a node that is not an
@@ -316,6 +319,10 @@ estimates drift.
 
 For a **counter** it authorizes nothing: the definition is **refused**,
 with or without the flag. See §5.8.
+
+For a **Lucene** definition it authorizes a **reset**: the hidden children
+are removed, nothing is built, and every visible property is left alone.
+See §5.9.
 
 ### 5.3 The work directory
 
@@ -368,18 +375,25 @@ is what will run:
 ```
 reindex plan for /var/aem/segmentstore
   rebuild /oak:index/uuid from the head: 51,204 entries, 2.1 MiB to sort
+  rebuild /oak:index/lucene-fulltext from lane async's checkpoint c-91f3: 4 indexing rules, 812,406 documents, 96.4 MiB stored and 1.1 GiB indexed, binary text the extraction-error marker under /var/aem/pre-extracted
   nothing to do for /oak:index/counter: it has no hidden child to remove
-  warning: /oak:index/lucene-fulltext is a lucene definition, which this froe version does not rebuild
-  work directory /var/tmp (up to 130 MiB for one definition's spill)
+  warning: /oak:index/old-lucene cannot be rebuilt natively: its codec resolves to Lucene46, and froe writes the oakCodec composition alone
+  work directory /var/tmp (3.6 GiB as a proxy for one definition's spill)
   the index records this run replaces stay live through every checkpoint that references them, and are reclaimed only by a later `froe compact`
 ```
+
+The work-directory figure is **a proxy and says so**. For a property index
+it is the entry bytes plus the fan-in times the budget; for a Lucene
+definition it rests on the two byte totals above — §5.3 records the basis
+for both. It is not an upper bound, and it is not measured.
 
 A scripted run without `--yes` plans and cancels, naming the flag. The
 summary afterwards is built from what happened, not from the plan:
 
 ```
   /oak:index/uuid: 51,204 entries, 51,204 distinct keys, 68,391 index nodes
-reindexed 1 index; head 8f3c….0000002a -> 2b91….0000010c
+  /oak:index/lucene-fulltext: 812,406 documents, 913,022 nodes visited, 1.4 GiB in 5 index files
+reindexed 2 indexes; head 8f3c….0000002a -> 2b91….0000010c
 the replaced index records stay live through 2 checkpoints: …, …. They are
 reclaimed only by a `froe compact` run after those are released.
 ```
@@ -401,7 +415,85 @@ collected entry count plus one. Reaching it means the written index holds
 more entries than the walk produced, which is a bug rather than a data
 condition; the head does not move, and the run should be reported.
 
-### 5.6 What a reindex costs
+### 5.6 Lucene definitions
+
+A `lucene` definition is rebuilt natively — froe makes the documents from
+the definition's own rules, analyzes them with Oak's own chain, writes one
+compound segment and copies it into `:data`. No oak-run, no JVM.
+
+**`--binary-text` is required for every Lucene definition**, whether it
+indexes a binary or not:
+
+```console
+$ froe index reindex /var/aem/segmentstore --binary-text skip
+$ froe index reindex /var/aem/segmentstore --binary-text marker \
+    --pre-extracted-text-directory /var/aem/pre-extracted
+```
+
+froe extracts no text from a binary, so what a binary contributes is a
+decision only you can make, and `skip` is how you state that a definition
+indexes none. What Oak does, and what each choice reproduces:
+
+* Oak runs Tika. For a type Tika does not support it indexes **nothing**,
+  which is what `skip` reproduces exactly. Where Tika threw it indexes the
+  marker `TextExtractionError`, which is what `marker` reproduces. Neither
+  reproduces a *successful* extraction.
+* `--pre-extracted-text-directory` is consulted first, and it does
+  reproduce one: text in Oak's own pre-extracted store is text Oak
+  extracted. `--binary-text` is then the fallback for a blob the store does
+  not cover. An **inline** segment blob is never in it — the store is keyed
+  by a blob's content identity, which an inlined value has none of.
+* A binary on a node with **no `jcr:mimeType`** is never indexed whatever
+  you choose, because Oak's own extraction stops there first.
+
+**What is refused, by name, before anything is written.** A definition
+whose codec verdict is not `oakCodec`: an explicit `codec` property is
+taken as Oak takes it, and without one a definition is `oakCodec` only when
+it is fulltext-enabled — a rule with a node aggregate, or with a property
+definition that is indexed and either `analyzed` or `nodeScopeIndex`.
+Anything else is `Lucene46`, which froe does not write. Then:
+
+* a definition-level `valueRegex` — it gates the fulltext loop with a
+  regular expression froe does not evaluate;
+* `similarityTags`, `useInSimilarity`, `dynamicBoost`, `function` — each
+  writes a field this version does not produce;
+* `compatVersion 1`, which names its analyzed fields without the `full:`
+  prefix, and a definition with no `indexRules` at all, which Oak reads the
+  same way;
+* `maxFieldLength = 0`, which in Lucene 4.7.2 leaves every analyzed field
+  silently empty;
+* two rules assigning **different doc-value types to one `:dv` field
+  name** — Oak keeps whichever type arrived first and drops the later
+  documents, by traversal order; froe refuses at load instead, which is a
+  recorded departure;
+* an `nt:base` rule carrying a `nullCheckEnabled` property definition,
+  which Oak's own rule validation throws on;
+* a definition with no `async`, and a **hybrid** one whose `async` lists
+  `sync`, or any `sync` or `unique` property definition: Oak keeps a
+  synchronous `:property-index` for those that froe does not build;
+* any child of an `analyzers` node — froe reproduces no
+  consumer-registered analyzer.
+
+A `tika` child is **accepted** and reported: nothing in it is read, because
+froe runs no Tika.
+
+One refusal lands at document time rather than at load: **a `DATE`
+property value that does not parse**. One such value anywhere in the
+indexed subtree refuses the run, naming the path, the property and the
+value — which is what Oak does too, its own commit failing there.
+
+**The suggester.** `:suggest-data` is removed and never rebuilt; Oak's own
+suggester schedule rebuilds it on the lane's next cycle.
+
+**A killed run leaves more behind than a property reindex does.** Its
+froe-named subdirectory under the work directory can hold a *complete
+assembled segment*, not only spill files. The next run refuses that residue
+in a directory you named and warns about it under the default; the remedy
+is the same — remove the subdirectory and rerun. A dead run's segment is
+never mistaken for a live one's: each attempt assembles into a fresh
+directory.
+
+### 5.7 What a reindex costs
 
 The records the run replaces become unreachable from the head — but they are
 not garbage. Every checkpoint that references them keeps them live, and each
@@ -413,7 +505,7 @@ So **a reindex grows the store until the next compaction**. That is the
 honest cost, the plan says so, and the summary names the checkpoints that
 pin them.
 
-### 5.7 The approximate counters, and why froe writes them
+### 5.8 The approximate counters, and why froe writes them
 
 A property index carries hidden `:count_*` properties on its `:index` node
 and on each key node. They are Oak's **approximate counter**, and they are
@@ -442,7 +534,7 @@ of two rebuilds must exclude `:count_*`, froe's against froe's as much as
 froe's against Oak's. That is what `froe digest --exclude-property-prefix`
 is for.
 
-### 5.8 Why a counter on an unresolvable lane is refused
+### 5.9 Why a counter on an unresolvable lane is refused, and a Lucene definition is reset
 
 A counter definition whose lane cannot be resolved is **refused by name**,
 and this is the one case `--from-head` does not authorize.
@@ -474,6 +566,19 @@ while Oak committed its own content normally.
 What to do instead: let Oak rebuild the lane from a checkpoint it still
 has, or release the lane's state through Oak so it starts a clean cycle.
 Either way the counter is Oak's to rebuild, not froe's to remove.
+
+**A Lucene definition on such a lane is the opposite case, and is reset.**
+Without `--from-head` it is refused, naming the lane and the checkpoint.
+With it, froe removes the hidden children, builds nothing, and leaves every
+visible property alone.
+
+The reason is Oak's own behaviour on the *next* cycle. After a lost
+checkpoint its fulltext editor re-enters reindex mode on a missing before
+state at the root, and its index writer's reindex branch **appends** every
+document to whatever `:data` still holds — doubling the index, whether or
+not froe had rebuilt it. A definition with **no hidden child** is the case
+Oak rebuilds from scratch, so removing them is what makes the next cycle
+produce a correct index. The plan line says the reset and the reason.
 
 ## 6. `froe index dump`
 
@@ -678,8 +783,7 @@ through every checkpoint that references them and are reclaimed only by a
 
 | Subcommand | Plan |
 | --- | --- |
-| `froe index reindex` for fulltext-enabled Lucene definitions | 0009 |
-| Native Lucene index building, so a rebuild needs no oak-run | 0010 |
+| A Lucene reindex proved against a live Oak, end to end | 0010, task 1009 |
 
 The read-only set grows in place; the mutating commands get their own
 sections, with the confirmation and locking rules the rest of froe's

@@ -10,6 +10,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use froe::index::lucene::documents::binaries::{BinaryTextFallback, BinaryTextPolicy};
 use froe::writer::index::selection::IndexingState;
 use froe::writer::index::{
     DefinitionReport, PreparedReindex, ReindexAction, ReindexOptions, ReindexOutcome, ReindexPlan,
@@ -31,6 +32,10 @@ pub(crate) struct ReindexCommandLine {
     pub(crate) work_directory: Option<PathBuf>,
     pub(crate) from_head: bool,
     pub(crate) sort_budget_mebibytes: Option<usize>,
+    /// `--binary-text`, without which no Lucene definition is rebuilt.
+    pub(crate) binary_text: Option<crate::command_line::index::BinaryTextChoice>,
+    /// `--pre-extracted-text-directory`, consulted before the fallback.
+    pub(crate) pre_extracted_text_directory: Option<PathBuf>,
 }
 
 impl ReindexCommandLine {
@@ -45,6 +50,17 @@ impl ReindexCommandLine {
         if let Some(mebibytes) = self.sort_budget_mebibytes {
             options =
                 options.with_sort_budget_bytes(mebibytes.saturating_mul(BYTES_PER_MEBIBYTE).max(1));
+        }
+        if let Some(choice) = self.binary_text {
+            let fallback = match choice {
+                crate::command_line::index::BinaryTextChoice::Marker => BinaryTextFallback::Marker,
+                crate::command_line::index::BinaryTextChoice::Skip => BinaryTextFallback::Skip,
+            };
+            let mut policy = BinaryTextPolicy::new(fallback);
+            if let Some(directory) = &self.pre_extracted_text_directory {
+                policy = policy.with_pre_extracted_text_directory(directory.clone());
+            }
+            options = options.with_binary_text_policy(policy);
         }
         options
     }
@@ -157,8 +173,11 @@ fn print_plan(plan: &ReindexPlan) {
     for warning in &plan.warnings {
         println!("  warning: {warning}");
     }
+    // A **proxy**, and the word is deliberate: for a Lucene definition it
+    // rests on two byte totals a counting walk can produce without
+    // analyzing anything, and `docs/index.md` §5.3 records the basis.
     println!(
-        "  work directory {} (up to {} for one definition's spill)",
+        "  work directory {} ({} as a proxy for one definition's spill)",
         plan.work_directory.display(),
         froe::format_byte_size(plan.work_directory_estimate_bytes),
     );
@@ -185,6 +204,26 @@ fn render_action(action: &ReindexAction) -> String {
                 ": {}, {} to sort",
                 count_noun(*entries, "entry", "entries"),
                 froe::format_byte_size(*entry_bytes),
+            );
+            line
+        }
+        ReindexAction::RebuildLucene {
+            path,
+            state,
+            rules,
+            documents,
+            stored_bytes,
+            indexed_bytes,
+            binary_text_policy,
+        } => {
+            let mut line = format!("rebuild {path} from {}", render_state(state));
+            let _ = write!(
+                line,
+                ": {}, {}, {} stored and {} indexed, binary text {binary_text_policy}",
+                count_noun(*rules as u64, "indexing rule", "indexing rules"),
+                count_noun(*documents, "document", "documents"),
+                froe::format_byte_size(*stored_bytes),
+                froe::format_byte_size(*indexed_bytes),
             );
             line
         }
@@ -244,6 +283,21 @@ fn print_summary(outcome: &ReindexOutcome) {
                     count_noun(*entries, "entry", "entries"),
                     count_noun(*distinct_keys, "distinct key", "distinct keys"),
                     count_noun(*nodes_written, "index node", "index nodes"),
+                );
+            }
+            DefinitionReport::RebuiltIndex {
+                documents,
+                nodes_visited,
+                files,
+                segment_bytes,
+            } => {
+                rebuilt += 1;
+                println!(
+                    "  {path}: {}, {} visited, {} in {}",
+                    count_noun(*documents, "document", "documents"),
+                    count_noun(*nodes_visited, "node", "nodes"),
+                    froe::format_byte_size(*segment_bytes),
+                    count_noun(files.len() as u64, "index file", "index files"),
                 );
             }
             DefinitionReport::Reset {

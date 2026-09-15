@@ -51,6 +51,10 @@ enum Subject {
     /// A flagged counter parked on a lane `/:async` does not hold, already
     /// carrying an `:index` from an earlier indexing run.
     CounterOnAnAbsentLane,
+    /// A flagged `lucene` definition on a lane whose checkpoint resolves,
+    /// with the analyzed catch-all rule the fixture's default definition
+    /// has.
+    FlaggedLucene,
 }
 
 /// The content the definitions cover: `/content/page` carrying `jcr:title`.
@@ -105,6 +109,113 @@ fn write_node_type_definition<Sink: SegmentSink>(
         .expect("write the nodetype definition")
 }
 
+/// The `lucene` definition: one `nt:base` rule whose catch-all property
+/// definition is analyzed, which is what makes it an `oakCodec` index.
+fn write_lucene_definition<Sink: SegmentSink>(
+    writer: &mut RecordWriter<Sink>,
+) -> froe::RecordIdentifier {
+    let catch_all = [
+        single(
+            writer,
+            "jcr:primaryType",
+            PropertyType::Name,
+            "nt:unstructured",
+        ),
+        single(writer, "name", PropertyType::String, r"^[^\/]*$"),
+        single(writer, "isRegexp", PropertyType::Boolean, "true"),
+        single(writer, "analyzed", PropertyType::Boolean, "true"),
+        single(writer, "nodeScopeIndex", PropertyType::Boolean, "true"),
+    ];
+    let all = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &catch_all)
+        .expect("write the catch-all property definition");
+    let properties = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "all".to_owned(),
+                node: all,
+            },
+            &[],
+        )
+        .expect("write the properties node");
+    let rule = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "properties".to_owned(),
+                node: properties,
+            },
+            &[],
+        )
+        .expect("write the rule");
+    let rules = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "nt:base".to_owned(),
+                node: rule,
+            },
+            &[],
+        )
+        .expect("write indexRules");
+    let definition = [
+        single(
+            writer,
+            "jcr:primaryType",
+            PropertyType::Name,
+            "oak:QueryIndexDefinition",
+        ),
+        single(writer, "type", PropertyType::String, "lucene"),
+        single(writer, "async", PropertyType::String, "async"),
+        single(writer, "reindex", PropertyType::Boolean, "true"),
+    ];
+    writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "indexRules".to_owned(),
+                node: rules,
+            },
+            &definition,
+        )
+        .expect("write the lucene definition")
+}
+
+/// `/jcr:system/jcr:nodeTypes`, which the Lucene rule resolves through.
+fn write_node_types<Sink: SegmentSink>(writer: &mut RecordWriter<Sink>) -> froe::RecordIdentifier {
+    let base_properties = [one_name(writer, "rep:primarySubtypes", "nt:unstructured")];
+    let base = writer
+        .write_node(None, &[], &ChildNodesToWrite::Zero, &base_properties)
+        .expect("write nt:base");
+    let types = writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "nt:base".to_owned(),
+                node: base,
+            },
+            &[],
+        )
+        .expect("write jcr:nodeTypes");
+    writer
+        .write_node(
+            None,
+            &[],
+            &ChildNodesToWrite::One {
+                name: "jcr:nodeTypes".to_owned(),
+                node: types,
+            },
+            &[],
+        )
+        .expect("write jcr:system")
+}
+
 /// The definition under test, and the lane `/:async` should name if any.
 fn write_subject<Sink: SegmentSink>(
     writer: &mut RecordWriter<Sink>,
@@ -130,6 +241,7 @@ fn write_subject<Sink: SegmentSink>(
                 None,
             )
         }
+        Subject::FlaggedLucene => (write_lucene_definition(writer), Some("async")),
         Subject::CounterOnAnAbsentLane => {
             let count = [single(writer, ":cnt", PropertyType::Long, "40")];
             let index = writer
@@ -200,8 +312,20 @@ fn build_store(directory: &Path, subject: Subject) {
         ("content".to_owned(), content),
         ("oak:index".to_owned(), oak_index),
     ];
+    // A Lucene definition is rebuilt from its lane's checkpoint, and the
+    // rule resolves node types from the state it indexes.
+    let lucene = subject == Subject::FlaggedLucene;
+    if lucene {
+        root_children.push(("jcr:system".to_owned(), write_node_types(&mut writer)));
+    }
     if let Some(lane) = lane {
-        let lane_properties = [single(&mut writer, lane, PropertyType::String, "c1")];
+        let checkpoint_name = if lucene { "lane-checkpoint" } else { "c1" };
+        let lane_properties = [single(
+            &mut writer,
+            lane,
+            PropertyType::String,
+            checkpoint_name,
+        )];
         let async_node = writer
             .write_node(None, &[], &ChildNodesToWrite::Zero, &lane_properties)
             .expect("write /:async");
@@ -212,16 +336,36 @@ fn build_store(directory: &Path, subject: Subject) {
     let root = writer
         .write_node(None, &[], &ChildNodesToWrite::Many(root_children), &[])
         .expect("write the root");
+    let mut super_children = vec![("root".to_owned(), root)];
+    if lucene {
+        // The checkpoint pins the same state the head holds, which is what
+        // a lane that has caught up looks like.
+        let checkpoint = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "root".to_owned(),
+                    node: root,
+                },
+                &[],
+            )
+            .expect("write the checkpoint");
+        let checkpoints = writer
+            .write_node(
+                None,
+                &[],
+                &ChildNodesToWrite::One {
+                    name: "lane-checkpoint".to_owned(),
+                    node: checkpoint,
+                },
+                &[],
+            )
+            .expect("write the checkpoints container");
+        super_children.push(("checkpoints".to_owned(), checkpoints));
+    }
     let head = writer
-        .write_node(
-            None,
-            &[],
-            &ChildNodesToWrite::One {
-                name: "root".to_owned(),
-                node: root,
-            },
-            &[],
-        )
+        .write_node(None, &[], &ChildNodesToWrite::Many(super_children), &[])
         .expect("write the super root");
     writer.finish().expect("finish");
     let previous = store.head();
@@ -455,4 +599,105 @@ pub(crate) fn reporting_never_reaches_the_standard_output_of_a_reindex_plan() {
             );
         }
     }
+}
+
+/// A Lucene definition is refused until the operator says what a binary
+/// property contributes, and the refusal names the flag.
+#[test]
+pub(crate) fn a_lucene_definition_without_the_binary_text_flag_is_refused() {
+    let (_directory, store, work) = fixture("reindex-lucene-no-policy", Subject::FlaggedLucene);
+    let run = froe_reindex(
+        &store,
+        &[
+            "--dry-run",
+            "--work-directory",
+            work.to_str().expect("path"),
+        ],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        run.stdout.contains("binary-text policy"),
+        "the plan must name what is missing: {}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("rebuild /oak:index/subject"),
+        "nothing may be planned: {}",
+        run.stdout
+    );
+}
+
+/// With the flag, the plan says what it will do and the run does it.
+#[test]
+pub(crate) fn the_binary_text_flag_reaches_the_library_and_the_run_rebuilds() {
+    let (_directory, store, work) = fixture("reindex-lucene-policy", Subject::FlaggedLucene);
+    let plan = froe_reindex(
+        &store,
+        &[
+            "--dry-run",
+            "--binary-text",
+            "marker",
+            "--work-directory",
+            work.to_str().expect("path"),
+        ],
+    );
+    assert!(plan.status.success(), "{}", plan.stderr);
+    assert!(
+        plan.stdout
+            .contains("rebuild /oak:index/subject from lane async's checkpoint"),
+        "{}",
+        plan.stdout
+    );
+    assert!(plan.stdout.contains("indexing rule"), "{}", plan.stdout);
+    assert!(
+        plan.stdout
+            .contains("binary text the extraction-error marker"),
+        "the policy in force is on the plan line: {}",
+        plan.stdout
+    );
+    assert!(
+        plan.stdout.contains("as a proxy"),
+        "the work-directory figure is labelled a proxy: {}",
+        plan.stdout
+    );
+
+    let run = froe_reindex(
+        &store,
+        &[
+            "--yes",
+            "--binary-text",
+            "skip",
+            "--work-directory",
+            work.to_str().expect("path"),
+        ],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        run.stdout.contains("document") && run.stdout.contains("index file"),
+        "the summary reports what happened: {}",
+        run.stdout
+    );
+}
+
+/// The pre-extracted directory is a refinement of the fallback, not a
+/// replacement for it.
+#[test]
+pub(crate) fn a_pre_extracted_directory_without_the_policy_is_refused() {
+    let (_directory, store, work) = fixture("reindex-lucene-pre-extracted", Subject::FlaggedLucene);
+    let run = froe_reindex(
+        &store,
+        &[
+            "--dry-run",
+            "--pre-extracted-text-directory",
+            work.to_str().expect("path"),
+            "--work-directory",
+            work.to_str().expect("path"),
+        ],
+    );
+    assert!(!run.status.success(), "{}", run.stdout);
+    assert!(
+        run.stderr.contains("--binary-text"),
+        "the refusal names the flag it requires: {}",
+        run.stderr
+    );
 }

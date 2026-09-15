@@ -373,6 +373,8 @@ fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode>
         work_directory,
         from_head,
         sort_budget_mebibytes,
+        binary_text,
+        pre_extracted_text_directory,
         ..
     } = action
     {
@@ -383,6 +385,8 @@ fn run_index(action: IndexAction, reporter: &Reporter) -> froe::Result<ExitCode>
             work_directory,
             from_head,
             sort_budget_mebibytes,
+            binary_text,
+            pre_extracted_text_directory,
         };
         return if index_reindex::run_reindex(&repository_path, &command_line, reporter)? {
             Ok(ExitCode::SUCCESS)

@@ -122,16 +122,24 @@ Beta until plan 0008's review freezes its evidence.
 **Rebuild a flagged index without waiting for Oak to do it.** Oak rebuilds a
 flagged property index synchronously inside the first commit after startup,
 and on a large store that blocks AEM for hours. `froe index reindex` does it
-offline instead — property, unique, reference and counter definitions, from
-the state Oak's own editors would have indexed: the head for a synchronous
-definition, the lane's own checkpoint for an asynchronous one, never the
-head in its place. One head move under the lock, one journal line, and a
-content tree that is never rewritten. The sort spills to disk, so the memory
-a rebuild needs does not grow with the number of indexed nodes. Everything
-froe cannot rebuild exactly — a `lucene` definition, a `valuePattern`
-regular expression, a composite mount's index data — is refused by name
-rather than approximated. Beta until plan 0007's review freezes its
-evidence.
+offline instead — property, unique, reference, counter and fulltext-enabled
+`lucene` definitions, from the state Oak's own editors would have indexed:
+the head for a synchronous definition, the lane's own checkpoint for an
+asynchronous one, never the head in its place. One head move under the lock,
+one journal line, and a content tree that is never rewritten. The sort
+spills to disk, so the memory a rebuild needs does not grow with the number
+of indexed nodes.
+
+A Lucene index is built natively: froe makes the documents from the
+definition's own rules, analyzes them with Oak's own chain — the same
+Unicode 6.3 tokenizer Lucene 4.7.2 baked in — and writes one compound
+segment. **froe extracts no binary text**, so `--binary-text` is required
+and says what a binary contributes; `--pre-extracted-text-directory` reads
+Oak's own extracted text first. Everything froe cannot rebuild exactly — a
+`valuePattern` regular expression, a composite mount's index data, a
+definition whose codec verdict is not `oakCodec`, and each unported Lucene
+feature by name — is refused rather than approximated. Beta until plans
+0007 and 0010's reviews freeze their evidence.
 
 Exactly one generation is retained — the value Oak's own offline tool uses
 (`SegmentGCOptions.setOffline`) — and, unlike Oak, froe rewrites *every*
