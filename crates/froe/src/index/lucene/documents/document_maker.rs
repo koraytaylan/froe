@@ -731,17 +731,20 @@ impl DocumentMaker<'_> {
         rule: &IndexingRule,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
+        let property_includes = rule.property_includes();
+        // Before the node is read for anything: a definition with neither
+        // include kind is the common one, and it owes this walk nothing.
+        if !rule.aggregate.has_node_aggregates() && property_includes.is_empty() {
+            return Ok(());
+        }
         let walk = AggregateWalk {
             rule,
             // Oak hands `indexProperty` the **document's own** node state
             // for a property include, however deep the property lives, so
             // the binary gate is the root node's `jcr:mimeType`.
             root_has_mime_type: node.property("jcr:mimeType")?.is_some(),
-            property_includes: rule.property_includes(),
+            property_includes,
         };
-        if !rule.aggregate.has_node_aggregates() && walk.property_includes.is_empty() {
-            return Ok(());
-        }
         let level = AggregateLevel {
             nodes: rule.aggregate.matcher(),
             properties: PropertyIncludeMatcher::new(&walk.property_includes),
@@ -851,7 +854,7 @@ impl DocumentMaker<'_> {
         &self,
         node: &NodeState<'_>,
         names: &[&str],
-        aggregates_deep: usize,
+        reaggregation_depth: usize,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
         let covering = self.rules.applicable_rule(node)?;
@@ -884,7 +887,7 @@ impl DocumentMaker<'_> {
                 }
             }
         }
-        self.reaggregate(node, covering, names, aggregates_deep, state)
+        self.reaggregate(node, covering, names, reaggregation_depth, state)
     }
 
     /// The **re-aggregation**: an aggregated node whose own rule declares
@@ -903,7 +906,7 @@ impl DocumentMaker<'_> {
         node: &NodeState<'_>,
         covering: Option<&IndexingRule>,
         names: &[&str],
-        aggregates_deep: usize,
+        reaggregation_depth: usize,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
         let Some(rule) = covering else {
@@ -913,14 +916,14 @@ impl DocumentMaker<'_> {
             return Ok(());
         }
         let limit = usize::try_from(rule.aggregate.reaggregation_limit).unwrap_or(0);
-        if aggregates_deep >= limit {
+        if reaggregation_depth >= limit {
             return Ok(());
         }
         self.walk_reaggregate(
             node,
             &rule.aggregate.matcher(),
             names,
-            aggregates_deep + 1,
+            reaggregation_depth + 1,
             state,
         )
     }
@@ -932,7 +935,7 @@ impl DocumentMaker<'_> {
         node: &NodeState<'_>,
         matcher: &Matcher<'_>,
         names: &[&str],
-        aggregates_deep: usize,
+        reaggregation_depth: usize,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
         for (name, child) in node.child_node_entries()? {
@@ -942,11 +945,11 @@ impl DocumentMaker<'_> {
                 Match::Continue => {}
                 Match::Aggregate(includes) => {
                     for _ in includes {
-                        self.aggregate_node(&child, names, aggregates_deep, state)?;
+                        self.aggregate_node(&child, names, reaggregation_depth, state)?;
                     }
                 }
             }
-            self.walk_reaggregate(&child, &next, names, aggregates_deep, state)?;
+            self.walk_reaggregate(&child, &next, names, reaggregation_depth, state)?;
         }
         Ok(())
     }
