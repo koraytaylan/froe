@@ -18,9 +18,15 @@ touches:
   - crates/froe/src/writer/fault_injection/test_support.rs
   - crates/froe/tests/lucene_reindex_tests.rs
   - crates/froe/tests/lucene_reindex_guard_tests.rs
+  - crates/froe/src/writer/fault_injection/lucene_fixture.rs
+  - crates/froe/src/writer/index/apply/verification.rs
+  - crates/froe/src/writer/index/apply/tests.rs
+  - crates/froe/src/writer/index/property_collector.rs
+  - crates/froe/tests/support/reindex_fixtures.rs
+  - docs/index.md
   - docs/plans/0010-lucene-offline-reindex/ARCHITECTURE.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "281ef83"
 ---
 # Rebuild Lucene Indexes Offline
 
