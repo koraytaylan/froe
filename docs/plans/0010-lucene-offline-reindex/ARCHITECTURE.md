@@ -395,23 +395,58 @@ are re-keyed by each document's own stored `:path` and rendered back in one
 canonical order. The commit file's `counter` is excluded for the same kind
 of reason — it counts flushes and merges, not contents.
 
+**What the variant definition carries.** The branches the one Sling ships
+has none of, and which the first version of this phase did not reach
+either: `evaluatePathRestrictions`; an `ordered` property in the
+new-format place, over a long, a double, a date, a **string** and a
+**boolean**, so both doc-value kinds are written; a **multi-valued**
+string that is faceted, ordered and node-scope indexed at once; `facets`
+on a **long**, which Oak's own type test writes no facet field for;
+`nullCheckEnabled` and `notNullCheckEnabled` under a rule whose node type
+is not `nt:base`; `useInSuggest` and `useInSpellcheck`; a `boost` other
+than the default; a **relative** property definition and a relative
+**pattern**, which are the two shapes AEM's own definitions are written
+in; `indexNodeName`; `excludedPaths` inside the included subtree;
+`valueExcludedPrefixes`; `maxFieldLength`; `indexOriginalTerm` beside a
+word the delimiter filter splits; a `codec` naming `oakCodec` outright;
+an aggregate of five includes — a plain one, two `relativeNode` ones, a
+two-step `jcr:content/*`, and two carrying a `primaryType` that holds and
+one that does not — and a **second indexing rule** over the node type an
+aggregated child carries, with `excludeFromAggregation` on one property,
+a relative definition of its own, and an aggregate of its own, which is
+what re-aggregation is. The content carries a **binary with no
+`jcr:mimeType`**, so the gate Oak's extraction stops at is compared
+rather than excluded.
+
 **Observed, 2026-09-15.** Both definitions identical:
-`/oak:index/interopLucene`, 12 documents and 1,031 enumerated lines, no
-exclusion; `/oak:index/lucene`, 8,321 documents and 106,969 enumerated
+`/oak:index/interopLucene`, 24 documents and 1,988 enumerated lines, no
+exclusion; `/oak:index/lucene`, 8,335 documents and 107,180 enumerated
 lines, identical outside 2,843 declared binary exclusions. Lucene's own
-`CheckIndex` clean over each froe rebuild. Each definition node identical
-to Oak's beside its index, excluding `:data`, the `:status` timestamps and
+`CheckIndex` clean over each froe rebuild, and `froe index check` clean
+over the store it wrote them into. Each definition node identical
+to Oak's beside its index, excluding `:data`, `:suggest-data`, the
+`:status` timestamps and
 `uid` and the `:index-definition` clone's `reindexCount` — so the `facets`
 configuration, the `seed`, the removed `refresh`, the `:version` and
 `:status`'s indexed-node count are all Oak's own values. The content digest
-changed only inside `/oak:index` (16 lines over 52,550 nodes) and `froe
+changed only inside `/oak:index` and `froe
 check` passed at the new head. A booted Oak logged no repair, no reindex
-and no index failure, and answered eight statements — node-scope and
+and no index failure, and answered ten statements — node-scope and
 property fulltext, `ORDER BY` over an ordered doc value, `IS NULL`, a facet
-column, an `ISDESCENDANTNODE` that reaches `:ancestors`, a path-restricted
-property term, and one against the repository-wide definition — with the
+column, a multi-valued facet column, an `ISDESCENDANTNODE` that reaches
+`:ancestors`, a path-restricted
+property term, a `CONTAINS` over a relative definition's own field, and one
+against the repository-wide definition — with the
 same rows and the same `EXPLAIN` plan it answers from its own rebuild, each
 plan naming the index the statement was written for.
+
+**The suggester is handed back, and that is checked.** froe removes
+`:suggest-data` and builds no dictionary. Oak's rebuild of a definition
+carrying `useInSuggest` writes one, so the definition comparison declares
+that node on both sides rather than excluding it quietly; the booted Oak
+then gets one node written under the definition and is waited for through
+a query until its lane has run a cycle, the store is extracted from that
+boot, and `:suggest-data` is back.
 
 **The declared difference.** froe extracts no text, so under
 `--binary-text marker` it indexes Oak's own `TextExtractionError` where Oak
@@ -442,11 +477,39 @@ enumeration rather than of the analyzer because the analyzer is compiled
 into the binary under test; the defect itself is neutralized against the
 analysis module's own hand-computed vectors.
 
-**What it found.** Four defects, recorded in the plan's status: the
-template property order `RecordWriter::write_node` now enforces, the
-counter refusal that order defect's symptom had justified,
+**What it found.** Four defects on its first run, recorded in the plan's
+status: the template property order `RecordWriter::write_node` now
+enforces, the counter refusal that order defect's symptom had justified,
 `skipTokenization` for a regular-expression definition, and the facet
 configuration's arity rule.
+
+**And seven more when the definition above was written**, each of them a
+shape the fixture had never carried — six of the document model and one of
+the writer, every one proved by Oak's own rebuild of the same store and
+fixed with a test that fails when the fix is neutralized:
+
+1. a `boost` on an analyzed property set a boost on `full:<name>`, which
+   omits norms, so froe's own writer **refused the run** — for the shape
+   nearly every AEM definition is written in;
+2. **relative property definitions were never indexed**: they reach
+   nothing through `getConfig`, and Oak's property includes of the
+   aggregate walk are their only path into a document;
+3. a relative **pattern** indexed hidden names, where Oak indexes none;
+4. `facets` on a non-string property wrote facet fields Oak does not;
+5. a `relativeNode` include wrote `fullnode:<path>` **instead of**
+   `:fulltext` rather than beside it;
+6. `excludeFromAggregation` was read from the document's own rule instead
+   of the rule covering the aggregated node, and **re-aggregation was
+   missing entirely** — an aggregated node whose rule declares an
+   aggregate contributes that aggregate's nodes too;
+7. the writer kept the **first** doc value of a field group, so a
+   multi-valued facet lost every label but one; Lucene unions a sorted
+   set and refuses a second of any other kind.
+
+An eighth was found beside them without the oracle, and proved with it: a
+definition naming `codec = oakCodec` outright — which `Codec.forName`
+resolves to the composition froe writes — was refused as though it named
+something else.
 
 #### Verification report
 

@@ -533,6 +533,55 @@ fn every_term(made: &MadeDocument, field: &str) -> Vec<String> {
         .collect()
 }
 
+/// §3.5: a sorted doc value is cut at 32,766 **bytes**, and never inside a
+/// character.
+///
+/// `getTruncatedBytesRef` walks back off a continuation byte and then off
+/// the lead byte it belongs to, so a cut that lands inside a character
+/// keeps one character less than the limit would allow. Measured against
+/// the pinned image, whose own method this reproduces.
+#[test]
+fn a_long_sorted_doc_value_is_cut_at_a_character_boundary() {
+    let definition = definition_with(vec![
+        ("text", analyzed("jcr:title")),
+        (
+            "long",
+            Node::new()
+                .string("name", "longValue")
+                .boolean("propertyIndex", true)
+                .boolean("ordered", true),
+        ),
+    ]);
+    // 32,760 one-byte characters and five two-byte ones: 32,770 bytes, so
+    // the cut at 32,765 lands on the second byte of the third `é`.
+    let mut value = "a".repeat(32_760);
+    value.push_str(&"é".repeat(5));
+    let subject = unstructured()
+        .string("jcr:title", "title")
+        .string("longValue", &value);
+    let (_directory, made) = make("truncation", &definition, &subject, marker_policy());
+    let made = made.expect("the node yields a document");
+    let doc_value = made
+        .document
+        .fields
+        .iter()
+        .find(|field| field.name == ":dvlongValue")
+        .and_then(|field| field.doc_value.as_ref())
+        .expect("the ordered doc value");
+    let DocValue::Sorted(bytes) = doc_value else {
+        panic!("a string ordered property is a sorted doc value: {doc_value:?}");
+    };
+    assert_eq!(
+        bytes.len(),
+        32_764,
+        "the two whole characters before the cut are kept and the split one is not"
+    );
+    assert_eq!(
+        std::str::from_utf8(bytes).expect("the bytes are a whole string"),
+        format!("{}{}", "a".repeat(32_760), "é".repeat(2))
+    );
+}
+
 /// §3.5: the doc value's type is the **rule's** declared type, not the
 /// property's.
 #[test]

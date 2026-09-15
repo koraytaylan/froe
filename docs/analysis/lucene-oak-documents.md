@@ -540,7 +540,25 @@ Four rules around them:
   being single-valued.
 * **A duplicate is dropped, not overwritten**: `if (doc.getField(f.name()) == null)`.
 * **A `STRING` doc value is truncated** at `STRING_PROPERTY_MAX_LENGTH`
-  (32,766 bytes) before it becomes a `BytesRef`. A `propertyIndex` string
+  (32,766 **bytes**) before it becomes a `BytesRef`, and never inside a
+  character — `LuceneDocumentMaker.getTruncatedBytesRef`:
+
+  ```java
+  BytesRef ref = new BytesRef(value);
+  if (ref.length <= maxLength) return ref;
+  int i = maxLength - 1;
+  while ((ref.bytes[i] & 0xC0) == 0x80) i--;   // off a continuation byte
+  if    ((ref.bytes[i] & 0xC0) == 0xC0) i--;   // and off its lead byte
+  byte[] copy = Arrays.copyOf(ref.bytes, i + 1);
+  ```
+
+  The second step runs whether or not the character it belongs to would
+  have fitted, so a cut that lands inside one keeps a character less than
+  the limit allows. Measured against the pinned image with `abcdefg`
+  followed by three `é` — thirteen bytes — a limit of 8 keeps 7 bytes, a
+  limit of **9** keeps 7 as well, and a limit of 10 keeps 9.
+
+  A `propertyIndex` string
   is **not** truncated: it becomes an unanalyzed term of whatever length,
   and Lucene's own inversion then skips a term above its maximum length
   while keeping the document.
