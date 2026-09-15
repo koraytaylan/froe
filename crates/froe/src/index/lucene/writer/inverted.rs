@@ -377,8 +377,8 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
             if let Some(norm) = self.invert_group(index, group, this_document)? {
                 norms.insert(index, norm);
             }
-            if let Some(value) = group.iter().find_map(|field| field.doc_value.as_ref()) {
-                values.insert(index, value.clone());
+            if let Some(value) = document_doc_value(name, group)? {
+                values.insert(index, value);
             }
         }
 
@@ -643,6 +643,46 @@ impl<Directory: SegmentDirectory> LuceneIndexWriter<Directory> {
         }
         Ok(())
     }
+}
+
+/// The one doc value a document's fields of one name carry between them.
+///
+/// Lucene's own `DocValuesProcessor.addField` keeps **one** value per
+/// document for a numeric, binary or sorted field and refuses a second —
+/// `"appears more than once in this document"` — while a
+/// `SortedSetDocValuesField` is a *set*, so every field of that name
+/// contributes and the union is the document's value. Oak's facet build
+/// pass writes one such field per facet value, so taking the first here
+/// dropped every value of a multi-valued dimension but one.
+fn document_doc_value(name: &str, group: &[&Field]) -> Result<Option<DocValue>> {
+    let mut carried = group.iter().filter_map(|field| field.doc_value.as_ref());
+    let Some(first) = carried.next() else {
+        return Ok(None);
+    };
+    let DocValue::SortedSet(entries) = first else {
+        if carried.next().is_some() {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "the field {name} carries more than one {:?} doc value in one document,                      and only a sorted set holds more than one",
+                    first.kind()
+                ),
+            });
+        }
+        return Ok(Some(first.clone()));
+    };
+    let mut union = entries.clone();
+    for value in carried {
+        let DocValue::SortedSet(entries) = value else {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "the field {name} carries both sorted-set and {:?} doc values in one                      document",
+                    value.kind()
+                ),
+            });
+        };
+        union.extend(entries.iter().cloned());
+    }
+    Ok(Some(DocValue::SortedSet(union)))
 }
 
 #[cfg(test)]
