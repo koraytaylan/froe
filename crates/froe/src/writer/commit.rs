@@ -250,10 +250,16 @@ pub(crate) fn rewrite_node_with_edits<Sink: SegmentSink>(
             values: replacement.values.clone(),
         });
     }
-    // Sorted, so a rewrite that replaces a property leaves the node's slots
-    // in the order the writer's template deduplication expects rather than
-    // in the order the edits happened to arrive.
-    properties.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    // Into the **template order**, which is Java's string hash then the
+    // name in UTF-16 order — not the name's UTF-8 bytes, which is what
+    // this used to sort by. Oak's own `getProperties` pairs the *i*-th
+    // sorted property template with the *i*-th value slot, so a node whose
+    // on-disk name order is anything else reads back with every value
+    // against the wrong name. `write_node` enforces it now as well; the
+    // sort stays here because the order is part of what this function
+    // produces, and because leaving it to the enforcement would hide the
+    // requirement from the next reader of this code.
+    crate::writer::record_writer::sort_properties_for_template(&mut properties);
 
     let children = resulting_children(provider, parts.children, &edits.child_edits)?;
     writer.write_node(

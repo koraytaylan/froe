@@ -93,9 +93,23 @@ pub(crate) fn write_tree(
         .iter()
         .map(|(name, child)| (name.clone(), write_tree(writer, child)))
         .collect();
+    // `jcr:primaryType` goes into the **template's** primary type, not
+    // into the property list: that is where Oak's own writer puts it, and
+    // a fixture that stored it as an ordinary property would order the
+    // node's properties differently from any store Oak wrote — the
+    // document maker walks them in the order the node state yields them,
+    // so the order is part of what these tests assert.
+    let primary_type: Option<String> = node
+        .properties
+        .iter()
+        .find(|(name, property_type, _, multi_valued)| {
+            name == "jcr:primaryType" && *property_type == PropertyType::Name && !multi_valued
+        })
+        .map(|(_, _, values, _)| values[0].clone());
     let properties: Vec<PropertyToWrite> = node
         .properties
         .iter()
+        .filter(|(name, _, _, _)| primary_type.is_none() || name != "jcr:primaryType")
         .map(|(name, property_type, values, multi_valued)| {
             let identifiers: Vec<RecordIdentifier> = values
                 .iter()
@@ -121,7 +135,7 @@ pub(crate) fn write_tree(
         _ => ChildNodesToWrite::Many(children),
     };
     writer
-        .write_node(None, &[], &child_nodes, &properties)
+        .write_node(primary_type.as_deref(), &[], &child_nodes, &properties)
         .expect("write a node")
 }
 

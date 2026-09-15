@@ -191,6 +191,22 @@ byte per property — the JCR type tag 1–12, negative for multi-valued.
 `jcr:primaryType` and `jcr:mixinTypes` live here, not in the property
 list.
 
+**The property order is load-bearing, and it is not the name's byte
+order.** `Template`'s constructor sorts its `PropertyTemplate`s by the
+Java string hash of the name, then by the name in UTF-16 order, then by
+the type tag — and `SegmentNodeState.getProperties()` then pairs the
+*i*-th of those **sorted** templates with the *i*-th entry of the node's
+value list. The two agree only when the stored name order already is that
+sort order, which Oak's own writer always produces. A node written with
+the names in any other order still answers `getProperty(name)` correctly,
+because that path resolves through the template's own index — but
+iterating its properties hands every value to the wrong name: a `STRING`
+where Oak expects a `LONG`, a single value decoded as a list of twenty
+million elements. froe's own reader pairs stored position with stored
+position and so cannot see the difference, which is why
+`RecordWriter::write_node` sorts into this order itself rather than
+trusting its callers.
+
 ### Nodes
 
 A sequence of record identifiers: stable identifier, template, then —

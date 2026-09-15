@@ -153,12 +153,27 @@ pub(crate) fn stable_identifier_names(
 /// of the name, then by name in UTF-16 order, then by type tag — the
 /// order `Template`'s constructor establishes in Java.
 pub fn sort_properties_for_template(properties: &mut [PropertyToWrite]) {
-    properties.sort_by(|first, second| {
-        crate::hashing::utf16_string_hash(&first.name)
-            .cmp(&crate::hashing::utf16_string_hash(&second.name))
-            .then_with(|| compare_utf16_strings(&first.name, &second.name))
-            .then_with(|| (first.property_type as u8).cmp(&(second.property_type as u8)))
-    });
+    properties.sort_by(template_order);
+}
+
+/// The comparator [`sort_properties_for_template`] sorts by, and the one
+/// [`RecordWriter::write_node`] checks against before it sorts a copy.
+fn template_order(first: &PropertyToWrite, second: &PropertyToWrite) -> std::cmp::Ordering {
+    crate::hashing::utf16_string_hash(&first.name)
+        .cmp(&crate::hashing::utf16_string_hash(&second.name))
+        .then_with(|| compare_utf16_strings(&first.name, &second.name))
+        .then_with(|| (first.property_type as u8).cmp(&(second.property_type as u8)))
+}
+
+/// Whether a property list is already in that order.
+///
+/// Checked rather than assumed, and checked rather than always sorting a
+/// copy: compaction writes every node in the store through this path and
+/// already hands it a sorted list, so the common case must not allocate.
+fn in_template_order(properties: &[PropertyToWrite]) -> bool {
+    properties
+        .windows(2)
+        .all(|pair| template_order(&pair[0], &pair[1]) != std::cmp::Ordering::Greater)
 }
 
 impl<Sink: SegmentSink> RecordWriter<Sink> {
@@ -322,6 +337,30 @@ impl<Sink: SegmentSink> RecordWriter<Sink> {
         properties: &[PropertyToWrite],
         stable_identifier: Option<[u8; 20]>,
     ) -> Result<RecordIdentifier> {
+        // **Sorted here, not by the caller.** Oak's own `getProperties`
+        // pairs `template.getPropertyTemplates()[i]` — the array its
+        // `Template` constructor sorted — with `properties.getEntry(i)`,
+        // the value list's *i*-th slot. So the two agree only when the
+        // on-disk name order already is that sort order, and a node
+        // written with the names in any other order reads back with every
+        // value against the wrong name: a `STRING` where Oak expects a
+        // `LONG`, a single value read as a list of twenty million
+        // elements. froe's own reader pairs on-disk position with on-disk
+        // position and so cannot see it, which is why this is enforced at
+        // the one place every node goes through rather than left to each
+        // caller. The interop suite is what found it, in a definition
+        // `rewrite_node_with_edits` had sorted by UTF-8 name bytes.
+        let sorted;
+        let properties = if in_template_order(properties) {
+            properties
+        } else {
+            sorted = {
+                let mut copy = properties.to_vec();
+                sort_properties_for_template(&mut copy);
+                copy
+            };
+            &sorted
+        };
         let template_identifier =
             self.write_template(primary_type, mixin_types, child_nodes, properties)?;
 
@@ -570,6 +609,74 @@ mod tests {
             single_tags.values,
             PropertyValues::Single(PropertyValue::String("solo".to_owned()))
         );
+    }
+
+    /// A node written with its properties out of template order is stored
+    /// **in** template order, names and values together.
+    ///
+    /// Oak's own `getProperties` pairs the *i*-th of the property
+    /// templates its `Template` constructor sorted with the *i*-th value
+    /// slot, so the two agree only when the on-disk name order already is
+    /// that sort order. froe's own reader pairs on-disk position with
+    /// on-disk position and cannot see a mismatch, so the assertion is on
+    /// the **template record's name order** — which is what Oak sorts —
+    /// beside the values read back by name.
+    #[test]
+    fn a_node_written_out_of_order_is_stored_in_template_order() {
+        use crate::content::property::PropertyType;
+
+        let mut writer = new_writer();
+        // `title` hashes above `active` (negative) and above `count`, so
+        // the UTF-8 name order this list is in — active, count, title — is
+        // also the template order; `zz` and `Aa` are what make them differ.
+        let mut properties = Vec::new();
+        for (name, text) in [
+            ("zz", "last by name"),
+            ("Aa", "collides with BB"),
+            ("active", "true"),
+        ] {
+            let identifier = writer.write_string(text).expect("write a value");
+            properties.push(PropertyToWrite {
+                name: name.to_owned(),
+                property_type: PropertyType::String,
+                values: PropertyValuesToWrite::Single(identifier),
+            });
+        }
+        let node = writer
+            .write_node(
+                Some("nt:unstructured"),
+                &[],
+                &ChildNodesToWrite::Zero,
+                &properties,
+            )
+            .expect("write the node");
+        let store = writer.finish().expect("finish");
+
+        let state = NodeState::new(&store, node);
+        let template = state.template().expect("read the template");
+        // `active` hashes negative, `Aa` is 2112, `zz` is 3904.
+        assert_eq!(
+            template
+                .properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "Aa", "zz"],
+            "the stored name order is the order Oak's own Template sorts into"
+        );
+        // And each name still resolves to its own value, which is the
+        // claim the order exists to protect.
+        for (name, text) in [
+            ("zz", "last by name"),
+            ("Aa", "collides with BB"),
+            ("active", "true"),
+        ] {
+            assert_eq!(
+                state.property(name).expect("read").expect("present").values,
+                PropertyValues::Single(PropertyValue::String(text.to_owned())),
+                "{name} resolves to its own value"
+            );
+        }
     }
 
     #[test]

@@ -130,8 +130,18 @@ fn rewrite_one_definition<Sink: SegmentSink>(
     reset: &BookkeepingReset<'_>,
     edit: DefinitionEdit,
 ) -> RecordIdentifier {
+    // The **stored** properties and the template's own primary type, never
+    // `properties()` — which synthesizes `jcr:primaryType` from the
+    // template. Writing that synthesized entry back as an ordinary
+    // property would give the definition a shape no store Oak wrote has,
+    // and the oracle would then be comparing froe's rebuild against a
+    // fixture froe had already deformed.
+    let template = node.template().expect("read the definition's template");
     let mut properties: Vec<PropertyToWrite> = Vec::new();
-    for property in node.properties().expect("read the definition's properties") {
+    for property in node
+        .stored_properties()
+        .expect("read the definition's properties")
+    {
         if property.name == "reindex" || property.name == "reindexCount" {
             continue;
         }
@@ -177,8 +187,8 @@ fn rewrite_one_definition<Sink: SegmentSink>(
 
     writer
         .write_node(
-            None,
-            &[],
+            template.primary_type.as_deref(),
+            &template.mixin_types,
             &match children.as_slice() {
                 [] => ChildNodesToWrite::Zero,
                 [(name, record)] => ChildNodesToWrite::One {
