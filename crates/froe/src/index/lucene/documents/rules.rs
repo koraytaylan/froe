@@ -264,6 +264,17 @@ impl PropertyDefinition {
 pub struct IndexingRules {
     /// The rules, in the order `indexRules` yields its children.
     pub rules: Vec<IndexingRule>,
+    /// Every `aggregates/<type>` child, as its own map keyed by the type
+    /// it is declared under.
+    ///
+    /// A rule carries the one its own node type names, which is what
+    /// selects `oakCodec` and what the walk starts from. This list is the
+    /// **re-aggregation's** lookup, and it is a different question: Oak's
+    /// `IndexDefinition.getAggregate(String)` is a plain map lookup, so an
+    /// aggregate declared for a type no `indexRules` child covers is
+    /// entered all the same, and a node covered by a rule through *type
+    /// inheritance* does not inherit that rule's aggregate.
+    pub aggregates: Vec<Aggregate>,
     /// `codec`'s verdict.
     pub codec: CodecVerdict,
     /// `analyzers/@indexOriginalTerm`.
@@ -708,6 +719,7 @@ impl IndexingRules {
         };
         let rules = Self {
             rules,
+            aggregates,
             codec,
             index_original_term,
             suggest_analyzed,
@@ -727,6 +739,49 @@ impl IndexingRules {
     /// `getApplicableIndexingRule`: the **primary type first**, then the
     /// mixins in order, and within each the first rule registered under
     /// that name.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the node-type reads.
+    /// The aggregate a **matched** node's own type declares, which is
+    /// `Aggregate.NodeInclude.getAggregate`:
+    ///
+    /// ```java
+    /// Aggregate agg = aggMapper.getAggregate(ConfigUtil.getPrimaryTypeName(state));
+    /// if (agg == null) {
+    ///     for (String mixin : ConfigUtil.getMixinNames(state)) {
+    ///         agg = aggMapper.getAggregate(mixin);
+    ///         if (agg != null) break;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// with `aggMapper` the definition's own `aggregates` map. The lookup
+    /// is by **name, exactly** — no rule, and no type inheritance.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the node-type reads.
+    pub fn aggregate_of(&self, node: &NodeState<'_>) -> IndexResult<Option<&Aggregate>> {
+        let primary = strict_name(node.property("jcr:primaryType")?.as_ref()).map(str::to_owned);
+        let mixins = strict_names(node.property("jcr:mixinTypes")?.as_ref()).unwrap_or_default();
+        for name in primary.into_iter().chain(mixins) {
+            if let Some(aggregate) = self
+                .aggregates
+                .iter()
+                .find(|aggregate| aggregate.node_type_name == name)
+            {
+                return Ok(Some(aggregate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The rule that applies to a node, which is Oak's
+    /// `getApplicableIndexingRule`: the **primary type first**, then the
+    /// mixins in order, and within each the first rule registered under
+    /// that name — a rule's own registration covering its subtypes when
+    /// it is `inherited`.
     ///
     /// # Errors
     ///

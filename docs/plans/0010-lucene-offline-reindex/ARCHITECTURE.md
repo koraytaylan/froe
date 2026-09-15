@@ -527,6 +527,13 @@ that the freeze inherits them rather than discovers them:
 * **Binary text is not extracted.** See the scope section: the index answers
   fulltext queries over binaries differently from Oak's unless Oak's own
   pre-extracted text store is complete and is given to the run.
+* **`--pre-extracted-text-directory` is proved by unit tests alone.** The
+  store is keyed by a blob's external content identity, and the interop
+  fixture's Sling runs with no external `DataStore` — every binary in it is
+  a segment blob, which has none — so the branch that reads Oak's own
+  extracted text cannot be reached with the oracle. What *is* proved
+  against Oak is the gate in front of it: a binary on a node with no
+  `jcr:mimeType` is indexed by neither side, and the fixture carries one.
 
 #### Review
 

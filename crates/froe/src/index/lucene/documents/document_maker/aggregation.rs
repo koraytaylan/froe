@@ -182,7 +182,7 @@ impl DocumentMaker<'_> {
                 }
             }
         }
-        self.reaggregate(node, covering, into, state)
+        self.reaggregate(node, into, state)
     }
 
     /// The **re-aggregation**: an aggregated node whose own rule declares
@@ -198,24 +198,26 @@ impl DocumentMaker<'_> {
     /// if (nextAgg != null && aggregateStack.size() < rootState.rootAggregate.reAggregationLimit)
     /// ```
     ///
-    /// Oak's rebuild of the interop fixture pins the rest: a `meta` child
-    /// of type `sling:Folder` whose rule declares `include0 = inner` puts
-    /// that grandchild's values in the page's `:fulltext` **and** in the
-    /// `fullnode:meta` of the relative include that reached `meta`.
+    /// The aggregate entered is the **matched node's own type's**, from
+    /// the definition's `aggregates` map rather than through any rule —
+    /// see [`IndexingRules::aggregate_of`]. Oak's rebuild of the interop
+    /// fixture pins the rest: a `meta` child
+    /// of type `sling:Folder` whose own type declares `include0 = inner`
+    /// puts that grandchild's values in the page's `:fulltext` **and** in
+    /// the `fullnode:meta` of the relative include that reached `meta`.
     fn reaggregate(
         &self,
         node: &NodeState<'_>,
-        covering: Option<&IndexingRule>,
         into: AggregatedInto<'_>,
         state: &mut DocumentState,
     ) -> IndexResult<()> {
-        let Some(rule) = covering else {
+        let Some(aggregate) = self.rules.aggregate_of(node)? else {
             return Ok(());
         };
-        if !rule.aggregate.has_node_aggregates() || into.depth >= into.limit {
+        if !aggregate.has_node_aggregates() || into.depth >= into.limit {
             return Ok(());
         }
-        self.walk_reaggregate(node, &rule.aggregate.matcher(), into.deeper(), state)
+        self.walk_reaggregate(node, &aggregate.matcher(), into.deeper(), state)
     }
 
     /// One level of a re-aggregation's own walk, which carries the field

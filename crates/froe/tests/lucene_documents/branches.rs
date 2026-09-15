@@ -483,6 +483,81 @@ fn a_reaggregated_grandchild_reaches_the_same_fields() {
     );
 }
 
+/// §4.1.2: the aggregate a re-aggregation enters is the **matched node's
+/// own type's**, looked up in the definition's `aggregates` map — so one
+/// declared for a type no `indexRules` child covers is entered all the
+/// same.
+#[test]
+fn a_reaggregated_type_needs_no_indexing_rule_of_its_own() {
+    let definition = definition_over("nt:unstructured", vec![("title", analyzed("jcr:title"))])
+        .child(
+            "aggregates",
+            Node::new()
+                .child(
+                    "nt:unstructured",
+                    Node::new().child("include0", Node::new().string("path", "extra")),
+                )
+                .child(
+                    "oak:Unstructured",
+                    Node::new().child("include0", Node::new().string("path", "leaf")),
+                ),
+        );
+    let subject = unstructured().child(
+        "extra",
+        Node::new()
+            .single("jcr:primaryType", PropertyType::Name, "oak:Unstructured")
+            .string("jcr:title", "extracorn")
+            .child(
+                "leaf",
+                Node::new()
+                    .single("jcr:primaryType", PropertyType::Name, "oak:Unstructured")
+                    .string("jcr:title", "leafcorn"),
+            ),
+    );
+    let (_directory, made) = make("aggregate-no-rule", &definition, &subject, marker_policy());
+    let made = made.expect("the node yields a document");
+    let terms = every_term(&made, ":fulltext");
+    assert!(terms.contains(&"extracorn".to_owned()), "{terms:?}");
+    assert!(
+        terms.contains(&"leafcorn".to_owned()),
+        "the aggregate declared for `oak:Unstructured`, which no rule covers, is entered: \
+         {terms:?}"
+    );
+}
+
+/// And the lookup is by **name, exactly**: a node covered by a rule
+/// through type inheritance does not inherit that rule's aggregate.
+#[test]
+fn a_rule_matched_by_inheritance_does_not_lend_its_aggregate() {
+    let definition = definition_with(vec![("title", analyzed("jcr:title"))]).child(
+        "aggregates",
+        Node::new().child(
+            "nt:base",
+            Node::new().child("include0", Node::new().string("path", "inner")),
+        ),
+    );
+    let subject = unstructured().child(
+        "inner",
+        unstructured()
+            .string("jcr:title", "innercorn")
+            .child("inner", unstructured().string("jcr:title", "deepcorn")),
+    );
+    let (_directory, made) = make(
+        "aggregate-inherited",
+        &definition,
+        &subject,
+        marker_policy(),
+    );
+    let made = made.expect("the node yields a document");
+    let terms = every_term(&made, ":fulltext");
+    assert!(terms.contains(&"innercorn".to_owned()), "{terms:?}");
+    assert!(
+        !terms.contains(&"deepcorn".to_owned()),
+        "the matched node's own type is `nt:unstructured`, which the aggregates map does not \
+         carry, so nothing is re-aggregated: {terms:?}"
+    );
+}
+
 /// A definition whose second rule covers the node the first rule's
 /// aggregate reaches.
 fn two_rule_definition() -> Node {

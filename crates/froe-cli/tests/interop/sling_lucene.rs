@@ -50,12 +50,23 @@ pub(crate) const VARIANT_SHARED_TAG: &str = "sharedtag";
 /// nothing else does.
 pub(crate) const VARIANT_RELATIVE_CHILD: &str = "meta";
 
+/// The page child whose type no indexing rule covers.
+pub(crate) const VARIANT_UNRULED_CHILD: &str = "extra";
+
 /// The subtree `excludedPaths` names, inside the included one.
 pub(crate) const VARIANT_EXCLUDED_SUBTREE: &str = "/content/interop/variant/pages/excluded";
 
 /// The prefix `valueExcludedPrefixes` refuses on the faceted category, so
 /// half the items contribute no category field of any kind.
 pub(crate) const VARIANT_EXCLUDED_CATEGORY: &str = "beta";
+
+/// The node type of the page child whose **own type** declares an
+/// aggregate and which no indexing rule covers.
+///
+/// `oak:Unstructured` extends `nt:base` rather than `nt:unstructured`, so
+/// neither of the definition's two rules registers under it, and it
+/// carries residual properties so a title can be set on it.
+pub(crate) const VARIANT_UNRULED_NODE_TYPE: &str = "oak:Unstructured";
 
 /// The node type of the page child the second `relativeNode` include
 /// names, and of the second indexing rule.
@@ -222,6 +233,26 @@ fn populate_variant_pages(port: u16) {
             &[
                 ("jcr:primaryType", LUCENE_VARIANT_NODE_TYPE),
                 ("jcr:title", "Innercorn Inner"),
+            ],
+        );
+        // A child whose own type declares an aggregate and which **no
+        // indexing rule covers**: Oak looks a re-aggregation up in the
+        // definition's `aggregates` map by the matched node's own type,
+        // so the grandchild below reaches the page all the same.
+        sling_post_fields(
+            port,
+            &format!("{path}/{VARIANT_UNRULED_CHILD}"),
+            &[
+                ("jcr:primaryType", VARIANT_UNRULED_NODE_TYPE),
+                ("jcr:title", "Extracorn Extra"),
+            ],
+        );
+        sling_post_fields(
+            port,
+            &format!("{path}/{VARIANT_UNRULED_CHILD}/leaf"),
+            &[
+                ("jcr:primaryType", VARIANT_UNRULED_NODE_TYPE),
+                ("jcr:title", "Leafcorn Leaf"),
             ],
         );
         // A child of the aggregated node, so that node carries a
@@ -425,6 +456,26 @@ pub(crate) fn populate_lucene_variant_definition(port: u16) {
             ("path", "jcr:content"),
             ("primaryType", "nt:file"),
         ],
+    );
+    // A plain include over the child whose type no rule covers, and that
+    // type's own aggregate beside it.
+    sling_post_fields(
+        port,
+        &format!("{root}/aggregates/{LUCENE_VARIANT_NODE_TYPE}/include6"),
+        &[
+            ("jcr:primaryType", "nt:unstructured"),
+            ("path", VARIANT_UNRULED_CHILD),
+        ],
+    );
+    sling_post_fields(
+        port,
+        &format!("{root}/aggregates/{VARIANT_UNRULED_NODE_TYPE}"),
+        &[("jcr:primaryType", "nt:unstructured")],
+    );
+    sling_post_fields(
+        port,
+        &format!("{root}/aggregates/{VARIANT_UNRULED_NODE_TYPE}/include0"),
+        &[("jcr:primaryType", "nt:unstructured"), ("path", "leaf")],
     );
     // The aggregate of the **aggregated** node's own type. Whether its
     // include reaches the page is whether Oak re-aggregates.
