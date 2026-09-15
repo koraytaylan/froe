@@ -659,6 +659,35 @@ the document model changed under `9b1e451`, `29d2a88`, `fc23055`,
 `729b715`, `8f5dfa9`, `220e7f8` and `de39236` after the earlier block was
 written.
 
+**Addendum — what the CI matrix found after this range was frozen.** The
+local gate is Linux, and the freeze above records it honestly; four
+defects survived it and were caught by the matrix on the release
+candidate, each fixed before `v0.12.0` was tagged.
+
+* **A norm whose value the hardware decided.** `boost 0, length 0` is
+  `0 * inf`, and `floatToRawIntBits` does not canonicalize the NaN, so
+  the quantized byte is `0` on `x86-64` and `0xff` on `AArch64` — Java
+  included. froe pins the `x86-64` answer, the one its vectors and its
+  oracle were produced on, because an index whose bytes depend on the
+  machine that wrote it is not a format. Caught by `macos-latest`.
+* **Two Lucene tests, and the production seam one of them uses, were
+  unbuildable on Windows** — they reach into the fault-injection harness,
+  which forks. `cfg(test)` code is part of a target's compilation
+  surface, which is exactly what the guide says and what the local gate
+  cannot show. Caught by `windows-build`.
+* **Three test harnesses shared a temporary path with a concurrent
+  sibling**, in this suite and in two others, so a case that expects a
+  missing file found the enormous one its neighbour had just written.
+  Caught by `macos-latest` and by two overlapping local gate runs.
+* **The interop suite's sampled query plan was judged on a coin toss.**
+  `ApproximateCounter` records on two random gates, so either rebuild is
+  sometimes left unpriced; the assertion accepted that from Oak's side
+  only and failed on froe's, over a store whose counters were there. It
+  is symmetric now, with a draw-proof assertion that the counters exist
+  at all.
+
+The matrix and the interop suite are green on the tagged commit.
+
 #### Known gaps
 
 Three were known before the freeze and are kept; the rest are what the
