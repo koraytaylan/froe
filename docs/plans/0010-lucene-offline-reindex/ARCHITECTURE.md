@@ -543,6 +543,15 @@ them the fixture *could* reach once the bytecode said what to look for:
     per-property fulltext loop instead. A `propertyIndex` property of a
     type outside a restricted rule's list lost its typed field.
 
+**The chain around it.** `generate` through `recover` ran to the
+completion sentinel twice on 2026-09-15, and every phase was also run on
+its own against the final fixture: `read`, `judge_smoke`,
+`index_inventory`, `property_reindex`, `lucene_dump`, `lucene_import`,
+`lucene_writer_conformance`, `lucene_reindex`, `commit`, `checkpoint`,
+`compact`, `compact_tail`, `checkpoint_removal`, `cleanup`,
+`journal_retention`, `compact_convergence`, `version_history_purge`,
+`repair`, `backup`, `recover`.
+
 #### Verification report
 
 *To be filled by task 1010, which freezes the range.*
