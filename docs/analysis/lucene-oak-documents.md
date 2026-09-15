@@ -490,8 +490,15 @@ protected boolean includePropertyValue(String value, PropertyDefinition pd) {
 The **property form** stands in front of the `:dv` field and inside the
 typed fields' per-value loop; the **bare form** stands inside the
 per-property pass's per-value loop. They agree there — a binary never
-reaches that loop, and a match-all pattern implies a match — so a value the
-pattern excludes contributes no field of any kind.
+reaches that loop, and a match-all pattern implies a match.
+
+**The facet branch is not gated by either.** `indexFacets` is called after
+the loop, on the property rather than per value, and reads nothing of the
+value pattern. Oak's own rebuild of the interop fixture pins it: a
+`valueExcludedPrefixes` of `beta` on a faceted `variantCategory` leaves the
+typed field with the `alpha` values alone and still writes
+`variantCategory_facet` — the drill-down terms and the sorted-set ordinal
+— for every `beta` value.
 
 The pattern is `valuePattern`, `valueIncludedPrefixes` and
 `valueExcludedPrefixes`; the prefix forms are the ones plan 0006 already

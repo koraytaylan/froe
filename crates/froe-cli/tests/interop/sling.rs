@@ -45,27 +45,26 @@ fn post_or_refuse(port: u16, path: &str, fields: &[(&str, &str)]) {
             }
             return;
         }
-        // A *bare Jetty* error means Sling's servlet is not mapped for this
-        // request — the boot-time gap this suite has hit before, and which
-        // also reopens briefly when a bundle re-wires mid-run. It is not a
-        // rejection of what was posted: Sling's own errors carry Sling's
-        // body. Waiting is the right response to a servlet that is not
-        // there; failing on anything else is the right response to a
-        // repository that refused.
+        // An unmapped servlet means the boot-time gap this suite has hit
+        // before, and which also reopens briefly when a bundle re-wires
+        // mid-run. It is not a rejection of what was posted. Waiting is
+        // the right response to a servlet that is not there; failing on
+        // anything else is the right response to a repository that
+        // refused.
         assert!(
-            is_bare_jetty_error(&response),
+            is_servlet_gap(&response),
             "posting {path} returned HTTP {status}\nfields: {fields:?}\nresponse:\n{}",
             &response[..response.len().min(2000)]
         );
         eprintln!(
-            "  posting {path} hit a bare Jetty {status} (attempt {attempt} of \
+            "  posting {path} hit an unmapped-servlet {status} (attempt {attempt} of \
              {SERVLET_GAP_ATTEMPTS}); Sling's servlet is momentarily unmapped, waiting"
         );
         last = response;
         std::thread::sleep(SERVLET_GAP_WAIT);
     }
     panic!(
-        "posting {path} kept hitting a bare Jetty error through {SERVLET_GAP_ATTEMPTS} \
+        "posting {path} kept hitting an unmapped servlet through {SERVLET_GAP_ATTEMPTS} \
          attempts over {:?}; Sling's servlet never came back.\nfields: {fields:?}\n\
          response:\n{}",
         SERVLET_GAP_WAIT * SERVLET_GAP_ATTEMPTS,
@@ -103,14 +102,23 @@ fn post_once(port: u16, path: &str, fields: &[(&str, &str)]) -> (String, String)
     (status, response)
 }
 
-/// Whether the body is Jetty's own error page rather than Sling's.
+/// Whether the body says a servlet is not mapped yet rather than that the
+/// repository refused what was posted.
 ///
-/// Jetty answers for requests Sling's servlet is not mapped for. Its page
-/// carries the container's own markup and none of Sling's, which is what
-/// separates "the servlet is not there" from "the repository said no".
-fn is_bare_jetty_error(response: &str) -> bool {
+/// Two shapes say it, and only these two. **Jetty's own error page**, for a
+/// request nothing in Sling answers: it carries the container's markup and
+/// none of Sling's. And **the default POST servlet answering a path that is
+/// not its own** — the one a late-starting bundle leaves uncovered — which
+/// falls through to creating a node and fails with
+/// `UnsupportedOperationException: create '<name>' at <parent>`, because
+/// the parent is a synthetic resource no node can be added to. A
+/// `/system/userManager` post answered that way is the user-manager
+/// servlet not being up yet, which is a wait rather than a failure; a real
+/// rejection carries a repository exception instead.
+fn is_servlet_gap(response: &str) -> bool {
     response.contains("<title>Error 404 Not Found</title>")
         || (response.contains("HTTP ERROR") && !response.contains("Sling"))
+        || response.contains("java.lang.UnsupportedOperationException: create ")
 }
 
 /// Churn content: create subtrees, then delete them. Produces orphaned

@@ -38,7 +38,7 @@ pub(crate) struct QuerySample {
 }
 
 /// The statements, one per branch the variant definition was posted for.
-pub(crate) const QUERY_SAMPLES: [QuerySample; 8] = [
+pub(crate) const QUERY_SAMPLES: [QuerySample; 10] = [
     // Node-scope fulltext, which is `:fulltext` and — through the
     // aggregate — a page's `jcr:content` text on the page's own document.
     QuerySample {
@@ -95,6 +95,25 @@ pub(crate) const QUERY_SAMPLES: [QuerySample; 8] = [
         statement: "SELECT [rep:facet(variantCategory)] FROM [nt:unstructured] WHERE \
                     ISDESCENDANTNODE('/content/interop/variant') AND CONTAINS(*, 'vandrelith')",
         column: Some("rep:facet(variantCategory)"),
+        ordered: false,
+        index: "lucene:interopLucene",
+    },
+    // The relative property definition, whose field carries the relative
+    // path as its name and whose value lives on a child node.
+    QuerySample {
+        statement: "SELECT * FROM [nt:unstructured] WHERE \
+                    ISDESCENDANTNODE('/content/interop/variant') AND \
+                    CONTAINS([jcr:content/jcr:title], 'pagecontentcorn')",
+        column: None,
+        ordered: false,
+        index: "lucene:interopLucene",
+    },
+    // The multi-valued facet dimension, which is the one the persisted
+    // configuration records as `multivalued`.
+    QuerySample {
+        statement: "SELECT [rep:facet(variantTags)] FROM [nt:unstructured] WHERE \
+                    ISDESCENDANTNODE('/content/interop/variant') AND CONTAINS(*, 'vandrelith')",
+        column: Some("rep:facet(variantTags)"),
         ordered: false,
         index: "lucene:interopLucene",
     },

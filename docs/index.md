@@ -419,6 +419,17 @@ A `lucene` definition is rebuilt natively — froe makes the documents from
 the definition's own rules, analyzes them with Oak's own chain, writes one
 compound segment and copies it into `:data`. No oak-run, no JVM.
 
+"The definition's own rules" includes the two shapes AEM's own definitions
+are written in, and both reach a node's document from **outside** the node:
+a **relative** property definition such as `jcr:content/jcr:title`, whose
+value lives on a child and whose fields carry the relative path as their
+name; and an **aggregate**, whose matched nodes contribute their text to
+the aggregating node's `:fulltext` — and to `fullnode:<path>` beside it for
+a `relativeNode` include. An aggregated node whose own indexing rule
+declares an aggregate is followed in turn, as deep as `reaggregateLimit`
+allows, and its rule is also the one that decides what
+`excludeFromAggregation` leaves out.
+
 **`--binary-text` is required for every Lucene definition**, whether it
 indexes a binary or not:
 

@@ -787,6 +787,7 @@ fn assert_every_definition_node_matches(oak: &Path, froe_store: &Path, names: &[
     for name in names {
         let subtree = format!("/oak:index/{name}");
         eprintln!("  comparing {subtree}'s own nodes against Oak's");
+        assert_suggest_data_is_oaks_alone(oak, froe_store, name);
         let theirs = definition_rendering(oak, name);
         let ours = definition_rendering(froe_store, name);
         assert!(
@@ -803,11 +804,42 @@ fn assert_every_definition_node_matches(oak: &Path, froe_store: &Path, names: &[
     }
 }
 
-/// One definition's subtree, with `:data` and the fresh-by-design values
-/// removed.
+/// The one node the rebuild deliberately leaves to Oak, asserted on both
+/// sides rather than excluded silently.
+///
+/// froe removes `:suggest-data` and builds no suggester — `docs/index.md`
+/// §5.6 — because the dictionary is Lucene's own suggester artifact rather
+/// than an index froe writes, and Oak's suggester schedule rebuilds it
+/// from the `:suggest` field on the lane's next cycle. Oak's own rebuild
+/// of a definition carrying `useInSuggest` writes one, so the difference
+/// is real and is the only one the renderings below drop.
+fn assert_suggest_data_is_oaks_alone(oak: &Path, froe_store: &Path, name: &str) {
+    let node = format!("/oak:index/{name}/:suggest-data");
+    let carries = |store: &Path| {
+        digest_store(store)
+            .lines()
+            .any(|line| line.starts_with(&node))
+    };
+    if !carries(oak) {
+        assert!(
+            !carries(froe_store),
+            "{node}: froe's rebuild wrote a suggester dictionary Oak's own rebuild did not"
+        );
+        return;
+    }
+    assert!(
+        !carries(froe_store),
+        "{node}: froe's rebuild wrote a suggester dictionary, which it declares it does not          build — so the exclusion below would hide a difference rather than declare one"
+    );
+    eprintln!("    declared: Oak's own {node} is the one node froe leaves to Oak's suggester");
+}
+
+/// One definition's subtree, with `:data`, `:suggest-data` and the
+/// fresh-by-design values removed.
 fn definition_rendering(store: &Path, name: &str) -> String {
     let subtree = format!("/oak:index/{name}");
     let data = format!("{subtree}/:data");
+    let suggester = format!("{subtree}/:suggest-data");
     let clone = format!("{subtree}/:index-definition");
     digest_store(store)
         .lines()
@@ -818,7 +850,7 @@ fn definition_rendering(store: &Path, name: &str) -> String {
                     .next()
                     .is_none_or(|character| character == '/' || character == '\t')
         })
-        .filter(|line| !line.starts_with(&data))
+        .filter(|line| !line.starts_with(&data) && !line.starts_with(&suggester))
         .map(|line| {
             let in_the_clone = line.starts_with(&clone);
             line.split('\t')
