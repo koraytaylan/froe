@@ -26,6 +26,12 @@ pub(crate) fn podman(args: &[&str]) -> String {
     stdout
 }
 
+/// How many times a container start waits for its port to come free.
+const PORT_WAIT_ATTEMPTS: u32 = 12;
+
+/// How long each of those waits is.
+const PORT_WAIT: Duration = Duration::from_secs(5);
+
 /// A podman volume that is removed on drop.
 pub(crate) struct PodmanVolume {
     pub(crate) name: String,
@@ -57,10 +63,20 @@ pub(crate) struct PodmanContainer {
 }
 
 impl PodmanContainer {
+    /// Starts Sling on `port`, waiting out a port another process still
+    /// holds.
+    ///
+    /// The suite's ports are fixed strings, so the container that had one
+    /// a moment ago is usually its own predecessor: podman returns from
+    /// `stop` before the rootless port forwarder has released the socket,
+    /// and the next `run` fails with `Address already in use` — an exit
+    /// status, not a Sling fault, and one that made a whole phase fail for
+    /// a reason it had nothing to do with. Waiting is the right response;
+    /// failing after the wait still names the port and whoever holds it.
     pub(crate) fn run_detached(name: &str, port: u16, volume: &str) -> Self {
         let port_arg = format!("{port}:8080");
         let volume_arg = format!("{volume}:/opt/sling/launcher");
-        podman(&[
+        let arguments = [
             "run",
             "-d",
             "--name",
@@ -70,10 +86,36 @@ impl PodmanContainer {
             "-v",
             &volume_arg,
             &sling_image(),
-        ]);
-        Self {
-            name: name.to_owned(),
+        ];
+        for attempt in 1..=PORT_WAIT_ATTEMPTS {
+            let output = Command::new("podman")
+                .args(arguments)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap_or_else(|error| panic!("failed to spawn podman run: {error}"));
+            if output.status.success() {
+                return Self {
+                    name: name.to_owned(),
+                };
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                stderr.contains("Address already in use"),
+                "podman run for {name} exited with {status}\nstderr:\n{stderr}",
+                status = output.status
+            );
+            eprintln!(
+                "  port {port} is still held (attempt {attempt} of {PORT_WAIT_ATTEMPTS}), waiting"
+            );
+            // The failed `run` still created the container, and the name
+            // is a fixed string: leaving it behind makes the next attempt
+            // fail for a second reason.
+            let _ = Command::new("podman").args(["rm", "-f", name]).output();
+            std::thread::sleep(PORT_WAIT);
         }
+        panic!("port {port} was still in use after {PORT_WAIT_ATTEMPTS} attempts");
     }
 
     pub(crate) fn stop(&self) {
