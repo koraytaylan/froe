@@ -241,7 +241,7 @@ impl<Record: SpillRecord> SortedRuns<Record> {
         self.resident.sort_unstable();
         let path = self.location.run_path(self.next_run_number);
         self.next_run_number += 1;
-        write_run(&path, self.resident.drain(..))?;
+        write_run(&path, self.resident.drain(..).map(Ok))?;
         self.spilled.push(path);
         self.budget.release(self.resident_bytes);
         self.resident_bytes = 0;
@@ -280,6 +280,14 @@ impl<Record: SpillRecord> SortedRuns<Record> {
     /// This is what keeps the open-file count off the run count. Each pass
     /// unlinks the inputs it merged, so the spill directory holds at most one
     /// level's worth of extra bytes at a time.
+    ///
+    /// A pass **streams**: each record is encoded as the heap yields it, so
+    /// what a merge holds is one record a cursor — the fan-in — rather than
+    /// the group it is merging. Collecting a group first would put the
+    /// budget's own multiple back in memory at exactly the scale the budget
+    /// exists for, which is what
+    /// `a_merge_pass_holds_one_record_a_cursor_rather_than_its_whole_group`
+    /// pins.
     fn reduce_to_fan_in(&mut self, mut runs: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         while runs.len() > MAXIMUM_FAN_IN {
             record_merge_pass();
@@ -288,7 +296,7 @@ impl<Record: SpillRecord> SortedRuns<Record> {
                 let path = self.location.run_path(self.next_run_number);
                 self.next_run_number += 1;
                 let merged = SortedPass::<Record>::over_borrowed(group)?;
-                write_run(&path, merged.collect::<Result<Vec<_>>>()?.into_iter())?;
+                write_run(&path, merged)?;
                 for input in group {
                     let _ = std::fs::remove_file(input);
                 }
@@ -548,7 +556,7 @@ impl Drop for RunCursor {
 /// declines to write over one.
 fn write_run<Record: SpillRecord>(
     path: &Path,
-    records: impl Iterator<Item = Record>,
+    records: impl Iterator<Item = Result<Record>>,
 ) -> Result<()> {
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -571,7 +579,7 @@ fn write_run<Record: SpillRecord>(
     let mut buffer = Vec::new();
     for record in records {
         buffer.clear();
-        record.encode(&mut buffer);
+        record?.encode(&mut buffer);
         let length = u32::try_from(buffer.len()).map_err(|_| Error::InvalidFormat {
             details: format!(
                 "a spill record of {} bytes exceeds the format",
@@ -723,6 +731,64 @@ mod tests {
 
     fn record(value: u32) -> ByteString {
         ByteString(format!("{value:08}").into_bytes())
+    }
+
+    thread_local! {
+        static LIVE_COUNTED_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static PEAK_COUNTED_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A record that counts how many of its kind exist at once.
+    ///
+    /// The budget counts bytes a caller pushed, which says nothing about
+    /// what a *merge* holds: the merge decodes records the budget has
+    /// already released. Counting live instances is the only way a test can
+    /// tell a pass that streams from one that materializes what it merges.
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+    struct CountedRecord(u32);
+
+    impl CountedRecord {
+        fn new(value: u32) -> Self {
+            LIVE_COUNTED_RECORDS.with(|live| {
+                let alive = live.get() + 1;
+                live.set(alive);
+                PEAK_COUNTED_RECORDS.with(|peak| peak.set(peak.get().max(alive)));
+            });
+            Self(value)
+        }
+    }
+
+    impl Drop for CountedRecord {
+        fn drop(&mut self) {
+            LIVE_COUNTED_RECORDS.with(|live| live.set(live.get().saturating_sub(1)));
+        }
+    }
+
+    impl SpillRecord for CountedRecord {
+        fn encode(&self, buffer: &mut Vec<u8>) {
+            // Big-endian, so the encoding orders the way the record does.
+            buffer.extend_from_slice(&self.0.to_be_bytes());
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Self> {
+            let value: [u8; 4] = bytes.try_into().map_err(|_| crate::Error::InvalidFormat {
+                details: format!("a counted record is four bytes, not {}", bytes.len()),
+            })?;
+            Ok(Self::new(u32::from_be_bytes(value)))
+        }
+
+        fn resident_size(&self) -> usize {
+            size_of::<u32>()
+        }
+    }
+
+    fn reset_counted_records() {
+        LIVE_COUNTED_RECORDS.with(|live| live.set(0));
+        PEAK_COUNTED_RECORDS.with(|peak| peak.set(0));
+    }
+
+    fn peak_counted_records() -> usize {
+        PEAK_COUNTED_RECORDS.with(std::cell::Cell::get)
     }
 
     /// A record's resident size, so a budget can be stated in records.
@@ -880,6 +946,52 @@ mod tests {
             "{:?}",
             directory.run_files()
         );
+    }
+
+    #[test]
+    fn a_merge_pass_holds_one_record_a_cursor_rather_than_its_whole_group() {
+        // The fan-in bounds open files; this bounds the memory behind them.
+        // A pass that collected its group before writing it would hold
+        // `MAXIMUM_FAN_IN` runs' worth of records — the budget's own
+        // multiple — at exactly the scale the budget exists for.
+        let directory = TestDirectory::new("merge-residency");
+        let records_a_run = 8;
+        // One less than a full run, so the run spills on its eighth push.
+        let budget = SortBudget::of_bytes((records_a_run - 1) * size_of::<u32>());
+        let record_count = (MAXIMUM_FAN_IN + 6) * records_a_run;
+        reset_counted_records();
+        let mut runs = SortedRuns::new(RunLocation::new(&directory.path, "counted"), budget);
+        for value in 0..record_count {
+            runs.push(CountedRecord::new(
+                u32::try_from(value).expect("a test value fits"),
+            ))
+            .expect("push");
+        }
+        assert!(
+            runs.spilled_run_count() > MAXIMUM_FAN_IN,
+            "the test needs more runs than the fan-in, not {}",
+            runs.spilled_run_count()
+        );
+
+        // The reduction happens inside `into_sorted`. What a caller does
+        // with the sequence afterwards is the caller's residency, not the
+        // merge's, so the peak is read before the walk.
+        let sorted = runs.into_sorted().expect("merge");
+        let peak = peak_counted_records();
+        let ceiling = MAXIMUM_FAN_IN + records_a_run + 2;
+        assert!(
+            peak <= ceiling,
+            "a merge pass held {peak} records at once, over the {ceiling} \
+             a streaming pass needs: one a cursor, the run being filled, and \
+             the record in hand"
+        );
+
+        let values: Vec<u32> = sorted
+            .map(|record| record.expect("read").0)
+            .collect::<Vec<_>>();
+        let expected: Vec<u32> =
+            (0..u32::try_from(record_count).expect("a test count fits")).collect();
+        assert_eq!(values, expected, "the merge must still sort");
     }
 
     #[test]
