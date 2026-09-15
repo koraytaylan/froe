@@ -54,16 +54,12 @@ pub enum IndexingState {
     /// Not rebuilt: the hidden children are removed and Oak's own replay
     /// rebuilds from scratch. A counter on a lane whose checkpoint is
     /// dangling or absent, under `--from-head`.
-    /// **No selection produces this today.** A counter on an unresolvable
-    /// lane was the only case, and it is now refused
-    /// ([`SelectionRefusal::CounterOnAnUnresolvableLane`]) because Oak does
-    /// not rebuild what the reset removed. The variant, the
-    /// [`DefinitionReport::Reset`](super::ReindexOutcome) it produces and
-    /// [`DefinitionEdits::reset`](super::definition_update::DefinitionEdits::reset)
-    /// are kept rather than deleted: they are public API on a published
-    /// crate, and plan 0010 may reset a Lucene definition for the same
-    /// shape of reason. Removing them is a maintainer's call, recorded in
-    /// plan 0007's status.
+    /// A counter and a Lucene definition both reach it, and for the same
+    /// kind of reason: Oak's own replay after a lost checkpoint would
+    /// double what froe rebuilt — the counter through its editor, the
+    /// Lucene index through its writer's appending reindex branch — while
+    /// a definition with no hidden child is the case Oak rebuilds from
+    /// scratch.
     ResetForReplay {
         /// The lane whose checkpoint could not be resolved.
         lane: String,
@@ -194,22 +190,6 @@ pub enum SelectionRefusal {
         /// The checkpoint the lane names.
         checkpoint: String,
     },
-    /// A counter definition whose lane cannot be resolved, under
-    /// `--from-head`.
-    ///
-    /// froe will not rebuild a counter — Oak's own replay would double it —
-    /// and Oak will not rebuild it either: a lane whose checkpoint is gone
-    /// never completes a cycle, so the reset would remove an index nothing
-    /// restores. Measured on the pinned image: 129 reindex attempts over 25
-    /// minutes with the reference dangling, 59 with it cleared, and 59 with
-    /// `async-temp` cleared too — no commit in any of them, while a
-    /// definition on a *healthy* lane rebuilds on the first cycle.
-    CounterOnAnUnresolvableLane {
-        /// The definition.
-        path: String,
-        /// The lane it indexes on.
-        lane: String,
-    },
     /// The lane has no entry on `/:async` at all. Oak's first cycle treats
     /// this like a lost checkpoint and diffs from the missing state, so it
     /// is the same hazard under a different shape — and its own variant, so
@@ -244,7 +224,6 @@ impl SelectionRefusal {
             | Self::PathFilterUnconstructable { path, .. }
             | Self::NestedDefinition { path }
             | Self::NotADefinition { path }
-            | Self::CounterOnAnUnresolvableLane { path, .. }
             | Self::DanglingLaneCheckpoint { path, .. }
             | Self::LaneAbsent { path, .. }
             | Self::ReindexLaneInProgress { path } => path,
@@ -308,15 +287,6 @@ impl std::fmt::Display for SelectionRefusal {
             Self::NotADefinition { path } => {
                 write!(formatter, "{path} is not an oak:QueryIndexDefinition")
             }
-            Self::CounterOnAnUnresolvableLane { path, lane } => write!(
-                formatter,
-                "{path} is a counter on lane {lane}, which cannot be resolved. froe does \
-                 not rebuild a counter — Oak's own replay would double it — and Oak does \
-                 not rebuild one on a lane whose checkpoint is gone: that lane never \
-                 completes a cycle, so removing the counter's data would leave an index \
-                 nothing restores. Release the lane's state through Oak, or let Oak \
-                 rebuild the lane from a checkpoint it still has"
-            ),
             Self::DanglingLaneCheckpoint {
                 path,
                 lane,
@@ -755,10 +725,12 @@ fn resolve_state(
     // restored. Clearing the lane's own state does not help either; the
     // measurements are on the refusal's own documentation.
     if definition.index_type.as_ref() == Some(&IndexType::Counter) {
-        return Ok(Err(SelectionRefusal::CounterOnAnUnresolvableLane {
-            path: definition.path.clone(),
-            lane: lane_name.to_owned(),
-        }));
+        return Ok(Ok((
+            IndexingState::ResetForReplay {
+                lane: lane_name.to_owned(),
+            },
+            None,
+        )));
     }
 
     // A Lucene definition is **reset** rather than rebuilt from the head,
