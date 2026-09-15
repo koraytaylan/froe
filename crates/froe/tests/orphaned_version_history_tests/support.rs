@@ -12,7 +12,11 @@ pub(crate) struct TestDirectory {
 
 impl TestDirectory {
     pub(crate) fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("froe-orphaned-histories-{name}"));
+        let path = std::env::temp_dir().join(format!(
+            "froe-orphaned-histories-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create the test repository directory");
         Self { path }

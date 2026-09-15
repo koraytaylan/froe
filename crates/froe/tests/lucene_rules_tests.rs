@@ -5,230 +5,27 @@
 //! each case publishes a small store and reads the definition back the
 //! way the reindex will. `docs/analysis/lucene-oak-documents.md` §1 and
 //! §2 are the specification these confirm; the name-pattern half lives in
-//! `lucene_name_pattern_tests.rs`, where Java's own engine is the oracle.
+//! `lucene_name_pattern_tests.rs`, where Java's own engine is the oracle,
+//! and the fixture harness in `support::lucene_definition_layout`.
 
-use std::path::{Path, PathBuf};
+#![allow(
+    unreachable_pub,
+    reason = "test binaries have no external interface; pub only means module-visible"
+)]
+#![allow(
+    dead_code,
+    reason = "the shared support module is larger than any one test binary uses"
+)]
+
+mod support;
 
 use froe::content::PropertyType;
 use froe::index::lucene::documents::aggregate::Match;
 use froe::index::lucene::documents::name_pattern::ALL_PROPERTIES;
 use froe::index::lucene::documents::rules::{CodecVerdict, IndexingRules, PropertyDefinition};
 use froe::index::{IndexError, IndexWarning};
-use froe::segment::record::RecordIdentifier;
 use froe::store::Repository;
-use froe::writer::record_writer::{
-    ChildNodesToWrite, PropertyToWrite, PropertyValuesToWrite, RecordWriter, SegmentSink,
-};
-use froe::writer::store_writer::WritableRepository;
-
-/// A directory that removes itself, so a failing test leaves nothing
-/// behind.
-struct TestDirectory {
-    path: PathBuf,
-}
-
-impl TestDirectory {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "froe-lucene-rules-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create the test repository directory");
-        Self { path }
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// A node to write: its properties, each a name, a type and one value, and
-/// its children.
-#[derive(Clone)]
-struct Node {
-    properties: Vec<(&'static str, PropertyType, String)>,
-    multiple: Vec<(&'static str, PropertyType, Vec<String>)>,
-    children: Vec<(String, Node)>,
-}
-
-impl Node {
-    fn new() -> Self {
-        Self {
-            properties: Vec::new(),
-            multiple: Vec::new(),
-            children: Vec::new(),
-        }
-    }
-
-    fn with(mut self, name: &'static str, property_type: PropertyType, value: &str) -> Self {
-        self.properties
-            .push((name, property_type, value.to_owned()));
-        self
-    }
-
-    fn boolean(self, name: &'static str, value: bool) -> Self {
-        self.with(
-            name,
-            PropertyType::Boolean,
-            if value { "true" } else { "false" },
-        )
-    }
-
-    fn string(self, name: &'static str, value: &str) -> Self {
-        self.with(name, PropertyType::String, value)
-    }
-
-    fn long(self, name: &'static str, value: i64) -> Self {
-        self.with(name, PropertyType::Long, &value.to_string())
-    }
-
-    /// A multi-valued `NAMES` property, which the node-type subtype lists
-    /// are.
-    fn names(mut self, name: &'static str, values: &[&str]) -> Self {
-        self.multiple.push((
-            name,
-            PropertyType::Name,
-            values.iter().map(|value| (*value).to_owned()).collect(),
-        ));
-        self
-    }
-
-    fn child(mut self, name: &str, node: Node) -> Self {
-        self.children.push((name.to_owned(), node));
-        self
-    }
-
-    /// The same, by value, for a caller that holds the node already.
-    fn clone_with_child(&self, name: &str, node: Node) -> Self {
-        self.clone().child(name, node)
-    }
-}
-
-fn write_tree(writer: &mut RecordWriter<impl SegmentSink>, node: &Node) -> RecordIdentifier {
-    let children: Vec<(String, RecordIdentifier)> = node
-        .children
-        .iter()
-        .map(|(name, child)| (name.clone(), write_tree(writer, child)))
-        .collect();
-    let mut properties: Vec<PropertyToWrite> = node
-        .properties
-        .iter()
-        .map(|(name, property_type, value)| PropertyToWrite {
-            name: (*name).to_owned(),
-            property_type: *property_type,
-            values: PropertyValuesToWrite::Single(
-                writer.write_string(value).expect("write a property value"),
-            ),
-        })
-        .collect();
-    for (name, property_type, values) in &node.multiple {
-        let identifiers = values
-            .iter()
-            .map(|value| writer.write_string(value).expect("write a property value"))
-            .collect();
-        properties.push(PropertyToWrite {
-            name: (*name).to_owned(),
-            property_type: *property_type,
-            values: PropertyValuesToWrite::Multiple(identifiers),
-        });
-    }
-    let child_nodes = match children.len() {
-        0 => ChildNodesToWrite::Zero,
-        1 => {
-            let (name, node) = children.into_iter().next().expect("one child");
-            ChildNodesToWrite::One { name, node }
-        }
-        _ => ChildNodesToWrite::Many(children),
-    };
-    writer
-        .write_node(None, &[], &child_nodes, &properties)
-        .expect("write a node")
-}
-
-/// Publishes a store holding `/oak:index/test` and, when one is given,
-/// `/jcr:system/jcr:nodeTypes`.
-fn publish(directory: &Path, definition: &Node, node_types: Option<&Node>) {
-    let store = WritableRepository::open(directory).expect("open the store directory");
-    let generation = store.writing_generation().expect("the writing generation");
-    let mut writer = store.record_writer(generation);
-    let written = write_tree(&mut writer, definition);
-    let index = writer
-        .write_node(
-            None,
-            &[],
-            &ChildNodesToWrite::One {
-                name: "test".to_owned(),
-                node: written,
-            },
-            &[],
-        )
-        .expect("write /oak:index");
-    let mut root_children = vec![("oak:index".to_owned(), index)];
-    if let Some(node_types) = node_types {
-        let types = write_tree(&mut writer, node_types);
-        let system = writer
-            .write_node(
-                None,
-                &[],
-                &ChildNodesToWrite::One {
-                    name: "jcr:nodeTypes".to_owned(),
-                    node: types,
-                },
-                &[],
-            )
-            .expect("write /jcr:system");
-        root_children.push(("jcr:system".to_owned(), system));
-    }
-    let root = writer
-        .write_node(
-            Some("rep:root"),
-            &[],
-            &ChildNodesToWrite::Many(root_children),
-            &[],
-        )
-        .expect("write the content root");
-    let super_root = writer
-        .write_node(
-            None,
-            &[],
-            &ChildNodesToWrite::One {
-                name: "root".to_owned(),
-                node: root,
-            },
-            &[],
-        )
-        .expect("write the super-root");
-    writer.finish().expect("finish the writer");
-    let previous = store.head();
-    assert!(
-        store.compare_and_set_head(previous, super_root),
-        "advance the head"
-    );
-    store.close().expect("close the store");
-}
-
-/// Reads one definition's rules, with the store kept alive by the caller.
-fn read_rules(
-    name: &str,
-    definition: &Node,
-    node_types: Option<&Node>,
-) -> (TestDirectory, Result<IndexingRules, IndexError>) {
-    let directory = TestDirectory::new(name);
-    publish(&directory.path, definition, node_types);
-    let repository = Repository::open(&directory.path).expect("open the repository");
-    let root = repository.content_root().expect("the content root");
-    let node = repository
-        .node_at_path("/oak:index/test")
-        .expect("resolve the definition")
-        .expect("the definition exists");
-    let mut warnings: Vec<IndexWarning> = Vec::new();
-    let rules = IndexingRules::read(&node, "/oak:index/test", &root, &mut warnings);
-    (directory, rules)
-}
+use support::lucene_definition_layout::{Node, TestDirectory, publish, read_rules};
 
 /// A definition shaped like the fixture's default: one `nt:base` rule with
 /// a catch-all analyzed property definition, which is what makes it

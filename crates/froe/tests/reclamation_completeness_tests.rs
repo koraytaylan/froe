@@ -36,7 +36,15 @@ struct TestDirectory {
 
 impl TestDirectory {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("froe-reclamation-{name}"));
+        // The process and thread ids are part of the name because two
+        // runs of this binary otherwise share a directory and delete each
+        // other's stores — which is how a green suite fails only when
+        // something else happens to be running it too.
+        let path = std::env::temp_dir().join(format!(
+            "froe-reclamation-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create the test repository directory");
         Self { path }
