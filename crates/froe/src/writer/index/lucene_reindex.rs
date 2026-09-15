@@ -278,7 +278,11 @@ std::thread_local! {
 
 /// Makes the next rebuild on this thread leave `name` in its segment
 /// directory.
-#[cfg(test)]
+///
+/// Its one caller is this module's Unix-only test, so the seam follows it
+/// rather than standing unused on a Windows `cargo check --all-targets`,
+/// where `cfg(test)` code is compiled and `dead_code` is an error.
+#[cfg(all(test, unix))]
 pub(crate) fn plant_stray_file(name: Option<String>) {
     STRAY_FILE.with(|cell| *cell.borrow_mut() = name);
 }
