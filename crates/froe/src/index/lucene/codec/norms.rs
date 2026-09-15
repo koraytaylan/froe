@@ -133,6 +133,24 @@ pub fn float_to_byte_315(value: f32) -> u8 {
 /// of zero — a norms-bearing field whose analyzed value yielded no token —
 /// makes the reciprocal infinite, which quantizes to `0xff` rather than
 /// saturating at the top of the ordinary range.
+///
+/// # The one input whose answer the *machine* would otherwise decide
+///
+/// A zero boost on a field with no terms multiplies zero by that infinity,
+/// and the product is a NaN. `SmallFloat.floatToByte315` reads its
+/// argument through `Float.floatToRawIntBits`, which — unlike
+/// `floatToIntBits` — does **not** canonicalize, so the sign bit it sees is
+/// whatever the hardware put there: `x86-64` writes the default quiet NaN
+/// with the sign **set** (`0xffc00000`) and `AArch64` writes it **clear**
+/// (`0x7fc00000`). Through the quantization that is the difference between
+/// `0x00` and `0xff` — the two ends of the range — and Java has the same
+/// split, so a real Oak on an Apple-silicon machine disagrees with a real
+/// Oak on an Intel one about this one input.
+///
+/// froe answers `0`, the byte the `x86-64` JVM produces: it is the JVM the
+/// norm vectors were generated on and the one the interoperability suite
+/// compares against, and an index whose bytes depend on the machine that
+/// wrote it is not something this port is willing to ship.
 #[must_use]
 pub fn norm_byte(boost: f32, term_count: u32) -> u8 {
     #[expect(
@@ -140,7 +158,11 @@ pub fn norm_byte(boost: f32, term_count: u32) -> u8 {
         reason = "the single narrowing to float is the rule, not an approximation of it"
     )]
     let reciprocal = (1.0 / f64::from(term_count).sqrt()) as f32;
-    float_to_byte_315(boost * reciprocal)
+    let value = boost * reciprocal;
+    if value.is_nan() {
+        return 0;
+    }
+    float_to_byte_315(value)
 }
 
 /// The `Lucene42` norms consumer.

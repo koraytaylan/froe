@@ -64,6 +64,15 @@ fn every_vector_lucene_produced_comes_back() {
 fn a_field_with_no_term_on_a_document_quantizes_to_the_top_byte() {
     // `1.0 / sqrt(0)` is infinite, and the small-float encoding returns
     // `-1` for it rather than saturating at the top of the ordinary range.
+    // A zero boost on a field with no terms is `0 * inf`, whose NaN's
+    // sign bit is the hardware's: x86-64 sets it and AArch64 does not, and
+    // `floatToRawIntBits` hands whichever it finds to the quantization,
+    // where the two signs land on opposite ends of the range. froe pins
+    // the x86-64 answer so that an index does not depend on the machine
+    // that wrote it. This case is the reason the macOS half of the CI
+    // matrix exists.
+    assert_eq!(norm_byte(0.0, 0), 0x00);
+    assert_eq!(norm_byte(f32::NAN, 4), 0x00);
     assert_eq!(norm_byte(1.0, 0), 0xff);
     assert_eq!(norm_byte(2.5, 0), 0xff);
     // A boost of zero is the other end: the value is zero or negative, so
