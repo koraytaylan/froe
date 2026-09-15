@@ -209,16 +209,44 @@ fn assert_oak_answers_queries_from_froes_index(froe_store: &Path) {
     // wrote none, Oak could not price the index, and this comparison is
     // what caught it — over froe's store Oak planned `traverse allNodes`
     // where over its own it planned `property uuid`.
+    //
+    // The comparison is **asymmetric**, for the same reason the number is
+    // replaced. `ApproximateCounter` records a count on two random gates,
+    // so a small index — the fixture's `uuid` has a few dozen entries —
+    // is sometimes left unpriced by a rebuild, Oak's own included, and
+    // Oak then plans a traversal over an index that is perfectly good. A
+    // run where *Oak's* rebuild is the unpriced one says nothing about
+    // froe's, and failing on it would be failing on a coin toss.
+    //
+    // What it must never be is the other way round: an index Oak prices
+    // from its own rebuild and does not price from froe's is froe's
+    // rebuild being unusable, which is exactly the defect this comparison
+    // was added for — froe's first reindex wrote no counters at all, and
+    // over its store Oak planned `traverse allNodes` where over its own
+    // it planned `property uuid`.
     for (statement, (oak_plan, froe_plan)) in DETERMINISTIC_PLAN_SAMPLES
         .iter()
         .zip(from_oak.plans.iter().zip(from_froe.plans.iter()))
     {
-        assert_eq!(
-            without_estimates(froe_plan),
-            without_estimates(oak_plan),
-            "{statement}: Oak chose a different plan over froe's index than over its own"
+        let (theirs, ours) = (without_estimates(oak_plan), without_estimates(froe_plan));
+        if theirs == ours {
+            continue;
+        }
+        assert!(
+            plans_a_traversal(&theirs),
+            "{statement}: Oak chose a different plan over froe's index than over its own, and \
+             its own is not the unpriced one\n  oak:  {theirs:?}\n  froe: {ours:?}"
+        );
+        eprintln!(
+            "    declared: Oak left its own rebuild of this index unpriced and traversed; \
+             froe's was priced and chosen"
         );
     }
+}
+
+/// Whether an `EXPLAIN` names a traversal rather than an index.
+fn plans_a_traversal(plan: &[String]) -> bool {
+    plan.iter().any(|line| line.contains("traverse"))
 }
 
 /// The statements whose `EXPLAIN` text carries no counter-derived number.

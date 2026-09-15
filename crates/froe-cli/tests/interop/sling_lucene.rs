@@ -389,6 +389,17 @@ pub(crate) fn populate_lucene_variant_definition(port: u16) {
 
     populate_aggregated_node_rule(port, &root);
 
+    populate_variant_aggregates(port, &root);
+
+    sling_post_fields(
+        port,
+        &root,
+        &[("reindex@TypeHint", "Boolean"), ("reindex", "true")],
+    );
+}
+
+/// The variant definition's aggregates, which are most of its shapes.
+fn populate_variant_aggregates(port: u16, root: &str) {
     sling_post_fields(
         port,
         &format!("{root}/aggregates"),
@@ -495,12 +506,6 @@ pub(crate) fn populate_lucene_variant_definition(port: u16) {
         port,
         &format!("{root}/aggregates/{VARIANT_AGGREGATED_NODE_TYPE}/include0"),
         &[("jcr:primaryType", "nt:unstructured"), ("path", "inner")],
-    );
-
-    sling_post_fields(
-        port,
-        &root,
-        &[("reindex@TypeHint", "Boolean"), ("reindex", "true")],
     );
 }
 
