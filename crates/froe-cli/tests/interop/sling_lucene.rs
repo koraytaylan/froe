@@ -309,6 +309,11 @@ pub(crate) fn populate_lucene_variant_definition(port: u16) {
             // field of this definition reports.
             ("maxFieldLength@TypeHint", "Long"),
             ("maxFieldLength", "4"),
+            // `:suggest` analyzed with the definition's own chain instead
+            // of the suggest helper's newline tokenizer, which is the
+            // other of the two chains that field can take.
+            ("suggestAnalyzed@TypeHint", "Boolean"),
+            ("suggestAnalyzed", "true"),
         ],
     );
     // `indexOriginalTerm` is a property **of** the `analyzers` node; a
@@ -571,6 +576,18 @@ fn variant_analyzed_property_definitions() -> Vec<(&'static str, Vec<(&'static s
                 ("propertyIndex", "true"),
                 ("analyzed@TypeHint", "Boolean"),
                 ("analyzed", "true"),
+            ],
+        ),
+        // A relative definition whose ancestor step is `*`, which the
+        // include matcher treats as every child — the one element form
+        // neither of the two above reaches.
+        (
+            "anyChildTitle",
+            vec![
+                ("jcr:primaryType", "nt:unstructured"),
+                ("name", "*/jcr:title"),
+                ("propertyIndex@TypeHint", "Boolean"),
+                ("propertyIndex", "true"),
             ],
         ),
         // The multi-valued string: an array of labels, faceted, analyzed
