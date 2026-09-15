@@ -47,7 +47,6 @@ import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.AtomicReader;
-import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.DocsAndPositionsEnum;
 import org.apache.lucene.index.DocsEnum;
@@ -504,6 +503,16 @@ public final class Corpus {
                     }
                     out.println("docvalue\t" + name + "\t" + document + rendered);
                 }
+            } else {
+                // A type this enumerator cannot render would otherwise be
+                // announced on the field line and then contribute no value
+                // line at all — on both sides, so the comparison would pass
+                // over it in silence. A dump that cannot render a field
+                // refuses instead.
+                StoreSupport.refuse("this enumerator renders no "
+                        + info.getDocValuesType().name() + " doc values, and "
+                        + name + " carries them");
+                return;
             }
         }
     }

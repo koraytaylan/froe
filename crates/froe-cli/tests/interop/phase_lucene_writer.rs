@@ -448,10 +448,14 @@ pub(crate) fn lucene_writer_conformance() {
     eprintln!("  writer: every transducer enumerates back");
     let corpus =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../froe/tests/fixtures/lucene-fst-corpus.tsv");
-    judge.run(
+    let enumerated = judge.run(
         "FstCheck",
         &["fst-check", "/corpus"],
         vec![Mount::read_only(&corpus, "/corpus")],
+    );
+    compare_transducer_pairs(
+        &std::fs::read_to_string(&corpus).expect("read the transducer corpus"),
+        &enumerated,
     );
 
     eprintln!(
@@ -459,6 +463,54 @@ pub(crate) fn lucene_writer_conformance() {
         documents.len(),
         ours.lines().count()
     );
+}
+
+/// Compares what Lucene enumerated out of each transducer with the pairs
+/// the corpus says froe put in.
+///
+/// `FstCheck` renders a verdict of its own for nothing: it prints
+/// `<name>\t<pairs>` and leaves the judging here, so a transducer whose
+/// bytes Lucene *parses* while yielding the wrong keys — or none — is
+/// caught by this comparison and by nothing else. Reading its exit status
+/// alone would prove only that `new FST<>` did not throw.
+fn compare_transducer_pairs(corpus: &str, enumerated: &str) {
+    let mut found = enumerated.lines();
+    let mut checked = 0usize;
+    for row in corpus.lines() {
+        if row.starts_with('#') || row.trim().is_empty() {
+            continue;
+        }
+        let mut fields = row.split('\t');
+        let name = fields.next().expect("a corpus row names its transducer");
+        let _serialized = fields.next().expect("a corpus row carries its bytes");
+        let expected = fields
+            .next()
+            .unwrap_or_else(|| panic!("the corpus row for {name} carries no expected pairs"));
+        let line = found
+            .next()
+            .unwrap_or_else(|| panic!("Lucene enumerated nothing for {name}"));
+        let (enumerated_name, pairs) = line
+            .split_once('\t')
+            .unwrap_or_else(|| panic!("the judge's line for {name} has no pairs: {line}"));
+        assert_eq!(
+            enumerated_name, name,
+            "the judge enumerated the transducers in another order"
+        );
+        assert_eq!(
+            pairs, expected,
+            "Lucene read {name} back as other pairs than froe put in"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "the transducer corpus carried no row to compare"
+    );
+    assert!(
+        found.next().is_none(),
+        "the judge enumerated more transducers than the corpus holds"
+    );
+    eprintln!("  writer: {checked} transducers enumerate back to their own pairs");
 }
 
 /// Compares two enumerations, naming the first line that differs.
@@ -473,6 +525,15 @@ fn compare_dumps(ours: &str, theirs: &str) {
         at += 1;
         match (our_lines.next(), their_lines.next()) {
             (Some(ours), Some(theirs)) if ours == theirs => {}
+            // Reached only when the two differ outside their lines, since
+            // the equality above has already returned: `lines()` drops a
+            // trailing newline, so identical line sequences can still come
+            // from dumps that are not the same string.
+            (None, None) => panic!(
+                "the two enumerations hold the same {} lines and differ \
+                 outside them, in trailing whitespace or a final newline",
+                at - 1
+            ),
             (ours, theirs) => panic!(
                 "the two enumerations part at line {at}\n  froe:   {}\n  lucene: {}",
                 ours.unwrap_or("<end of dump>"),
