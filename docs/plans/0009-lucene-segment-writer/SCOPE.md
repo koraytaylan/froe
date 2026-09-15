@@ -15,7 +15,7 @@ Risk is managed by a feasibility gate: the specification task ends with a record
 ## In scope
 
 - **Specification** of every file a fresh index carries under `oakCodec` — `segments.gen`, `segments_N`, `.si`, `.fnm`, the uncompressed `Lucene40` stored fields `.fdt`/`.fdx`, the block-tree terms dictionary `.tim`/`.tip`, the `Lucene41` postings `.doc`/`.pos`/`.pay` with their frame-of-reference blocks and skip lists, the `Lucene45` doc values `.dvd`/`.dvm`, the `Lucene42` norms `.nvd`/`.nvm`, and the compound file `.cfs`/`.cfe` — plus the primitives beneath them: the output encodings, codec headers, packed integers, the block-packed and monotonic block-packed writers, the transducer byte format, and the norm the default similarity computes with its small-float quantization.
-- **The writer**, producing one segment per index, from an in-memory document model with bounded-memory spilling of postings.
+- **The writer**, producing one segment per index, from an in-memory document model with bounded-memory spilling of postings — bounded in the sense the writer's own module doc states: the un-spilled tail of each run is charged against the budget, one document's inverted form and one field's terms index are not.
 - **Field capabilities Oak's fields need**: `DOCS_ONLY`, `DOCS_AND_FREQS_AND_POSITIONS` and `…_AND_OFFSETS` index options, stored string and binary fields, norms present or omitted per field, `NUMERIC`, `SORTED` and `SORTED_SET` doc values, field boosts folded into norms.
 - **Conformance evidence**: Lucene's own index checker clean; enumeration equality against a Lucene-built index; the interop phase `lucene_writer_conformance`.
 

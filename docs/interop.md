@@ -576,8 +576,19 @@ statements: the samples cover one shape per storage strategy, not the query
 language. Cost estimation is explicitly excluded — a property index's plan
 text prints an `estimatedCost:` the mirror strategy derives from the
 randomized `:count_*` counters, and index selection between competing mirror
-indexes can differ for the same reason, so only plans carrying no
-counter-derived number are compared. And it proves nothing about Lucene,
+indexes can differ for the same reason, so the plans are compared with
+every counter-derived number replaced by a placeholder.
+
+The one sampled plan is then compared **asymmetrically**, because even
+that is not deterministic: `ApproximateCounter` records a count on two
+random gates, so a small index is sometimes left unpriced by a rebuild —
+Oak's own included. A difference is accepted when **Oak's** rebuild is
+the unpriced one and the run says so; a difference the other way is a
+failure, because an index Oak prices from its own rebuild and not from
+froe's is froe's rebuild being unusable. That is the defect the
+comparison was added for: froe's first reindex wrote no counters at all,
+and Oak planned `traverse allNodes` over its store where it planned
+`property uuid` over its own. And it proves nothing about Lucene,
 which `froe index reindex` refuses by name until plan 0010.
 
 ### lucene_dump

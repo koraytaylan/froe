@@ -81,7 +81,7 @@ The rows below are the boundaries the native reindex adds. The shared publicatio
 | --- | --- | --- | --- | --- | --- |
 | Documents made and postings, doc-value and norm runs spilled in a per-run subdirectory under `--work-directory`; stored fields already streaming into the segment (`lucene-reindex.after-last-document`, fired after the last document is added and before `finish`) | plan replanned under the lock | files outside the store only | removed on return (regression named by 1007) | leftover spill files and partial stored-field files in the run's subdirectory, never in the store (1007) | operator removes them; the next run's plan refuses residue in an operator-named directory (0707) |
 | Segment finished in the work directory (`lucene-reindex.after-segment-finished`, fired when `finish` returns and before the first `:data` record) | every run merged into the segment | files outside the store only | removed on return (1007) | a complete segment in the run's subdirectory, never in the store (1007) | operator removes it; the next run's plan refuses residue in an operator-named directory and warns under the default, and each attempt writes into a fresh segment directory so a dead run's segment is never mistaken for this one's (1007) |
-| Segment files copied into `:data` (`lucene-reindex.mid-file-copy`) | segment assembled and parsed by plan 0008's readers; the three apply-identity gates passed in `prepare`; `open_prepared` after the fingerprint and path-identity rechecks | new archives only, unreachable from the head | store unchanged plus unreferenced archives; the file and byte offset reached are reported (1007) | same (1007) | the next `froe compact` retires the archives |
+| Segment files copied into `:data` (`lucene-reindex.mid-file-copy`) | segment assembled and parsed by plan 0008's readers; the three apply-identity gates passed in `prepare`; `open_prepared` after the fingerprint and path-identity rechecks | new archives only, unreachable from the head | store unchanged plus unreferenced archives; the returned error is the underlying I/O error, naming neither the file nor an offset — the file-and-offset report is plan 0008's import path, not this one (1007) | same (1007) | the next `froe compact` retires the archives |
 | Definition rewritten (in addition to plan 0008's row — `reindex=false`, `corrupt` and `indexImportState` removed, `:disableIndexesOnNextCycle` under its predicate — `ReindexCount::Increment`, `refresh` removed when set, `seed` created when absent, the `facets` node created on the first facet property with per-element children carrying `jcr:primaryType` and, for `STRINGS` dimensions, `multivalued`, `:status` and `:version` set, `:index-definition` replaced by the visible clone of the pre-run state, `:suggest-data` removed; under a reset only the hidden children removed) | the segment read back and parsed (not under a reset, which writes no segment); every gate passed in `prepare` | new records only, unreachable from the head until publication | store unchanged plus unreferenced archives at the head's generation (1007) | same (1007) | as plan 0008's row |
 | Head publication and applied-state verification | as plan 0007's rows, with the `:data` read-back precondition from plan 0008's (under a `--from-head` reset: no read-back and no `:status`/`:version` — the only mutation is the definition rewrite with its hidden children removed, then the spine; 1007's reset test) | as plan 0007's rows | as plan 0007's rows; the Lucene branch publishes through task 0707's `apply.rs`, so the cutpoints are the `index-reindex.` ones task 0708 armed, reached by a wiring test (1007) | same | as plan 0007's rows |
 
@@ -166,7 +166,7 @@ every visible child, except:
 | `refresh` | removed when set | Oak's editor consumes it when it builds the definition |
 | `seed` | created when absent, kept when present | Oak's fulltext editor creates one for a definition that has none |
 | `facets` (visible child) | created on the first facet property indexed, with one child per path element of each dimension carrying `jcr:primaryType = nt:unstructured` and, for a multi-valued `STRINGS` dimension, `multivalued = true` | Oak's facet configuration is node-state-backed and persists into the visible definition as the document maker consults it |
-| `:disableIndexesOnNextCycle` (hidden, on `/:async`) | written under the disabler's predicate | froe never disables a superseded index itself; Oak's next cycle does |
+| `:disableIndexesOnNextCycle` (hidden, on the definition node) | written under the disabler's predicate | froe never disables a superseded index itself; Oak's next cycle does |
 
 **What is replaced.** `:data` with the segment this run assembled, `:status`
 with a fresh `uid` and the run's `lastUpdated`, `indexedNodes` and
@@ -176,10 +176,15 @@ own editor clones when it enters reindex mode, so it carries `reindex =
 true`, the old `reindexCount` and no `seed` this run created.
 `:suggest-data` is removed and never rebuilt.
 
-**What a `--from-head` reset does instead.** Removes the hidden children,
-keeps `reindexCount` (`ReindexCount::Keep`), builds nothing, writes no
-`:status` and no `:version`, and leaves every visible property untouched.
-That is the whole mutation. It exists because a definition whose lane
+**What a `--from-head` reset does instead.** Removes the hidden children
+**and raises `reindex` as a stored `BOOLEAN`**, keeps `reindexCount`
+(`ReindexCount::Keep`), builds nothing, and writes no `:status` and no
+`:version`. The raised flag is the load-bearing half rather than an
+afterthought: `IndexUpdate.shouldReindex`'s other trigger needs the
+definition to be *absent* from the before state, which a definition the
+store already holds never is, so without the flag Oak never attempts the
+rebuild the reset is handing it. Every other visible property is left
+untouched. That is the whole mutation. It exists because a definition whose lane
 checkpoint is gone cannot be rebuilt into a state Oak will agree with:
 Oak's fulltext editor re-enters reindex mode on a missing before-state and
 its writer's reindex branch *appends* every document to whatever `:data`
@@ -255,10 +260,13 @@ What this plan adds is *outside* the store, and its prefixes are:
   subdirectory. Same rule: removed on return, left behind on death, never in
   the store. **Each attempt assembles into a fresh segment directory**, so a
   dead run's complete segment can never be mistaken for this attempt's.
-* **During the copy (`lucene-reindex.mid-file-copy`).** Unreferenced archives
-  at the head's generation, which the next `froe compact` retires; the store's
-  reachable state is unchanged. A returned error reports the file and the
-  byte offset reached.
+* **Between two files of the copy (`lucene-reindex.mid-file-copy`).**
+  Unreferenced archives at the head's generation, which the next
+  `froe compact` retires; the store's reachable state is unchanged. The
+  cutpoint fires *between* files rather than inside one — the name is
+  plan 0008's, where the import's own cutpoint does fire mid-file — and a
+  returned error here is the underlying I/O error, naming neither the file
+  nor an offset.
 
 The reconciliation for the first two is an operator removing the
 subdirectory: the next run's plan refuses residue in an operator-named work
@@ -274,8 +282,10 @@ plan it started with: **documents made** (one per visited node with a rule),
 head **before and after**. A run that refused reports no counts at all
 rather than the plan's estimates, and a reset reports the hidden children it
 removed rather than a document count it never produced. `ReindexPlan::is_empty()`
-short-circuits a selection with nothing to do, and the outcome says
-`nothing to do` with the head unmoved.
+short-circuits a selection with nothing to do and the head does not move,
+which is what the named regression asserts; the words `nothing to do` are
+the command's rendering of that outcome, and no test in this plan
+exercises them.
 
 #### Resources
 
@@ -331,7 +341,7 @@ otherwise.
 | A Lucene definition needs a binary-text policy, and the gate **refuses rather than skips** (`select` → `refuse_lucene`; both production phases — the lockless plan and the replan under the lock — go through it) | `a_lucene_definition_without_a_binary_text_policy_is_refused_by_name`, and `a_lucene_definition_without_a_binary_text_policy_is_refused` in `index_reindex_guard_tests.rs` for a run of any selection | `if !options.has_binary_text_policy` replaced with `if false && …` | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: LaneCheckpoint { lane: "async", checkpoint: "lane-checkpoint" }, rules: 1, documents: 2, stored_bytes: 0, indexed_bytes: 47, binary_text_policy: "none" }]` — a plan to rebuild a fulltext index with no answer for its binaries. |
 | The codec verdict must be `oakCodec` (`select` → `refuse_lucene` → `IndexingRules::read`) | `a_definition_whose_codec_is_not_oak_codec_is_refused_naming_lucene46` | `if codec != CodecVerdict::OakCodec` replaced with `if false && …` | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: LaneCheckpoint { lane: "async", checkpoint: "lane-checkpoint" }, rules: 1, documents: 2, stored_bytes: 0, indexed_bytes: 17, binary_text_policy: "the extraction-error marker" }]` — froe would have written the `oakCodec` composition into an index Oak opens with `Lucene46`. |
 | A definition-level `valueRegex` is refused: it gates the per-property fulltext loop with `Matcher.find`, and froe evaluates no value regular expression (same path) | `a_definition_level_value_regex_is_refused_by_name`, and the twin in `lucene_rules_tests.rs` for the rules reader itself | the `valueRegex` read replaced with `None` | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: LaneCheckpoint { lane: "async", checkpoint: "lane-checkpoint" }, rules: 1, documents: 2, stored_bytes: 0, indexed_bytes: 47, binary_text_policy: "the extraction-error marker" }]` — every value indexed, where Oak indexes the ones the expression finds. |
-| A construct this plan does not port — `function`, `dynamicBoost`, `useInSimilarity`, `similarityTags`, `compatVersion 1`, `maxFieldLength = 0`, a consumer-registered analyzer, an `nt:base` rule with `nullCheckEnabled`, a `unique` or `sync` property definition, two rules typing one ordered property differently (same path) | `a_definition_using_an_unported_feature_is_refused_by_name`, over the eleven cases of `lucene_rules_tests.rs` | the four-name loop's `is_some()` test replaced with `false && …` | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: LaneCheckpoint { lane: "async", checkpoint: "lane-checkpoint" }, rules: 1, documents: 2, stored_bytes: 0, indexed_bytes: 47, binary_text_policy: "the extraction-error marker" }]` — an index missing the fields that construct writes. |
+| A construct this plan does not port — `function`, `dynamicBoost`, `useInSimilarity`, `similarityTags`, `compatVersion 1`, `maxFieldLength = 0`, a consumer-registered analyzer, an `nt:base` rule with `nullCheckEnabled`, a `unique` or `sync` property definition, two rules typing one ordered property differently (same path) | `a_definition_using_an_unported_feature_is_refused_by_name` — the `dynamicBoost` case; the other seven constructs are refused in separate code and covered by separate tests in `lucene_rules_tests.rs`, none of them neutralized here | the four-name loop's `is_some()` test replaced with `false && …`, which neutralizes **four** of the eleven refusals and not the rest | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: LaneCheckpoint { lane: "async", checkpoint: "lane-checkpoint" }, rules: 1, documents: 2, stored_bytes: 0, indexed_bytes: 47, binary_text_policy: "the extraction-error marker" }]` — an index missing the fields that construct writes. |
 | A hybrid definition is refused: Oak keeps a synchronous `:property-index` froe does not build (same path) | `a_hybrid_definition_is_refused_by_name` | `if definition.indexing_mode.synchronous_synonym` replaced with `if false && …` | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: Head, rules: 1, documents: 6, stored_bytes: 0, indexed_bytes: 127, binary_text_policy: "the extraction-error marker" }]` — note the state: a hybrid definition falls through to a **head** rebuild, which is the wrong state as well as the wrong index. |
 | A definition with no `async` is refused: Oak documents it as required and no oracle exists for the synchronous case (same path) | `a_definition_without_async_is_refused_by_name` | `if definition.indexing_mode.synchronous` replaced with `if false && …` | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: Head, rules: 1, documents: 6, stored_bytes: 0, indexed_bytes: 127, binary_text_policy: "the extraction-error marker" }]` |
 | A Lucene definition on a lane whose checkpoint is gone is **reset** under `--from-head` and refused without it (`resolve_state`) | `a_lost_checkpoint_resets_a_lucene_definition_under_from_head` and `a_lost_checkpoint_is_refused_without_from_head` (in `lucene_reindex_tests.rs`) | the `IndexType::Lucene` arm removed, so the definition falls through to the head rebuild | `a lost checkpoint resets rather than rebuilds: RebuiltIndex { documents: 0, nodes_visited: 9, files: ["segments.gen", "segments_1"], segment_bytes: 65 }` — an index rebuilt from a head whose content the lane never reached, which Oak's own next cycle would then append to again. |
@@ -341,7 +351,7 @@ otherwise.
 | The facet configuration persists a child **only** for a multi-valued dimension (`lucene_definition_edits` → `write_facet_configuration`) | `a_single_valued_facet_leaves_the_configuration_node_childless` (in `lucene_reindex_tests.rs`), with `a_multi_valued_facet_writes_one_child_carrying_multivalued` beside it | `if !dimension.multi_valued { continue; }` replaced with `if false && …` | `left: ["\tjcr:primaryType=Name:nt:unstructured", "/jcr:title\tjcr:primaryType=Name:nt:unstructured\tmultivalued=Boolean:true"]`, `right: ["\tjcr:primaryType=Name:nt:unstructured"]` — a child per dimension whatever its arity, where `NodeStateFacetsConfig` writes one only from `setMultiValued(dim, true)`. Oak's own rebuild of the fixture's faceted definition writes an empty `facets` node. |
 | The document-time refusal of an unparseable `DATE` (`DocumentMaker::make` → `date_value`) | `fields::an_unparseable_date_is_refused_by_name` (in `tests/lucene_documents/`) | the conversion replaced with `Ok(0)` | `an unparseable date is refused` — every unparseable date indexed as the epoch, where Oak's own commit fails. |
 | The segment reads back through plan 0008's own readers **before publication**, and its live document count is the writer's (`verify_before_publication` → `verify_lucene_segment`) | `a_run_rebuilds_a_lucene_index_and_leaves_the_content_tree_untouched` (in `lucene_reindex_tests.rs`), and the row above, whose neutralization it caught | — | **Not neutralizable from outside**: no input makes the bytes disagree, because the only way to produce a mismatch is a writer/reader disagreement, which is what the check exists to catch — the same carve-out plan 0008 records for its own read-back. The row above is the evidence it fires. |
-| Each attempt assembles into a **fresh** segment directory (`rebuild_lucene_index`) | `a_death_after_the_segment_is_finished_leaves_a_whole_segment_outside_the_store`, in-crate in `writer/fault_injection/lucene_reindex.rs` | — | **Not neutralized.** The residue refusal of plan 0007 stops a retry against a dead run's directory before the freshness rule could matter, so removing the `remove_dir_all` changes no observable behaviour today — defence in depth, recorded as a finding about the design rather than a gap in the evidence. |
+| Each attempt assembles into a **fresh** segment directory (`rebuild_lucene_index`) | `a_death_after_the_segment_is_finished_leaves_a_whole_segment_outside_the_store`, in-crate in `writer/fault_injection/lucene_reindex.rs` | — | **Not neutralized, and untested.** Under an **operator-named** work directory plan 0007's residue refusal stops the retry before the rule is reached — and that is the only configuration the fault tests use, one of which deletes the residue before retrying. Under the **default** work directory residue is only warned about, and the run subdirectory's name is derived from the store path, so a retry does reach the rebuild with a dead run's segment directory in place. No regression exercises that path: a gap in the evidence, not a property of the design. |
 | The empty-plan short circuit (`ReindexPlan::is_empty`) | `a_refused_run_leaves_the_store_byte_identical` | — | Task 0709's row: this plan adds a caller, not a guard. |
 | The disabler's flag is written only under Oak's predicate (`rebuild_one` → `disabler_verdict`) | plan 0008's `a_supersedes_naming_an_active_index_raises_the_disabler_flag` and plan 0007's rows | — | Task 0709 recorded the neutralization; this plan adds a caller, not a guard. |
 | The three writer refusals plan 0009 installs and this plan publishes through — a boost on an `omit_norms` field, a first token with position increment 0, a doc-values type change (`LuceneIndexWriter::add_document`) | task 0910's named regressions in `lucene_writer_tests.rs` | — | Task 0910 recorded each neutralization in the landed writer. |
@@ -441,6 +451,14 @@ property term, a `CONTAINS` over a relative definition's own field, and one
 against the repository-wide definition — with the
 same rows and the same `EXPLAIN` plan it answers from its own rebuild, each
 plan naming the index the statement was written for.
+
+Two exclusions the row above rests on, stated rather than left in the
+code: rows under `/var` and under `/content/slingshot` are dropped before
+the comparison, because two boots of the same image disagree about them
+for reasons outside any index — `/var` holds Sling's own instance-keyed
+discovery nodes — and the two counter-derived cost estimates are
+replaced by a placeholder. A sample without an `ORDER BY` is sorted
+before comparison, since no index decides the order there.
 
 **The suggester is handed back, and that is checked.** froe removes
 `:suggest-data` and builds no dictionary. Oak's rebuild of a definition

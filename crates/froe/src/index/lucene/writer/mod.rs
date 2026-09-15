@@ -20,13 +20,37 @@
 //! position-increment gap and the offset gap; boosts multiply into one
 //! norm; and the norm's token and overlap counts sum over the values.
 //!
-//! # What is bounded
+//! # What is bounded, and what is not
 //!
 //! Postings, doc values and norms are spilled through the workspace's
 //! external sort against one shared budget, and merged per format at
 //! [`LuceneIndexWriter::finish`]. Stored fields stream out as documents
-//! arrive. What stays resident is the field table, the terms writer's
-//! pending blocks, and one document at a time.
+//! arrive, and a merge pass streams too — it holds one record a cursor,
+//! not the group it merges.
+//!
+//! The budget's accounting unit is a record's own heap and inline bytes.
+//! Three resident structures are **not** charged against it, each because
+//! it is what Lucene's own writer holds as well:
+//!
+//! * **one document's inverted form** — every distinct term of one field
+//!   group with its positions, built before anything is pushed, so a
+//!   single enormous field is bounded by that field rather than by the
+//!   budget;
+//! * **the terms index of the field being written** — the block-tree
+//!   writer's root block index and the transducer it builds from it,
+//!   which grow with a field's *distinct term count*, not with its block
+//!   count, and are dropped when the field ends;
+//! * **the field table**, one entry per distinct field name, each owning
+//!   its three sorts.
+//!
+//! Nor is the `Vec` slot holding a resident record, a per-record constant
+//! the budget would have to know the layout to charge. For the short
+//! records a property rebuild produces that slot is the larger half, so a
+//! declared budget of *n* bytes is a resident set of several *n*.
+//!
+//! What the budget does bound is the un-spilled tail of each run, which is
+//! the part that grows with the *repository* rather than with one document
+//! or one field.
 
 mod flush;
 mod inverted;
