@@ -32,6 +32,7 @@ pub mod counter_builder;
 pub mod definition_update;
 pub mod lucene_directory;
 pub mod lucene_import;
+pub mod lucene_reindex;
 pub mod plan;
 pub mod prepared;
 pub mod property_builder;
@@ -190,6 +191,7 @@ pub struct ReindexOptions {
     from_head: bool,
     work_directory: WorkDirectory,
     sort_budget_bytes: usize,
+    binary_text_policy: Option<crate::index::lucene::documents::binaries::BinaryTextPolicy>,
 }
 
 impl Default for ReindexOptions {
@@ -208,6 +210,7 @@ impl ReindexOptions {
             from_head: false,
             work_directory: WorkDirectory::Default,
             sort_budget_bytes: DEFAULT_SORT_BUDGET_BYTES,
+            binary_text_policy: None,
         }
     }
 
@@ -230,6 +233,23 @@ impl ReindexOptions {
     #[must_use]
     pub fn with_work_directory(mut self, directory: WorkDirectory) -> Self {
         self.work_directory = directory;
+        self
+    }
+
+    /// Where a binary property's text comes from, which a Lucene
+    /// definition cannot be rebuilt without.
+    ///
+    /// The gate is **unconditional and refuses rather than skips**: a
+    /// Lucene definition in the selection, named or automatically
+    /// selected, without a policy refuses the plan. froe extracts no
+    /// binary text, so what a binary contributes is a decision an operator
+    /// makes, not a default froe may pick for them.
+    #[must_use]
+    pub fn with_binary_text_policy(
+        mut self,
+        policy: crate::index::lucene::documents::binaries::BinaryTextPolicy,
+    ) -> Self {
+        self.binary_text_policy = Some(policy);
         self
     }
 
@@ -262,5 +282,13 @@ impl ReindexOptions {
     #[must_use]
     pub fn sort_budget_bytes(&self) -> usize {
         self.sort_budget_bytes
+    }
+
+    /// The binary-text policy, when one was given.
+    #[must_use]
+    pub fn binary_text_policy(
+        &self,
+    ) -> Option<&crate::index::lucene::documents::binaries::BinaryTextPolicy> {
+        self.binary_text_policy.as_ref()
     }
 }

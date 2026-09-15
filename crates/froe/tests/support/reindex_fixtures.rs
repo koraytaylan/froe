@@ -346,3 +346,219 @@ pub(crate) fn store_with_a_counter_on_an_absent_lane(directory: &TestDirectory) 
 pub(crate) fn from_head(directory: &TestDirectory) -> ReindexOptions {
     options(directory).with_from_head(true)
 }
+
+/// A store with content and one flagged `lucene` definition of the shape
+/// the interop fixture's default definition has: an `nt:base` rule whose
+/// catch-all property definition is analyzed and `nodeScopeIndex`, with
+/// path restrictions on.
+///
+/// The node types are written too, because a rule over `nt:base` reaches a
+/// node of another type only through the registry.
+pub(crate) fn store_with_a_flagged_lucene_index(directory: &TestDirectory) -> PathBuf {
+    write_lucene_store(directory, lucene_definition(Vec::new(), Vec::new()))
+}
+
+/// The `lucene` definition, with extra definition properties and extra
+/// property definitions a case names.
+pub(crate) fn lucene_definition(
+    extras: Vec<(&str, Property)>,
+    properties: Vec<(&str, Node)>,
+) -> Node {
+    lucene_definition_over("nt:base", extras, properties)
+}
+
+/// The same over a named node type, for a case that needs the rule to
+/// cover something else — or nothing.
+pub(crate) fn lucene_definition_over(
+    node_type: &str,
+    extras: Vec<(&str, Property)>,
+    properties: Vec<(&str, Node)>,
+) -> Node {
+    let mut catch_all = Node::new()
+        .with(
+            "jcr:primaryType",
+            Property::Name("nt:unstructured".to_owned()),
+        )
+        .with("name", Property::Text("^[^\\/]*$".to_owned()))
+        .with("isRegexp", Property::Boolean(true))
+        .with("analyzed", Property::Boolean(true))
+        .with("nodeScopeIndex", Property::Boolean(true));
+    let _ = &mut catch_all;
+    let mut property_node = Node::new().with(
+        "jcr:primaryType",
+        Property::Name("nt:unstructured".to_owned()),
+    );
+    // The analyzed catch-all is what makes the definition fulltext-enabled,
+    // and therefore an `oakCodec` one. A case that needs a definition
+    // *without* it states its own property set and passes `no-catch-all`.
+    if !extras.iter().any(|(name, _)| *name == "no-catch-all") {
+        property_node = property_node.with_child("all", catch_all);
+    }
+    for (name, node) in properties {
+        property_node = property_node.with_child(name, node);
+    }
+    let rule = Node::new()
+        .with(
+            "jcr:primaryType",
+            Property::Name("nt:unstructured".to_owned()),
+        )
+        .with_child("properties", property_node);
+    let rules = Node::new()
+        .with(
+            "jcr:primaryType",
+            Property::Name("nt:unstructured".to_owned()),
+        )
+        .with_child(node_type, rule);
+    let mut node = definition(
+        "lucene",
+        if extras.iter().any(|(name, _)| *name == "no-async") {
+            vec![("evaluatePathRestrictions", Property::Boolean(true))]
+        } else {
+            vec![
+                ("async", Property::Text("async".to_owned())),
+                ("evaluatePathRestrictions", Property::Boolean(true)),
+            ]
+        },
+    );
+    for (name, value) in extras {
+        if name == "no-async" || name == "no-catch-all" {
+            continue;
+        }
+        node = node.with(name, value);
+    }
+    node.with_child("indexRules", rules)
+}
+
+/// Writes a store holding `definition` at `/oak:index/lucene`, the
+/// `nodetype` definition the path service requires, a small content tree
+/// and the node types the rules resolve through.
+pub(crate) fn write_lucene_store(directory: &TestDirectory, definition_node: Node) -> PathBuf {
+    let store = directory.store();
+    // A Lucene definition is rebuilt from its lane's checkpoint, so the
+    // fixture carries the lane, the checkpoint it names and the state that
+    // checkpoint pins.
+    let typed = || {
+        Node::new().with(
+            "jcr:primaryType",
+            Property::Name("nt:unstructured".to_owned()),
+        )
+    };
+    let content_tree = || {
+        typed()
+            .with("jcr:title", Property::Text("Alpha One".to_owned()))
+            .with_child(
+                "page",
+                typed().with("jcr:title", Property::Text("Beta Two".to_owned())),
+            )
+    };
+    let content = Node::new()
+        .with_child("content", content_tree())
+        .with_child(
+            ":async",
+            Node::new().with("async", Property::Text("lane-checkpoint".to_owned())),
+        )
+        .with_child(
+            "jcr:system",
+            Node::new().with_child(
+                "jcr:nodeTypes",
+                Node::new().with_child(
+                    "nt:base",
+                    Node::new().with(
+                        "rep:primarySubtypes",
+                        Property::Names(vec!["nt:unstructured".to_owned(), "nt:file".to_owned()]),
+                    ),
+                ),
+            ),
+        )
+        .with_child(
+            "oak:index",
+            Node::new()
+                .with_child(
+                    "nodetype",
+                    Node::new()
+                        .with(
+                            "jcr:primaryType",
+                            Property::Name("oak:QueryIndexDefinition".to_owned()),
+                        )
+                        .with("type", Property::Text("property".to_owned()))
+                        .with(
+                            "propertyNames",
+                            Property::Names(vec!["jcr:primaryType".to_owned()]),
+                        ),
+                )
+                .with_child("lucene", definition_node),
+        );
+    let pinned = Node::new()
+        .with_child("content", content_tree())
+        .with_child(
+            "jcr:system",
+            Node::new().with_child(
+                "jcr:nodeTypes",
+                Node::new().with_child(
+                    "nt:base",
+                    Node::new().with(
+                        "rep:primarySubtypes",
+                        Property::Names(vec!["nt:unstructured".to_owned(), "nt:file".to_owned()]),
+                    ),
+                ),
+            ),
+        );
+    super::property_index_layout::write_repository_with_checkpoints(
+        &store,
+        &content,
+        &[("lane-checkpoint", pinned)],
+    );
+    store
+}
+
+/// The same store, with the lane naming a checkpoint that is not there.
+pub(crate) fn write_lucene_store_without_a_checkpoint(directory: &TestDirectory) -> PathBuf {
+    let store = directory.store();
+    let typed = || {
+        Node::new().with(
+            "jcr:primaryType",
+            Property::Name("nt:unstructured".to_owned()),
+        )
+    };
+    let content = Node::new()
+        .with_child("content", typed())
+        .with_child(
+            ":async",
+            Node::new().with("async", Property::Text("lane-checkpoint".to_owned())),
+        )
+        .with_child(
+            "oak:index",
+            Node::new()
+                .with_child(
+                    "nodetype",
+                    Node::new()
+                        .with(
+                            "jcr:primaryType",
+                            Property::Name("oak:QueryIndexDefinition".to_owned()),
+                        )
+                        .with("type", Property::Text("property".to_owned()))
+                        .with(
+                            "propertyNames",
+                            Property::Names(vec!["jcr:primaryType".to_owned()]),
+                        ),
+                )
+                .with_child(
+                    "lucene",
+                    // A `:data` from a previous cycle, which is what a reset
+                    // removes: a definition with none is `NothingToDo`.
+                    lucene_definition(Vec::new(), Vec::new()).with_child(":data", Node::new()),
+                ),
+        );
+    write_repository_with_tree(&store, &content);
+    store
+}
+
+/// Options with a binary-text policy, which a Lucene definition cannot be
+/// rebuilt without.
+pub(crate) fn lucene_options(directory: &TestDirectory) -> ReindexOptions {
+    options(directory).with_binary_text_policy(
+        froe::index::lucene::documents::binaries::BinaryTextPolicy::new(
+            froe::index::lucene::documents::binaries::BinaryTextFallback::Marker,
+        ),
+    )
+}

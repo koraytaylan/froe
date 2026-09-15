@@ -142,15 +142,18 @@ fn a_type_with_no_editor_is_refused() {
     assert!(refusal.contains("is of type ordered"), "{refusal}");
 }
 
+/// A Lucene definition needs a binary-text policy before froe will rebuild
+/// it, and a run that gives none is refused rather than skipped.
+///
+/// The rest of the Lucene refusals are in `lucene_reindex_guard_tests.rs`;
+/// this one is here because the gate is on the run's options rather than on
+/// the definition, and a run of *any* selection reaches it.
 #[test]
-fn a_lucene_definition_is_refused_until_the_lucene_plan_lands() {
+fn a_lucene_definition_without_a_binary_text_policy_is_refused() {
     let directory = TestDirectory::new("guard-lucene");
     let store = store_with(&directory, flagged("lucene", Vec::new()));
     let refusal = refusal_for_the_subject(&directory, &store);
-    assert!(
-        refusal.contains("which this froe version does not rebuild"),
-        "{refusal}"
-    );
+    assert!(refusal.contains("binary-text policy"), "{refusal}");
 }
 
 #[test]

@@ -479,7 +479,7 @@ fn entry_bytes(entry: &IndexEntry) -> u64 {
 /// The path set is exact rather than a depth bound, so a spliced
 /// self-reference is a refusal rather than an unbounded walk — the same rule
 /// `content/traversal.rs` applies.
-fn walk_visible(
+pub(crate) fn walk_visible(
     root: &NodeState<'_>,
     mut visit: impl FnMut(&NodeState<'_>, &str) -> Result<()>,
 ) -> Result<()> {
@@ -536,7 +536,7 @@ fn walk_visible(
     Ok(())
 }
 
-fn index_error_to_store_error(error: crate::index::IndexError) -> Error {
+pub(crate) fn index_error_to_store_error(error: crate::index::IndexError) -> Error {
     match error {
         crate::index::IndexError::Record(source) => source,
         other => Error::InvalidFormat {

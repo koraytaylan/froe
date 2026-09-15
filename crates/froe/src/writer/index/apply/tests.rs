@@ -330,3 +330,44 @@ fn the_same_fixtures_pass_unperturbed() {
         assert!(outcome.moved_the_head(), "{index_type} rebuilt nothing");
     }
 }
+
+/// A Lucene selection runs through `PreparedReindex` and therefore through
+/// the `index-reindex.` cutpoints task 0708 armed.
+///
+/// The assertion is the wiring itself: the publication and verification
+/// boundaries are `apply.rs`'s, shared with every other definition type, so
+/// what this plan has to show is that a Lucene definition *reaches* them
+/// rather than taking a path of its own. A dropped arm would rebuild
+/// correctly and simply never be interrupted where the case says it is.
+#[test]
+fn a_lucene_selection_runs_through_the_prepared_wrapper() {
+    use crate::index::lucene::documents::binaries::{BinaryTextFallback, BinaryTextPolicy};
+
+    let directory = TestDirectory::new("lucene-wiring");
+    let store = crate::writer::fault_injection::lucene_fixture::write_lucene_reindex_fixture(
+        &directory.path,
+    );
+    let options = ReindexOptions::new()
+        .with_work_directory(crate::writer::index::WorkDirectory::OperatorNamed(
+            crate::writer::fault_injection::test_support::reindex_work_directory(&store),
+        ))
+        .with_binary_text_policy(BinaryTextPolicy::new(BinaryTextFallback::Marker));
+
+    // `reindex` is the shared entry: it prepares, applies and publishes.
+    // A Lucene definition that did not reach it would come back with no
+    // report at all.
+    let outcome = crate::writer::index::reindex(&store, options).expect("reindex");
+    assert!(outcome.moved_the_head(), "the wrapper published nothing");
+    let (path, report) = outcome
+        .definitions
+        .first()
+        .expect("the Lucene definition reached the shared tail");
+    assert_eq!(path, "/oak:index/lucene");
+    assert!(
+        matches!(
+            report,
+            crate::writer::index::DefinitionReport::RebuiltIndex { .. }
+        ),
+        "{report:?}"
+    );
+}

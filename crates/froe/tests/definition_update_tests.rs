@@ -643,6 +643,7 @@ fn from_head_rebuilds_a_mirror_and_resets_a_counter() {
         &SelectionOptions {
             requested_paths: Vec::new(),
             from_head: true,
+            has_binary_text_policy: false,
         },
     );
     let states: std::collections::BTreeMap<String, IndexingState> = selected.into_iter().collect();
@@ -675,7 +676,7 @@ fn every_unsupported_type_is_refused_by_name() {
     let kinds: Vec<&str> = refused
         .iter()
         .map(|refusal| match refusal {
-            SelectionRefusal::LuceneNotYetSupported { .. } => "lucene",
+            SelectionRefusal::LuceneWithoutBinaryTextPolicy { .. } => "lucene",
             SelectionRefusal::ExternalIndex { .. } => "external",
             SelectionRefusal::NoEditor { .. } => "no-editor",
             _ => "other",
@@ -729,6 +730,7 @@ fn an_unflagged_definition_is_left_alone_unless_it_is_named() {
         &SelectionOptions {
             requested_paths: vec!["/oak:index/title".to_owned()],
             from_head: false,
+            has_binary_text_policy: false,
         },
     );
     assert_eq!(selected.len(), 1, "a named definition is rebuilt anyway");

@@ -86,6 +86,7 @@ fn build_plan(
         &SelectionOptions {
             requested_paths: options.requested_paths().to_vec(),
             from_head: options.from_head(),
+            has_binary_text_policy: options.binary_text_policy().is_some(),
         },
     )?;
 
@@ -98,6 +99,19 @@ fn build_plan(
                 *entry_bytes,
                 options.sort_budget_bytes() as u64,
             ));
+        }
+        if let ReindexAction::RebuildLucene {
+            stored_bytes,
+            indexed_bytes,
+            ..
+        } = &action
+        {
+            peak_estimate =
+                peak_estimate.max(crate::writer::index::plan::lucene_work_directory_estimate(
+                    *stored_bytes,
+                    *indexed_bytes,
+                    options.sort_budget_bytes() as u64,
+                ));
         }
         actions.push(action);
     }
@@ -179,6 +193,10 @@ fn plan_one(
     };
     let state_root = crate::content::node::NodeState::new(repository, state_record);
 
+    if selected.definition.index_type.as_ref() == Some(&crate::index::IndexType::Lucene) {
+        return plan_lucene(repository, selected, &state_root, options, observer);
+    }
+
     let (entries, entry_bytes) = match selected.definition.index_type.as_ref() {
         Some(crate::index::IndexType::Counter) => {
             let builder = CounterBuilder::new(&selected.definition);
@@ -222,6 +240,65 @@ fn plan_one(
         entries,
         entry_bytes,
     })
+}
+
+/// The Lucene arm of the plan: a counting walk that analyzes nothing.
+///
+/// The two byte totals are the proxies the safety case names, and the plan
+/// reports them beside the figure implementation derives from them rather
+/// than instead of it.
+fn plan_lucene(
+    repository: &Repository,
+    selected: &crate::writer::index::selection::SelectedIndex,
+    state_root: &crate::content::node::NodeState<'_>,
+    options: &ReindexOptions,
+    observer: &mut dyn ProgressObserver,
+) -> Result<ReindexAction> {
+    let definition_node =
+        crate::content::node::NodeState::new(repository, selected.definition_record);
+    let mut warnings = Vec::new();
+    // Selection read these already and refused what it could not carry; the
+    // read here is against the **state root**, which is where the rebuild
+    // resolves its node types from.
+    let rules = crate::index::lucene::documents::rules::IndexingRules::read(
+        &definition_node,
+        &selected.definition.path,
+        state_root,
+        &mut warnings,
+    )
+    .map_err(index_error_to_store_error)?;
+    let estimate = crate::writer::index::lucene_reindex::estimate_lucene_index(
+        state_root,
+        &selected.definition,
+        &rules,
+        observer,
+    )?;
+    Ok(ReindexAction::RebuildLucene {
+        path: selected.definition.path.clone(),
+        state: selected.state.clone(),
+        rules: rules.rules.len(),
+        documents: estimate.documents,
+        stored_bytes: estimate.stored_bytes,
+        indexed_bytes: estimate.indexed_bytes,
+        binary_text_policy: render_binary_text_policy(options),
+    })
+}
+
+/// The policy in force, for the plan line.
+fn render_binary_text_policy(options: &ReindexOptions) -> String {
+    let Some(policy) = options.binary_text_policy() else {
+        return "none".to_owned();
+    };
+    let fallback = match policy.fallback() {
+        crate::index::lucene::documents::binaries::BinaryTextFallback::Marker => {
+            "the extraction-error marker"
+        }
+        crate::index::lucene::documents::binaries::BinaryTextFallback::Skip => "nothing",
+    };
+    match policy.pre_extracted_text_directory() {
+        None => fallback.to_owned(),
+        Some(directory) => format!("{} under {}", fallback, directory.display()),
+    }
 }
 
 /// The hidden children a reindex would remove: every one not flagged

@@ -36,6 +36,25 @@ pub enum ReindexAction {
         /// Their total resident bytes, which is what the sort spills.
         entry_bytes: u64,
     },
+    /// Rebuild a Lucene definition: make documents, write a segment,
+    /// copy it into `:data`.
+    RebuildLucene {
+        /// The definition.
+        path: String,
+        /// Which state it is rebuilt from.
+        state: IndexingState,
+        /// Indexing rules the definition declares.
+        rules: usize,
+        /// Documents the counting walk would make: one per included node
+        /// with a rule.
+        documents: u64,
+        /// The bytes of values the rules mark stored.
+        stored_bytes: u64,
+        /// The bytes of values the rules mark indexed.
+        indexed_bytes: u64,
+        /// Where a binary property's text comes from, rendered.
+        binary_text_policy: String,
+    },
     /// Remove the hidden children and leave the rest to Oak's own replay.
     Reset {
         /// The definition.
@@ -60,6 +79,7 @@ impl ReindexAction {
     pub fn path(&self) -> &str {
         match self {
             Self::Rebuild { path, .. }
+            | Self::RebuildLucene { path, .. }
             | Self::Reset { path, .. }
             | Self::NothingToDo { path, .. } => path,
         }
@@ -182,6 +202,15 @@ impl ReindexPlan {
             .count()
     }
 
+    /// How many Lucene definitions will be rebuilt.
+    #[must_use]
+    pub fn lucene_rebuild_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|action| matches!(action, ReindexAction::RebuildLucene { .. }))
+            .count()
+    }
+
     /// How many will be reset.
     #[must_use]
     pub fn reset_count(&self) -> usize {
@@ -190,6 +219,27 @@ impl ReindexPlan {
             .filter(|action| matches!(action, ReindexAction::Reset { .. }))
             .count()
     }
+}
+
+/// The work-directory proxy for one Lucene definition.
+///
+/// The two byte totals are the only ones a counting walk can produce
+/// without analyzing anything; the multiplier is a **structural count** and
+/// not a measurement — the spill runs, the assembled segment and the
+/// compound copy — and `docs/index.md` §5.3 records it as such. Nothing
+/// here measures bytes per token or bytes per posting.
+#[must_use]
+pub fn lucene_work_directory_estimate(
+    stored_bytes: u64,
+    indexed_bytes: u64,
+    sort_budget_bytes: u64,
+) -> u64 {
+    stored_bytes
+        .saturating_add(indexed_bytes)
+        .saturating_mul(3)
+        .saturating_add(
+            (crate::writer::index::MAXIMUM_FAN_IN as u64).saturating_mul(sort_budget_bytes),
+        )
 }
 
 /// The work-directory estimate for one definition.

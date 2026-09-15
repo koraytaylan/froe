@@ -236,6 +236,10 @@ pub(crate) fn cleanup_fault_child() {
         run_reindex_child(&directory, &cutpoint, &mode);
         return;
     }
+    if scenario == super::lucene_fixture::LUCENE_REINDEX_SCENARIO {
+        super::lucene_fixture::run_lucene_reindex_child(&directory, &cutpoint, &mode);
+        return;
+    }
     if scenario == LUCENE_IMPORT_SCENARIO {
         run_lucene_import_child(&directory, &cutpoint, &mode);
         return;
@@ -489,7 +493,7 @@ pub(crate) fn write_orphaned_history_fixture(directory: &Path) {
 pub(crate) const REINDEX_SCENARIO: &str = "reindex";
 
 /// A single-valued property of `property_type`, written from its text.
-fn single_valued<Sink: crate::writer::SegmentSink>(
+pub(crate) fn single_valued<Sink: crate::writer::SegmentSink>(
     writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
     name: &str,
     property_type: crate::content::property::PropertyType,
@@ -505,7 +509,7 @@ fn single_valued<Sink: crate::writer::SegmentSink>(
 
 /// A single-entry multi-valued `NAME` property, which is what
 /// `propertyNames` is.
-fn one_name<Sink: crate::writer::SegmentSink>(
+pub(crate) fn one_name<Sink: crate::writer::SegmentSink>(
     writer: &mut crate::writer::record_writer::RecordWriter<Sink>,
     name: &str,
     value: &str,

@@ -88,8 +88,33 @@ pub struct SelectedIndex {
 /// attribute is a refusal they will work around.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SelectionRefusal {
-    /// A `lucene` definition. Plan 0010 fills this in.
-    LuceneNotYetSupported {
+    /// A `lucene` definition selected with no binary-text policy. froe
+    /// extracts no binary text, so what a binary property contributes is
+    /// an operator's decision; the gate refuses rather than skipping,
+    /// because a rebuild that quietly left every binary out would be a
+    /// fulltext index that answers fewer queries than Oak's.
+    LuceneWithoutBinaryTextPolicy {
+        /// The definition.
+        path: String,
+    },
+    /// A `lucene` definition declaring something this plan does not
+    /// reproduce: a codec verdict that is not `oakCodec`, a
+    /// definition-level `valueRegex`, a property definition using
+    /// `function`, `dynamicBoost`, `useInSimilarity` or `similarityTags`,
+    /// a `compatVersion` of 1, a `maxFieldLength` of zero, a
+    /// consumer-registered analyzer, or one of the other constructs
+    /// `documents::rules` names.
+    LuceneDefinitionUnsupported {
+        /// The definition.
+        path: String,
+        /// What it declares, as the rules reader named it.
+        reason: String,
+    },
+    /// A `lucene` definition with no `async` property. Oak documents
+    /// `async` as required for a Lucene index and provides no oracle for
+    /// the synchronous case, so froe refuses rather than guessing which
+    /// state to build from.
+    LuceneSynchronous {
         /// The definition.
         path: String,
     },
@@ -207,7 +232,9 @@ impl SelectionRefusal {
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Self::LuceneNotYetSupported { path }
+            Self::LuceneWithoutBinaryTextPolicy { path }
+            | Self::LuceneDefinitionUnsupported { path, .. }
+            | Self::LuceneSynchronous { path }
             | Self::ExternalIndex { path, .. }
             | Self::NoEditor { path, .. }
             | Self::Unmodellable { path, .. }
@@ -228,9 +255,18 @@ impl SelectionRefusal {
 impl std::fmt::Display for SelectionRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LuceneNotYetSupported { path } => write!(
+            Self::LuceneWithoutBinaryTextPolicy { path } => write!(
                 formatter,
-                "{path} is a lucene definition, which this froe version does not rebuild"
+                "{path} is a lucene definition and no binary-text policy was given; froe \
+                 extracts no binary text, so the run needs one before it can rebuild it"
+            ),
+            Self::LuceneDefinitionUnsupported { path, reason } => {
+                write!(formatter, "{path} cannot be rebuilt natively: {reason}")
+            }
+            Self::LuceneSynchronous { path } => write!(
+                formatter,
+                "{path} is a lucene definition with no async property, which Oak documents as \
+                 required and provides no oracle for"
             ),
             Self::ExternalIndex { path, index_type } => write!(
                 formatter,
@@ -320,6 +356,9 @@ pub struct SelectionOptions {
     pub requested_paths: Vec<String>,
     /// Whether a dangling or absent lane checkpoint is authorized.
     pub from_head: bool,
+    /// Whether the caller supplied a binary-text policy, without which a
+    /// Lucene definition is refused.
+    pub has_binary_text_policy: bool,
 }
 
 /// Chooses what to rebuild.
@@ -367,6 +406,12 @@ pub fn select(
             continue;
         }
         if let Some(refusal) = refuse_by_shape(&definition) {
+            selection.refused.push(refusal);
+            continue;
+        }
+        if definition.index_type.as_ref() == Some(&IndexType::Lucene)
+            && let Some(refusal) = refuse_lucene(&head_root, &definition, options)?
+        {
             selection.refused.push(refusal);
             continue;
         }
@@ -486,6 +531,59 @@ fn refuse_unmodellable(
     }
 }
 
+/// The refusals a Lucene definition's own rules decide, which
+/// [`refuse_by_shape`] cannot: they need the definition node.
+///
+/// The rules are read against the **head's** node types here, because what
+/// this answers is whether the definition can be rebuilt at all — a
+/// question about its own shape. The rebuild reads them again against the
+/// state root, as Oak's own cycle does.
+fn refuse_lucene(
+    head_root: &NodeState<'_>,
+    definition: &IndexDefinition,
+    options: &SelectionOptions,
+) -> crate::Result<Option<SelectionRefusal>> {
+    let path = definition.path.clone();
+    if !options.has_binary_text_policy {
+        return Ok(Some(SelectionRefusal::LuceneWithoutBinaryTextPolicy {
+            path,
+        }));
+    }
+    if definition.indexing_mode.synchronous {
+        return Ok(Some(SelectionRefusal::LuceneSynchronous { path }));
+    }
+    // A hybrid definition lists `sync` beside its lane name, and Oak keeps
+    // a synchronous `:property-index` for it that this plan does not build.
+    if definition.indexing_mode.synchronous_synonym {
+        return Ok(Some(SelectionRefusal::LuceneDefinitionUnsupported {
+            path,
+            reason: "it is hybrid — `async` lists `sync` beside its lane — and Oak keeps a \
+                     synchronous :property-index for it that froe does not build"
+                .to_owned(),
+        }));
+    }
+    let Some(node) = descend(head_root, &definition.path)? else {
+        return Ok(Some(SelectionRefusal::Unmodellable {
+            path,
+            reason: "the definition node vanished between the listing and the selection".to_owned(),
+        }));
+    };
+    let mut warnings = Vec::new();
+    match crate::index::lucene::documents::rules::IndexingRules::read(
+        &node,
+        &definition.path,
+        head_root,
+        &mut warnings,
+    ) {
+        Ok(_) => Ok(None),
+        Err(crate::index::IndexError::Record(error)) => Err(error),
+        Err(other) => Ok(Some(SelectionRefusal::LuceneDefinitionUnsupported {
+            path,
+            reason: other.to_string(),
+        })),
+    }
+}
+
 /// The refusals that follow from the definition alone.
 fn refuse_by_shape(definition: &IndexDefinition) -> Option<SelectionRefusal> {
     let path = definition.path.clone();
@@ -521,7 +619,6 @@ fn refuse_by_shape(definition: &IndexDefinition) -> Option<SelectionRefusal> {
 
     match definition.index_type.as_ref() {
         None => Some(SelectionRefusal::NotADefinition { path }),
-        Some(IndexType::Lucene) => Some(SelectionRefusal::LuceneNotYetSupported { path }),
         Some(IndexType::Elasticsearch) => Some(SelectionRefusal::ExternalIndex {
             path,
             index_type: "elasticsearch".to_owned(),
@@ -538,7 +635,12 @@ fn refuse_by_shape(definition: &IndexDefinition) -> Option<SelectionRefusal> {
             path,
             index_type: name.clone(),
         }),
-        Some(IndexType::Property | IndexType::Reference | IndexType::Counter) => None,
+        // A Lucene definition's own refusals need its rules, which this
+        // function cannot read: `refuse_lucene` does them after this
+        // returns nothing.
+        Some(
+            IndexType::Property | IndexType::Reference | IndexType::Counter | IndexType::Lucene,
+        ) => None,
     }
 }
 
@@ -658,6 +760,25 @@ fn resolve_state(
             lane: lane_name.to_owned(),
         }));
     }
+
+    // A Lucene definition is **reset** rather than rebuilt from the head,
+    // which is the one place this plan needs the variant plan 0007 kept.
+    //
+    // After a lost checkpoint Oak's fulltext editor re-enters reindex mode
+    // on a missing before state at the root, and its index writer's reindex
+    // branch *appends* every document again to the retained `:data` —
+    // doubling the index whether or not froe rebuilt it. A definition with
+    // no hidden child is the case Oak rebuilds from scratch, so removing
+    // them is what makes the next cycle produce a correct index.
+    if definition.index_type.as_ref() == Some(&IndexType::Lucene) {
+        return Ok(Ok((
+            IndexingState::ResetForReplay {
+                lane: lane_name.to_owned(),
+            },
+            None,
+        )));
+    }
+
     Ok(Ok((
         IndexingState::Head,
         Some(head_root.record_identifier()),

@@ -56,7 +56,100 @@ fn verify_one_definition(store: &WritableRepository, definition: &RebuiltDefinit
             state_root,
             credited_by_path,
         } => verify_counter(store, definition, *state_root, credited_by_path),
+        Verification::LuceneSegment { documents, files } => {
+            verify_lucene_segment(store, definition, *documents, files)
+        }
     }
+}
+
+/// The Lucene arm: the `:data` the run wrote is read back **through the
+/// open session, before publication**, with plan 0008's own readers.
+///
+/// Two things are asserted, and they are the two a wrong write would break:
+/// every file the copy named reads back with the bytes the segment
+/// directory holds, and the commit the directory carries names the document
+/// count the writer reported. A file that does not read back refuses here,
+/// which is the precondition plan 0008's case states for its own `:data`
+/// write and this plan's mutation table repeats.
+fn verify_lucene_segment(
+    store: &WritableRepository,
+    definition: &RebuiltDefinition,
+    documents: u64,
+    files: &[String],
+) -> Result<()> {
+    use std::io::Read as _;
+
+    let node = crate::content::node::NodeState::new(store, definition.rebuilt_record);
+    let model = crate::index::definition::IndexDefinition::read(&node, &definition.path)
+        .map_err(index_error_to_store_error)?;
+    let directory = crate::index::lucene::OakDirectory::open(
+        store,
+        &node,
+        &model,
+        crate::index::lucene::INDEX_DATA_CHILD_NAME,
+    )
+    .map_err(index_error_to_store_error)?
+    .ok_or_else(|| Error::InvalidFormat {
+        details: format!(
+            "the rebuilt definition {} has no {} child",
+            definition.path,
+            crate::index::lucene::INDEX_DATA_CHILD_NAME
+        ),
+    })?;
+    let present: std::collections::BTreeSet<&str> =
+        directory.file_names().iter().map(String::as_str).collect();
+    for name in files {
+        if !present.contains(name.as_str()) {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "the rebuilt {} is missing the file {name} the copy wrote",
+                    definition.path
+                ),
+            });
+        }
+        // Reading the file back is what proves the records hold it: a
+        // truncated or unreadable blob fails here, before the head moves.
+        let file = directory.file(name).map_err(index_error_to_store_error)?;
+        let mut stored = Vec::new();
+        file.reader().read_to_end(&mut stored)?;
+        if stored.is_empty() {
+            return Err(Error::InvalidFormat {
+                details: format!(
+                    "the rebuilt {}'s {name} reads back empty, which no segment file is",
+                    definition.path
+                ),
+            });
+        }
+    }
+    // The structural check is plan 0008's own, over the records this run
+    // just wrote: the commit parses, every file it names is present,
+    // nothing is unreferenced, and the live document count is the one the
+    // writer reported.
+    let report = crate::index::lucene::check::check_structure(&directory)
+        .map_err(index_error_to_store_error)?;
+    if !report.is_coherent() {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "the rebuilt {} does not read back as a coherent index: {} missing, {} \
+                 unreferenced, {} unreadable",
+                definition.path,
+                report.missing_files.len(),
+                report.unreferenced_files.len(),
+                report.unreadable_files.len()
+            ),
+        });
+    }
+    let counted = u64::try_from(report.live_document_count).unwrap_or(0);
+    if counted != documents {
+        return Err(Error::InvalidFormat {
+            details: format!(
+                "the rebuilt {} holds {counted} live documents where the writer wrote \
+                 {documents}",
+                definition.path
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// A test-only way to damage a subtree between the builders and the tail.

@@ -127,6 +127,14 @@ pub enum Verification {
         /// How many entries the walk produced, which is the budget.
         entries: u64,
     },
+    /// The Lucene arm: the segment reads back through plan 0008's own
+    /// readers, and its document count is the one the writer reported.
+    LuceneSegment {
+        /// Documents the writer wrote.
+        documents: u64,
+        /// The files the copy put in `:data`, by name.
+        files: Vec<String>,
+    },
     /// The counter's own arm: paths resolve, and every `:cnt` adds up.
     Counter {
         /// The state root the rebuild walked.
@@ -148,6 +156,17 @@ pub enum DefinitionReport {
         distinct_keys: u64,
         /// Index nodes written.
         nodes_written: u64,
+    },
+    /// A Lucene index rebuilt, with what the run observed.
+    RebuiltIndex {
+        /// Documents written.
+        documents: u64,
+        /// Nodes entered, whether or not they produced a document.
+        nodes_visited: u64,
+        /// The segment's files, in the order they were copied.
+        files: Vec<String>,
+        /// Their total bytes.
+        segment_bytes: u64,
     },
     /// Reset: hidden children removed, nothing built.
     Reset {
@@ -425,6 +444,7 @@ fn rebuild_every_definition<Sink: SegmentSink>(
         &crate::writer::index::selection::SelectionOptions {
             requested_paths: prepared.options.requested_paths().to_vec(),
             from_head: prepared.options.from_head(),
+            has_binary_text_policy: prepared.options.binary_text_policy().is_some(),
         },
     )?;
 
@@ -488,6 +508,122 @@ fn reset_one<Sink: SegmentSink>(
     }))
 }
 
+/// What the Lucene arm hands back to the dispatch.
+type LuceneArm = (
+    Vec<(String, RecordIdentifier)>,
+    DefinitionReport,
+    Verification,
+    crate::writer::index::lucene_reindex::LuceneRebuild,
+);
+
+/// The Lucene arm, lifted out of the dispatch so that neither function
+/// outgrows what a reader holds at once.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatch's own inputs, passed through rather than re-derived"
+)]
+fn rebuild_lucene_one<Sink: SegmentSink>(
+    writer: &mut RecordWriter<Sink>,
+    selected: &crate::writer::index::selection::SelectedIndex,
+    definition: &crate::content::node::NodeState<'_>,
+    prepared: &PreparedReindex,
+    state_root: &crate::content::node::NodeState<'_>,
+    location: &RunLocation,
+    budget: &SortBudget,
+    run: &RunDirectory,
+    observer: &mut dyn ProgressObserver,
+) -> Result<LuceneArm> {
+    let policy = prepared.options.binary_text_policy().ok_or_else(|| {
+        // Selection refuses without one, so this is the wiring
+        // assertion rather than the gate: an arm reached with no
+        // policy is a selection that changed under it.
+        Error::InvalidFormat {
+            details:
+                crate::writer::index::selection::SelectionRefusal::LuceneWithoutBinaryTextPolicy {
+                    path: selected.definition.path.clone(),
+                }
+                .to_string(),
+        }
+    })?;
+    // Oak's own cycle builds the node types from the state it
+    // indexes, so the rules resolve against the state root and
+    // never against the head.
+    let mut warnings = Vec::new();
+    let rules = crate::index::lucene::documents::rules::IndexingRules::read(
+        definition,
+        &selected.definition.path,
+        state_root,
+        &mut warnings,
+    )
+    .map_err(index_error_to_store_error)?;
+    let segment_directory = run.path.join(format!(
+        "{}-segment",
+        sanitized_prefix(&selected.definition.path)
+    ));
+    let subject = crate::writer::index::lucene_reindex::LuceneRebuildSubject {
+        state_root,
+        definition: &selected.definition,
+        rules: &rules,
+        policy,
+        segment_directory: &segment_directory,
+        runs: location,
+        budget,
+    };
+    let built =
+        crate::writer::index::lucene_reindex::rebuild_lucene_index(&subject, writer, observer)?;
+    let children = vec![(
+        crate::index::lucene::INDEX_DATA_CHILD_NAME.to_owned(),
+        built.data_record,
+    )];
+    let report = DefinitionReport::RebuiltIndex {
+        documents: built.documents,
+        nodes_visited: built.nodes_visited,
+        files: built.files.clone(),
+        segment_bytes: built.segment_bytes,
+    };
+    let verification = Verification::LuceneSegment {
+        documents: built.documents,
+        files: built.files.clone(),
+    };
+    Ok((children, report, verification, built))
+}
+
+/// The lane checkpoint's `properties/created`, when the state is a
+/// checkpoint and the value parses as Jackrabbit's own ISO-8601.
+///
+/// `docs/analysis/index-definitions.md` records the rule: Oak's fulltext
+/// editor writes the `indexingCheckpointTime` commit attribute as
+/// `lastUpdated` when the cycle set one, and the current time otherwise.
+fn checkpoint_creation_time(
+    store: &WritableRepository,
+    state: &IndexingState,
+) -> Result<Option<String>> {
+    let IndexingState::LaneCheckpoint { checkpoint, .. } = state else {
+        return Ok(None);
+    };
+    let Some(checkpoints) = store.head_node().child_node("checkpoints")? else {
+        return Ok(None);
+    };
+    let Some(node) = checkpoints.child_node(checkpoint)? else {
+        return Ok(None);
+    };
+    let Some(properties) = node.child_node("properties")? else {
+        return Ok(None);
+    };
+    let Some(created) = properties.property("created")? else {
+        return Ok(None);
+    };
+    let Some(text) = crate::index::values_of(&created)
+        .first()
+        .and_then(crate::content::PropertyValue::as_text)
+    else {
+        return Ok(None);
+    };
+    // A value that does not parse is one Oak would not have written, and the
+    // run's own time is the honest answer.
+    Ok(crate::java::parse_epoch_milliseconds(&text).map(|_| text))
+}
+
 /// A rebuild: collect, sort, build, rewrite.
 fn rebuild_one<Sink: SegmentSink>(
     store: &WritableRepository,
@@ -512,6 +648,7 @@ fn rebuild_one<Sink: SegmentSink>(
     let location = RunLocation::new(&run.path, sanitized_prefix(&selected.definition.path));
 
     let mut created_seed = None;
+    let mut lucene_built = None;
     let (hidden_children, report, verification) = match selected.definition.index_type.as_ref() {
         Some(crate::index::IndexType::Counter) => {
             let builder = CounterBuilder::new(&selected.definition);
@@ -536,17 +673,19 @@ fn rebuild_one<Sink: SegmentSink>(
             )
         }
         Some(crate::index::IndexType::Lucene) => {
-            // Selection refuses a Lucene definition, so this arm is
-            // unreachable through `select`. It is here so the fall-through
-            // below cannot one day treat a Lucene definition as a property
-            // one — a silent wrong rebuild — and so plan 0010 has the place
-            // to fill.
-            return Err(Error::InvalidFormat {
-                details: crate::writer::index::selection::SelectionRefusal::LuceneNotYetSupported {
-                    path: selected.definition.path.clone(),
-                }
-                .to_string(),
-            });
+            let (children, report, verification, built) = rebuild_lucene_one(
+                writer,
+                selected,
+                definition,
+                prepared,
+                &state_root,
+                &location,
+                &budget,
+                run,
+                observer,
+            )?;
+            lucene_built = Some(built);
+            (children, report, verification)
         }
         Some(crate::index::IndexType::Reference) => {
             let (children, report) =
@@ -568,6 +707,37 @@ fn rebuild_one<Sink: SegmentSink>(
         }
     };
 
+    let rebuilt_record = rewrite_the_rebuilt_definition(
+        store,
+        writer,
+        definition,
+        hidden_children,
+        created_seed,
+        lucene_built.as_ref(),
+        &selected.state,
+    )?;
+
+    Ok(RebuiltDefinition {
+        path: selected.definition.path.clone(),
+        previous_record: selected.definition_record,
+        rebuilt_record,
+        report,
+        verification,
+    })
+}
+
+/// The definition rewrite every rebuild ends with: the disabler's verdict,
+/// the shared edits, and — for a Lucene definition — the bookkeeping Oak's
+/// fulltext editor performs around its own reindex.
+fn rewrite_the_rebuilt_definition<Sink: SegmentSink>(
+    store: &WritableRepository,
+    writer: &mut RecordWriter<Sink>,
+    definition: &crate::content::node::NodeState<'_>,
+    hidden_children: Vec<(String, RecordIdentifier)>,
+    created_seed: Option<i64>,
+    lucene_built: Option<&crate::writer::index::lucene_reindex::LuceneRebuild>,
+    state: &IndexingState,
+) -> Result<RecordIdentifier> {
     // Oak raises the disabler's flag on both branches of its reindex
     // (`docs/analysis/index-definitions.md` §5.2, §5.5), over the *head's*
     // definitions rather than the indexed state's: the question is which
@@ -580,6 +750,20 @@ fn rebuild_one<Sink: SegmentSink>(
         })?;
     let verdict = disabler_verdict(&head_root, definition)?;
     let mut edits = DefinitionEdits::reindexed(verdict, hidden_children);
+    if let Some(built) = lucene_built {
+        // Oak's own editor writes the lane checkpoint's creation time as
+        // `lastUpdated` — the `indexingCheckpointTime` commit attribute —
+        // and the run's current time when there is none.
+        let last_updated = checkpoint_creation_time(store, state)?;
+        crate::writer::index::lucene_reindex::lucene_definition_edits(
+            store,
+            writer,
+            definition,
+            built,
+            last_updated.as_deref(),
+            &mut edits,
+        )?;
+    }
     if let Some(seed) = created_seed {
         let value = writer.write_string(&seed.to_string())?;
         edits.property_replacements.push(PropertyToWrite {
@@ -588,15 +772,7 @@ fn rebuild_one<Sink: SegmentSink>(
             values: PropertyValuesToWrite::Single(value),
         });
     }
-    let rebuilt_record = rewrite_definition(store, writer, definition, &edits)?;
-
-    Ok(RebuiltDefinition {
-        path: selected.definition.path.clone(),
-        previous_record: selected.definition_record,
-        rebuilt_record,
-        report,
-        verification,
-    })
+    rewrite_definition(store, writer, definition, &edits)
 }
 
 /// The entry-half verification for a report that wrote entries.

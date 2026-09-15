@@ -337,6 +337,28 @@ the default. The remedy either way: remove the subdirectory and rerun.
 `--sort-budget-mebibytes` raises how much stays resident before spilling.
 Higher is faster and uses more memory.
 
+**The figure the plan prints is a proxy, and for a Lucene definition it is
+a proxy resting on two other proxies.** A property index spills entries
+froe can count and size exactly, so its figure is the entry bytes plus the
+fan-in times the budget — a reduction pass writes merged runs before
+unlinking the inputs it merged, so that much more is on disk transiently.
+
+A Lucene definition has no such count. What the counting walk can produce
+without analyzing anything is two byte totals: the bytes of values the
+rules mark **stored**, and the bytes of values they mark **indexed**. The
+figure is their sum times three, plus the same fan-in term:
+
+* once for the spilled postings, doc values and norms, which coexist with
+  the segment until `finish` drains them;
+* once for the assembled segment;
+* once for the compound copy, which holds the segment's files a second
+  time while it is written.
+
+Nothing in this repository measures bytes per token or bytes per posting,
+and both are workload statistics rather than format facts — a stated
+figure would be worse than a named proxy. The multiplier is the structural
+count above and not a measurement, and the plan line says so.
+
 ### 5.4 What the plan prints, and what the summary reports
 
 `--dry-run` plans read-only, takes no lock and writes nothing. Otherwise the

@@ -19,8 +19,12 @@ use std::ffi::OsStr;
 mod index_reindex;
 #[cfg(unix)]
 mod journal;
+#[cfg(all(test, unix))]
+pub(crate) mod lucene_fixture;
 #[cfg(unix)]
 mod lucene_import;
+#[cfg(unix)]
+mod lucene_reindex;
 #[cfg(unix)]
 mod manifest;
 #[cfg(unix)]
@@ -30,7 +34,7 @@ mod session;
 #[cfg(unix)]
 mod sweep;
 #[cfg(all(test, unix))]
-mod test_support;
+pub(crate) mod test_support;
 
 pub(crate) const CHILD_ENVIRONMENT: &str = "FROE_CLEANUP_FAULT_CHILD";
 
