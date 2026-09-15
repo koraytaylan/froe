@@ -819,12 +819,30 @@ pub(crate) fn without_estimates(plan: &[String]) -> Vec<String> {
 /// Excluding `/var` is therefore excluding the difference between two
 /// boots, not a difference between two indexes. Nothing the fixture owns
 /// lives there.
+///
+/// `/content/slingshot` is the second such subtree and needs its own
+/// sentence, because the reason is not the same. The Slingshot sample
+/// application's content loader **rewrites** it on every boot — creating
+/// the two nodes under `slingshot2` it finds missing, and re-setting what
+/// it finds — so whether a row for a node under it comes back depends on
+/// how far that loader had got when the query ran. Both stores hold the
+/// identical index entry for every one of those nodes, which the
+/// rendering comparison above asserts entry by entry; what the two live
+/// sessions disagree about is the tree, not the index.
 pub(crate) fn without_instance_scoped_rows(rows: &[String]) -> Vec<String> {
     rows.iter()
         .filter(|path| !path.starts_with("/var/"))
+        .filter(|path| *path != SLINGSHOT_SUBTREE && !path.starts_with(SLINGSHOT_PREFIX))
         .cloned()
         .collect()
 }
+
+/// The Slingshot sample application's own content root.
+const SLINGSHOT_SUBTREE: &str = "/content/slingshot";
+
+/// The same, as a prefix that matches its descendants and nothing beside
+/// them.
+const SLINGSHOT_PREFIX: &str = "/content/slingshot/";
 
 /// Each node's digest line, by path, so a row can be checked against the
 /// properties the store actually holds.

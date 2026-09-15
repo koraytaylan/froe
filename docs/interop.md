@@ -833,16 +833,25 @@ Then:
 * **The whole-store delta** confined to `/oak:index`, and `froe check` at the
   new head.
 * **Oak booted on froe's store**, logging no repair, no reindex and no index
-  failure, answering eight statements with the same rows and the same
+  failure, answering ten statements with the same rows and the same
   `EXPLAIN` plan it answers from its own rebuild — node-scope fulltext,
   property fulltext, an `ORDER BY` over an ordered doc value, `IS NULL`, a
-  facet column, an `ISDESCENDANTNODE` that reaches `:ancestors`, a
-  path-restricted property term, and one statement against the
-  repository-wide definition. Every plan must name the index the statement
-  was written for: equal rows from a traversal would be equal rows proving
-  nothing. Every statement meant for the variant is restricted at or below
-  its `queryPaths`, because Oak's own fulltext planner offers an index
+  facet column, a **multi-valued** facet column, an `ISDESCENDANTNODE` that
+  reaches `:ancestors`, a path-restricted property term, a `CONTAINS` over
+  a **relative** property definition's own field, and one statement against
+  the repository-wide definition. Every plan must name the index the
+  statement was written for: equal rows from a traversal would be equal rows
+  proving nothing. Every statement meant for the variant is restricted at or
+  below its `queryPaths`, because Oak's own fulltext planner offers an index
   carrying them only to a query restricted that way.
+* **The suggester handed back.** froe removes `:suggest-data` and builds no
+  suggester dictionary, which is safe only because Oak builds one again. So
+  the definition carries `useInSuggest`, the definition comparison above
+  *declares* that node rather than excluding it silently — asserting that
+  Oak's rebuild has one and froe's has none — and the booted Oak then gets
+  one node written under the definition, waited for through a query until
+  the lane has run a cycle over it. The store is extracted from that boot
+  and `:suggest-data` must be back.
 * **The reset**: froe removes the variant's lane checkpoint, resets the
   definition under `--from-head` — which for a Lucene definition is what
   froe does instead of rebuilding, leaving `reindex` raised, every other

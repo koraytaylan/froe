@@ -128,6 +128,12 @@ pub(crate) fn lucene_reindex() {
         PHASE,
     );
     assert_check_passes_at_head(&froe_store, PHASE);
+    // froe's own index checker over the index froe just wrote. Oak accepts
+    // it above and Lucene's `CheckIndex` calls it clean, and an operator
+    // who runs `froe index check` after a rebuild would still be the first
+    // to find a writer the checker disagrees with.
+    eprintln!("  froe index check over the rebuilt indexes");
+    froe(&["index", "check", froe_store.to_str().expect("utf-8")]);
     let after_boot = work.join("froe-after-boot");
     lucene_reindex_queries::assert_oak_answers_queries_from_froes_index(
         &froe_store,
