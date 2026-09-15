@@ -385,6 +385,11 @@ pub(crate) fn interop_full() {
     // directory, so its position is free. It runs here because plan 0010's
     // rebuild installs what this phase proves.
     lucene_writer_conformance();
+    // froe's Lucene rebuild against Oak's own, which is what the writer
+    // above is installed by. Before `commit` for the reason
+    // `property_reindex` is: froe's direct commits run none of Oak's index
+    // editors, so afterwards the fixture is legitimately short an entry.
+    lucene_reindex();
     commit();
     checkpoint();
     compact();
@@ -428,18 +433,25 @@ pub(crate) fn write_run_record() {
         .find_map(|line| line.trim().strip_prefix("store.version="))
         .unwrap_or("unknown")
         .to_owned();
-    let canonical_index = std::fs::read_to_string(work_root().join("canonical-index-property.txt"))
-        .map_or_else(
+    let verdict = |name: &str| {
+        std::fs::read_to_string(work_root().join(name)).map_or_else(
             |_| "verdict not recorded in this process".to_owned(),
             |verdict| verdict.trim().to_owned(),
-        );
+        )
+    };
+    let canonical_index = verdict("canonical-index-property.txt");
+    let canonical_lucene = verdict("canonical-index-lucene.txt");
     let seconds_since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     let record = format!(
         "{header}{phases}{closing}",
         header = run_record_header(seconds_since_epoch, &oak_version, &store_version),
-        phases = run_record_phases(&canonical_index, &lucene_document_count()),
+        phases = run_record_phases(&Verdicts {
+            canonical_index: &canonical_index,
+            canonical_lucene: &canonical_lucene,
+            lucene_documents: &lucene_document_count(),
+        }),
         closing = RUN_RECORD_CLOSING,
     );
     let path = work_root().join("interop-run-record.txt");
@@ -469,16 +481,30 @@ fn run_record_header(seconds_since_epoch: u64, oak_version: &str, store_version:
 ///
 /// Split at the writer's own conformance phase, which is where the record
 /// turns from what froe does to Oak's store to what it does beside it.
-fn run_record_phases(canonical_index: &str, lucene_documents: &str) -> String {
+fn run_record_phases(verdicts: &Verdicts<'_>) -> String {
     format!(
-        "{}{}",
-        run_record_reading_phases(canonical_index, lucene_documents),
+        "{}{}{}",
+        run_record_reading_phases(verdicts),
+        run_record_lucene_reindex_phase(verdicts.canonical_lucene),
         run_record_writing_phases(),
     )
 }
 
+/// The figures a run records that no phase's own text can carry: the two
+/// canonicality verdicts and the Lucene document count.
+struct Verdicts<'a> {
+    canonical_index: &'a str,
+    canonical_lucene: &'a str,
+    lucene_documents: &'a str,
+}
+
 /// The phases up to and including the writer's conformance.
-fn run_record_reading_phases(canonical_index: &str, lucene_documents: &str) -> String {
+fn run_record_reading_phases(verdicts: &Verdicts<'_>) -> String {
+    let Verdicts {
+        canonical_index,
+        lucene_documents,
+        ..
+    } = verdicts;
     format!(
         "\x20 generate    Oak wrote the fixture store\n\
          \x20 read        froe read Oak's store (summary, tree, check, search, export)\n\
@@ -561,6 +587,59 @@ fn run_record_reading_phases(canonical_index: &str, lucene_documents: &str) -> S
     )
 }
 
+/// The `lucene_reindex` phase's own entry, split out because the record's
+/// reading half is otherwise one function past the line gate.
+fn run_record_lucene_reindex_phase(canonical_lucene: &str) -> String {
+    format!(
+        "\x20 lucene_     Oak's own async lane rebuilt every lucene definition in the\n\
+         \x20 reindex     fixture — the repository-wide one Sling ships and a second,\n\
+         \x20             fulltext-enabled variant carrying evaluatePathRestrictions,\n\
+         \x20             an ordered property, a nullCheckEnabled property under a\n\
+         \x20             non-nt:base rule, a facet property and an aggregate — and\n\
+         \x20             froe's own offline rebuild of the *same extracted bytes*\n\
+         \x20             enumerated identically through the judge: every field with\n\
+         \x20             its options, every term with statistics recomputed from live\n\
+         \x20             postings, every posting with frequency, positions and\n\
+         \x20             offsets, every stored value, doc value and norm, over the\n\
+         \x20             same documents. Both enumerations are re-keyed by each\n\
+         \x20             document's own :path first: Lucene's document numbers record\n\
+         \x20             the order a writer added documents in, which Oak's editor\n\
+         \x20             takes from a node's map order and froe's walk takes sorted,\n\
+         \x20             and which no query can observe. The one declared difference\n\
+         \x20             is the binary text froe does not extract: under\n\
+         \x20             --binary-text marker it indexes Oak's own TextExtractionError\n\
+         \x20             where Oak indexed a binary's text, and the exclusion is\n\
+         \x20             applied at the posting level to both sides before any\n\
+         \x20             statistic is derived, over exactly the documents the store\n\
+         \x20             says carry a binary. The extracted index was checked to\n\
+         \x20             carry no deletion in any segments_N first ({canonical_lucene}),\n\
+         \x20             because a lane cycle between Oak's rebuild and the stop\n\
+         \x20             updates a document as a delete and an add and the judge's\n\
+         \x20             enumerate reads live documents only. Before froe's rebuild\n\
+         \x20             each definition's bookkeeping was put back to what Oak\n\
+         \x20             started from — reindex flagged, reindexCount one below Oak's\n\
+         \x20             value. Each definition node was compared beside its index,\n\
+         \x20             excluding :data, the :status timestamps and uid and the\n\
+         \x20             :index-definition clone's reindexCount, which is the oracle\n\
+         \x20             for the facets configuration, the seed and the rest of the\n\
+         \x20             visible bookkeeping. Nothing outside /oak:index changed,\n\
+         \x20             froe check passed at the new head, and a booted Oak answered\n\
+         \x20             eight statements — node-scope and property fulltext, an\n\
+         \x20             ORDER BY over an ordered doc value, IS NULL, a facet column,\n\
+         \x20             an ISDESCENDANTNODE that reaches :ancestors and a\n\
+         \x20             path-restricted property term — with the same rows and the\n\
+         \x20             same plan it answers from its own rebuild, each plan naming\n\
+         \x20             the index it was written for. Finally the reset: froe removed\n\
+         \x20             the variant's lane checkpoint, reset the definition under\n\
+         \x20             --from-head leaving every visible property but the flag\n\
+         \x20             untouched and no hidden child behind, and Oak's own next\n\
+         \x20             cycle logged the lost checkpoint, advanced reindexCount by\n\
+         \x20             exactly one and rebuilt the definition from scratch — which\n\
+         \x20             froe's rebuild from that cycle's own lane checkpoint then\n\
+         \x20             matched\n"
+    )
+}
+
 /// The phases that write to the store.
 fn run_record_writing_phases() -> String {
     String::from(
@@ -604,8 +683,11 @@ const RUN_RECORD_CLOSING: &str = "\n\
          The froe-side edits made to a copy *before* an operation under test,\n\
          each through the public writer API and each visible in the digest\n\
          delta the phase declares: index bookkeeping put back to what Oak\n\
-         started from (property_reindex); a definition's hidden children\n\
-         removed, the state a lost index leaves (lucene_import); `corrupt`\n\
+         started from (property_reindex, lucene_reindex); a definition's\n\
+         hidden children\n\
+         removed, the state a lost index leaves (lucene_import); a lane's\n\
+         checkpoint removed and the definition reset, the state a lane whose\n\
+         checkpoint is gone leaves (lucene_reindex); `corrupt`\n\
          forged as a DATE, the type Oak's own async lane writes\n\
          (lucene_import); `async` removed, which is what makes a definition\n\
          synchronous (lucene_import). Nothing in the fixture store itself is\n\
@@ -617,8 +699,9 @@ const RUN_RECORD_CLOSING: &str = "\n\
          2 (Oak's own IndexConsistencyChecker, the second running CheckIndex\n\
          over a local copy); OutOfBandBuild's `build` (Oak's own Lucene\n\
          editors, dumper and JsonSerializer, driving oak-run's own\n\
-         out-of-band sequence); and IndexJudge's definition and index\n\
-         printers.\n\
+         out-of-band sequence); Corpus's `enumerate` (Lucene's own readers\n\
+         over a directory, live documents only); and IndexJudge's definition\n\
+         and index printers.\n\
          \n\
          Not covered: native macOS or Windows execution, store.version=1,\n\
          external blob stores, and Adobe AEM itself (this loop is Apache Sling\n\

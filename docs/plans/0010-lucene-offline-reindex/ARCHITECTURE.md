@@ -336,6 +336,9 @@ otherwise.
 | A definition with no `async` is refused: Oak documents it as required and no oracle exists for the synchronous case (same path) | `a_definition_without_async_is_refused_by_name` | `if definition.indexing_mode.synchronous` replaced with `if false && …` | `the definition must be refused, not planned: [RebuildLucene { path: "/oak:index/lucene", state: Head, rules: 1, documents: 6, stored_bytes: 0, indexed_bytes: 127, binary_text_policy: "the extraction-error marker" }]` |
 | A Lucene definition on a lane whose checkpoint is gone is **reset** under `--from-head` and refused without it (`resolve_state`) | `a_lost_checkpoint_resets_a_lucene_definition_under_from_head` and `a_lost_checkpoint_is_refused_without_from_head` (in `lucene_reindex_tests.rs`) | the `IndexType::Lucene` arm removed, so the definition falls through to the head rebuild | `a lost checkpoint resets rather than rebuilds: RebuiltIndex { documents: 0, nodes_visited: 9, files: ["segments.gen", "segments_1"], segment_bytes: 65 }` — an index rebuilt from a head whose content the lane never reached, which Oak's own next cycle would then append to again. |
 | `:data` is copied **by name from the file set `finish` returned**, never from the directory listing (`rebuild_lucene_index` → `copy_segment_into_store`) | `a_stray_file_in_the_segment_directory_is_not_copied`, in-crate in `writer/index/lucene_reindex.rs` over the seam that plants one | the loop replaced with one over `std::fs::read_dir(segment_directory)` | `the rebuild runs: InvalidFormat { details: "the rebuilt /oak:index/lucene does not read back as a coherent index: 0 missing, 1 unreferenced, 0 unreadable" }` — **defence in depth**: the read-back verification catches the stray as an unreferenced file before the head moves, so the run refuses rather than publishing it. The regression's own assertion never runs, which is the honest result and is why the row says so. |
+| A node's template property names are written in **Oak's own `Template` sort order** — Java string hash, then the name in UTF-16 order, then the type tag — whatever order the caller passed (`RecordWriter::write_node_with_stable_identifier`; every node froe writes, the index definitions `rewrite_node_with_edits` rewrites among them) | `a_node_written_out_of_order_is_stored_in_template_order`, in-crate in `writer/record_writer/nodes.rs` | `if in_template_order(properties)` replaced with `if true \|\| …` | `assertion left == right failed: the stored name order is the order Oak's own Template sorts into` — `left: ["zz", "Aa", "active"]`, `right: ["active", "Aa", "zz"]`. Oak's `getProperties` pairs the *i*-th **sorted** property template with the *i*-th value slot, so the stored order is the only thing that keeps a value with its own name; froe's own reader pairs stored position with stored position and cannot see the difference. Task 1009's interop oracle is what found it: Oak read a definition froe had rewritten as `:version LONG "async"`, `includedPaths STRINGS count=20054016`. |
+| A regular-expression property definition writes an **untokenized** `full:<name>` for a name in `IndexHelper.NOT_TOKENIZED` (`DocumentMaker::index_analyzed` → `skip_tokenization`) | `fields::a_regular_expression_definition_does_not_tokenize_the_names_oak_excludes` (in `tests/lucene_documents/`) | the `skip_tokenization` branch replaced with `if false && …` | `left: ("full:jcr:uuid", DocumentsAndFrequenciesAndPositionsAndOffsets, true, false, ["b4f8474f", "885f", "4725", "a389", "ce6deb1c3532"])`, `right: ("full:jcr:uuid", Documents, false, false, ["b4f8474f-885f-4725-a389-ce6deb1c3532"])` — a `jcr:uuid` broken into five terms with offsets and stored, where Oak writes one untokenized `DOCS_ONLY` term and stores nothing. Every `jcr:uuid` in a Sling repository reaches the fixture's catch-all pattern. |
+| The facet configuration persists a child **only** for a multi-valued dimension (`lucene_definition_edits` → `write_facet_configuration`) | `a_single_valued_facet_leaves_the_configuration_node_childless` (in `lucene_reindex_tests.rs`), with `a_multi_valued_facet_writes_one_child_carrying_multivalued` beside it | `if !dimension.multi_valued { continue; }` replaced with `if false && …` | `left: ["\tjcr:primaryType=Name:nt:unstructured", "/jcr:title\tjcr:primaryType=Name:nt:unstructured\tmultivalued=Boolean:true"]`, `right: ["\tjcr:primaryType=Name:nt:unstructured"]` — a child per dimension whatever its arity, where `NodeStateFacetsConfig` writes one only from `setMultiValued(dim, true)`. Oak's own rebuild of the fixture's faceted definition writes an empty `facets` node. |
 | The document-time refusal of an unparseable `DATE` (`DocumentMaker::make` → `date_value`) | `fields::an_unparseable_date_is_refused_by_name` (in `tests/lucene_documents/`) | the conversion replaced with `Ok(0)` | `an unparseable date is refused` — every unparseable date indexed as the epoch, where Oak's own commit fails. |
 | The segment reads back through plan 0008's own readers **before publication**, and its live document count is the writer's (`verify_before_publication` → `verify_lucene_segment`) | `a_run_rebuilds_a_lucene_index_and_leaves_the_content_tree_untouched` (in `lucene_reindex_tests.rs`), and the row above, whose neutralization it caught | — | **Not neutralizable from outside**: no input makes the bytes disagree, because the only way to produce a mismatch is a writer/reader disagreement, which is what the check exists to catch — the same carve-out plan 0008 records for its own read-back. The row above is the evidence it fires. |
 | Each attempt assembles into a **fresh** segment directory (`rebuild_lucene_index`) | `a_death_after_the_segment_is_finished_leaves_a_whole_segment_outside_the_store`, in-crate in `writer/fault_injection/lucene_reindex.rs` | — | **Not neutralized.** The residue refusal of plan 0007 stops a retry against a dead run's directory before the freshness rule could matter, so removing the `remove_dir_all` changes no observable behaviour today — defence in depth, recorded as a finding about the design rather than a gap in the evidence. |
@@ -363,11 +366,87 @@ prefix. The tests live in `writer/fault_injection/lucene_reindex.rs`.
 
 #### Interoperability
 
-*To be filled by task 1009: the loop, the oracle, the scenarios and their
-runs.* The standard is stated in `### Verification design` above —
-enumeration equality between froe's `:data` and Oak's own reindex of the
-same definition on a copy of the same store, with a live Sling answering
-queries through both.
+The `lucene_reindex` phase, against the pinned image
+(`docker.io/apache/sling@sha256:8722cd66…`, oak-segment-tar 1.90.0), with
+`docs/interop.md` carrying the operator's account of it.
+
+**The loop.** Sling boots on a copy of the fixture, the query probe is
+installed *before* anything is flagged so both sides index it
+symmetrically, every `lucene` definition is flagged, the `async` lane
+rebuilds them, Sling stops and that store is extracted. froe gets a copy
+with each definition's bookkeeping put back to what Oak started from —
+`reindex` flagged, `reindexCount` one below Oak's value — and rebuilds it
+with `--binary-text marker`. Both `:data` subtrees are dumped and
+enumerated by the judge's `Corpus enumerate`, which reads live documents
+only through Lucene's own readers.
+
+**The extracted index is checked canonical first.** A lane cycle between
+Oak's rebuild and the stop updates a document as a delete and an add, so
+the phase reads every `segments_N` with plan 0008's own segment reader and
+repeats the cycle — bounded to three attempts — while any segment carries a
+deletion. The attempt it passed on goes into `canonical-index-lucene.txt`
+and into the run record.
+
+**The comparison is re-keyed by `:path`.** Lucene's document numbers record
+the order a writer added documents in: Oak's editor takes it from a node's
+`MapRecord` order and froe's walk takes it sorted by name. Nothing in the
+index records that order and no query can observe it, so both enumerations
+are re-keyed by each document's own stored `:path` and rendered back in one
+canonical order. The commit file's `counter` is excluded for the same kind
+of reason — it counts flushes and merges, not contents.
+
+**Observed, 2026-09-15.** Both definitions identical:
+`/oak:index/interopLucene`, 12 documents and 1,031 enumerated lines, no
+exclusion; `/oak:index/lucene`, 8,321 documents and 106,969 enumerated
+lines, identical outside 2,843 declared binary exclusions. Lucene's own
+`CheckIndex` clean over each froe rebuild. Each definition node identical
+to Oak's beside its index, excluding `:data`, the `:status` timestamps and
+`uid` and the `:index-definition` clone's `reindexCount` — so the `facets`
+configuration, the `seed`, the removed `refresh`, the `:version` and
+`:status`'s indexed-node count are all Oak's own values. The content digest
+changed only inside `/oak:index` (16 lines over 52,550 nodes) and `froe
+check` passed at the new head. A booted Oak logged no repair, no reindex
+and no index failure, and answered eight statements — node-scope and
+property fulltext, `ORDER BY` over an ordered doc value, `IS NULL`, a facet
+column, an `ISDESCENDANTNODE` that reaches `:ancestors`, a path-restricted
+property term, and one against the repository-wide definition — with the
+same rows and the same `EXPLAIN` plan it answers from its own rebuild, each
+plan naming the index the statement was written for.
+
+**The declared difference.** froe extracts no text, so under
+`--binary-text marker` it indexes Oak's own `TextExtractionError` where Oak
+indexed a binary's extracted text. The exclusion is applied at the posting
+level to **both** sides before any statistic is derived — postings, stored
+value and norm for that document and field, terms left with no postings
+dropped, frequencies recomputed — and its extent is derived twice and
+required to agree exactly: from froe's index, as the documents whose
+`:fulltext` carries the marker term, and from the store, as every node the
+definition includes that carries a binary property the rule indexes
+fulltext and a `jcr:mimeType`. 2,843 documents on the repository-wide
+definition, none on the variant.
+
+**The reset scenario.** froe removes the variant's lane checkpoint and
+resets the definition under `--from-head`, leaving `reindex` raised, every
+other visible property untouched and no hidden child behind. Oak's own next
+cycle logs `Failed to retrieve previously indexed checkpoint`, logs
+`Reindexing will be performed for following indexes:
+[/oak:index/interopLucene]`, advances `reindexCount` by **exactly one** and
+rebuilds from scratch; froe then rebuilds from *that* cycle's own lane
+checkpoint and the two enumerate identically (12 documents, 1,031 lines).
+
+**The negative control.** One `:fulltext` posting's first position is
+advanced by one on a copy of froe's rendered enumeration — exactly what a
+wrong position increment in the word delimiter produces — and the same
+comparison must refuse it naming `:fulltext`. The perturbation is of the
+enumeration rather than of the analyzer because the analyzer is compiled
+into the binary under test; the defect itself is neutralized against the
+analysis module's own hand-computed vectors.
+
+**What it found.** Four defects, recorded in the plan's status: the
+template property order `RecordWriter::write_node` now enforces, the
+counter refusal that order defect's symptom had justified,
+`skipTokenization` for a regular-expression definition, and the facet
+configuration's arity rule.
 
 #### Verification report
 

@@ -174,9 +174,22 @@ fn assert_list_agrees_with_oaks_index_printer(judge: &Judge, store: &Path, work:
             }
             compare_one_field(path, field, oak_value, froe_fields);
         }
+        // The other half of the drift comparison: Oak emits the field only
+        // for a definition that drifted, so its absence is a verdict too.
+        if !oak_fields.iter().any(|(field, _)| field == DRIFT_FIELD) {
+            assert_eq!(
+                froe_fields.get("definition drift").map(String::as_str),
+                Some("false"),
+                "{path}: Oak's printer emitted no drift diff and froe reports drift"
+            );
+        }
     }
     eprintln!("    {} definitions agree field by field", oak_paths.len());
 }
+
+/// Oak's own name for the drift diff, which it emits only when there is
+/// one.
+const DRIFT_FIELD: &str = "Index definition changed without reindexing";
 
 /// One of Oak's fields against froe's rendering of the same fact.
 fn compare_one_field(
@@ -234,15 +247,56 @@ fn compare_one_field(
             froe_value("property index"),
             "{path}: property index"
         ),
+        // Definition drift. Oak emits this field **only for a definition
+        // that drifted**, and its value is the diff text rather than a
+        // verdict: `^"/reindexCount":1^"/reindex":false^"/:version":2` and
+        // `+"/facets":{…}` for the fixture's faceted definition. froe
+        // renders the verdict and a count, so the comparable fact is that
+        // both say the definition drifted — the *reasons* are two
+        // different comparisons, this printer's unfiltered diff against
+        // the filtered one Oak's own index-information provider performs
+        // and plan 0006 models, which ignores `reindex`, `reindexCount`
+        // and hidden property names. The absent case is asserted after the
+        // loop, so a froe verdict of `true` where Oak emitted nothing is
+        // caught too.
+        //
+        // The fixture's second Lucene definition is what makes this
+        // reachable at all: Oak's own editor writes the visible `facets`
+        // configuration *during* the cycle that cloned the definition, so
+        // a faceted index drifts from its own clone the moment Oak
+        // finishes building it.
+        "Index definition changed without reindexing" => {
+            assert!(
+                !oak_value.is_empty(),
+                "{path}: Oak emitted an empty drift diff, which it does only for a \
+                 definition that drifted"
+            );
+            assert_eq!(
+                "true",
+                froe_value("definition drift"),
+                "{path}: Oak's printer diffed the definition against its stored clone \
+                 ({oak_value}) and froe reports no drift. The two comparisons differ by \
+                 design — froe models the index-information provider's filtered one — so a \
+                 disagreement here means Oak found a difference outside what that filter \
+                 removes"
+            );
+        }
         // Task 0802 gave froe the commit-file reader this number needs, so
         // a Lucene definition is compared the same way every other type is.
         // Oak's own count over the directory is documents minus deletions,
         // which is what froe's structural check computes.
-        "Estimated entry count" => assert_eq!(
-            oak_value,
-            froe_value("estimated entries").replace(',', ""),
-            "{path}: estimated entry count"
-        ),
+        // froe omits the line for an index whose storage holds no entry at
+        // all — the fixture's `jcrLockOwner` is one: a `:index` node
+        // carrying an approximate counter and nothing else, which a
+        // released lock leaves. Oak computes zero for it. Both mean "no
+        // entries", so the omission is read as the zero it stands for,
+        // exactly as the suggest size above is.
+        "Estimated entry count" => {
+            let froes = froe_fields
+                .get("estimated entries")
+                .map_or_else(|| "0".to_owned(), |rendered| rendered.replace(',', ""));
+            assert_eq!(oak_value, froes, "{path}: estimated entry count");
+        }
         // Oak emits these two only for Lucene and froe reports them
         // elsewhere; neither is a field both compute.
         "Async" | "Size" | "Suggest size" | "Index size" => {}

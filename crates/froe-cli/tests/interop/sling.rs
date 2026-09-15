@@ -304,12 +304,44 @@ pub(crate) fn sling_delete(port: u16, path: &str) {
 /// A node rendered as JSON, straight from Sling.
 pub(crate) fn sling_get_json(port: u16, path: &str) -> String {
     let url = format!("http://localhost:{port}{path}.json");
-    let output = Command::new("curl")
-        .args(["-s", "--fail", "-u", "admin:admin", &url])
-        .output()
-        .expect("curl GET json");
-    assert!(output.status.success(), "reading {path} failed");
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    let mut last = String::new();
+    // Waited out, for the same reason a post is: Sling answers a read of a
+    // node it has just accepted with a bare Jetty 404 while its servlet is
+    // momentarily unmapped, and `generate` has failed on exactly that —
+    // reading back the reference target it had just posted. A read that
+    // gave up on the first status turned a servlet gap into a fixture
+    // failure attributed to the node.
+    for attempt in 1..=SERVLET_GAP_ATTEMPTS {
+        let output = Command::new("curl")
+            .args(["-s", "-u", "admin:admin", "-w", "\nHTTP %{http_code}", &url])
+            .output()
+            .expect("curl GET json");
+        let response = String::from_utf8_lossy(&output.stdout).into_owned();
+        let status = response
+            .rsplit_once("HTTP ")
+            .map_or("unknown", |(_, code)| code.trim())
+            .to_owned();
+        if status.starts_with('2') {
+            if attempt > 1 {
+                eprintln!("  reading {path} succeeded on attempt {attempt}");
+            }
+            let body = response
+                .rsplit_once("\nHTTP ")
+                .map_or(response.as_str(), |(body, _)| body);
+            return body.to_owned();
+        }
+        eprintln!(
+            "  reading {path} returned HTTP {status} (attempt {attempt} of \
+             {SERVLET_GAP_ATTEMPTS}), waiting"
+        );
+        last = response;
+        std::thread::sleep(SERVLET_GAP_WAIT);
+    }
+    panic!(
+        "reading {path} never succeeded over {:?}:\n{}",
+        SERVLET_GAP_WAIT * SERVLET_GAP_ATTEMPTS,
+        &last[..last.len().min(2000)]
+    );
 }
 
 /// The node's `jcr:uuid`, read from Sling's JSON rendering.
@@ -537,12 +569,18 @@ pub(crate) fn sling_install_query_probe(port: u16) {
     // Oak's explain result does not name its column the way an ordinary
     // one does and `getPath()` then throws "this query does not have a
     // selector" — a 500 that says nothing about the query.
+    //
+    // A `column` parameter prints that column's value instead of the row's
+    // path, which is the only way to read a facet result: `rep:facet(x)`
+    // has no path of its own, and a probe that could only print paths
+    // would make every facet comparison a comparison of row counts.
     const PROBE: &str = concat!(
         "<%@page session=\"false\" import=\"javax.jcr.*,javax.jcr.query.*\"%>",
         "<%@taglib prefix=\"sling\" uri=\"http://sling.apache.org/taglibs/sling/1.0\"%>",
         "<sling:defineObjects/><%\n",
         "response.setContentType(\"text/plain\");\n",
         "String statement = request.getParameter(\"statement\");\n",
+        "String column = request.getParameter(\"column\");\n",
         "boolean explaining = statement.trim().toUpperCase().startsWith(\"EXPLAIN\");\n",
         "Session session = resourceResolver.adaptTo(Session.class);\n",
         "QueryManager manager = session.getWorkspace().getQueryManager();\n",
@@ -553,6 +591,9 @@ pub(crate) fn sling_install_query_probe(port: u16) {
         "  Row row = rows.nextRow();\n",
         "  if (explaining) {\n",
         "    out.println(row.getValue(\"plan\").getString());\n",
+        "  } else if (column != null && column.length() > 0) {\n",
+        "    javax.jcr.Value value = row.getValue(column);\n",
+        "    out.println(value == null ? \"\" : value.getString());\n",
         "  } else {\n",
         "    out.println(row.getPath());\n",
         "  }\n",
@@ -627,21 +668,37 @@ const PROBE_RESOURCE: &str = "/content/froe-query-probe";
 
 /// Runs one JCR-SQL2 statement through the probe and returns its lines.
 pub(crate) fn sling_query(port: u16, statement: &str) -> Vec<String> {
+    run_the_probe(port, statement, None)
+}
+
+/// The same, printing one named column's value per row instead of the
+/// row's path.
+///
+/// This is how a facet result is read: `rep:facet(<property>)` names no
+/// node, so every row of such a query has the same (absent) path and a
+/// comparison of paths would compare nothing.
+pub(crate) fn sling_query_column(port: u16, statement: &str, column: &str) -> Vec<String> {
+    run_the_probe(port, statement, Some(column))
+}
+
+/// One request to the probe, with or without a column.
+fn run_the_probe(port: u16, statement: &str, column: Option<&str>) -> Vec<String> {
     let url = format!("http://localhost:{port}{PROBE_RESOURCE}.html");
-    let output = Command::new("curl")
-        .args([
-            "-s",
-            "-u",
-            "admin:admin",
-            "-w",
-            "\nHTTP %{http_code}",
-            "--data-urlencode",
-            &format!("statement={statement}"),
-            "-G",
-            &url,
-        ])
-        .output()
-        .expect("run the query probe");
+    let mut command = Command::new("curl");
+    command.args([
+        "-s",
+        "-u",
+        "admin:admin",
+        "-w",
+        "\nHTTP %{http_code}",
+        "--data-urlencode",
+        &format!("statement={statement}"),
+    ]);
+    if let Some(column) = column {
+        command.args(["--data-urlencode", &format!("column={column}")]);
+    }
+    command.args(["-G", &url]);
+    let output = command.output().expect("run the query probe");
     let response = String::from_utf8_lossy(&output.stdout);
     let (body, status) = response
         .rsplit_once("\nHTTP ")

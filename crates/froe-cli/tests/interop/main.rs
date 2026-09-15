@@ -70,43 +70,50 @@
 //!     checker over froe's directory, and the two indexes enumerated and
 //!     compared line for line. Read-only over the fixture — it writes only
 //!     into its own work directory — so its position is free; it runs here
-//!     because it is what plan 0010's rebuild will rest on.
+//!     because it is what plan 0010's rebuild rests on.
 //!
-//!  9. **`commit`** — froe adds nodes with typed properties through the
+//!  9. **`lucene_reindex`** — froe's offline Lucene rebuild against Oak's
+//!     own rebuild of the same bytes: both indexes enumerated by the judge
+//!     and compared outside one declared binary difference, the definition
+//!     nodes compared, every query pair and plan equal through Oak's own
+//!     engine, and a reset on a lost lane ending in Oak's own from-scratch
+//!     rebuild. Before `commit`, for the reason `property_reindex` is.
+//!
+//! 10. **`commit`** — froe adds nodes with typed properties through the
 //!     library's commit API; Sling reads them back. The core interop claim.
 //!
-//! 10. **`checkpoint`** — froe writes a checkpoint: a metadata-only
+//! 11. **`checkpoint`** — froe writes a checkpoint: a metadata-only
 //!     write-path test the compaction phases' checkpoint handling rests on.
 //!
-//! 11. **`compact`** — froe compacts a copy and Sling boots the result.
+//! 12. **`compact`** — froe compacts a copy and Sling boots the result.
 //!
-//! 12. **`compact_tail`** — the same with `--tail`, which retains the shared
+//! 13. **`compact_tail`** — the same with `--tail`, which retains the shared
 //!     full generation and so reclaims strictly less.
 //!
-//! 13. **`checkpoint_removal`** — remove by name, remove-unreferenced and
+//! 14. **`checkpoint_removal`** — remove by name, remove-unreferenced and
 //!     remove-all; the checkpoint Oak's indexer resumes from survives the
 //!     middle one.
 //!
-//! 14. **`cleanup`** — a multi-generational store with an expired
+//! 15. **`cleanup`** — a multi-generational store with an expired
 //!     checkpoint, a stale archive, a truncated journal and corrupt journal
 //!     lines, all resolved in one run.
 //!
-//! 15. **`journal_retention`** — a plain compact retires every revision but
+//! 16. **`journal_retention`** — a plain compact retires every revision but
 //!     the head it wrote and sweeps the segments behind them.
 //!
-//! 16. **`compact_convergence`** — the run after a full compaction proves
+//! 17. **`compact_convergence`** — the run after a full compaction proves
 //!     the store fully compacted, mutates nothing, and says so.
 //!
-//! 17. **`version_history_purge`** — Oak versions two nodes and deletes one;
+//! 18. **`version_history_purge`** — Oak versions two nodes and deletes one;
 //!     froe purges the orphaned history under a digest with the purge as its
 //!     only exclusion.
 //!
-//! 18. **`repair`** — Oak's JVM is killed with SIGKILL holding an archive
+//! 19. **`repair`** — Oak's JVM is killed with SIGKILL holding an archive
 //!     open; an authorized compact rebuilds the index.
 //!
-//! 19. **`backup`** — froe backup and restore; Sling boots the result.
+//! 20. **`backup`** — froe backup and restore; Sling boots the result.
 //!
-//! 20. **`recover`** — froe recover-journal after deleting `journal.log`.
+//! 21. **`recover`** — froe recover-journal after deleting `journal.log`.
 //!     Last because it is the most destructive.
 //!
 //! All code in the loop is Apache-2.0 (Apache Sling + Apache Jackrabbit
@@ -135,11 +142,15 @@ mod digest;
 mod environment;
 mod fixtures;
 mod judge;
+mod lucene_enumeration;
+mod lucene_reindex_queries;
+mod lucene_reindex_reset;
 mod oak;
 mod phase_baseline;
 mod phase_index_inventory;
 mod phase_judge;
 mod phase_lucene_import;
+mod phase_lucene_reindex;
 mod phase_lucene_transport;
 mod phase_lucene_writer;
 mod phase_maintenance;
@@ -148,6 +159,7 @@ mod phase_recovery;
 mod phase_writing;
 mod podman;
 mod sling;
+mod sling_lucene;
 mod store;
 
 use content::*;
@@ -161,6 +173,7 @@ use phase_baseline::*;
 use phase_index_inventory::*;
 use phase_judge::*;
 use phase_lucene_import::*;
+use phase_lucene_reindex::*;
 use phase_lucene_transport::*;
 use phase_lucene_writer::*;
 use phase_maintenance::*;
@@ -168,4 +181,5 @@ use phase_property_reindex::*;
 use phase_writing::*;
 use podman::*;
 use sling::*;
+use sling_lucene::*;
 use store::*;

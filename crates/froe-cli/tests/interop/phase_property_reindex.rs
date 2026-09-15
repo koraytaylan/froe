@@ -140,6 +140,23 @@ const QUERY_SAMPLES: [&str; 3] = [
     "SELECT * FROM [nt:base] WHERE [sling:resourceType] IS NOT NULL",
 ];
 
+/// The property each sample's rows turn on, where a **booting Sling writes
+/// that property for itself**.
+///
+/// `sling:resourceType` is one: the Slingshot sample application sets it on
+/// `/content/slingshot` and creates two nodes under `slingshot2` some
+/// seconds into every boot, and the synchronous property index picks them
+/// up the moment it does. Neither store holds any of it — `froe node`
+/// finds no `sling:resourceType` on `/content/slingshot` in either — so
+/// whether a row appears depends only on how far that boot had got when
+/// the query ran, and the comparison failed on it intermittently.
+///
+/// Filtering both sides to rows whose node carries the property **in the
+/// store** removes exactly that. It cannot hide a difference between the
+/// two indexes: a row froe's index is missing for a node the store does
+/// carry the property on still fails.
+const SAMPLE_PROPERTIES: [Option<&str>; 3] = [None, None, Some("sling:resourceType")];
+
 /// Oak boots on froe's store, accepts the indexes as written, and answers
 /// the same queries with the same rows it answers from its own rebuild.
 ///
@@ -153,13 +170,29 @@ fn assert_oak_answers_queries_from_froes_index(froe_store: &Path) {
     let from_oak = read_oracle_answers();
     let from_froe = query_a_booted_store(froe_store, "froe-reindex-froe", 8092);
 
-    for (statement, (oak_rows, froe_rows)) in QUERY_SAMPLES
+    let carriers = property_carriers(froe_store);
+    for ((statement, property), (oak_rows, froe_rows)) in QUERY_SAMPLES
         .iter()
+        .zip(SAMPLE_PROPERTIES)
         .zip(from_oak.results.iter().zip(from_froe.results.iter()))
     {
+        let comparable = |rows: &[String]| -> Vec<String> {
+            let rows = without_instance_scoped_rows(rows);
+            match property {
+                None => rows,
+                Some(name) => rows
+                    .into_iter()
+                    .filter(|path| {
+                        carriers
+                            .get(path.as_str())
+                            .is_some_and(|line| line.contains(&format!("\t{name}=")))
+                    })
+                    .collect(),
+            }
+        };
         assert_eq!(
-            without_instance_scoped_rows(froe_rows),
-            without_instance_scoped_rows(oak_rows),
+            comparable(froe_rows),
+            comparable(oak_rows),
             "{statement}: Oak answered differently from froe's index than from its own"
         );
     }
@@ -511,16 +544,23 @@ fn oak_rebuild_once(extracted: &Path, definitions: &[String]) {
         eprintln!("    reindexCount {count} -> {after}");
     }
 
-    // The oracle's answers are collected here, from the session that just
-    // rebuilt: booting a second Sling on the extracted copy would prove the
-    // same thing at the cost of another full boot, and this host's memory
-    // watchdog has killed the phase at exactly that point three times.
-    eprintln!("  collecting the oracle's query answers before stopping Sling");
-    let answers = collect_query_answers(8091);
-    write_oracle_answers(&answers);
-
     drop(sling);
     store_from_volume(&volume.name, extracted);
+
+    // The oracle's answers come from a **fresh boot on the extracted
+    // store**, not from the session that rebuilt. That session is still
+    // running Sling, and Sling writes content of its own while it is up:
+    // the Slingshot sample application gives `/content/slingshot` a
+    // `sling:resourceType` and creates two nodes under `slingshot2` that
+    // are gone again by the time the store is extracted. Answers collected
+    // mid-session therefore name rows the extracted store does not hold,
+    // and the comparison against a fresh boot on froe's copy failed on
+    // them — intermittently, which is worse. Collecting both sides the
+    // same way, each from a fresh boot on its own extracted store, is what
+    // makes the two comparable. It costs one more boot.
+    eprintln!("  collecting the oracle's query answers from the extracted store");
+    let answers = query_a_booted_store(extracted, "froe-reindex-oracle", 8091);
+    write_oracle_answers(&answers);
 }
 
 /// Every sample's rows and every deterministic sample's plan, from a Sling
@@ -751,7 +791,7 @@ fn record_canonical_verdict(attempt: usize) {
 /// `estimatedCost` and `estimatedEntries` are the two numbers Oak derives
 /// from the randomized approximate counters. Everything else in the plan —
 /// which index, which access pattern, which warnings — is the claim.
-fn without_estimates(plan: &[String]) -> Vec<String> {
+pub(crate) fn without_estimates(plan: &[String]) -> Vec<String> {
     plan.iter()
         .map(|line| {
             let trimmed = line.trim();
@@ -779,10 +819,23 @@ fn without_estimates(plan: &[String]) -> Vec<String> {
 /// Excluding `/var` is therefore excluding the difference between two
 /// boots, not a difference between two indexes. Nothing the fixture owns
 /// lives there.
-fn without_instance_scoped_rows(rows: &[String]) -> Vec<String> {
+pub(crate) fn without_instance_scoped_rows(rows: &[String]) -> Vec<String> {
     rows.iter()
         .filter(|path| !path.starts_with("/var/"))
         .cloned()
+        .collect()
+}
+
+/// Each node's digest line, by path, so a row can be checked against the
+/// properties the store actually holds.
+fn property_carriers(store: &Path) -> std::collections::BTreeMap<String, String> {
+    phase_digest(store)
+        .lines()
+        .filter(|line| line.starts_with('/'))
+        .map(|line| {
+            let path = line.split_once('\t').map_or(line, |(path, _)| path);
+            (path.to_owned(), line.to_owned())
+        })
         .collect()
 }
 

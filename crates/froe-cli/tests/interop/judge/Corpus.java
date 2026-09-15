@@ -442,7 +442,7 @@ public final class Corpus {
                     rendered = field.numericValue().getClass().getSimpleName()
                             + "\t" + field.numericValue();
                 } else {
-                    rendered = "text\t" + field.stringValue();
+                    rendered = "text\t" + escape(field.stringValue());
                 }
                 out.println("stored\t" + document + "\t" + field.name() + "\t" + rendered);
             }
@@ -524,6 +524,33 @@ public final class Corpus {
                         + "\t" + (norms == null ? 0 : (norms.get(document) & 0xff)));
             }
         }
+    }
+
+    /**
+     * A stored string as one line: the dump is line-oriented, and a stored
+     * value is the only field in it that carries text a document supplied.
+     * Oak stores a binary's extracted text as a `:fulltext` value, and an
+     * SVG or an HTML page's text carries newlines and tabs — which would
+     * otherwise turn one stored value into several lines of a kind no
+     * reader knows.
+     */
+    private static String escape(String value) {
+        StringBuilder rendered = new StringBuilder(value.length());
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (character == '\\') {
+                rendered.append("\\\\");
+            } else if (character == '\n') {
+                rendered.append("\\n");
+            } else if (character == '\r') {
+                rendered.append("\\r");
+            } else if (character == '\t') {
+                rendered.append("\\t");
+            } else {
+                rendered.append(character);
+            }
+        }
+        return rendered.toString();
     }
 
     private static String hexadecimal(BytesRef bytes) {

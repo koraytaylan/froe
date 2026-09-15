@@ -22,7 +22,7 @@ pub(crate) const FULL_CONSISTENCY_LEVEL: &str = "2";
 /// A hardcoded name would quietly stop covering a definition the fixture
 /// gained — and plan 0010 adds one — so the comparison is per definition
 /// directory rather than one against one.
-fn lucene_definitions(store: &Path) -> Vec<String> {
+pub(crate) fn lucene_definitions(store: &Path) -> Vec<String> {
     let repository = froe::Repository::open(store).expect("open the fixture");
     let oak_index = repository
         .node_at_path("/oak:index")
@@ -311,7 +311,7 @@ fn assert_same_index_details(oak: &Path, froe_directory: &Path, index_path: &str
 /// `indexPath` lands as `/oak\:index/lucene`. Comparing the raw lines
 /// would compare an encoding rather than the facts, and would silently
 /// pass if one side stopped escaping.
-fn read_details(path: &Path) -> std::collections::BTreeMap<String, String> {
+pub(crate) fn read_details(path: &Path) -> std::collections::BTreeMap<String, String> {
     std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
         .lines()

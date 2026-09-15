@@ -155,6 +155,18 @@ lucene_writer_conformance
    │  rebuild would install. Reads the fixture not at all and writes only
    │  into its work directory, so its position is free.
    ▼
+lucene_reindex
+   │  Oak's own async lane rebuilds every lucene definition in the fixture;
+   │  froe rebuilds the same extracted bytes offline, and the two indexes
+   │  enumerate identically outside the one declared binary difference.
+   │  Every query pair and every plan agree through Oak's own engine, and a
+   │  reset on a lane whose checkpoint is gone ends in Oak's own
+   │  from-scratch rebuild.
+   │  If this fails: froe's offline Lucene rebuild is not what Oak's own
+   │  reindex produces, which is the whole claim of `froe index reindex`
+   │  for a lucene definition. Runs before commit for the reason
+   │  property_reindex does.
+   ▼
 commit
    │  froe adds nodes with typed properties to the content tree via
    │  the library's commit API, then Sling reads them back
@@ -298,6 +310,45 @@ churns content (create + delete 20 subtrees × 5 children × 3 rounds) to
 produce orphaned segments, and stops cleanly. The resulting store is the
 shared fixture for all later phases.
 
+Beside the content it adds the index shapes the reindex phases rebuild,
+each through Sling so the bytes are authentically Oak's: a
+`mix:referenceable` target with a `REFERENCE` and a `WEAKREFERENCE` to it, a
+group with two members, a property index over `jcr:title` posted *after* the
+content exists so Oak rebuilds it in one synchronous cycle, and — for plan
+0010 — a second Lucene definition beside the repository-wide `lucene` one
+Sling ships.
+
+That second definition, `/oak:index/interopLucene`, is the fixture's
+coverage of everything the shipped one has no branch for. It is
+fulltext-enabled (an `analyzed`, `nodeScopeIndex` property, so Oak selects
+`oakCodec`), on the fixture's one `async` lane, with `includedPaths` and
+`queryPaths` both `/content/interop/variant` — the subtree its content lives
+in, which is what keeps plan 0008's transport phases unchanged: its import
+phase names `/oak:index/lucene` explicitly, its dump phase compares per
+definition, and both query under `/content/interop/pages`. It carries
+`evaluatePathRestrictions`, an `ordered = true` property definition in the
+new-format place under `indexRules` (the old `orderedProps` list is read
+only by the old-format rule construction, for definitions without
+`indexRules`), a `nullCheckEnabled` property under a rule whose node type is
+`nt:unstructured` rather than `nt:base` — Oak's own rule validation refuses
+that combination — a `facets` property and an `aggregates` rule including
+`jcr:content`.
+
+The content under `/content/interop/variant` is what those branches need: six
+items carrying a long, a double, a date, a boolean and two strings, one of
+which is present on four of them and absent on two, and three page-like trees
+with `jcr:content` children for the aggregate. Its words are nonsense on
+purpose, so a query's row set is attributable to this content rather than to
+whatever else the image ships.
+
+`generate` waits for Oak's `async` lane to finish that definition before it
+churns, and asserts afterwards — from the extracted store, through `froe
+node` — that Oak wrote a `facets` configuration into the visible definition.
+That configuration is the evidence Oak read the rules: Oak's own editor
+writes it only when a facet property was actually indexed, and a definition
+whose rules Oak could not load would still leave a `:data`, an empty one, and
+a reindex oracle comparing two empty indexes would pass.
+
 ### The log gate, and its positive control
 
 Every phase that boots Oak against a froe-written store asserts Oak logged
@@ -388,8 +439,15 @@ update. Since plan 0009 it also stands in for Lucene's own *writer*:
 under the `oakCodec` composition and enumerates any index into a canonical
 dump, `CodecVectors` replays froe's codec primitives through Lucene's own
 readers, and `FstCheck` enumerates froe's transducers back to the maps they
-were built from. What it cannot: anything `oak-run` alone does, and anything
-that needs a booted Sling, which is what the container phases are for.
+were built from. Plan 0010 added three more, none of which needs a store at
+all: `Analyze` puts a corpus through each of Oak's own analyzer chains and
+prints the tokens with their increments and offsets, `NumericVectors` prints
+Lucene's own prefix-coded numeric terms and Jackrabbit's own `ISO8601`
+parse of a date corpus — refusing to run unless that class came from
+`jackrabbit-jcr-commons` — and `RegularExpressionVectors` puts a pattern and
+a name through Java's own engine under Oak's `NamePattern` logic. What the
+judge cannot stand in for: anything `oak-run` alone does, and anything that
+needs a booted Sling, which is what the container phases are for.
 
 One convention runs through it. A class that opens a segment store writes its
 data to a file the caller names, never to standard output, because opening a
@@ -706,6 +764,130 @@ Nor does it say anything about **merging or deletions**: both indexes are
 one segment written in one commit, which is what froe writes and all it
 writes. A segment that Oak later merges, or into which Oak later writes a
 deletions file, is Oak's to produce.
+
+### lucene_reindex
+
+The strongest oracle available for a Lucene reindex. Not "the index froe
+wrote reads back", which a self-consistent mistake satisfies, but **"Oak
+rebuilt these same definitions over these same bytes, and the two indexes
+hold the same thing"**.
+
+Both rebuilds must therefore run over the *very same store*, for the reason
+`property_reindex`'s header gives: a booted Sling writes content of its own
+before any request arrives. The phase boots Sling on a copy of the fixture,
+installs the query probe **before** anything is flagged so both sides index
+it symmetrically, flags every `lucene` definition, waits for the `async`
+lane, stops, extracts *that* store, and gives froe a copy of it with each
+definition's bookkeeping put back to what Oak started from — `reindex`
+flagged, `reindexCount` one below Oak's value, so froe's single increment
+lands on exactly Oak's.
+
+Three things are specific to Lucene.
+
+**The rebuild is asynchronous.** Oak clears `reindex` and advances
+`reindexCount` on the lane, not in the commit that flags it. The wait is on
+both together, through Sling's GET servlet; the hidden `:status` is
+invisible to JCR, so the phase asserts on the extracted store instead that
+each definition's `reindexCompletionTimestamp` is not the one the fixture
+carried. A definition whose flag cleared without its writer ever closing
+would pass the wait and fail there.
+
+**The extracted index must carry no deletion.** A lane cycle between Oak's
+rebuild and the stop updates a document through Oak's index writer as a
+delete and an add, and the judge's `enumerate` reads live documents only. An
+index carrying deletions therefore enumerates a subset of what it holds,
+which no from-scratch rebuild produces. The phase reads every `segments_N`
+with plan 0008's own segment reader, repeats the boot-flag-wait-stop-extract
+cycle while any segment carries one — bounded to three attempts — and fails
+naming the condition rather than comparing a weakened pair. The attempt it
+passed on goes into `canonical-index-lucene.txt` beside the property phase's
+own verdict, and into the run record.
+
+**One difference is declared.** froe extracts no text. Under `--binary-text
+marker` it indexes Oak's own `TextExtractionError` where Oak indexed a
+binary's extracted text, so the comparison removes that at the **posting
+level from both sides before any statistic is derived**: for each affected
+document and field the postings, the stored value and the norm go, terms
+left with no postings go, and each surviving term's document and total
+frequencies are recomputed from what remains. Which documents those are is
+derived twice and the two must agree exactly — from froe's own index, as the
+documents whose `:fulltext` carries the marker term, and from the store, as
+every node the definition includes that carries a binary property the rule
+indexes fulltext and a `jcr:mimeType`. An exclusion wider than the binaries
+would hide a real difference; one narrower would fail on a difference that
+is declared.
+
+Then:
+
+* **Lucene's own `CheckIndex` over froe's rebuild**, first, because an
+  enumeration that matches is worth nothing if the index it came from is
+  malformed.
+* **Both indexes enumerated by the judge and compared**, re-keyed by each
+  document's own `:path` — see below.
+* **Each definition node compared** beside its index, excluding `:data`, the
+  `:status` timestamps and `uid`, and the `:index-definition` clone's
+  `reindexCount`. This is the oracle for the `facets` configuration the
+  document maker's dimensions persist, the `seed`, the removal of `refresh`
+  and `indexImportState`, the `:version`, and `:status`'s own indexed-node
+  count.
+* **The whole-store delta** confined to `/oak:index`, and `froe check` at the
+  new head.
+* **Oak booted on froe's store**, logging no repair, no reindex and no index
+  failure, answering eight statements with the same rows and the same
+  `EXPLAIN` plan it answers from its own rebuild — node-scope fulltext,
+  property fulltext, an `ORDER BY` over an ordered doc value, `IS NULL`, a
+  facet column, an `ISDESCENDANTNODE` that reaches `:ancestors`, a
+  path-restricted property term, and one statement against the
+  repository-wide definition. Every plan must name the index the statement
+  was written for: equal rows from a traversal would be equal rows proving
+  nothing. Every statement meant for the variant is restricted at or below
+  its `queryPaths`, because Oak's own fulltext planner offers an index
+  carrying them only to a query restricted that way.
+* **The reset**: froe removes the variant's lane checkpoint, resets the
+  definition under `--from-head` — which for a Lucene definition is what
+  froe does instead of rebuilding, leaving `reindex` raised, every other
+  visible property untouched and no hidden child behind — and Oak's own next
+  cycle logs `Failed to retrieve previously indexed checkpoint`, advances
+  `reindexCount` by exactly one and rebuilds the definition from scratch.
+  froe then rebuilds from *that cycle's* own lane checkpoint and the two
+  enumerate identically. The comparison is against the second boot's
+  checkpoint rather than the first oracle because the second boot's
+  instance-keyed content makes the first non-deterministic.
+
+#### Why the comparison is re-keyed by `:path`
+
+`Corpus.enumerate` keys every line by Lucene's **document number**, which is
+an artefact of the order documents were added in. The two sides do not share
+that order: Oak's own editor walks a node's children in the order its
+`MapRecord` yields them, which is by the hash of each name, and froe's
+rebuild walks them sorted by name. Neither order is part of the format —
+nothing in the index records it, and no query can observe it — so comparing
+the enumerations line for line would compare the walk rather than the index.
+
+What *is* comparable is every document identified by its own `:path`, which
+Oak's document maker stores on every document it makes. Both enumerations
+are re-keyed by it and rendered back in one canonical order, so the equality
+is an equality of contents: the same fields with the same options, the same
+terms with the same statistics recomputed from live postings, the same
+postings with the same frequencies, positions and offsets, the same stored
+values, doc values and norms, over the same documents. The commit file's
+`counter` is excluded for the same kind of reason: it counts the flushes and
+merges that produced the index, not what is in it, and Oak rebuilds through
+its own merge policy where froe writes one segment in one commit.
+
+#### The negative control
+
+A comparison that passed over everything would pass over this phase too. The
+phase therefore perturbs a copy of froe's own rendered enumeration exactly as
+a wrong position increment in the word delimiter would — one `:fulltext`
+posting's first position advanced by one — and requires the same comparison
+to refuse it, naming `:fulltext`. The perturbation is of the enumeration
+rather than of the analyzer because the analyzer is compiled into the binary
+under test: a run that rebuilt froe with a defect would be comparing a
+different binary from the one that produced the index above. The defect
+itself is neutralized against the analysis module's own hand-computed
+vectors, which is where a wrong increment is caught first; this proves the
+*comparison* would not let one through.
 
 ### commit
 

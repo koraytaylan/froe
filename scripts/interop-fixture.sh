@@ -18,8 +18,8 @@
 # to anything.
 #
 #   generate, read, judge_smoke, index_inventory, property_reindex,
-#   lucene_dump, lucene_import, lucene_writer_conformance, commit,
-#   checkpoint, compact, compact_tail,
+#   lucene_dump, lucene_import, lucene_writer_conformance, lucene_reindex,
+#   commit, checkpoint, compact, compact_tail,
 #   checkpoint_removal, cleanup, journal_retention, compact_convergence,
 #   version_history_purge, repair, backup, recover
 #
@@ -64,7 +64,7 @@ else
     # Run a single phase.
     phase="$1"
     case "$phase" in
-        generate|read|judge_smoke|index_inventory|property_reindex|lucene_dump|lucene_import|lucene_writer_conformance|commit|checkpoint|compact|compact_tail|checkpoint_removal|cleanup|journal_retention|compact_convergence|version_history_purge|repair|backup|recover)
+        generate|read|judge_smoke|index_inventory|property_reindex|lucene_dump|lucene_import|lucene_writer_conformance|lucene_reindex|commit|checkpoint|compact|compact_tail|checkpoint_removal|cleanup|journal_retention|compact_convergence|version_history_purge|repair|backup|recover)
             # generate must run first for all other phases.
             if [[ "$phase" != "generate" ]]; then
                 echo "Running 'generate' first (required by all phases)..."
@@ -76,7 +76,7 @@ else
             echo "Unknown phase: $phase" >&2
             echo "Phases: generate, read, judge_smoke, index_inventory," >&2
             echo "        property_reindex, lucene_dump, lucene_import," >&2
-            echo "        lucene_writer_conformance," >&2
+            echo "        lucene_writer_conformance, lucene_reindex," >&2
             echo "        commit, checkpoint, compact, compact_tail," >&2
             echo "        checkpoint_removal, cleanup, journal_retention," >&2
             echo "        compact_convergence, version_history_purge," >&2

@@ -40,9 +40,24 @@ pub(crate) fn generate() {
     eprintln!("  adding references, a group with members, and an index to rebuild");
     populate_references(8080);
     populate_group_with_members(8080);
-    // Posted last, after the content it indexes exists, so Oak's rebuild has
-    // something to find.
+    // The content plan 0010's rebuild has branches for, and which the
+    // fixture's own `/oak:index/lucene` — an `nt:base` rule over strings
+    // and binaries — exercises none of: typed properties, a page-like tree
+    // for an aggregate, and a property present on some nodes and absent on
+    // others.
+    eprintln!("  adding the Lucene variant's content");
+    populate_lucene_variant_content(8080);
+    // Posted last, after the content they index exists, so Oak's rebuilds
+    // have something to find.
     populate_rebuilt_property_index(8080);
+    eprintln!("  adding the second Lucene definition");
+    populate_lucene_variant_definition(8080);
+    // Oak rebuilds a Lucene definition on its `async` lane rather than in
+    // the commit that flags it, so `generate` waits for the cycle here —
+    // before the churn, the baseline and the stop — instead of extracting
+    // a store whose second index is empty.
+    eprintln!("  waiting for Oak's async lane to build the second Lucene index");
+    sling_wait_until_reindexed(8080, &format!("/oak:index/{LUCENE_VARIANT_DEFINITION}"), 0);
 
     eprintln!("  churning content to produce orphaned segments");
     churn_content(8080);
@@ -293,5 +308,61 @@ pub(crate) fn assert_index_fixture_built(store: &Path) {
         "the rebuilt index has an empty :index, so Oak found no content to \
          index and the oracle would compare two empty trees:\n{storage}"
     );
+    assert_lucene_variant_built(store_path);
     eprintln!("  index fixture: references, group members and a rebuilt property index");
+}
+
+/// Asserts Oak's own lane built the second Lucene definition, and built it
+/// over the features the definition was posted for.
+///
+/// Presence of `:data` is not enough. A definition whose rules Oak could
+/// not load still gets a `:data` — an empty one — and the reindex oracle
+/// would then compare two empty indexes and pass. The evidence that Oak
+/// read the rules is the **`facets` configuration**, which Oak's own
+/// editor writes into the visible definition only when a facet property
+/// was actually indexed, and the `:status` node's indexed-node count.
+fn assert_lucene_variant_built(store_path: &str) {
+    let root = format!("/oak:index/{LUCENE_VARIANT_DEFINITION}");
+    let definition = froe(&["node", store_path, &root]);
+    assert!(
+        definition.contains("reindex <Boolean> = false"),
+        "{root} is still flagged, so Oak's lane never finished it:\n{definition}"
+    );
+    assert!(
+        definition.contains("child             :data"),
+        "{root} has no :data, so Oak's lane built no index:\n{definition}"
+    );
+    assert!(
+        definition.contains("child             facets"),
+        "{root} carries no facets configuration, which Oak's own editor writes only \
+         when a facet property was indexed — so Oak did not read the rules this \
+         definition was posted for:\n{definition}"
+    );
+    let status = froe(&["node", store_path, &format!("{root}/:status")]);
+    let indexed = status
+        .lines()
+        .find(|line| line.contains("indexedNodes"))
+        .unwrap_or_else(|| panic!("{root}/:status names no indexedNodes:\n{status}"));
+    let count: u64 = indexed
+        .rsplit_once("= ")
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("indexedNodes is not a number: {indexed}"));
+    assert!(
+        count >= u64::from(VARIANT_ITEMS + VARIANT_PAGES),
+        "{root} indexed {count} nodes, fewer than the {} the variant subtree holds",
+        VARIANT_ITEMS + VARIANT_PAGES
+    );
+    // The path restriction Oak was given, read back from the definition
+    // rather than from what was posted: a `queryPaths` that arrived as a
+    // single STRING plans as though it were not there.
+    for property in ["includedPaths", "queryPaths"] {
+        assert!(
+            definition.contains(&format!(
+                "{property} <String[]> = [\"{LUCENE_VARIANT_SUBTREE}\"]"
+            )),
+            "{root} does not carry {property} as a String[] naming {LUCENE_VARIANT_SUBTREE}:\n\
+             {definition}"
+        );
+    }
+    eprintln!("  index fixture: a second Lucene definition Oak built over {count} nodes");
 }
